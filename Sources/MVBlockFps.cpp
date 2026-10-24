@@ -51,6 +51,8 @@ MVBlockFps::MVBlockFps(
   try { env->CheckVersion(8); }
   catch (const AvisynthError&) { has_at_least_v8 = false; }
 
+  _mt_flag = mt_flag;
+
   cpuFlags = _isse2 ? env->GetCPUFlags() : 0;
 
   numeratorOld = vi.fps_numerator;
@@ -216,10 +218,7 @@ MVBlockFps::MVBlockFps(
   smallMaskB = new BYTE[nBlkXP*nBlkYP];
   smallMaskO = new BYTE[nBlkXP*nBlkYP];
 
-  const int tmpBlkAlign = 16;
-
-  nBlkPitch = AlignNumber(nBlkSizeX, tmpBlkAlign); // padded to 16 , 2.5.11.22
-  TmpBlock = (BYTE *)_aligned_malloc(nBlkPitch*nBlkSizeY*pixelsize_super, tmpBlkAlign); // new BYTE[nBlkPitch*nBlkSizeY*pixelsize_super]; // may be more padding?
+  nBlkPitch = AlignNumber(nBlkSizeX, 16); // padded to 16 , 2.5.11.22
 
   int CPUF_Resize = env->GetCPUFlags();
 
@@ -251,6 +250,10 @@ MVBlockFps::MVBlockFps(
       DstShortU = (uint16_t *)_aligned_malloc(dstShortPitchUV*nHeight * DestBufElementSize, tmpDstAlign);
       DstShortV = (uint16_t *)_aligned_malloc(dstShortPitchUV*nHeight * DestBufElementSize, tmpDstAlign);
     }
+    if (nOverlapY > 0)
+    {
+      _boundary_cnt_arr.resize(nBlkY);
+    }
   }
 }
 
@@ -272,8 +275,6 @@ MVBlockFps::~MVBlockFps()
   delete[] smallMaskF;
   delete[] smallMaskB;
   delete[] smallMaskO;
-
-  _aligned_free(TmpBlock); // PF 161116
 
 
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
@@ -567,6 +568,172 @@ void MVBlockFps::ResultBlock(BYTE *pDst8, int dst_pitch, const BYTE * pMCB8, int
 }
 
 
+void MVBlockFps::compensate_overlap_slice(Slicer::TaskData &td)
+{
+  if (nOverlapY == 0
+    || (td._y_beg == 0 && td._y_end == nBlkY))
+  {
+    compensate_overlap_slice(td._y_beg, td._y_end);
+  }
+
+  else
+  {
+    assert(td._y_end - td._y_beg >= 2);
+
+    compensate_overlap_slice(td._y_beg, td._y_end - 1);
+
+    const conc::AioAdd <int> inc_ftor(+1);
+
+    const int cnt_top = conc::AtomicIntOp::exec_new(
+      _boundary_cnt_arr[td._y_beg],
+      inc_ftor
+    );
+    if (td._y_beg > 0 && cnt_top == 2)
+    {
+      compensate_overlap_slice(td._y_beg - 1, td._y_beg);
+    }
+
+    int cnt_bot = 2;
+    if (td._y_end < nBlkY)
+    {
+      cnt_bot = conc::AtomicIntOp::exec_new(
+        _boundary_cnt_arr[td._y_end],
+        inc_ftor
+      );
+    }
+    if (cnt_bot == 2)
+    {
+      compensate_overlap_slice(td._y_end - 1, td._y_end);
+    }
+  }
+}
+
+
+
+void MVBlockFps::compensate_overlap_slice(int y_beg, int y_end)
+{
+  const int cpStepX = nBlkSizeX - nOverlapX;
+  const int cpStepY = nBlkSizeY - nOverlapY;
+  const int cpStepX_UV = cpStepX >> nLogxRatioUVs[1];
+  const int cpStepY_UV = cpStepY >> nLogyRatioUVs[1];
+  const int nBlkSizeX_UV = nBlkSizeX >> nLogxRatioUVs[1];
+  const int nBlkSizeY_UV = nBlkSizeY >> nLogyRatioUVs[1];
+
+  BYTE *myTmpBlock = (BYTE *)_aligned_malloc(nBlkPitch * nBlkSizeY * pixelsize_super, 16);
+
+  short *winOver;
+  short *winOverUV;
+
+  for (int by = y_beg; by < y_end; by++)
+  {
+    // indexing overlap windows weighting table: top=0 middle=3 bottom=6
+    /*
+    0 = Top Left    1 = Top Middle    2 = Top Right
+    3 = Middle Left 4 = Middle Middle 5 = Middle Right
+    6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
+    */
+    const int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3;
+
+    for (int bx = 0; bx < nBlkX; bx++)
+    {
+      const int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1;
+      winOver = OverWins->GetWindow(wby + wbx);
+      if (!isGrey)
+        winOverUV = OverWinsUV->GetWindow(wby + wbx);
+
+      const int i = by*nBlkX + bx;
+
+      const FakeBlockData &blockB = mvClipB.GetBlock(0, i);
+      const FakeBlockData &blockF = mvClipF.GetBlock(0, i);
+
+      const int refxB = blockB.GetX() * nPel + ((blockB.GetMV().x*(256 - _cpTime256)) >> 8);
+      const int refyB = blockB.GetY() * nPel + ((blockB.GetMV().y*(256 - _cpTime256)) >> 8);
+      const int refxF = blockF.GetX() * nPel + ((blockF.GetMV().x*_cpTime256) >> 8);
+      const int refyF = blockF.GetY() * nPel + ((blockF.GetMV().y*_cpTime256) >> 8);
+
+      const int xx = bx * cpStepX;
+      const int xxUV = bx * cpStepX_UV;
+
+      for (int p = 0; p < 3; p++)
+      {
+        if (_cpNeedProcessPlanes[p]) {
+          const int current_xx = (p == 0) ? xx : xxUV;
+          const int curStepY = (p == 0) ? cpStepY : cpStepY_UV;
+          const int curPitch = (p == 0) ? nPitchY : nPitchUV;
+          BYTE *pMaskB = (p == 0 ? _cpPMaskFullYB : _cpPMaskFullUVB) + (int64_t)by * curStepY * curPitch + current_xx;
+          BYTE *pMaskF = (p == 0 ? _cpPMaskFullYF : _cpPMaskFullUVF) + (int64_t)by * curStepY * curPitch + current_xx;
+          BYTE *pOcc = (p == 0 ? _cpPMaskOccY : _cpPMaskOccUV) + (int64_t)by * curStepY * curPitch + current_xx;
+          const BYTE *pRefP = _cpPRef[p] + (int64_t)by * curStepY * _cpNRefPitches[p] + (int64_t)current_xx * pixelsize_super;
+          const BYTE *pSrcP = _cpPSrc[p] + (int64_t)by * curStepY * _cpNSrcPitches[p] + (int64_t)current_xx * pixelsize_super;
+
+          if (pixelsize_super == 1) {
+            ResultBlock<uint8_t>(myTmpBlock, nBlkPitch*pixelsize_super,
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPitch(),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPitch(),
+              pRefP, _cpNRefPitches[p],
+              pSrcP, _cpNSrcPitches[p],
+              pMaskB, curPitch,
+              pMaskF,
+              pOcc,
+              (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
+              (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
+              _cpTime256, _cpMode, bits_per_pixel_super);
+            switch (p) {
+            case 0: OVERSLUMA((uint16_t *)(DstShort) + (int64_t)by * cpStepY * dstShortPitch + current_xx, dstShortPitch, myTmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
+            case 1: OVERSCHROMA((uint16_t *)(DstShortU) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx, dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX_UV); break;
+            case 2: OVERSCHROMA((uint16_t *)(DstShortV) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx, dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX_UV); break;
+            }
+          }
+          else if (pixelsize_super == 2) {
+            ResultBlock<uint16_t>(myTmpBlock, nBlkPitch*pixelsize_super,
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPitch(),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPitch(),
+              pRefP, _cpNRefPitches[p],
+              pSrcP, _cpNSrcPitches[p],
+              pMaskB, curPitch,
+              pMaskF,
+              pOcc,
+              (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
+              (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
+              _cpTime256, _cpMode, bits_per_pixel_super);
+            switch (p) {
+            case 0: OVERSLUMA16((uint16_t *)((int *)(DstShort) + (int64_t)by * cpStepY * dstShortPitch + current_xx), dstShortPitch, myTmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
+            case 1: OVERSCHROMA16((uint16_t *)((int *)(DstShortU) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx), dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
+            case 2: OVERSCHROMA16((uint16_t *)((int *)(DstShortV) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx), dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
+            }
+          }
+          else if (pixelsize_super == 4) {
+            ResultBlock<float>(myTmpBlock, nBlkPitch*pixelsize_super,
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPitch(),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPitch(),
+              pRefP, _cpNRefPitches[p],
+              pSrcP, _cpNSrcPitches[p],
+              pMaskB, curPitch,
+              pMaskF,
+              pOcc,
+              (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
+              (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
+              _cpTime256, _cpMode, bits_per_pixel_super);
+            switch (p) {
+            case 0: OVERSLUMA32((uint16_t *)((float *)(DstShort) + (int64_t)by * cpStepY * dstShortPitch + current_xx), dstShortPitch, myTmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
+            case 1: OVERSCHROMA32((uint16_t *)((float *)(DstShortU) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx), dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
+            case 2: OVERSCHROMA32((uint16_t *)((float *)(DstShortV) + (int64_t)by * cpStepY_UV * dstShortPitchUV + current_xx), dstShortPitchUV, myTmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
+            }
+          } // pixelsize_super
+        } // needprocess
+      } // planes
+    } // for bx
+  } // for by
+
+  _aligned_free(myTmpBlock);
+}
+
 PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
 {
   int nWidth_B = nBlkX*(nBlkSizeX - nOverlapX) + nOverlapX;
@@ -587,10 +754,6 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
   int nDstPitches[3], nRefPitches[3], nSrcPitches[3];
   unsigned char *pDstYUY2;
   int nDstPitchYUY2;
-
-  uint16_t *pDstShort;
-  uint16_t *pDstShortU;
-  uint16_t *pDstShortV;
 
   int off = mvClipB.GetDeltaFrame(); // integer offset of reference frame
   if (off <= 0)
@@ -1024,147 +1187,36 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
         if (nSuperModeYUV & VPLANE) MemZoneSet(reinterpret_cast<unsigned char*>(DstShortV), 0, nWidth_B_UV * DestBufElementSize, nHeight_B_UV, 0, 0, dstShortPitchUV * DestBufElementSize);
       }
       
-      pDstShort = DstShort;   // PF: can be used for Int or Float array instead of short for 8+ bits
-      pDstShortU = DstShortU;
-      pDstShortV = DstShortV;
+      // Frame state for the slices (MT_MULTI_INSTANCE: GetFrame is never
+      // reentered on the same instance)
+      _cpPRef[0] = pRef[0]; _cpPRef[1] = pRef[1]; _cpPRef[2] = pRef[2];
+      _cpPSrc[0] = pSrc[0]; _cpPSrc[1] = pSrc[1]; _cpPSrc[2] = pSrc[2];
+      _cpNRefPitches[0] = nRefPitches[0]; _cpNRefPitches[1] = nRefPitches[1]; _cpNRefPitches[2] = nRefPitches[2];
+      _cpNSrcPitches[0] = nSrcPitches[0]; _cpNSrcPitches[1] = nSrcPitches[1]; _cpNSrcPitches[2] = nSrcPitches[2];
+      _cpPMaskFullYB = pMaskFullYB; _cpPMaskFullYF = pMaskFullYF;
+      _cpPMaskFullUVB = pMaskFullUVB; _cpPMaskFullUVF = pMaskFullUVF;
+      _cpPMaskOccY = pMaskOccY; _cpPMaskOccUV = pMaskOccUV;
+      _cpNeedProcessPlanes[0] = needProcessPlanes[0];
+      _cpNeedProcessPlanes[1] = needProcessPlanes[1];
+      _cpNeedProcessPlanes[2] = needProcessPlanes[2];
+      _cpTime256 = time256;
+      _cpMode = mode;
+      _cpPPlanesB[0] = pPlanesB[0]; _cpPPlanesB[1] = pPlanesB[1]; _cpPPlanesB[2] = pPlanesB[2];
+      _cpPPlanesF[0] = pPlanesF[0]; _cpPPlanesF[1] = pPlanesF[1]; _cpPPlanesF[2] = pPlanesF[2];
 
-      for (int by = 0; by < nBlkY; by++)
+      if (nOverlapY > 0)
       {
-        // indexing overlap windows weighting table: top=0 middle=3 bottom=6
-        /*
-        0 = Top Left    1 = Top Middle    2 = Top Right
-        3 = Middle Left 4 = Middle Middle 5 = Middle Right
-        6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
-        */
+        memset(
+          &_boundary_cnt_arr[0],
+          0,
+          _boundary_cnt_arr.size() * sizeof(_boundary_cnt_arr[0])
+        );
+      }
 
-        int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
-        int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-        int xxUV = 0;
-        for (int bx = 0; bx < nBlkX; ++bx)
-        {
-          // select window
-          // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-          int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
-          winOver = OverWins->GetWindow(wby + wbx);
-          if (!isGrey)
-            winOverUV = OverWinsUV->GetWindow(wby + wbx);
+      Slicer slicer(_mt_flag);
+      slicer.start(nBlkY, *this, &MVBlockFps::compensate_overlap_slice, 2);
+      slicer.wait();
 
-          int i = by*nBlkX + bx;
-
-          const FakeBlockData &blockB = mvClipB.GetBlock(0, i);
-          const FakeBlockData &blockF = mvClipF.GetBlock(0, i);
-
-          int refxB = blockB.GetX() * nPel + ((blockB.GetMV().x*(256 - time256)) >> 8);
-          int refyB = blockB.GetY() * nPel + ((blockB.GetMV().y*(256 - time256)) >> 8);
-          int refxF = blockF.GetX() * nPel + ((blockF.GetMV().x*time256) >> 8);
-          int refyF = blockF.GetY() * nPel + ((blockF.GetMV().y*time256) >> 8);
-
-          // firstly calculate result block and write it to temporary place, not to dst
-          // luma
-          for (int p = 0; p < 3; p++)
-          {
-            if (needProcessPlanes[p]) {
-              int current_xx;
-              if (p == 0) current_xx = xx; else current_xx = xxUV;
-              if (pixelsize_super == 1) {
-                ResultBlock<uint8_t>(TmpBlock, nBlkPitch*pixelsize_super,
-                  pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
-                  pPlanesB[p]->GetPitch(),
-                  pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
-                  pPlanesF[p]->GetPitch(),
-                  pRef[p] + current_xx*pixelsize_super, nRefPitches[p],
-                  pSrc[p] + current_xx*pixelsize_super, nSrcPitches[p],
-                  (p == 0 ? pMaskFullYB : pMaskFullUVB) + current_xx,
-                  (p == 0 ? nPitchY : nPitchUV),
-                  (p == 0 ? pMaskFullYF : pMaskFullUVF) + current_xx,
-                  (p == 0 ? pMaskOccY : pMaskOccUV) + current_xx,
-                  (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
-                  (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
-                  time256, mode, bits_per_pixel_super);
-                // now write result block to short dst with overlap window weight
-                switch (p) {
-                case 0: OVERSLUMA(pDstShort + current_xx, dstShortPitch, TmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
-                case 1: OVERSCHROMA(pDstShortU + current_xx, dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX_UV); break;
-                case 2: OVERSCHROMA(pDstShortV + current_xx, dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX_UV); break;
-                }
-              }
-              else if (pixelsize_super == 2) {
-                ResultBlock<uint16_t>(TmpBlock, nBlkPitch*pixelsize_super,
-                  pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
-                  pPlanesB[p]->GetPitch(),
-                  pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
-                  pPlanesF[p]->GetPitch(),
-                  pRef[p] + current_xx*pixelsize_super, nRefPitches[p],
-                  pSrc[p] + current_xx*pixelsize_super, nSrcPitches[p],
-                  (p == 0 ? pMaskFullYB : pMaskFullUVB) + current_xx,
-                  (p == 0 ? nPitchY : nPitchUV),
-                  (p == 0 ? pMaskFullYF : pMaskFullUVF) + current_xx,
-                  (p == 0 ? pMaskOccY : pMaskOccUV) + current_xx,
-                  (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
-                  (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
-                  time256, mode, bits_per_pixel_super);
-                // now write result block to short dst with overlap window weight
-                switch (p) { // pitch of TmpBlock is byte-level only, regardless of 8/16 bit 
-                case 0: OVERSLUMA16((uint16_t *)((int *)(pDstShort)+current_xx), dstShortPitch, TmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
-                case 1: OVERSCHROMA16((uint16_t *)((int *)(pDstShortU)+current_xx), dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
-                case 2: OVERSCHROMA16((uint16_t *)((int *)(pDstShortV)+current_xx), dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
-                }
-              }
-              else if (pixelsize_super == 4) {
-                ResultBlock<float>(TmpBlock, nBlkPitch*pixelsize_super,
-                  pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
-                  pPlanesB[p]->GetPitch(),
-                  pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
-                  pPlanesF[p]->GetPitch(),
-                  pRef[p] + current_xx * pixelsize_super, nRefPitches[p],
-                  pSrc[p] + current_xx * pixelsize_super, nSrcPitches[p],
-                  (p == 0 ? pMaskFullYB : pMaskFullUVB) + current_xx,
-                  (p == 0 ? nPitchY : nPitchUV),
-                  (p == 0 ? pMaskFullYF : pMaskFullUVF) + current_xx,
-                  (p == 0 ? pMaskOccY : pMaskOccUV) + current_xx,
-                  (p == 0 ? nBlkSizeX : nBlkSizeX_UV),
-                  (p == 0 ? nBlkSizeY : nBlkSizeY_UV),
-                  time256, mode, bits_per_pixel_super);
-                // now write result block to short dst with overlap window weight
-                switch (p) { // pitch of TmpBlock is byte-level only, regardless of 8/16 bit 
-                case 0: OVERSLUMA32((uint16_t *)((float *)(pDstShort)+current_xx), dstShortPitch, TmpBlock, nBlkPitch * pixelsize_super, winOver, nBlkSizeX); break;
-                case 1: OVERSCHROMA32((uint16_t *)((float *)(pDstShortU)+current_xx), dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
-                case 2: OVERSCHROMA32((uint16_t *)((float *)(pDstShortV)+current_xx), dstShortPitchUV, TmpBlock, nBlkPitch * pixelsize_super, winOverUV, nBlkSizeX / xRatioUVs[1]); break;
-                }
-              } // pixelsize_super
-            } // needprocess
-          } // planes
-
-          xx += (nBlkSizeX - nOverlapX);
-          xxUV += (nBlkSizeX - nOverlapX) >> nLogxRatioUVs[1]; // * pixelsize_super is at the usage place
-
-        } // for bx
-        // update pDsts
-        const int nBlkSizeYOverlapDiff = (nBlkSizeY - nOverlapY);
-        const int nBlkSizeYOverlapDiff_UV = (nBlkSizeY - nOverlapY) >> nLogyRatioUVs[1];
-        pDstShort += dstShortPitch * nBlkSizeYOverlapDiff* (DestBufElementSize / sizeof(short)); // pointer is short, 10-16bit: really int *, so mul 2x
-        pDst[0] += nDstPitches[0] * nBlkSizeYOverlapDiff;
-        pRef[0] += nRefPitches[0] * nBlkSizeYOverlapDiff;
-        pSrc[0] += nSrcPitches[0] * nBlkSizeYOverlapDiff;
-        if (!isGrey) {
-          pDstShortU += dstShortPitchUV * nBlkSizeYOverlapDiff_UV*(DestBufElementSize / sizeof(short));
-          pDstShortV += dstShortPitchUV * (nBlkSizeY - nOverlapY) / yRatioUVs[1] * (DestBufElementSize / sizeof(short));
-          pDst[1] += nDstPitches[1] * nBlkSizeYOverlapDiff_UV;
-          pDst[2] += nDstPitches[2] * nBlkSizeYOverlapDiff_UV;
-          pRef[1] += nRefPitches[1] * nBlkSizeYOverlapDiff_UV;
-          pRef[2] += nRefPitches[2] * nBlkSizeYOverlapDiff_UV;
-          pSrc[1] += nSrcPitches[1] * nBlkSizeYOverlapDiff_UV;
-          pSrc[2] += nSrcPitches[2] * nBlkSizeYOverlapDiff_UV;
-        }
-        pMaskFullYB += nPitchY*nBlkSizeYOverlapDiff;
-        pMaskFullYF += nPitchY * nBlkSizeYOverlapDiff;
-        pMaskOccY += nPitchY * nBlkSizeYOverlapDiff;
-        if (!isGrey) {
-          pMaskFullUVB += nPitchUV * nBlkSizeYOverlapDiff_UV;
-          pMaskFullUVF += nPitchUV * nBlkSizeYOverlapDiff_UV;
-          pMaskOccUV += nPitchUV * nBlkSizeYOverlapDiff_UV;
-        }
-      }  // for by
         // post 2.5.1.22 bug: the copy from internal 16 bit array to destination was missing for overlaps!
       if (pixelsize_super == 1) {
         // nWidth_B and nHeight_B, right and bottom was blended

@@ -1,14 +1,19 @@
 #ifndef __MV_INTER__
 #define __MV_INTER__
 
+#include "conc/AtomicInt.h"
 #include "CopyCode.h"
+#include "MTSlicer.h"
 #include "MVClip.h"
 #include "MVFilter.h"
 #include "SimpleResize.h"
 #include "yuy2planes.h"
 #include "overlap.h"
 
+#include <vector>
+
 class MVGroupOfFrames;
+class MVPlane;
 
 /*! \brief Filter that change fps by blocks moving
  */
@@ -49,8 +54,7 @@ private:
   BYTE *smallMaskB; // backward
   BYTE *smallMaskO; // both
 
-  BYTE *TmpBlock; // block for temporary calculations
-  int nBlkPitch;// padded (pitch)
+  int nBlkPitch;// padded (pitch) of the per-slice temporary block
 
   int nWidthP, nHeightP, nPitchY, nPitchUV, nHeightPUV, nWidthPUV, nHeightUV, nWidthUV;
   int nBlkXP, nBlkYP;
@@ -108,6 +112,29 @@ private:
   SimpleResize *upsizerUV;
 
   int nSuperHPad, nSuperVPad;
+
+  typedef MTSlicer <MVBlockFps> Slicer;
+
+  void compensate_overlap_slice(Slicer::TaskData &td);
+  void compensate_overlap_slice(int y_beg, int y_end);
+
+  bool _mt_flag;
+
+  // Same scheme as MVCompensate: counts, per slice boundary, how many of
+  // the two adjacent slices have finished their interior rows. The task
+  // that brings a counter to 2 processes the boundary row.
+  std::vector <conc::AtomicInt <int> > _boundary_cnt_arr;
+
+  // Per-frame state read by compensate_overlap_slice()
+  const BYTE *_cpPRef[3];
+  const BYTE *_cpPSrc[3];
+  int _cpNRefPitches[3], _cpNSrcPitches[3];
+  BYTE *_cpPMaskFullYB, *_cpPMaskFullYF, *_cpPMaskFullUVB, *_cpPMaskFullUVF, *_cpPMaskOccY, *_cpPMaskOccUV;
+  bool _cpNeedProcessPlanes[3];
+  int _cpTime256;
+  int _cpMode;
+  MVPlane *_cpPPlanesB[3];
+  MVPlane *_cpPPlanesF[3];
 
 public:
   MVBlockFps(
