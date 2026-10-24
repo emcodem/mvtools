@@ -101,8 +101,6 @@ private:
 
 	void *         _dll_hnd;	// Avoids loading windows.h just for HMODULE
 
-	static int     _dummy_dispatcher;
-
 
 
 /*\\\ FORBIDDEN MEMBER FUNCTIONS \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\*/

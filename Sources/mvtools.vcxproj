@@ -1450,6 +1450,7 @@
     </NASM>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AvstpFallbackPool.cpp" />
     <ClCompile Include="AvstpFinder.cpp" />
     <ClCompile Include="AvstpWrapper.cpp" />
     <ClCompile Include="ClipFnc.cpp" />
@@ -1557,6 +1558,7 @@
     <ClInclude Include="AllocAlign.hpp" />
     <ClInclude Include="AnaFlags.h" />
     <ClInclude Include="avstp.h" />
+    <ClInclude Include="AvstpFallbackPool.h" />
     <ClInclude Include="AvstpFinder.h" />
     <ClInclude Include="AvstpWrapper.h" />
     <ClInclude Include="ClipFnc.h" />

@@ -35,6 +35,7 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 #if defined (_MSC_VER)
  #include "AvstpFinder.h"
 #endif
+#include "AvstpFallbackPool.h"
 #include "AvstpWrapper.h"
 
 #if defined (_MSC_VER)
@@ -240,61 +241,36 @@ int	AvstpWrapper::fallback_get_interface_version_ptr ()
 
 avstp_TaskDispatcher *	AvstpWrapper::fallback_create_dispatcher_ptr ()
 {
-	return ((avstp_TaskDispatcher *) (&_dummy_dispatcher));
+	return (AvstpFallbackPool::create_dispatcher ());
 }
 
 
 
 void	AvstpWrapper::fallback_destroy_dispatcher_ptr (avstp_TaskDispatcher *td_ptr)
 {
-	fstb::unused (td_ptr);
-
-	assert (td_ptr == (avstp_TaskDispatcher *) (&_dummy_dispatcher));
+	AvstpFallbackPool::destroy_dispatcher (td_ptr);
 }
 
 
 
 int	AvstpWrapper::fallback_get_nbr_threads_ptr ()
 {
-	return (1);
+	return (AvstpFallbackPool::get_nbr_threads ());
 }
 
 
 
 int	AvstpWrapper::fallback_enqueue_task_ptr (avstp_TaskDispatcher *td_ptr, avstp_TaskPtr task_ptr, void *user_data_ptr)
 {
-	int            ret_val = avstp_Err_OK;
-
-	if (   td_ptr != (avstp_TaskDispatcher *) (&_dummy_dispatcher)
-	    || task_ptr == 0)
-	{
-		ret_val = avstp_Err_INVALID_ARG;
-	}
-	else
-	{
-		task_ptr (td_ptr, user_data_ptr);
-	}
-
-	return (ret_val);
+	return (AvstpFallbackPool::enqueue_task (td_ptr, task_ptr, user_data_ptr));
 }
 
 
 
 int	AvstpWrapper::fallback_wait_completion_ptr (avstp_TaskDispatcher *td_ptr)
 {
-	int            ret_val = avstp_Err_OK;
-
-	if (td_ptr != (avstp_TaskDispatcher *) (&_dummy_dispatcher))
-	{
-		ret_val = avstp_Err_INVALID_ARG;
-	}
-
-	return (ret_val);
+	return (AvstpFallbackPool::wait_completion (td_ptr));
 }
-
-
-
-int	AvstpWrapper::_dummy_dispatcher;
 
 
 

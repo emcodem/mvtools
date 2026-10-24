@@ -83,6 +83,9 @@
     <ClCompile Include="MVSuper.cpp">
       <Filter>Filters</Filter>
     </ClCompile>
+    <ClCompile Include="AvstpFallbackPool.cpp">
+      <Filter>threading</Filter>
+    </ClCompile>
     <ClCompile Include="AvstpFinder.cpp">
       <Filter>threading</Filter>
     </ClCompile>
@@ -198,6 +201,9 @@
       <Filter>Filters</Filter>
     </ClInclude>
     <ClInclude Include="avstp.h">
+      <Filter>threading</Filter>
+    </ClInclude>
+    <ClInclude Include="AvstpFallbackPool.h">
       <Filter>threading</Filter>
     </ClInclude>
     <ClInclude Include="AvstpFinder.h">
