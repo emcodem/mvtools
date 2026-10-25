@@ -120,13 +120,19 @@ private:
 
   typedef MTSlicer <MVFlowFps> Slicer;
 
-  void interpolate_slice(Slicer::TaskData &td);
+  void process_slice(Slicer::TaskData &td);
+  void upsize_rows(int y_beg, int y_end);
+  void upsize_vectors(short *VXFullY, short *VYFullY, short *VXFullUV, short *VYFullUV,
+    const short *VXSmallY, const short *VYSmallY, const short *VXSmallUV, const short *VYSmallUV,
+    int y_beg, int y_end, void *work, void *workUV);
+  void upsize_mask(BYTE *MaskFullY, BYTE *MaskFullUV, const BYTE *MaskSmall,
+    int y_beg, int y_end, void *work, void *workUV);
   template <typename pixel_t>
   void interpolate_rows(int y_beg, int y_end);
 
   bool _mt_flag;
 
-  // Per-frame state read by interpolate_slice()
+  // Per-frame state read by process_slice()
   BYTE *_cpPDst[3];
   const BYTE *_cpPRef[3];
   const BYTE *_cpPSrc[3];
@@ -134,6 +140,7 @@ private:
   int _cpNOffsetY, _cpNOffsetUV;
   int _cpTime256;
   int _cpMode; // 0: FlowInterSimple, 1: FlowInter, 2: FlowInterExtra
+  bool _cpUpsizeB, _cpUpsizeF; // the B/F vectors changed: upsize them again
 
 public:
   MVFlowFps(PClip _child, PClip _super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,

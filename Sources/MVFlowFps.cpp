@@ -403,14 +403,74 @@ void MVFlowFps::interpolate_rows(int y_beg, int y_end)
   }
 }
 
-void MVFlowFps::interpolate_slice(Slicer::TaskData &td)
+void MVFlowFps::upsize_vectors(short *VXFullY, short *VYFullY, short *VXFullUV, short *VYFullUV,
+  const short *VXSmallY, const short *VYSmallY, const short *VXSmallUV, const short *VYSmallUV,
+  int y_beg, int y_end, void *work, void *workUV)
 {
-  if (pixelsize_super == 1)
-    interpolate_rows<uint8_t>(td._y_beg, td._y_end);
-  else if (pixelsize_super == 2)
-    interpolate_rows<uint16_t>(td._y_beg, td._y_end);
-  else
-    interpolate_rows<float>(td._y_beg, td._y_end);
+  upsizer->SimpleResizeDo_int16(VXFullY, nWidthP, nHeightP, VPitchY, VXSmallY, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight, y_beg, y_end, work);
+  upsizer->SimpleResizeDo_int16(VYFullY, nWidthP, nHeightP, VPitchY, VYSmallY, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight, y_beg, y_end, work);
+  if (needDistinctChroma) {
+    const int yb = y_beg >> nLogyRatioUVs[1];
+    const int ye = y_end >> nLogyRatioUVs[1];
+    upsizerUV->SimpleResizeDo_int16(VXFullUV, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUV, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV, yb, ye, workUV);
+    upsizerUV->SimpleResizeDo_int16(VYFullUV, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUV, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV, yb, ye, workUV);
+  }
+}
+
+void MVFlowFps::upsize_mask(BYTE *MaskFullY, BYTE *MaskFullUV, const BYTE *MaskSmall,
+  int y_beg, int y_end, void *work, void *workUV)
+{
+  upsizer->SimpleResizeDo_uint8(MaskFullY, nWidthP, nHeightP, VPitchY, MaskSmall, nBlkXP, nBlkXP, y_beg, y_end, work);
+  if (needDistinctChroma)
+    upsizerUV->SimpleResizeDo_uint8(MaskFullUV, nWidthPUV, nHeightPUV, VPitchUV, MaskSmall, nBlkXP, nBlkXP, y_beg >> nLogyRatioUVs[1], y_end >> nLogyRatioUVs[1], workUV);
+}
+
+// Upsizes (bilinear) the small vectors and masks this frame needs to frame
+// size, rows [y_beg, y_end) of the padded frame (chroma scaled). Each row
+// of the result depends only on the small arrays, so the slices are
+// independent; the work buffers are per call because the ones inside
+// SimpleResize are not thread-safe.
+void MVFlowFps::upsize_rows(int y_beg, int y_end)
+{
+  void *work = _aligned_malloc(upsizer->work_size(), 128);
+  void *workUV = needDistinctChroma ? _aligned_malloc(upsizerUV->work_size(), 128) : 0;
+
+  if (_cpUpsizeB)
+    upsize_vectors(VXFullYB, VYFullYB, VXFullUVB, VYFullUVB, VXSmallYB, VYSmallYB, VXSmallUVB, VYSmallUVB, y_beg, y_end, work, workUV);
+  upsize_mask(MaskFullYB, MaskFullUVB, MaskSmallB, y_beg, y_end, work, workUV);
+
+  if (_cpUpsizeF)
+    upsize_vectors(VXFullYF, VYFullYF, VXFullUVF, VYFullUVF, VXSmallYF, VYSmallYF, VXSmallUVF, VYSmallUVF, y_beg, y_end, work, workUV);
+  upsize_mask(MaskFullYF, MaskFullUVF, MaskSmallF, y_beg, y_end, work, workUV);
+
+  if (_cpMode == 2)
+  {
+    upsize_vectors(VXFullYBB, VYFullYBB, VXFullUVBB, VYFullUVBB, VXSmallYBB, VYSmallYBB, VXSmallUVBB, VYSmallUVBB, y_beg, y_end, work, workUV);
+    upsize_vectors(VXFullYFF, VYFullYFF, VXFullUVFF, VYFullUVFF, VXSmallYFF, VYSmallYFF, VXSmallUVFF, VYSmallUVFF, y_beg, y_end, work, workUV);
+  }
+
+  _aligned_free(work);
+  if (workUV)
+    _aligned_free(workUV);
+}
+
+// One slice: rows [y_beg, y_end) of the padded frame. The interpolation of
+// a row reads only the same row of the upsized arrays, so a slice can
+// interpolate its rows right after upsizing them, while they are in cache.
+void MVFlowFps::process_slice(Slicer::TaskData &td)
+{
+  upsize_rows(td._y_beg, td._y_end);
+
+  const int y_end = std::min(td._y_end, nHeight); // no picture in the padding rows
+  if (td._y_beg < y_end)
+  {
+    if (pixelsize_super == 1)
+      interpolate_rows<uint8_t>(td._y_beg, y_end);
+    else if (pixelsize_super == 2)
+      interpolate_rows<uint16_t>(td._y_beg, y_end);
+    else
+      interpolate_rows<float>(td._y_beg, y_end);
+  }
 }
 
 //-------------------------------------------------------------------------
@@ -566,9 +626,12 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
     int nOffsetY = nRefPitches[0] * nVPadding*nPel + nHPadding*nPel*pixelsize_super;
     int nOffsetUV = nRefPitches[1] * nVPaddingUV*nPel + nHPaddingUV*nPel*pixelsize_super;
 
-    if (nright != nrightLast)
+    // Block-grid work (small vectors and masks) is done here; upsizing them
+    // to frame size is done by the slices, together with the interpolation.
+    PROFILE_START(MOTION_PROFILE_MASK);
+    const bool upsizeB = (nright != nrightLast);
+    if (upsizeB)
     {
-      PROFILE_START(MOTION_PROFILE_MASK);
       // make  vector vx and vy small masks
       MakeVectorSmallMasks(mvClipB, nBlkX, nBlkY, VXSmallYB, nBlkXP, VYSmallYB, nBlkXP);
 
@@ -578,42 +641,20 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
         VectorSmallMaskYToHalfUV(VXSmallYB, nBlkXP, nBlkYP, VXSmallUVB, xRatioUVs[1]);
         VectorSmallMaskYToHalfUV(VYSmallYB, nBlkXP, nBlkYP, VYSmallUVB, yRatioUVs[1]);
       }
-
-      PROFILE_STOP(MOTION_PROFILE_MASK);
-      // upsize (bilinear interpolate) vector masks to fullframe size
-      PROFILE_START(MOTION_PROFILE_RESIZE);
-
-      upsizer->SimpleResizeDo_int16(VXFullYB, nWidthP, nHeightP, VPitchY, VXSmallYB, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
-      upsizer->SimpleResizeDo_int16(VYFullYB, nWidthP, nHeightP, VPitchY, VYSmallYB, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
-      if (needDistinctChroma) {
-        upsizerUV->SimpleResizeDo_int16(VXFullUVB, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVB, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
-        upsizerUV->SimpleResizeDo_int16(VYFullUVB, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVB, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
-      }
-      PROFILE_STOP(MOTION_PROFILE_RESIZE);
-
     }
    // analyse vectors field to detect occlusion
    // Backward part
-    PROFILE_START(MOTION_PROFILE_MASK);
     MakeVectorOcclusionMaskTime(mvClipB, nBlkX, nBlkY, ml, 1.0, nPel, MaskSmallB, nBlkXP, (256 - time256), nBlkSizeX - nOverlapX, nBlkSizeY - nOverlapY);
 
     CheckAndPadMaskSmall(MaskSmallB, nBlkXP, nBlkYP, nBlkX, nBlkY);
 
-    PROFILE_STOP(MOTION_PROFILE_MASK);
-    PROFILE_START(MOTION_PROFILE_RESIZE);
-  // upsize (bilinear interpolate) vector masks to fullframe size
-    upsizer->SimpleResizeDo_uint8(MaskFullYB, nWidthP, nHeightP, VPitchY, MaskSmallB, nBlkXP, nBlkXP);
-    if(needDistinctChroma)
-      upsizerUV->SimpleResizeDo_uint8(MaskFullUVB, nWidthPUV, nHeightPUV, VPitchUV, MaskSmallB, nBlkXP, nBlkXP);
-    PROFILE_STOP(MOTION_PROFILE_RESIZE);
-
     nrightLast = nright;
 
     // Forward part
-    if (nleft != nleftLast)
+    const bool upsizeF = (nleft != nleftLast);
+    if (upsizeF)
     {
      // make  vector vx and vy small masks
-      PROFILE_START(MOTION_PROFILE_MASK);
       MakeVectorSmallMasks(mvClipF, nBlkX, nBlkY, VXSmallYF, nBlkXP, VYSmallYF, nBlkXP);
 
       CheckAndPadSmallY(VXSmallYF, VYSmallYF, nBlkXP, nBlkYP, nBlkX, nBlkY);
@@ -622,34 +663,14 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
         VectorSmallMaskYToHalfUV(VXSmallYF, nBlkXP, nBlkYP, VXSmallUVF, xRatioUVs[1]);
         VectorSmallMaskYToHalfUV(VYSmallYF, nBlkXP, nBlkYP, VYSmallUVF, yRatioUVs[1]);
       }
-
-      PROFILE_STOP(MOTION_PROFILE_MASK);
-      // upsize (bilinear interpolate) vector masks to fullframe size
-      PROFILE_START(MOTION_PROFILE_RESIZE);
-
-      upsizer->SimpleResizeDo_int16(VXFullYF, nWidthP, nHeightP, VPitchY, VXSmallYF, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
-      upsizer->SimpleResizeDo_int16(VYFullYF, nWidthP, nHeightP, VPitchY, VYSmallYF, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
-      if (needDistinctChroma) {
-        upsizerUV->SimpleResizeDo_int16(VXFullUVF, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVF, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
-        upsizerUV->SimpleResizeDo_int16(VYFullUVF, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVF, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
-      }
-      PROFILE_STOP(MOTION_PROFILE_RESIZE);
-
     }
    // analyse vectors field to detect occlusion
    // Forward part
-    PROFILE_START(MOTION_PROFILE_MASK);
     MakeVectorOcclusionMaskTime(mvClipF, nBlkX, nBlkY, ml, 1.0, nPel, MaskSmallF, nBlkXP, time256, nBlkSizeX - nOverlapX, nBlkSizeY - nOverlapY);
 
     CheckAndPadMaskSmall(MaskSmallF, nBlkXP, nBlkYP, nBlkX, nBlkY);
 
     PROFILE_STOP(MOTION_PROFILE_MASK);
-    PROFILE_START(MOTION_PROFILE_RESIZE);
-  // upsize (bilinear interpolate) vector masks to fullframe size
-    upsizer->SimpleResizeDo_uint8(MaskFullYF, nWidthP, nHeightP, VPitchY, MaskSmallF, nBlkXP, nBlkXP);
-    if(needDistinctChroma)
-      upsizerUV->SimpleResizeDo_uint8(MaskFullUVF, nWidthPUV, nHeightPUV, VPitchUV, MaskSmallF, nBlkXP, nBlkXP);
-    PROFILE_STOP(MOTION_PROFILE_RESIZE);
 
     nleftLast = nleft;
 
@@ -686,23 +707,6 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
       }
       PROFILE_STOP(MOTION_PROFILE_MASK);
 
-      PROFILE_START(MOTION_PROFILE_RESIZE);
-    // upsize vectors to full frame
-      upsizer->SimpleResizeDo_int16(VXFullYBB, nWidthP, nHeightP, VPitchY, VXSmallYBB, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
-      upsizer->SimpleResizeDo_int16(VYFullYBB, nWidthP, nHeightP, VPitchY, VYSmallYBB, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
-      if (needDistinctChroma) {
-        upsizerUV->SimpleResizeDo_int16(VXFullUVBB, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVBB, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
-        upsizerUV->SimpleResizeDo_int16(VYFullUVBB, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVBB, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
-      }
-
-      upsizer->SimpleResizeDo_int16(VXFullYFF, nWidthP, nHeightP, VPitchY, VXSmallYFF, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
-      upsizer->SimpleResizeDo_int16(VYFullYFF, nWidthP, nHeightP, VPitchY, VYSmallYFF, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
-      if (needDistinctChroma) {
-        upsizerUV->SimpleResizeDo_int16(VXFullUVFF, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVFF, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
-        upsizerUV->SimpleResizeDo_int16(VYFullUVFF, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVFF, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
-      }
-      PROFILE_STOP(MOTION_PROFILE_RESIZE);
-
       interMode = 2;
     }
     else if (maskmode == 1) // old method without extra frames
@@ -725,9 +729,11 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
       _cpNOffsetUV = nOffsetUV;
       _cpTime256 = time256;
       _cpMode = interMode;
+      _cpUpsizeB = upsizeB;
+      _cpUpsizeF = upsizeF;
 
       Slicer slicer(_mt_flag);
-      slicer.start(nHeight, *this, &MVFlowFps::interpolate_slice, 16);
+      slicer.start(nHeightP, *this, &MVFlowFps::process_slice, 16);
       slicer.wait();
     }
     PROFILE_STOP(MOTION_PROFILE_FLOWINTER);

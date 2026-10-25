@@ -44,18 +44,33 @@ public:
   SimpleResize(int _newwidth, int _newheight, int _oldwidth, int _oldheight, long CPUFlags);
   ~SimpleResize();
 
+  // Size in bytes of the work buffer for the row-range versions below
+  int work_size() const { return 2 * oldwidth + 128; }
+
   template<typename src_type, typename dst_type, bool limitIt, int nPel, bool isXpart>
   void SimpleResizeDo_New(uint8_t *dstp8, int row_size, int height, int dst_pitch,
-    const uint8_t* srcp8, int src_row_size, int src_pitch, int bits_per_pixel, int real_width, int real_height);
+    const uint8_t* srcp8, int src_row_size, int src_pitch, int bits_per_pixel, int real_width, int real_height,
+    int y_beg, int y_end, void *work);
 
   void SimpleResizeDo_uint8_to_uint16(uint8_t *dstp, int dst_row_size, int dst_height, int dst_pitch,
     const uint8_t* srcp, int src_row_size, int src_pitch, int bits_per_pixel);
 
-  void SimpleResizeDo_uint8(uint8_t *dstp,  int dst_row_size, int dst_height, int dst_pitch, 
-    const uint8_t* srcp, int src_row_size, int src_pitch); 
+  void SimpleResizeDo_uint8(uint8_t *dstp,  int dst_row_size, int dst_height, int dst_pitch,
+    const uint8_t* srcp, int src_row_size, int src_pitch);
 
   void SimpleResizeDo_int16(short *dstp, int dst_row_size, int dst_height, int dst_pitch,
     const short* srcp, int src_row_size, int src_pitch, int nPel, bool isXpart, int real_width, int real_height);
+
+  // Row-range versions: destination rows [y_beg, y_end) only, with a
+  // caller-owned, 128-byte aligned work buffer of work_size() bytes. The
+  // instance's own work buffer is not used, so several threads may call
+  // them on the same instance at the same time.
+  void SimpleResizeDo_uint8(uint8_t *dstp,  int dst_row_size, int dst_height, int dst_pitch,
+    const uint8_t* srcp, int src_row_size, int src_pitch, int y_beg, int y_end, void *work);
+
+  void SimpleResizeDo_int16(short *dstp, int dst_row_size, int dst_height, int dst_pitch,
+    const short* srcp, int src_row_size, int src_pitch, int nPel, bool isXpart, int real_width, int real_height,
+    int y_beg, int y_end, void *work);
 
 };
 
