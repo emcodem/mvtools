@@ -110,12 +110,20 @@ private:
 
 			job._task_ptr (job._td_ptr, job._user_data_ptr);
 
-			if (job._disp_ptr->_pending.fetch_sub (1, std::memory_order_acq_rel) == 1)
+			// The decrement must happen under the Dispatcher's mutex. Once
+			// wait_completion() can see _pending == 0 it returns and the
+			// caller deletes the Dispatcher, so this thread must not touch it
+			// after that point. Decrementing outside the lock (and locking only
+			// to notify) let the waiter see 0 first - on entry or after a
+			// spurious wakeup - and free the Dispatcher while this thread was
+			// about to lock its mutex: a use-after-free that corrupted the
+			// next Dispatcher allocated at the same address and deadlocked.
 			{
-				// Taking the lock makes sure wait_completion() cannot return
-				// (and the caller delete the Dispatcher) before notify_all().
 				std::lock_guard <std::mutex>	lock (job._disp_ptr->_mtx);
-				job._disp_ptr->_cv.notify_all ();
+				if (job._disp_ptr->_pending.fetch_sub (1, std::memory_order_acq_rel) == 1)
+				{
+					job._disp_ptr->_cv.notify_all ();
+				}
 			}
 		}
 	}
