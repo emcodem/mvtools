@@ -29,12 +29,13 @@
 
 
 MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
-  bool _blend, sad_t nSCD1, int nSCD2, bool _isse, bool _planar, int _optDebug, IScriptEnvironment* env) :
+  bool _blend, sad_t nSCD1, int nSCD2, bool _isse, bool _planar, int _optDebug, bool mt_flag, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
   MVFilter(_mvfw, "MFlowFps", env, 1, 0),
   mvClipB(_mvbw, nSCD1, nSCD2, env, 1, 0),
   mvClipF(_mvfw, nSCD1, nSCD2, env, 1, 0),
-  optDebug(_optDebug)
+  optDebug(_optDebug),
+  _mt_flag(mt_flag)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -346,6 +347,72 @@ MVFlowFps::~MVFlowFps()
 
 }
 
+// Renders the destination rows [y_beg, y_end) (luma rows; chroma scaled)
+// of all planes. A row depends only on its own row of the full-frame
+// vectors and masks and on the reference frames, which are read-only, so
+// the slices need no synchronisation. The FlowInter* functions advance
+// their pointers row by row; a slice just starts them at its first row.
+template <typename pixel_t>
+void MVFlowFps::interpolate_rows(int y_beg, int y_end)
+{
+  for (int p = 0; p < 3; p++)
+  {
+    if (p > 0 && isGrey)
+      break;
+    const bool uv = (p > 0 && needDistinctChroma);
+    const int yb = uv ? (y_beg >> nLogyRatioUVs[1]) : y_beg;
+    const int ye = uv ? (y_end >> nLogyRatioUVs[1]) : y_end;
+    if (ye <= yb)
+      continue;
+    const int vpitch = uv ? VPitchUV : VPitchY;
+    const int voff = yb * vpitch;
+    // one destination row is nPel reference rows (ref_pitch << NPELL2 in FlowInter*_NPel)
+    const int refoff = (uv ? _cpNOffsetUV : _cpNOffsetY) + yb * _cpNRefPitches[p] * nPel;
+    BYTE *pdst = _cpPDst[p] + yb * _cpNDstPitches[p];
+    const BYTE *prefB = _cpPRef[p] + refoff;
+    const BYTE *prefF = _cpPSrc[p] + refoff;
+    short *vxB = (uv ? VXFullUVB : VXFullYB) + voff;
+    short *vxF = (uv ? VXFullUVF : VXFullYF) + voff;
+    short *vyB = (uv ? VYFullUVB : VYFullYB) + voff;
+    short *vyF = (uv ? VYFullUVF : VYFullYF) + voff;
+    BYTE *maskB = (uv ? MaskFullUVB : MaskFullYB) + voff;
+    BYTE *maskF = (uv ? MaskFullUVF : MaskFullYF) + voff;
+    const int width = uv ? nWidthUV : nWidth;
+    const int height = ye - yb;
+
+    if (_cpMode == 2)
+    {
+      FlowInterExtra<pixel_t>(pdst, _cpNDstPitches[p], prefB, prefF, _cpNRefPitches[p],
+        vxB, vxF, vyB, vyF, maskB, maskF, vpitch,
+        width, height, _cpTime256, nPel,
+        (uv ? VXFullUVBB : VXFullYBB) + voff, (uv ? VXFullUVFF : VXFullYFF) + voff,
+        (uv ? VYFullUVBB : VYFullYBB) + voff, (uv ? VYFullUVFF : VYFullYFF) + voff);
+    }
+    else if (_cpMode == 1)
+    {
+      FlowInter<pixel_t>(pdst, _cpNDstPitches[p], prefB, prefF, _cpNRefPitches[p],
+        vxB, vxF, vyB, vyF, maskB, maskF, vpitch,
+        width, height, _cpTime256, nPel);
+    }
+    else
+    {
+      FlowInterSimple<pixel_t>(pdst, _cpNDstPitches[p], prefB, prefF, _cpNRefPitches[p],
+        vxB, vxF, vyB, vyF, maskB, maskF, vpitch,
+        width, height, _cpTime256, nPel);
+    }
+  }
+}
+
+void MVFlowFps::interpolate_slice(Slicer::TaskData &td)
+{
+  if (pixelsize_super == 1)
+    interpolate_rows<uint8_t>(td._y_beg, td._y_end);
+  else if (pixelsize_super == 2)
+    interpolate_rows<uint16_t>(td._y_beg, td._y_end);
+  else
+    interpolate_rows<float>(td._y_beg, td._y_end);
+}
+
 //-------------------------------------------------------------------------
 PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
 {
@@ -601,6 +668,7 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
     bool isUsableF = mvClipF.IsUsable();
     _RPT5(0, "part#2 IsUsableB=%d IsUsableF=%d frame=%d,nleft=%d,nright=%d\n", isUsableB ? 1 : 0, isUsableF ? 1 : 0, n, nleft, nright);
 
+    int interMode; // which FlowInter variant renders this frame
     if (maskmode == 2 && isUsableB && isUsableF) // slow method with extra frames
     {
      // get vector mask from extra frames
@@ -635,290 +703,92 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
       }
       PROFILE_STOP(MOTION_PROFILE_RESIZE);
 
-      PROFILE_START(MOTION_PROFILE_FLOWINTER);
-      {
-        if (pixelsize_super == 1) {
-          FlowInterExtra<uint8_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterExtra<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-              FlowInterExtra<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-            }
-            else {
-              FlowInterExtra<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-              FlowInterExtra<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-            }
-          }
-        }
-        else if (pixelsize_super == 2) {
-          FlowInterExtra<uint16_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterExtra<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-              FlowInterExtra<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-            }
-            else {
-              FlowInterExtra<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-              FlowInterExtra<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-            }
-          }
-        }
-        else if (pixelsize_super == 4) {
-          FlowInterExtra<float>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterExtra<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-              FlowInterExtra<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel, VXFullUVBB, VXFullUVFF, VYFullUVBB, VYFullUVFF);
-            }
-            else {
-              FlowInterExtra<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-              FlowInterExtra<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel, VXFullYBB, VXFullYFF, VYFullYBB, VYFullYFF);
-            }
-          }
-        }
+      interMode = 2;
+    }
+    else if (maskmode == 1) // old method without extra frames
+      interMode = 1;
+    else // mode=0, faster simple method
+      interMode = 0;
+
+    PROFILE_START(MOTION_PROFILE_FLOWINTER);
+    {
+      // Per-frame state for the slices. GetFrame is never re-entered on the
+      // same instance (MT_MULTI_INSTANCE), so plain members are fine.
+      for (int p = 0; p < planecount; p++) {
+        _cpPDst[p] = pDst[p];
+        _cpPRef[p] = pRef[p];
+        _cpPSrc[p] = pSrc[p];
+        _cpNDstPitches[p] = nDstPitches[p];
+        _cpNRefPitches[p] = nRefPitches[p];
       }
-      PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
-      if (optDebug > 0) {
+      _cpNOffsetY = nOffsetY;
+      _cpNOffsetUV = nOffsetUV;
+      _cpTime256 = time256;
+      _cpMode = interMode;
+
+      Slicer slicer(_mt_flag);
+      slicer.start(nHeight, *this, &MVFlowFps::interpolate_slice, 16);
+      slicer.wait();
+    }
+    PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
+
+    if (optDebug > 0) {
+      if (interMode == 2) {
         char buf[100];
         snprintf(buf, sizeof(buf), "FlowInter mode=2");
         DrawString(dst, vi, 0, 6, buf);
       }
-    }
-    else if (maskmode == 1) // old method without extra frames
-    {
-      PROFILE_START(MOTION_PROFILE_FLOWINTER);
-      {
-        if (pixelsize_super == 1) {
-          FlowInter<uint8_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInter<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInter<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-            }
-            else {
-              FlowInter<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInter<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
-          }
-        }
-        else if (pixelsize_super == 2) {
-          FlowInter<uint16_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInter<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInter<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-            }
-            else {
-              FlowInter<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInter<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
-          }
-        }
-        else if (pixelsize_super == 4) {
-          FlowInter<float>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInter<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInter<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-            }
-            else {
-              FlowInter<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInter<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
-          }
-        }
-      }
-      if (optDebug > 0) {
+      else if (interMode == 1) {
         char buf[2048];
         snprintf(buf, sizeof(buf), "FlowInter mode=1");
         DrawString(dst, vi, 0, 6, buf);
       }
-      PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
-    }
-    else // mode=0, faster simple method
-    {
-
-      PROFILE_START(MOTION_PROFILE_FLOWINTER);
-      {
-        if (pixelsize_super == 1) {
-          FlowInterSimple<uint8_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterSimple<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInterSimple<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel); // 2.5.11.22 Line 598
-            }
-            else {
-              FlowInterSimple<uint8_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInterSimple<uint8_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
+      else {
+        int sum_VXFullYB = 0;
+        int sum_VXFullYF = 0;
+        int sum_VYFullYB = 0;
+        int sum_VYFullYF = 0;
+        int sum_MaskFullYB = 0;
+        int sum_MaskFullYF = 0;
+        for (int y = 0; y < nHeight; y++)
+          for (int x = 0; x < nWidth; x++) {
+            sum_VXFullYB += VXFullYB[y * VPitchY + x];
+            sum_VXFullYF += VXFullYF[y * VPitchY + x];
+            sum_VYFullYB += VYFullYB[y * VPitchY + x];
+            sum_VYFullYF += VYFullYF[y * VPitchY + x];
+            sum_MaskFullYB += MaskFullYB[y * VPitchY + x];
+            sum_MaskFullYF += MaskFullYF[y * VPitchY + x];
           }
-        }
-        else if (pixelsize_super == 2) {
-          FlowInterSimple<uint16_t>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterSimple<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInterSimple<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel); // 2.5.11.22 Line 598
-            }
-            else {
-              FlowInterSimple<uint16_t>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInterSimple<uint16_t>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
-          }
-        }
-        else if (pixelsize_super == 4) {
-          FlowInterSimple<float>(pDst[0], nDstPitches[0], pRef[0] + nOffsetY, pSrc[0] + nOffsetY, nRefPitches[0],
-            VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-            nWidth, nHeight, time256, nPel);
-          if (!isGrey) {
-            if (needDistinctChroma) {
-              FlowInterSimple<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetUV, pSrc[1] + nOffsetUV, nRefPitches[1],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel);
-              FlowInterSimple<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetUV, pSrc[2] + nOffsetUV, nRefPitches[2],
-                VXFullUVB, VXFullUVF, VYFullUVB, VYFullUVF, MaskFullUVB, MaskFullUVF, VPitchUV,
-                nWidthUV, nHeightUV, time256, nPel); // 2.5.11.22 Line 598
-            }
-            else {
-              FlowInterSimple<float>(pDst[1], nDstPitches[1], pRef[1] + nOffsetY, pSrc[1] + nOffsetY, nRefPitches[1],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-              FlowInterSimple<float>(pDst[2], nDstPitches[2], pRef[2] + nOffsetY, pSrc[2] + nOffsetY, nRefPitches[2],
-                VXFullYB, VXFullYF, VYFullYB, VYFullYF, MaskFullYB, MaskFullYF, VPitchY,
-                nWidth, nHeight, time256, nPel);
-            }
-          }
-        }
-        if (optDebug > 0) {
-          int sum_VXFullYB = 0;
-          int sum_VXFullYF = 0;
-          int sum_VYFullYB = 0;
-          int sum_VYFullYF = 0;
-          int sum_MaskFullYB = 0;
-          int sum_MaskFullYF = 0;
-          for (int y = 0; y < nHeight; y++)
-            for (int x = 0; x < nWidth; x++) {
-              sum_VXFullYB += VXFullYB[y * VPitchY + x];
-              sum_VXFullYF += VXFullYF[y * VPitchY + x];
-              sum_VYFullYB += VYFullYB[y * VPitchY + x];
-              sum_VYFullYF += VYFullYF[y * VPitchY + x];
-              sum_MaskFullYB += MaskFullYB[y * VPitchY + x];
-              sum_MaskFullYF += MaskFullYF[y * VPitchY + x];
-            }
 
-          int sum_MaskSmallB = 0;
-          int sum_MaskSmallF = 0;
-          for (int y = 0; y < nBlkY; y++)
-            for (int x = 0; x < nBlkX; x++) {
-              sum_MaskSmallB += MaskSmallB[nBlkXP*y + x];
-              sum_MaskSmallF += MaskSmallF[nBlkXP*y + x];
-            }
+        int sum_MaskSmallB = 0;
+        int sum_MaskSmallF = 0;
+        for (int y = 0; y < nBlkY; y++)
+          for (int x = 0; x < nBlkX; x++) {
+            sum_MaskSmallB += MaskSmallB[nBlkXP*y + x];
+            sum_MaskSmallF += MaskSmallF[nBlkXP*y + x];
+          }
 
-          int sum_MaskSmallBP = 0;
-          int sum_MaskSmallFP = 0;
-          for (int y = 0; y < nBlkYP; y++)
-            for (int x = 0; x < nBlkXP; x++) {
-              sum_MaskSmallBP += MaskSmallB[nBlkXP*y + x];
-              sum_MaskSmallFP += MaskSmallB[nBlkXP*y + x];
-            }
-          char buf[2048];
-          snprintf(buf, sizeof(buf), "FlowInterSimple mode=0 or mode=2 not usable");
-          DrawString(dst, vi, 0, 6, buf);
-          snprintf(buf, sizeof(buf), "sum_VXFullYB=%d sum_VXFullYF=%d", sum_VXFullYB, sum_VXFullYF);
-          DrawString(dst, vi, 0, 7, buf);
-          snprintf(buf, sizeof(buf), "sum_VYFullYB=%d sum_VYFullYF=%d", sum_VYFullYB, sum_VYFullYF);
-          DrawString(dst, vi, 0, 8, buf);
-          snprintf(buf, sizeof(buf), "sum_MaskFullYB=%d sum_MaskFullYF=%d", sum_MaskFullYB, sum_MaskFullYF);
-          DrawString(dst, vi, 0, 9, buf);
-          snprintf(buf, sizeof(buf), "sum_MaskSmallBP=%d sum_MaskSmallFP=%d", sum_MaskSmallBP, sum_MaskSmallFP);
-          DrawString(dst, vi, 0, 10, buf);
-          snprintf(buf, sizeof(buf), "sum_MaskSmallB=%d sum_MaskSmallF=%d", sum_MaskSmallB, sum_MaskSmallF);
-          DrawString(dst, vi, 0, 11, buf);
-        }
-        PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
-      }
-      if (optDebug > 0) {
+        int sum_MaskSmallBP = 0;
+        int sum_MaskSmallFP = 0;
+        for (int y = 0; y < nBlkYP; y++)
+          for (int x = 0; x < nBlkXP; x++) {
+            sum_MaskSmallBP += MaskSmallB[nBlkXP*y + x];
+            sum_MaskSmallFP += MaskSmallB[nBlkXP*y + x];
+          }
         char buf[2048];
+        snprintf(buf, sizeof(buf), "FlowInterSimple mode=0 or mode=2 not usable");
+        DrawString(dst, vi, 0, 6, buf);
+        snprintf(buf, sizeof(buf), "sum_VXFullYB=%d sum_VXFullYF=%d", sum_VXFullYB, sum_VXFullYF);
+        DrawString(dst, vi, 0, 7, buf);
+        snprintf(buf, sizeof(buf), "sum_VYFullYB=%d sum_VYFullYF=%d", sum_VYFullYB, sum_VYFullYF);
+        DrawString(dst, vi, 0, 8, buf);
+        snprintf(buf, sizeof(buf), "sum_MaskFullYB=%d sum_MaskFullYF=%d", sum_MaskFullYB, sum_MaskFullYF);
+        DrawString(dst, vi, 0, 9, buf);
+        snprintf(buf, sizeof(buf), "sum_MaskSmallBP=%d sum_MaskSmallFP=%d", sum_MaskSmallBP, sum_MaskSmallFP);
+        DrawString(dst, vi, 0, 10, buf);
+        snprintf(buf, sizeof(buf), "sum_MaskSmallB=%d sum_MaskSmallF=%d", sum_MaskSmallB, sum_MaskSmallF);
+        DrawString(dst, vi, 0, 11, buf);
+
         snprintf(buf, sizeof(buf), "FRAME %d time256=%d IsUsableB=%d IsUsableF=%d", n, time256, isUsableB ? 1 : 0, isUsableF ? 1 : 0);
         DrawString(dst, vi, 0, 0, buf);
         snprintf(buf, sizeof(buf), "B: BlkCount=%d OVx=%d OVy=%d thSCD1=%d thSCD2=%d", mvClipB.GetBlkCount(), mvClipB.GetOverlapX(), mvClipB.GetOverlapY(), mvClipB.GetThSCD1(), mvClipB.GetThSCD2());

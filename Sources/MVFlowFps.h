@@ -3,6 +3,7 @@
 
 #include "MVClip.h"
 #include "MVFilter.h"
+#include "MTSlicer.h"
 #include "SimpleResize.h"
 #include "yuy2planes.h"
 #include <atomic>
@@ -117,9 +118,26 @@ private:
   int nLogxRatioUVs[3];
   int nLogyRatioUVs[3];
 
+  typedef MTSlicer <MVFlowFps> Slicer;
+
+  void interpolate_slice(Slicer::TaskData &td);
+  template <typename pixel_t>
+  void interpolate_rows(int y_beg, int y_end);
+
+  bool _mt_flag;
+
+  // Per-frame state read by interpolate_slice()
+  BYTE *_cpPDst[3];
+  const BYTE *_cpPRef[3];
+  const BYTE *_cpPSrc[3];
+  int _cpNDstPitches[3], _cpNRefPitches[3];
+  int _cpNOffsetY, _cpNOffsetUV;
+  int _cpTime256;
+  int _cpMode; // 0: FlowInterSimple, 1: FlowInter, 2: FlowInterExtra
+
 public:
   MVFlowFps(PClip _child, PClip _super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
-    bool _blend, sad_t nSCD1, int nSCD2, bool isse, bool _planar, int _optDebug, IScriptEnvironment* env);
+    bool _blend, sad_t nSCD1, int nSCD2, bool isse, bool _planar, int _optDebug, bool mt_flag, IScriptEnvironment* env);
   ~MVFlowFps();
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 
