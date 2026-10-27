@@ -82,6 +82,11 @@ public:
   MV_FORCEINLINE int GetVPadding() const { return nVPadding; }
   MV_FORCEINLINE void ResetState() { isRefined = isFilled = isPadded = false; }
 
+  // golden-data dump (GoldenDump.cpp) only
+  MV_FORCEINLINE int DbgPel() const { return nPel; }
+  MV_FORCEINLINE int DbgPixelSize() const { return pixelsize; }
+  MV_FORCEINLINE const uint8_t *DbgSubPlane(int i) const { return pPlane[i]; }
+
 private:
 
   typedef	MTFlowGraphSched <MVPlane, MTFlowGraphSimple <16>, MVPlane, 16>	SchedulerRefine;

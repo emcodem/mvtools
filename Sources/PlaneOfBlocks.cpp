@@ -26,6 +26,7 @@
 #include "DCTFactory.h"
 #include "debugprintf.h"
 #include "FakePlaneOfBlocks.h"
+#include "GoldenDump.h"
 #include "MVClip.h"
 #include "MVFrame.h"
 #include "MVPlane.h"
@@ -362,6 +363,16 @@ void PlaneOfBlocks::SearchMVs(
   penaltyNew = _pnew; // penalty for new vector
   LSAD = _lsad;    // SAD limit for lambda using
 
+  GOLDEN_LOG("plane level %d blkX %d blkY %d blkSizeX %d blkSizeY %d overlapX %d overlapY %d pel %d nScale %d chroma %d smallest %d",
+    nLogScale, nBlkX, nBlkY, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, nPel, nScale, chroma ? 1 : 0, smallestPlane ? 1 : 0);
+  GOLDEN_LOG("plane lambda_in %d lambda_level %d plevel %d lsad %d pnew %d pzero %d pglobal %d badSAD %d badrange %d dctmode %d chromaSADscale %d",
+    lambda, _lambda_level, plevel, (int)LSAD, penaltyNew, penaltyZero, pglobal, (int)badSAD, badrange, dctmode, effective_chromaSADscale);
+  GOLDEN_LOG("plane slicer mt %d avstp_threads %d blkY %d (slices: min(threads, 64, blkY / 4), at least 1; y_end = (t + 1) * blkY / n)",
+    _mt_flag ? 1 : 0, _mt_flag ? AvstpWrapper::use_instance().get_nbr_threads() : 1, nBlkY);
+  GOLDEN_LOG("plane search type %d param %d meander %d temporal %d tryMany %d glob_pred x %d y %d sad %d zeroMVfieldShifted y %d",
+    (int)searchType, nSearchParam, _meander_flag ? 1 : 0, temporal ? 1 : 0, tryMany ? 1 : 0,
+    _glob_mv_pred_def.x, _glob_mv_pred_def.y, (int)_glob_mv_pred_def.sad, zeroMVfieldShifted.y);
+
   Slicer			slicer(_mt_flag); // fixme: mt bug
   if(bits_per_pixel == 8)
     slicer.start(nBlkY, *this, &PlaneOfBlocks::search_mv_slice<uint8_t>, 4);
@@ -471,6 +482,10 @@ void PlaneOfBlocks::RecalculateMVs(
 
   // -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
   // fixme: consider disabling internal mt, it's giving inconsistent results when used
+  GOLDEN_LOG("recalc plane blkX %d blkY %d blkSizeX %d blkSizeY %d overlapX %d overlapY %d pel %d chroma %d",
+    nBlkX, nBlkY, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, nPel, chroma ? 1 : 0);
+  GOLDEN_LOG("recalc lambda_in %d lambda_level %d pnew %d thSAD %d smooth %d dctmode %d chromaSADscale %d search type %d param %d meander %d",
+    lambda, _lambda_level, _pnew, (int)_thSAD, _smooth, dctmode, effective_chromaSADscale, (int)searchType, nSearchParam, _meander_flag ? 1 : 0);
   Slicer			slicer(_mt_flag);
   if(pixelsize==1)
     slicer.start(nBlkY, *this, &PlaneOfBlocks::recalculate_mv_slice<uint8_t>, 4);

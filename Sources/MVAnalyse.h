@@ -112,6 +112,12 @@ protected:
 
   int _delta_max;
 
+  // GPU search (GpuBackend / mvtools_cuda.dll): decided once at construction, falls back to the CPU per frame
+  bool _gpu_ok;
+  int _gpu_slices;
+  int _gpu_effective_chroma_scale;
+  int _gpu_super_levels;
+
 public:
 
   MVAnalyse(
@@ -121,7 +127,7 @@ public:
     int _overlapx, int _overlapy, const char* _outfilename, int _dctmode,
     int _divide, int _sadx264, sad_t _badSAD, int _badrange, bool _isse,
     bool _meander, bool temporal_flag, bool _tryMany, bool multi_flag,
-    bool mt_flag, int _chromaSADScale, IScriptEnvironment* env);
+    bool mt_flag, int _chromaSADScale, bool gpu_flag, IScriptEnvironment* env);
   ~MVAnalyse();
 
   ::PVideoFrame __stdcall	GetFrame(int n, ::IScriptEnvironment* env) override;
@@ -134,6 +140,7 @@ public:
 
 private:
 
+  bool gpu_search(int nsrc, int *payload);
   void load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data);
 };
 

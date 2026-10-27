@@ -118,6 +118,11 @@ protected:
     int pixelsize; // PF
     int bits_per_pixel;
 
+  // GPU recalculation (GpuBackend / mvtools_cuda.dll): decided at construction, falls back to the CPU per frame
+  bool _gpu_ok;
+  int _gpu_slices;
+  int _gpu_effective_chroma_scale;
+
 public :
 
   MVRecalculate (
@@ -125,7 +130,7 @@ public :
     int _blksizex, int _blksizey, int st, int stp, int lambda, bool chroma,
     int _pnew, int _overlapx, int _overlapy, const char* _outfilename,
     int _dctmode, int _divide, int _sadx264, bool _isse, bool _meander,
-		int trad, bool mt_flag, int _chromaSADScale, IScriptEnvironment* env
+		int trad, bool mt_flag, int _chromaSADScale, bool gpu_flag, IScriptEnvironment* env
   );
   ~MVRecalculate();
 
@@ -137,6 +142,7 @@ public :
 
 private:
 
+  bool gpu_recalc(SrcRefData &srd, int nsrc, int *payload);
   void				load_src_frame (MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data);
 
 };

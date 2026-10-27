@@ -1,0 +1,810 @@
+// GPU version of MAnalyse's hierarchical search (GPU_PLAN.md M3), bit-exact against GroupOfPlanes::SearchMVs /
+// PlaneOfBlocks::search_mv_slice for the production configuration: exhaustive search at every level, truemotion
+// parameters, global MV, meander, 16-bit samples, chroma on, dct 0, divide 0, no temporal predictor, tryMany off.
+//
+// Parallelism. Inside a plane the block search is a chain: with meander a block depends on its left neighbour in scan
+// order and on the block above, which snakes through the whole plane. The CPU code removes the chain by cutting the
+// plane into horizontal slices that are searched independently (the "up" predictor and nLambda are dropped on the
+// first row of a slice, the "bottom-right" predictor on the last row; see the "mt-inconsistency" comments in
+// PlaneOfBlocks.cpp). That is what the multi-threaded CPU result already contains, and what is reproduced here:
+// one CUDA block per slice, the slices of a plane run concurrently. slice_threads = 1 reproduces the single-thread
+// CPU result, slice_threads = N the CPU result with N avstp threads (slices = min(N, 64, blkY / 4), at least 1).
+// Inside a slice the blocks are processed one after the other, the candidate vectors of a block in parallel.
+//
+// Blocks whose result would trigger the CPU's "bad vector" wide search (UMH, depends on a counter shared by all
+// slices) are not supported: the call returns MVCUDA_NEEDS_CPU and the caller falls back to the CPU.
+
+#include "mvcuda_internal.h"
+
+#include <cuda_runtime.h>
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+namespace
+{
+  using mvc::pix;
+
+  const int FREQ_HALF = 8192; // PlaneOfBlocks: freqArray size 8192 * pel * 2, coarse levels have pel 1
+  const int MAX_CAND = 64;
+
+  struct LevelArgs
+  {
+    int level, n_blk_x, n_blk_y;
+    int pel, log_pel, n_scale, log_scale, smallest;
+    int bs_x, bs_y, ov_x, ov_y, cw, ch, log_x_uv, log_y_uv;
+    int ext_w, ext_h, ew[3], hpad[3], vpad[3];
+    const pix *src[3];
+    const pix *ref[3][4];
+    int lambda_level, lsad, pnew, pzero, pglobal, bits, chroma_scale, radius, meander, use_global;
+    int bad_sad, n_slices;
+    const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
+    int *vec;          // device: (vx, vy, sad) triples of this level
+    int *bad_flag;
+  };
+
+  __device__ __forceinline__ int warp_sum(int v)
+  {
+    for (int o = 16; o > 0; o >>= 1)
+      v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+  }
+
+  __device__ __forceinline__ int scale_chroma(int sad, int scale)
+  {
+    if (scale == 0)
+      return sad;
+    return scale > 0 ? sad >> scale : sad << (-scale);
+  }
+
+  __device__ int sad_block(const LevelArgs &a, int p, int x0, int y0, int w, int h, int xp, int yp, int lane)
+  {
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const pix *rp = a.ref[p][sub];
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    const int ew = a.ew[p];
+    int s = 0;
+    for (int i = lane; i < w * h; i += 32)
+    {
+      const int r = i / w, c = i - r * w;
+      s += abs((int)a.src[p][(size_t)(y0 + r) * ew + x0 + c] - (int)rp[(size_t)(ry + r) * ew + rx + c]);
+    }
+    return warp_sum(s);
+  }
+
+  // InterpolatePrediction<bigsad_t, bigsad_t> for 16-bit data
+  __global__ void k_interp(LevelArgs a, const int *coarse, int c_blk_x, int c_blk_y, int log_pel_coarse)
+  {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= a.n_blk_x * a.n_blk_y)
+      return;
+    int norm_factor = 3 - a.log_pel + log_pel_coarse;
+    const int mul_factor = norm_factor < 0 ? -norm_factor : 0;
+    norm_factor = norm_factor < 0 ? 0 : norm_factor;
+    const int normov = (a.bs_x - a.ov_x) * (a.bs_y - a.ov_y);
+    const int aoddx = a.bs_x * 3 - a.ov_x * 2, aevenx = a.bs_x * 3 - a.ov_x * 4;
+    const int aoddy = a.bs_y * 3 - a.ov_y * 2, aeveny = a.bs_y * 3 - a.ov_y * 4;
+    const bool no_overlap = (a.ov_x == 0 && a.ov_y == 0);
+    const bool small_overlap = a.ov_x <= (a.bs_x >> 1) && a.ov_y <= (a.bs_y >> 1);
+
+    const int k = index % a.n_blk_x, l = index / a.n_blk_x;
+    int i = k, j = l;
+    if (i >= 2 * c_blk_x)
+      i = 2 * c_blk_x - 1;
+    if (j >= 2 * c_blk_y)
+      j = 2 * c_blk_y - 1;
+    const int offy = -1 + 2 * (j % 2), offx = -1 + 2 * (i % 2);
+    const int iper2 = i / 2, jper2 = j / 2;
+    const int *v1, *v2, *v3, *v4;
+#define CV(ix, iy) (coarse + 3 * ((ix) + (iy) * c_blk_x))
+    if (i == 0 || i >= 2 * c_blk_x - 1)
+    {
+      if (j == 0 || j >= 2 * c_blk_y - 1)
+        v1 = v2 = v3 = v4 = CV(iper2, jper2);
+      else
+      {
+        v1 = v2 = CV(iper2, jper2);
+        v3 = v4 = CV(iper2, jper2 + offy);
+      }
+    }
+    else if (j == 0 || j >= 2 * c_blk_y - 1)
+    {
+      v1 = v2 = CV(iper2, jper2);
+      v3 = v4 = CV(iper2 + offx, jper2);
+    }
+    else
+    {
+      v1 = CV(iper2, jper2);
+      v2 = CV(iper2 + offx, jper2);
+      v3 = CV(iper2, jper2 + offy);
+      v4 = CV(iper2 + offx, jper2 + offy);
+    }
+#undef CV
+    int x, y;
+    long long tmp_sad;
+    if (no_overlap)
+    {
+      x = 9 * v1[0] + 3 * v2[0] + 3 * v3[0] + v4[0];
+      y = 9 * v1[1] + 3 * v2[1] + 3 * v3[1] + v4[1];
+      tmp_sad = 9 * (long long)v1[2] + 3 * (long long)v2[2] + 3 * (long long)v3[2] + (long long)v4[2] + 8;
+    }
+    else if (small_overlap)
+    {
+      const int ax1 = offx > 0 ? aoddx : aevenx;
+      const int ax2 = (a.bs_x - a.ov_x) * 4 - ax1;
+      const int ay1 = offy > 0 ? aoddy : aeveny;
+      const int ay2 = (a.bs_y - a.ov_y) * 4 - ay1;
+      const int a11 = ax1 * ay1, a12 = ax1 * ay2, a21 = ax2 * ay1, a22 = ax2 * ay2;
+      x = (a11 * v1[0] + a21 * v2[0] + a12 * v3[0] + a22 * v4[0]) / normov;
+      y = (a11 * v1[1] + a21 * v2[1] + a12 * v3[1] + a22 * v4[1]) / normov;
+      tmp_sad = ((long long)a11 * v1[2] + (long long)a21 * v2[2] + (long long)a12 * v3[2] + (long long)a22 * v4[2]) / normov;
+    }
+    else
+    {
+      x = (v1[0] + v2[0] + v3[0] + v4[0]) << 2;
+      y = (v1[1] + v2[1] + v3[1] + v4[1]) << 2;
+      tmp_sad = ((long long)v1[2] + v2[2] + v3[2] + v4[2] + 2) << 2;
+    }
+    a.vec[3 * index + 0] = (x >> norm_factor) << mul_factor;
+    a.vec[3 * index + 1] = (y >> norm_factor) << mul_factor;
+    a.vec[3 * index + 2] = (int)(tmp_sad >> 4);
+  }
+
+  // PlaneOfBlocks::estimate_global_mv_doubled_slice on the vectors of the coarser plane; one CUDA block.
+  // freq: device scratch of 2 * 2 * FREQ_HALF ints.
+  __global__ void k_global(const int *vec, int n_blk, int *freq, int *glob_out, int use_global)
+  {
+    __shared__ int s_min[2], s_max[2], s_best[2], s_sum[2], s_num;
+    const int freq_size = 2 * FREQ_HALF; // coarse planes have pel 1
+    if (!use_global)
+    {
+      if (threadIdx.x == 0)
+      {
+        glob_out[0] = 0;
+        glob_out[1] = 0;
+      }
+      return;
+    }
+    for (int i = threadIdx.x; i < 2 * freq_size; i += blockDim.x)
+      freq[i] = 0;
+    if (threadIdx.x < 2)
+    {
+      s_min[threadIdx.x] = freq_size - 1;
+      s_max[threadIdx.x] = 0;
+      s_sum[threadIdx.x] = 0;
+    }
+    if (threadIdx.x == 0)
+      s_num = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_blk; i += blockDim.x)
+    {
+      for (int c = 0; c < 2; c++)
+      {
+        const int ind = (freq_size >> 1) + vec[3 * i + c];
+        if (ind >= 0 && ind < freq_size)
+        {
+          atomicAdd(&freq[c * freq_size + ind], 1);
+          atomicMax(&s_max[c], ind);
+          atomicMin(&s_min[c], ind);
+        }
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < 2)
+    {
+      const int c = threadIdx.x;
+      const int *f = freq + c * freq_size;
+      int count = f[s_min[c]], index = s_min[c];
+      for (int i = s_min[c] + 1; i <= s_max[c]; i++)
+        if (f[i] > count)
+        {
+          count = f[i];
+          index = i;
+        }
+      s_best[c] = index - (freq_size >> 1);
+    }
+    __syncthreads();
+    const int medx = s_best[0], medy = s_best[1];
+    for (int i = threadIdx.x; i < n_blk; i += blockDim.x)
+    {
+      if (abs(vec[3 * i] - medx) < 6 && abs(vec[3 * i + 1] - medy) < 6)
+      {
+        atomicAdd(&s_sum[0], vec[3 * i]);
+        atomicAdd(&s_sum[1], vec[3 * i + 1]);
+        atomicAdd(&s_num, 1);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+      if (s_num > 0)
+      {
+        glob_out[0] = 2 * s_sum[0] / s_num;
+        glob_out[1] = 2 * s_sum[1] / s_num;
+      }
+      else
+      {
+        glob_out[0] = 2 * medx;
+        glob_out[1] = 2 * medy;
+      }
+    }
+  }
+
+  struct Vec
+  {
+    int x, y, sad;
+  };
+
+  __device__ __forceinline__ int median3(int a, int b, int c)
+  {
+    if (a < b)
+    {
+      if (b < c) return b;
+      else if (a < c) return c;
+      else return a;
+    }
+    else
+    {
+      if (a < c) return a;
+      else if (b < c) return c;
+      else return b;
+    }
+  }
+
+  __device__ __forceinline__ Vec clip_mv(int dx_min, int dx_max, int dy_min, int dy_max, int x, int y, int sad)
+  {
+    Vec v;
+    v.x = x < dx_min ? dx_min : (x >= dx_max ? dx_max - 1 : x);
+    v.y = y < dy_min ? dy_min : (y >= dy_max ? dy_max - 1 : y);
+    v.sad = sad;
+    return v;
+  }
+
+  struct BlockShared
+  {
+    int sl[MAX_CAND], sc[MAX_CAND];
+    int ring_dx[MAX_CAND], ring_dy[MAX_CAND];
+    int nlambda;
+    int best_x, best_y, best_sad;
+  };
+
+  // luma SAD of the source block in shared memory against the reference displaced to sub-pel position (xp, yp);
+  // lane = column, rows unrolled so that the loads of a batch are in flight together
+  __device__ __forceinline__ int sad_luma(const LevelArgs &a, const pix *s_src, int xp, int yp, int lane)
+  {
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    const int ew = a.ew[0];
+    int s = 0;
+    if (lane < a.bs_x)
+    {
+      const pix *r = a.ref[0][sub] + (size_t)ry * ew + rx + lane;
+      const pix *q = s_src + lane;
+      #pragma unroll 16
+      for (int row = 0; row < a.bs_y; row++)
+        s += abs((int)q[row * a.bs_x] - (int)r[(size_t)row * ew]);
+    }
+    return warp_sum(s);
+  }
+
+  // U + V SAD of the candidate (cx, cy), scaled like ScaleSadChroma. For cw <= 16 both planes share the warp
+  // (lanes [0, cw) U, [cw, 2 cw) V).
+  __device__ __forceinline__ int sad_chroma(const LevelArgs &a, const pix *s_u, const pix *s_v, int x1, int y1,
+    int cx, int cy, int lane, bool pair)
+  {
+    const int xp = x1 * a.pel + (cx >> a.log_x_uv);
+    const int yp = y1 * a.pel + (cy >> a.log_y_uv);
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    int s = 0;
+    if (pair)
+    {
+      const int pl = lane < a.cw ? 1 : 2, col = lane < a.cw ? lane : lane - a.cw;
+      if (lane < 2 * a.cw)
+      {
+        const pix *r = a.ref[pl][sub] + (size_t)ry * a.ew[pl] + rx + col;
+        const pix *q = (pl == 1 ? s_u : s_v) + col;
+        #pragma unroll 16
+        for (int row = 0; row < a.ch; row++)
+          s += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+      }
+    }
+    else
+    {
+      for (int pl = 1; pl < 3; pl++)
+        if (lane < a.cw)
+        {
+          const pix *r = a.ref[pl][sub] + (size_t)ry * a.ew[pl] + rx + lane;
+          const pix *q = (pl == 1 ? s_u : s_v) + lane;
+          #pragma unroll 16
+          for (int row = 0; row < a.ch; row++)
+            s += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+        }
+    }
+    return scale_chroma(warp_sum(s), a.chroma_scale);
+  }
+
+#ifdef MVCUDA_PROFILE
+  __device__ long long g_prof[12];
+  #define PROF_T(i) long long t##i = clock64();
+  #define PROF_ADD(slot, a_, b_) if (tid == 0 && blockIdx.x == 0 && a.level == 0) g_prof[slot] += (b_) - (a_);
+#else
+  #define PROF_T(i)
+  #define PROF_ADD(slot, a_, b_)
+#endif
+
+  // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
+  __global__ void k_search(LevelArgs a)
+  {
+    extern __shared__ pix s_dyn[];
+    __shared__ BlockShared b;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+    const int slice = blockIdx.x;
+    const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
+    const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
+    const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
+    const int ring_n = 4 * a.radius * (a.radius + 1);
+    pix *s_y = s_dyn, *s_u = s_dyn + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
+    const bool pair_chroma = (2 * a.cw <= 32);
+
+    // ring offsets in ExpandingSearch order (sides without corners, then the corners), relative to the centre
+    if (tid == 0)
+    {
+      int n = 0;
+      for (int r = 1; r <= a.radius; r++)
+      {
+        for (int i = -r + 1; i < r; i++)
+        {
+          b.ring_dx[n] = i; b.ring_dy[n++] = -r;
+          b.ring_dx[n] = i; b.ring_dy[n++] = r;
+        }
+        for (int j = -r + 1; j < r; j++)
+        {
+          b.ring_dx[n] = -r; b.ring_dy[n++] = j;
+          b.ring_dx[n] = r; b.ring_dy[n++] = j;
+        }
+        b.ring_dx[n] = -r; b.ring_dy[n++] = -r;
+        b.ring_dx[n] = -r; b.ring_dy[n++] = r;
+        b.ring_dx[n] = r; b.ring_dy[n++] = -r;
+        b.ring_dx[n] = r; b.ring_dy[n++] = r;
+      }
+    }
+
+    for (int blky = beg; blky < end; blky++)
+    {
+      const int dir = (blky % 2 == 0 || !a.meander) ? 1 : -1;
+      const int start = (dir == 1) ? 0 : a.n_blk_x - 1;
+      for (int it = 0; it < a.n_blk_x; it++)
+      {
+        const int blkx = start + it * dir;
+        const int idx = blky * a.n_blk_x + blkx;
+
+        PROF_T(0)
+        // ---- geometry (identical in every thread) and the source block into shared memory
+        int x0[3], y0[3];
+        x0[0] = a.hpad[0] + blkx * step_x;
+        y0[0] = a.vpad[0] + blky * step_y;
+        for (int p = 1; p < 3; p++)
+        {
+          x0[p] = a.hpad[p] + blkx * (step_x >> a.log_x_uv);
+          y0[p] = a.vpad[p] + blky * (step_y >> a.log_y_uv);
+        }
+        for (int i = tid; i < a.bs_x * a.bs_y; i += blockDim.x)
+          s_y[i] = a.src[0][(size_t)(y0[0] + i / a.bs_x) * a.ew[0] + x0[0] + i % a.bs_x];
+        for (int i = tid; i < a.cw * a.ch; i += blockDim.x)
+        {
+          const int r = i / a.cw, c = i - r * a.cw;
+          s_u[i] = a.src[1][(size_t)(y0[1] + r) * a.ew[1] + x0[1] + c];
+          s_v[i] = a.src[2][(size_t)(y0[2] + r) * a.ew[2] + x0[2] + c];
+        }
+
+        const int dx_max = a.pel * (a.ext_w - x0[0] - a.bs_x - a.hpad[0] + h_scaled);
+        const int dy_max = a.pel * (a.ext_h - y0[0] - a.bs_y - a.vpad[0] + v_scaled);
+        const int dx_min = -a.pel * (x0[0] - a.hpad[0] + h_scaled);
+        const int dy_min = -a.pel * (y0[0] - a.vpad[0] + v_scaled);
+
+        // ---- predictors (FetchPredictors), identical in every thread
+        const bool is_top = (blky == beg), is_bottom = (blky == end - 1);
+        const bool side_ok = (dir == 1 && blkx < a.n_blk_x - 1) || (dir == -1 && blkx > 0);
+        const int *own = a.vec + 3 * idx;
+        const Vec own_v = clip_mv(dx_min, dx_max, dy_min, dy_max, own[0], own[1], own[2]);
+        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0); // field shift 0
+        Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
+        if ((dir == 1 && blkx > 0) || (dir == -1 && blkx < a.n_blk_x - 1))
+        {
+          const int *v = a.vec + 3 * (idx - dir);
+          p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
+        }
+        if (!is_top)
+        {
+          const int *v = a.vec + 3 * (idx - a.n_blk_x);
+          p2 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
+        }
+        if (!is_bottom && !a.smallest && side_ok)
+        {
+          const int *v = a.vec + 3 * (idx + a.n_blk_x + dir);
+          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
+        }
+        else if (!is_top && side_ok)
+        {
+          const int *v = a.vec + 3 * (idx - a.n_blk_x + dir);
+          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
+        }
+        if (!is_top)
+        {
+          p0.x = median3(p1.x, p2.x, p3.x);
+          p0.y = median3(p1.y, p2.y, p3.y);
+          p0.sad = max(p1.sad, max(p2.sad, p3.sad));
+        }
+        else
+          p0 = p1;
+        const Vec pred = a.smallest ? p0 : own_v;
+        if (tid == 0)
+        {
+          int nlambda = (blky == beg) ? 0 : a.lambda_level;
+          if (a.lsad == 0)
+            nlambda = 0;
+          else
+          {
+            // double arithmetic, IEEE exact like the CPU code (no fused operations in these lines); FP64 is slow on
+            // GeForce, so this is done by one thread only
+            const double factor = __ddiv_rn((double)a.lsad, (double)(a.lsad + (pred.sad >> 1)));
+            nlambda = (int)__dmul_rn(__dmul_rn((double)nlambda, factor), factor);
+          }
+          b.nlambda = nlambda;
+        }
+        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel, 0);
+        __syncthreads(); // source block and nLambda in shared memory; the previous block's vector is visible
+        const int nlambda = b.nlambda;
+        PROF_T(1)
+
+        // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
+        for (int c = warp; c < 7; c += nwarps)
+        {
+          int cx, cy;
+          switch (c)
+          {
+          case 0: cx = 0; cy = 0; break;
+          case 1: cx = glob.x; cy = glob.y; break;
+          case 2: cx = pred.x; cy = pred.y; break;
+          case 3: cx = p0.x; cy = p0.y; break;
+          case 4: cx = p1.x; cy = p1.y; break;
+          case 5: cx = p2.x; cy = p2.y; break;
+          default: cx = p3.x; cy = p3.y; break;
+          }
+          const int sl = sad_luma(a, s_y, x0[0] * a.pel + cx, y0[0] * a.pel + cy, lane);
+          const int sc = sad_chroma(a, s_u, s_v, x0[1], y0[1], cx, cy, lane, pair_chroma);
+          if (lane == 0)
+          {
+            b.sl[c] = sl;
+            b.sc[c] = sc;
+          }
+        }
+        PROF_T(2)
+        __syncthreads();
+        PROF_T(3)
+
+        // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
+        int best_x, best_y, best_sad, min_cost;
+        {
+          const int sad = b.sl[0] + b.sc[0];
+          best_x = 0;
+          best_y = 0;
+          best_sad = sad;
+          min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
+          const int sadg = b.sl[1] + b.sc[1];
+          const int costg = sadg + (int)(((long long)a.pglobal * sadg) >> 8);
+          if (costg < min_cost)
+          {
+            best_x = glob.x;
+            best_y = glob.y;
+            best_sad = sadg;
+            min_cost = costg;
+          }
+          const int sadp = b.sl[2] + b.sc[2];
+          if (sadp < min_cost)
+          {
+            best_x = pred.x;
+            best_y = pred.y;
+            best_sad = sadp;
+            min_cost = sadp;
+          }
+          const Vec pv[4] = { p0, p1, p2, p3 };
+          for (int i = 0; i < 4; i++) // CheckMV0
+          {
+            const int cx = pv[i].x, cy = pv[i].y;
+            if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+              continue;
+            const int dxp = pred.x - cx, dyp = pred.y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+            if (cost >= min_cost)
+              continue;
+            cost += b.sl[3 + i];
+            if (cost >= min_cost)
+              continue;
+            cost += b.sc[3 + i];
+            if (cost >= min_cost)
+              continue;
+            best_x = cx;
+            best_y = cy;
+            best_sad = b.sl[3 + i] + b.sc[3 + i];
+            min_cost = cost;
+          }
+        }
+        __syncthreads(); // everybody has read the phase A results before phase B overwrites them
+        PROF_T(4)
+
+        // ---- phase B: SADs of the ring candidates around the best vector so far
+        for (int c = warp; c < ring_n; c += nwarps)
+        {
+          const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
+          if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+            continue; // never read: the fold below skips invalid vectors
+          const int sl = sad_luma(a, s_y, x0[0] * a.pel + cx, y0[0] * a.pel + cy, lane);
+          const int sc = sad_chroma(a, s_u, s_v, x0[1], y0[1], cx, cy, lane, pair_chroma);
+          if (lane == 0)
+          {
+            b.sl[c] = sl;
+            b.sc[c] = sc;
+          }
+        }
+        PROF_T(5)
+        __syncthreads();
+        PROF_T(6)
+
+        // ---- fold the ring (CheckMV, with penaltyNew) in warp 0, one lane per candidate. The sequential CPU rule
+        // "accept if cost < running minimum" ends at the earliest candidate with the smallest cost below the
+        // minimum before the ring, so a minimum over (cost, index) is equivalent (the partial sums only grow, hence
+        // the cost chain with early exits accepts exactly when its final sum is below the minimum).
+        if (warp == 0)
+        {
+          long long key = 0x7fffffffffffffffLL;
+          for (int c = lane; c < ring_n; c += 32)
+          {
+            const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
+            if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+              continue;
+            const int dxp = pred.x - cx, dyp = pred.y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+            if (cost >= min_cost)
+              continue;
+            cost += b.sl[c] + (int)(((long long)a.pnew * b.sl[c]) >> 8);
+            if (cost >= min_cost)
+              continue;
+            cost += b.sc[c] + (int)(((long long)a.pnew * b.sc[c]) >> 8);
+            if (cost >= min_cost)
+              continue;
+            const long long k = (long long)cost * 128 + c;
+            key = k < key ? k : key;
+          }
+          for (int o = 16; o > 0; o >>= 1)
+          {
+            const long long other = __shfl_xor_sync(0xffffffffu, key, o);
+            key = other < key ? other : key;
+          }
+          if (lane == 0)
+          {
+            if (key != 0x7fffffffffffffffLL)
+            {
+              const int c = (int)(key & 127);
+              best_x += b.ring_dx[c];
+              best_y += b.ring_dy[c];
+              best_sad = b.sl[c] + b.sc[c];
+            }
+            // the CPU runs a wide UMH search for very bad vectors (not reproduced, see the file header)
+            if (idx > 1 + beg * a.n_blk_x && best_sad > a.bad_sad)
+              atomicExch(a.bad_flag, 1);
+            a.vec[3 * idx + 0] = best_x;
+            a.vec[3 * idx + 1] = best_y;
+            a.vec[3 * idx + 2] = best_sad;
+          }
+        }
+        __syncthreads(); // the next block reads this vector
+        PROF_T(7)
+        PROF_ADD(0, t0, t1)  // setup (loads, predictors) incl. sync
+        PROF_ADD(1, t1, t2)  // phase A warp work (thread 0's share)
+        PROF_ADD(2, t2, t3)  // wait for phase A at the sync
+        PROF_ADD(3, t3, t4)  // fold A + sync
+        PROF_ADD(4, t4, t5)  // phase B warp work (thread 0's share)
+        PROF_ADD(5, t5, t6)  // wait at the sync
+        PROF_ADD(6, t6, t7)  // fold B (thread 0) + write + sync
+      }
+    }
+  }
+
+  int ilog2(int v)
+  {
+    int l = 0;
+    while ((1 << l) < v)
+      l++;
+    return l;
+  }
+}
+
+extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
+{
+  if (!sp || !ap || !src || !ref || !payload)
+    return -4;
+  // supported: chroma on, pel 1 or 2, exhaustive search everywhere, field shift 0
+  if (!sp->chroma || sp->levels != ap->n_levels || ap->n_levels < 1 || ap->n_levels > MVCUDA_MAX_LEVELS
+    || ap->search_param < 1 || ap->pel_search < 1 || ap->search_param > 3 || ap->pel_search > 3 || ap->n_blk_x < 1
+    || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2)
+    return -4;
+  if (mvcuda_device_count() <= 0)
+    return -1;
+
+  const int nl = ap->n_levels;
+  int nbx[MVCUDA_MAX_LEVELS], nby[MVCUDA_MAX_LEVELS];
+  const int w_b = (ap->blk_x - ap->overlap_x) * ap->n_blk_x + ap->overlap_x;
+  const int h_b = (ap->blk_y - ap->overlap_y) * ap->n_blk_y + ap->overlap_y;
+  int words = 2;
+  int offs[MVCUDA_MAX_LEVELS]; // word offset of the first triple of each level inside the payload
+  for (int l = nl - 1; l >= 0; l--)
+  {
+    nbx[l] = ((w_b >> l) - ap->overlap_x) / (ap->blk_x - ap->overlap_x);
+    nby[l] = ((h_b >> l) - ap->overlap_y) / (ap->blk_y - ap->overlap_y);
+    if (nbx[l] < 1 || nby[l] < 1)
+      return -4;
+    offs[l] = words + 1;
+    words += 1 + nbx[l] * nby[l] * 3;
+  }
+  if (payload_words < words)
+    return -4;
+
+  const bool timing = getenv("MVCUDA_TIMING") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
+  auto lap = [&](const char *what) {
+    if (!timing)
+      return;
+    auto t1 = std::chrono::steady_clock::now();
+    fprintf(stderr, "mvcuda analyse: %-22s %7.2f ms\n", what, std::chrono::duration<double, std::milli>(t1 - t0).count());
+    t0 = t1;
+  };
+
+  int rc = 0;
+  mvc::DevSuper s_src, s_ref;
+  int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr;
+  rc = mvc::super_build(*sp, src, src_pitch_bytes, s_src);
+  if (!rc)
+    rc = mvc::super_build(*sp, ref, ref_pitch_bytes, s_ref);
+  lap("2 x super build");
+  if (rc)
+  {
+    mvc::super_free(s_src);
+    mvc::super_free(s_ref);
+    return rc;
+  }
+
+#define AN_CHECK(call) \
+  do { \
+    cudaError_t e_ = (call); \
+    if (e_ != cudaSuccess) { \
+      fprintf(stderr, "mvcuda: %s failed: %s\n", #call, cudaGetErrorString(e_)); \
+      rc = -2; \
+      goto done; \
+    } \
+  } while (0)
+
+  {
+    std::vector<int> host(words, 0);
+    host[0] = words;
+    host[1] = 1;
+    for (int l = nl - 1; l >= 0; l--)
+      host[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
+
+    AN_CHECK(cudaMalloc(&d_pay, words * sizeof(int)));
+    AN_CHECK(cudaMalloc(&d_freq, 2 * 2 * FREQ_HALF * sizeof(int)));
+    AN_CHECK(cudaMalloc(&d_glob, 2 * sizeof(int)));
+    AN_CHECK(cudaMalloc(&d_bad, sizeof(int)));
+    AN_CHECK(cudaMemcpy(d_pay, host.data(), words * sizeof(int), cudaMemcpyHostToDevice));
+    AN_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
+    AN_CHECK(cudaMemset(d_glob, 0, 2 * sizeof(int)));
+
+    for (int l = nl - 1; l >= 0; l--)
+    {
+      LevelArgs a = {};
+      a.level = l;
+      a.n_blk_x = nbx[l];
+      a.n_blk_y = nby[l];
+      a.pel = (l == 0) ? sp->pel : 1;
+      a.log_pel = ilog2(a.pel);
+      a.n_scale = 1 << l;
+      a.log_scale = l;
+      a.smallest = (l == nl - 1) ? 1 : 0;
+      a.bs_x = ap->blk_x;
+      a.bs_y = ap->blk_y;
+      a.ov_x = ap->overlap_x;
+      a.ov_y = ap->overlap_y;
+      a.log_x_uv = ilog2(sp->x_ratio_uv);
+      a.log_y_uv = ilog2(sp->y_ratio_uv);
+      a.cw = a.bs_x >> a.log_x_uv;
+      a.ch = a.bs_y >> a.log_y_uv;
+      for (int p = 0; p < 3; p++)
+      {
+        const mvc::DevPlane &dr = s_ref.pl[l * 3 + p];
+        a.src[p] = s_src.pl[l * 3 + p].sub[0];
+        for (int i = 0; i < 4; i++)
+          a.ref[p][i] = dr.sub[i];
+        a.ew[p] = dr.d.ew;
+        a.hpad[p] = dr.d.hpad;
+        a.vpad[p] = dr.d.vpad;
+      }
+      a.ext_w = s_ref.pl[l * 3].d.ew;
+      a.ext_h = s_ref.pl[l * 3].d.eh;
+      // _lambda_level = lambda / (pel * pel) * nScale (plevel 1) or * nScale^2 (plevel 2)
+      a.lambda_level = ap->lambda / (a.pel * a.pel);
+      if (ap->plevel == 1)
+        a.lambda_level *= a.n_scale;
+      else if (ap->plevel == 2)
+        a.lambda_level *= a.n_scale * a.n_scale;
+      a.lsad = ap->lsad;
+      a.pnew = ap->pnew;
+      a.pzero = ap->pzero;
+      a.pglobal = ap->use_global ? ap->pglobal : ap->pzero;
+      a.bits = sp->bits_per_pixel;
+      a.chroma_scale = ap->chroma_sad_scale;
+      a.radius = (l == 0) ? ap->pel_search : ap->search_param;
+      a.meander = ap->meander;
+      a.use_global = ap->use_global;
+      a.bad_sad = ap->bad_sad;
+      a.glob = d_glob;
+      a.vec = d_pay + offs[l];
+      a.bad_flag = d_bad;
+      int slices = ap->slice_threads;
+      if (slices > 64)
+        slices = 64;
+      if (slices > a.n_blk_y / 4)
+        slices = a.n_blk_y / 4;
+      a.n_slices = slices < 1 ? 1 : slices;
+
+      if (l < nl - 1)
+      {
+        // global MV estimate from the coarser plane (doubled), then the interpolated prediction for this plane
+        k_global<<<1, 1024>>>(d_pay + offs[l + 1], nbx[l + 1] * nby[l + 1], d_freq, d_glob, ap->use_global);
+        const int total = a.n_blk_x * a.n_blk_y;
+        k_interp<<<(total + 127) / 128, 128>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], 0);
+      }
+      else
+        AN_CHECK(cudaMemset(d_glob, 0, 2 * sizeof(int)));
+      {
+        const size_t shm = ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix);
+        k_search<<<a.n_slices, 768, shm>>>(a);
+      }
+      AN_CHECK(cudaGetLastError());
+    }
+    AN_CHECK(cudaDeviceSynchronize());
+    lap("analysis kernels");
+    AN_CHECK(cudaMemcpy(payload, d_pay, words * sizeof(int), cudaMemcpyDeviceToHost));
+    int bad = 0;
+    AN_CHECK(cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+    if (bad)
+      rc = MVCUDA_NEEDS_CPU;
+  }
+
+done:
+  cudaFree(d_pay);
+  cudaFree(d_freq);
+  cudaFree(d_glob);
+  cudaFree(d_bad);
+  mvc::super_free(s_src);
+  mvc::super_free(s_ref);
+  return rc;
+}
+
+#ifdef MVCUDA_PROFILE
+extern "C" __declspec(dllexport) void mvcuda_profile_dump()
+{
+  long long h[12] = {};
+  cudaMemcpyFromSymbol(h, g_prof, sizeof(h));
+  const char *names[10] = { "setup+predictors+sync", "phase A (thread 0 warp)", "wait A", "fold A + sync", "phase B (thread 0 warp)",
+    "wait B", "fold B + write + sync", "  fold B loop", "  bad check + store", "  final barrier" };
+  for (int i = 0; i < 10; i++)
+    fprintf(stderr, "prof %-26s %12lld cycles\n", names[i], h[i]);
+}
+#endif

@@ -23,6 +23,7 @@
 #include "MVGroupOfFrames.h"
 #include "profile.h"
 #include "avisynth.h"
+#include "GoldenDump.h"
 
 
 
@@ -153,6 +154,8 @@ void	GroupOfPlanes::SearchMVs(
     (nLevelCount == 1) ? nPelSearch : nSearchParam;
   DebugPrintf("SearchType %i", searchType);
   bool				tryManyLevel = (tryMany && nLevelCount > 1);
+  GOLDEN_LOG("level %d searchType %d searchParam %d global_in x %d y %d sad %d meanLumaChange_in %d",
+    nLevelCount - 1, (int)searchTypeSmallest, nSearchParamSmallest, globalMV.x, globalMV.y, (int)globalMV.sad, meanLumaChange);
   planes[nLevelCount - 1]->SearchMVs(
     pSrcGOF->GetFrame(nLevelCount - 1),
     pRefGOF->GetFrame(nLevelCount - 1),
@@ -178,6 +181,7 @@ void	GroupOfPlanes::SearchMVs(
     tryManyLevel
   );
 
+  GOLDEN_LOG("level %d done meanLumaChange_out %d", nLevelCount - 1, meanLumaChange);
   out += planes[nLevelCount - 1]->GetArraySize(divideExtra);
   if (vecPrev)
   {
@@ -219,6 +223,8 @@ void	GroupOfPlanes::SearchMVs(
     PROFILE_STOP(MOTION_PROFILE_PREDICTION);
 
     fieldShiftCur = (i == 0) ? fieldShift : 0; // may be non zero for finest level only
+    GOLDEN_LOG("level %d searchType %d searchParam %d global_in(doubled estimate) x %d y %d sad %d meanLumaChange_in %d fieldShift %d",
+      i, (int)searchTypeLevel, nSearchParamLevel, globalMV.x, globalMV.y, (int)globalMV.sad, meanLumaChange, fieldShiftCur);
 //		DebugPrintf("SearchMV level %i", i);
     tryManyLevel = (tryMany && i > 0); // not for finest level to not decrease speed
     planes[i]->SearchMVs(

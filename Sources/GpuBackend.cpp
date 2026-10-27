@@ -1,0 +1,87 @@
+#define NOMINMAX
+#define NOGDI
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include "AvstpWrapper.h"
+#include "GpuBackend.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+GpuBackend &GpuBackend::instance()
+{
+  static GpuBackend inst; // thread-safe initialisation (C++11)
+  return inst;
+}
+
+bool GpuBackend::log_enabled()
+{
+  static const bool on = (std::getenv("MVTOOLS_GPU_LOG") != nullptr);
+  return on;
+}
+
+int GpuBackend::slice_threads(bool mt_flag)
+{
+  if (!mt_flag)
+    return 1;
+  const int n = AvstpWrapper::use_instance().get_nbr_threads();
+  return n > 1 ? n : 24;
+}
+
+GpuBackend::GpuBackend()
+  : analyse_host(nullptr)
+  , recalc_host(nullptr)
+  , _usable(false)
+{
+  if (std::getenv("MVTOOLS_GPU_DISABLE") != nullptr)
+  {
+    if (log_enabled())
+      std::fprintf(stderr, "mvtools gpu: disabled by MVTOOLS_GPU_DISABLE\n");
+    return;
+  }
+
+  wchar_t path[MAX_PATH] = {};
+  if (GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) == 0)
+  {
+    if (log_enabled())
+      std::fprintf(stderr, "mvtools gpu: cannot determine the plugin folder\n");
+    return;
+  }
+  std::wstring dir(path);
+  const size_t slash = dir.find_last_of(L"\\/");
+  if (slash == std::wstring::npos)
+  {
+    if (log_enabled())
+      std::fprintf(stderr, "mvtools gpu: plugin path has no folder part\n");
+    return;
+  }
+  dir.resize(slash + 1);
+
+  HMODULE lib = LoadLibraryW((dir + L"mvtools_cuda.dll").c_str());
+  if (lib == nullptr)
+  {
+    if (log_enabled())
+      std::fprintf(stderr, "mvtools gpu: mvtools_cuda.dll not found next to mvtools2.dll, using the CPU\n");
+    return;
+  }
+  auto version = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_api_version"));
+  auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
+  analyse_host = reinterpret_cast<decltype(analyse_host)>(GetProcAddress(lib, "mvcuda_analyse_host"));
+  recalc_host = reinterpret_cast<decltype(recalc_host)>(GetProcAddress(lib, "mvcuda_recalc_host"));
+  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr
+    || version() != MVCUDA_API_VERSION || count() <= 0)
+  {
+    if (log_enabled())
+      std::fprintf(stderr, "mvtools gpu: library unusable (missing exports, API version or no device), using the CPU\n");
+    analyse_host = nullptr;
+    recalc_host = nullptr;
+    return;
+  }
+  _usable = true;
+  if (log_enabled())
+    std::fprintf(stderr, "mvtools gpu: backend loaded\n");
+}

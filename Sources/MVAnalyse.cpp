@@ -31,6 +31,10 @@
 #include "MVSuper.h"
 #include "profile.h"
 #include "SuperParams64Bits.h"
+#include "GoldenDump.h"
+#include "GpuBackend.h"
+#include "MVFrame.h"
+#include "MVPlane.h"
 
 #include <cmath>
 #include <cstdio>
@@ -43,7 +47,7 @@ MVAnalyse::MVAnalyse(
   int _overlapx, int _overlapy, const char* _outfilename, int _dctmode,
   int _divide, int _sadx264, sad_t _badSAD, int _badrange, bool _isse,
   bool _meander, bool temporal_flag, bool _tryMany, bool multi_flag,
-  bool mt_flag, int _chromaSADScale, IScriptEnvironment* env
+  bool mt_flag, int _chromaSADScale, bool gpu_flag, IScriptEnvironment* env
 )
   : ::GenericVideoFilter(_child)
   , _srd_arr(1)
@@ -54,7 +58,10 @@ MVAnalyse::MVAnalyse(
   , _dct_factory_ptr()
   , _dct_pool()
   , _delta_max(0)
-
+  , _gpu_ok(false)
+  , _gpu_slices(1)
+  , _gpu_effective_chroma_scale(0)
+  , _gpu_super_levels(0)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -413,6 +420,31 @@ MVAnalyse::MVAnalyse(
     outfilebuf = NULL;
   }
 
+  // ---- GPU search: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md); anything else
+  // stays on the CPU, silently
+  if (gpu_flag)
+  {
+    const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 /* rfilter */
+      && ((params.param >> 3) & 3) == 2 /* sharp */ && !(params.param & 0x20) /* no pelclip */;
+    const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
+    _gpu_ok = GpuBackend::instance().usable() && super_ok && pixelsize == 2 && !vi.IsYUY2() && vi.IsPlanar()
+      && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && !temporal_flag && !_tryMany && !multi_flag
+      && searchType == EXHAUSTIVE && nSearchParam >= 1 && nSearchParam <= 3 && nPelSearch >= 1 && nPelSearch <= 3
+      && (nSuperPel == 1 || nSuperPel == 2) && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2)
+      && lstrlen(_outfilename) == 0 && analysisData.nLvCount <= 12;
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MAnalyse gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
+    if (_gpu_ok)
+    {
+      _gpu_slices = GpuBackend::slice_threads(mt_flag);
+      int lx = 0, ly = 0;
+      while ((1 << lx) < xr) lx++;
+      while ((1 << ly) < yr) ly++;
+      _gpu_effective_chroma_scale = (2 - (lx + ly)) - analysisData.chromaSADScale;
+      _gpu_super_levels = nSuperLevels;
+    }
+  }
+
   // Defines the format of the output vector clip
   // count of 32 bit integers: 2_size_validity+(foreachblock(1_validity+blockCount*3))
   const int		width_bytes = headerSize + _vectorfields_aptr->GetArraySize() * 4;
@@ -622,6 +654,32 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       pVecPrevOrNull = &srd._vec_prev[0];
     }
 
+#ifdef MV_GOLDEN_DUMP
+    const bool golden_on = golden::begin("MAnalyse", nsrc, srd._analysis_data.isBackward);
+    if (golden_on)
+    {
+      const MVAnalysisData &a = srd._analysis_data;
+      golden::logf("call n %d nsrc %d nref %d delta %d backward %d fieldShift %d", n, nsrc, nref, a.nDeltaFrame, a.isBackward ? 1 : 0, fieldShift);
+      golden::logf("analysis width %d height %d blksizeX %d blksizeY %d overlapX %d overlapY %d blkX %d blkY %d levels %d pel %d",
+        a.nWidth, a.nHeight, a.nBlkSizeX, a.nBlkSizeY, a.nOverlapX, a.nOverlapY, a.nBlkX, a.nBlkY, a.nLvCount, a.nPel);
+      golden::logf("analysis flags 0x%x xRatioUV %d yRatioUV %d pixelsize %d bits %d chromaSADScale %d hpad %d vpad %d pixelType 0x%x",
+        a.nFlags, a.xRatioUV, a.yRatioUV, a.pixelsize, a.bits_per_pixel, a.chromaSADScale, a.nHPadding, a.nVPadding, a.pixelType);
+      golden::logf("analyse lambda %d lsad %d pnew %d pzero %d pglobal %d plevel %d global %d badSAD %d badrange %d",
+        nLambda, (int)lsad, pnew, pzero, pglobal, plevel, global ? 1 : 0, (int)badSAD, badrange);
+      golden::logf("analyse searchType %d searchParam %d pelSearch %d meander %d tryMany %d temporal %d divide %d modeYUV %d mt %d",
+        (int)searchType, nSearchParam, nPelSearch, meander ? 1 : 0, tryMany ? 1 : 0, _temporal_flag ? 1 : 0, divideExtra, nModeYUV, _mt_flag ? 1 : 0);
+      golden::dump_gof("src", *pSrcGOF, srd._analysis_data.nLvCount, nModeYUV == YUVPLANES);
+      golden::dump_gof("ref", *pRefGOF, srd._analysis_data.nLvCount, nModeYUV == YUVPLANES);
+    }
+#endif
+
+    bool gpu_done = false;
+    if (_gpu_ok && fieldShift == 0 && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
+    {
+      gpu_done = gpu_search(nsrc, reinterpret_cast<int*>(pDst));
+    }
+    if (!gpu_done)
+    {
     _vectorfields_aptr->SearchMVs(
       pSrcGOF, pRefGOF,
       searchType, nSearchParam, nPelSearch, nLambda, lsad, pnew, plevel,
@@ -629,6 +687,17 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       outfilebuf, fieldShift, pzero, pglobal, badSAD, badrange,
       meander, pVecPrevOrNull, tryMany
     );
+    }
+
+#ifdef MV_GOLDEN_DUMP
+    if (golden_on)
+    {
+      // payload of the vector frame: all levels coarse to fine, each with its own size word, as returned
+      golden::write_bin("vec_out.bin", pDst, size_t(_vectorfields_aptr->GetArraySize()) * 4);
+      golden::end();
+      // note: ExtraDivide (divide != 0) would add data after this payload; the production call has divide=0
+    }
+#endif
 
     if (divideExtra)
     {
@@ -669,6 +738,79 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 }
 
 
+
+
+// Runs the whole search on the GPU for the frames already loaded into pSrcGOF / pRefGOF (raw level-0 planes of the
+// super frames). Returns false (nothing written that matters) when the CPU has to do it.
+bool MVAnalyse::gpu_search(int nsrc, int *payload)
+{
+  (void)nsrc;
+  GpuBackend &gpu = GpuBackend::instance();
+  const MVAnalysisData &a = _srd_arr[0]._analysis_data;
+
+  const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
+  const void *src_p[3], *ref_p[3];
+  int src_pitch[3], ref_pitch[3];
+  for (int p = 0; p < 3; p++)
+  {
+    MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
+    MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
+    src_p[p] = ps->GetAbsolutePelPointer(ps->GetHPadding(), ps->GetVPadding());
+    ref_p[p] = pr->GetAbsolutePelPointer(pr->GetHPadding(), pr->GetVPadding());
+    src_pitch[p] = ps->GetPitch();
+    ref_pitch[p] = pr->GetPitch();
+  }
+
+  MvCudaSuperParams sp = {};
+  sp.width = a.nWidth;
+  sp.height = a.nHeight;
+  sp.x_ratio_uv = a.xRatioUV;
+  sp.y_ratio_uv = a.yRatioUV;
+  sp.hpad = a.nHPadding;
+  sp.vpad = a.nVPadding;
+  sp.pel = a.nPel;
+  sp.levels = a.nLvCount;
+  sp.bits_per_pixel = a.bits_per_pixel;
+  sp.chroma = 1;
+  sp.rfilter = 4;
+  sp.sharp = 2;
+
+  MvCudaAnalyseParams ap = {};
+  ap.blk_x = a.nBlkSizeX;
+  ap.blk_y = a.nBlkSizeY;
+  ap.overlap_x = a.nOverlapX;
+  ap.overlap_y = a.nOverlapY;
+  ap.n_blk_x = a.nBlkX;
+  ap.n_blk_y = a.nBlkY;
+  ap.n_levels = a.nLvCount;
+  ap.lambda = nLambda;
+  ap.lsad = (int)lsad;
+  ap.pnew = pnew;
+  ap.pzero = pzero;
+  ap.pglobal = pglobal;
+  ap.plevel = plevel;
+  ap.use_global = global ? 1 : 0;
+  ap.meander = meander ? 1 : 0;
+  ap.bad_sad = (int)badSAD;
+  ap.search_param = nSearchParam;
+  ap.pel_search = nPelSearch;
+  ap.chroma_sad_scale = _gpu_effective_chroma_scale;
+  ap.slice_threads = _gpu_slices;
+
+  const int words = _vectorfields_aptr->GetArraySize();
+  int rc = -1;
+  try
+  {
+    rc = gpu.analyse_host(&sp, &ap, src_p, src_pitch, ref_p, ref_pitch, payload, words);
+  }
+  catch (...)
+  {
+    rc = -2;
+  }
+  if (GpuBackend::log_enabled())
+    std::fprintf(stderr, "MAnalyse gpu frame %d rc=%d%s\n", nsrc, rc, rc == 0 ? "" : " -> CPU");
+  return rc == 0 && payload[0] == words;
+}
 
 void	MVAnalyse::load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data)
 {

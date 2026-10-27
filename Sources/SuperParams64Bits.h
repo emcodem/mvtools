@@ -31,7 +31,7 @@ public:
   unsigned char nPel;
   unsigned char nModeYUV;
   unsigned char nLevels;
-  unsigned char param;
+  unsigned char param; // MSuper: 0x80 | rfilter | sharp << 3 | pelclip << 5 (see MVSuper.cpp); 0 / garbage = unknown
 };
 
 

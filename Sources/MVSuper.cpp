@@ -151,6 +151,9 @@ MVSuper::MVSuper(
   params.nPel = nPel;
   params.nModeYUV = nModeYUV;
   params.nLevels = nLevels;
+  // spare byte: bit 7 = "set by this MSuper", bits 0-2 rfilter, bits 3-4 sharp, bit 5 pelclip used. The GPU path of
+  // MAnalyse / MRecalculate rebuilds the super frame from the raw plane and only does so for matching settings.
+  params.param = (unsigned char)(0x80 | (rfilter & 7) | ((sharp & 3) << 3) | (usePelClip ? 0x20 : 0));
 
 
   // pack parameters to fake audio properties

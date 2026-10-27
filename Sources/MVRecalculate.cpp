@@ -30,10 +30,15 @@
 #include "MVRecalculate.h"
 #include "profile.h"
 #include "SuperParams64Bits.h"
+#include "GoldenDump.h"
+#include "GpuBackend.h"
+#include "MVFrame.h"
+#include "MVPlane.h"
 
 #include	<algorithm>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 
 MVRecalculate::MVRecalculate(
@@ -41,7 +46,7 @@ MVRecalculate::MVRecalculate(
   int _blksizex, int _blksizey, int st, int stp, int lambda, bool chroma,
   int _pnew, int _overlapx, int _overlapy, const char* _outfilename,
   int _dctmode, int _divide, int _sadx264, bool _isse, bool _meander,
-  int trad, bool mt_flag, int _chromaSADScale, IScriptEnvironment* env
+  int trad, bool mt_flag, int _chromaSADScale, bool gpu_flag, IScriptEnvironment* env
 )
   : GenericVideoFilter(_super)
   , _srd_arr()
@@ -50,6 +55,9 @@ MVRecalculate::MVRecalculate(
   , _dct_pool()
   , _nbr_srd((trad > 0) ? trad * 2 : 1)
   , _mt_flag(mt_flag)
+  , _gpu_ok(false)
+  , _gpu_slices(1)
+  , _gpu_effective_chroma_scale(0)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -402,6 +410,37 @@ MVRecalculate::MVRecalculate(
     srd._analysis_data_divided = analysisDataDivided;
   }
 
+  // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
+  if (gpu_flag)
+  {
+    const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 && ((params.param >> 3) & 3) == 2
+      && !(params.param & 0x20);
+    const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
+    _gpu_ok = GpuBackend::instance().usable() && super_ok && pixelsize == 2 && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
+      && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && _nbr_srd == 1 && searchType == EXHAUSTIVE
+      && nSearchParam >= 1 && nSearchParam <= 3 && (nSuperPel == 1 || nSuperPel == 2) && smooth >= 0 && smooth <= 1
+      && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2) && lstrlen(_outfilename) == 0;
+    if (GpuBackend::log_enabled())
+    {
+      std::fprintf(stderr, "MRecalculate gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
+      if (!_gpu_ok)
+        std::fprintf(stderr,
+          "  usable %d super_ok %d (param 0x%x) pixelsize %d yuy2 %d planar %d chroma %d modeYUV %d divide %d nbr_srd %d "
+          "searchType %d searchParam %d superPel %d smooth %d blkX %d outfile %d\n",
+          GpuBackend::instance().usable() ? 1 : 0, super_ok ? 1 : 0, params.param, pixelsize,
+          child->GetVideoInfo().IsYUY2() ? 1 : 0, child->GetVideoInfo().IsPlanar() ? 1 : 0, chroma ? 1 : 0, nModeYUV, divideExtra, _nbr_srd, (int)searchType, nSearchParam, nSuperPel,
+          smooth, analysisData.nBlkSizeX, (int)lstrlen(_outfilename));
+    }
+    if (_gpu_ok)
+    {
+      _gpu_slices = GpuBackend::slice_threads(mt_flag);
+      int lx = 0, ly = 0;
+      while ((1 << lx) < xr) lx++;
+      while ((1 << ly) < yr) ly++;
+      _gpu_effective_chroma_scale = (2 - (lx + ly)) - analysisData.chromaSADScale;
+    }
+  }
+
   // normalize threshold to block size
     // PF _thSAD is originally on 255 scale, for 16 bit we have to scale it.
   thSAD = _thSAD;
@@ -549,12 +588,54 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
       fwrite(&n, sizeof(int), 1, outfile);	// write frame number
     }
 
+#ifdef MV_GOLDEN_DUMP
+    const bool golden_on = golden::begin("MRecalculate", nsrc, srd._analysis_data.isBackward);
+    if (golden_on)
+    {
+      const MVAnalysisData &a = srd._analysis_data;
+      golden::logf("call n %d nsrc %d nref %d delta %d backward %d fieldShift %d", n, nsrc, nref, a.nDeltaFrame, a.isBackward ? 1 : 0, fieldShift);
+      golden::logf("analysis width %d height %d blksizeX %d blksizeY %d overlapX %d overlapY %d blkX %d blkY %d levels %d pel %d",
+        a.nWidth, a.nHeight, a.nBlkSizeX, a.nBlkSizeY, a.nOverlapX, a.nOverlapY, a.nBlkX, a.nBlkY, a.nLvCount, a.nPel);
+      golden::logf("analysis flags 0x%x xRatioUV %d yRatioUV %d pixelsize %d bits %d chromaSADScale %d hpad %d vpad %d pixelType 0x%x",
+        a.nFlags, a.xRatioUV, a.yRatioUV, a.pixelsize, a.bits_per_pixel, a.chromaSADScale, a.nHPadding, a.nVPadding, a.pixelType);
+      golden::logf("recalc lambda %d lsad(uninitialised member, unused) pnew %d thSAD %d smooth %d searchType %d searchParam %d meander %d divide %d modeYUV %d mt %d",
+        nLambda, pnew, (int)thSAD, smooth, (int)searchType, nSearchParam, meander ? 1 : 0, divideExtra, nModeYUV, _mt_flag ? 1 : 0);
+      // input vectors: the frame the MVClip was built from (Analyse output), header included
+      // payload only (first word = its own size in int32 words): the frame header holds uninitialised struct
+      // bytes (80 of them differ between identical runs), so it is neither reproducible nor needed
+      {
+        const unsigned char *vp = mvn->GetReadPtr();
+        const int hdr = *reinterpret_cast<const int *>(vp);
+        const int words = *reinterpret_cast<const int *>(vp + hdr);
+        golden::write_bin("vec_in.bin", vp + hdr, size_t(words) * 4);
+      }
+      golden::dump_gof("src", *pSrcGOF, 1, nModeYUV == YUVPLANES);
+      golden::dump_gof("ref", *pRefGOF, 1, nModeYUV == YUVPLANES);
+    }
+#endif
+
+    bool gpu_done = false;
+    if (_gpu_ok && fieldShift == 0 && outfile == NULL)
+    {
+      gpu_done = gpu_recalc(srd, nsrc, reinterpret_cast <int *> (pDst));
+    }
+    if (!gpu_done)
+    {
     _vectorfields_aptr->RecalculateMVs(
       *(srd._clip_sptr), pSrcGOF, pRefGOF,
       searchType, nSearchParam, nLambda, lsad, pnew,
       srd._analysis_data.nFlags, reinterpret_cast <int *> (pDst),
       outfilebuf, fieldShift, thSAD, smooth, meander
     );
+    }
+
+#ifdef MV_GOLDEN_DUMP
+    if (golden_on)
+    {
+      golden::write_bin("vec_out.bin", pDst, size_t(_vectorfields_aptr->GetArraySize()) * 4);
+      golden::end();
+    }
+#endif
 
     if (divideExtra)
     {
@@ -583,6 +664,98 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
 }
 
 
+
+
+// GPU version of GroupOfPlanes::RecalculateMVs for the frames loaded into pSrcGOF / pRefGOF.
+bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int *payload)
+{
+  GpuBackend &gpu = GpuBackend::instance();
+  const MVAnalysisData &a = srd._analysis_data;
+
+  const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
+  const void *src_p[3], *ref_p[3];
+  int src_pitch[3], ref_pitch[3];
+  for (int p = 0; p < 3; p++)
+  {
+    MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
+    MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
+    src_p[p] = ps->GetAbsolutePelPointer(ps->GetHPadding(), ps->GetVPadding());
+    ref_p[p] = pr->GetAbsolutePelPointer(pr->GetHPadding(), pr->GetVPadding());
+    src_pitch[p] = ps->GetPitch();
+    ref_pitch[p] = pr->GetPitch();
+  }
+
+  // the old vectors: finest plane of the vector clip, (vx, vy, sad) per block
+  const FakePlaneOfBlocks &old = srd._clip_sptr->GetPlane(0);
+  const int n_old = old.GetReducedWidth() * old.GetReducedHeight();
+  std::vector<int> old_vec(size_t(n_old) * 3);
+  for (int i = 0; i < n_old; i++)
+  {
+    const VECTOR v = old.GetBlock(i).GetMV();
+    old_vec[3 * i + 0] = v.x;
+    old_vec[3 * i + 1] = v.y;
+    old_vec[3 * i + 2] = (int)v.sad;
+  }
+
+  MvCudaSuperParams sp = {};
+  sp.width = a.nWidth;
+  sp.height = a.nHeight;
+  sp.x_ratio_uv = a.xRatioUV;
+  sp.y_ratio_uv = a.yRatioUV;
+  sp.hpad = a.nHPadding;
+  sp.vpad = a.nVPadding;
+  sp.pel = a.nPel;
+  sp.levels = 1;
+  sp.bits_per_pixel = a.bits_per_pixel;
+  sp.chroma = 1;
+  sp.rfilter = 4;
+  sp.sharp = 2;
+
+  MvCudaRecalcParams rp = {};
+  rp.blk_x = a.nBlkSizeX;
+  rp.blk_y = a.nBlkSizeY;
+  rp.overlap_x = a.nOverlapX;
+  rp.overlap_y = a.nOverlapY;
+  rp.n_blk_x = a.nBlkX;
+  rp.n_blk_y = a.nBlkY;
+  rp.old_blk_x = old.GetReducedWidth();
+  rp.old_blk_y = old.GetReducedHeight();
+  rp.old_size_x = old.GetBlockSizeX();
+  rp.old_size_y = old.GetBlockSizeY();
+  rp.old_overlap_x = old.GetOverlapX();
+  rp.old_overlap_y = old.GetOverlapY();
+  rp.old_pel = old.GetPel();
+  rp.lambda_level = nLambda / (a.nPel * a.nPel);
+  rp.pnew = pnew;
+  rp.th_sad = (int)thSAD;
+  rp.smooth = smooth;
+  rp.search_radius = nSearchParam;
+  rp.chroma_sad_scale = _gpu_effective_chroma_scale;
+  rp.slice_threads = _gpu_slices;
+
+  const int n_new = a.nBlkX * a.nBlkY;
+  std::vector<int> out_vec(size_t(n_new) * 3);
+  int rc = -1;
+  try
+  {
+    rc = gpu.recalc_host(&sp, &rp, src_p, src_pitch, ref_p, ref_pitch, old_vec.data(), out_vec.data());
+  }
+  catch (...)
+  {
+    rc = -2;
+  }
+  if (GpuBackend::log_enabled())
+    std::fprintf(stderr, "MRecalculate gpu frame %d rc=%d%s\n", nsrc, rc, rc == 0 ? "" : " -> CPU");
+  if (rc != 0)
+    return false;
+
+  // payload as GroupOfPlanes::RecalculateMVs writes it: [total words, validity], [plane words, triples...]
+  payload[0] = _vectorfields_aptr->GetArraySize();
+  payload[1] = 1;
+  payload[2] = n_new * 3 + 1;
+  std::memcpy(payload + 3, out_vec.data(), out_vec.size() * sizeof(int));
+  return true;
+}
 
 void	MVRecalculate::load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data)
 {

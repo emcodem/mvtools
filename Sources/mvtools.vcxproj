@@ -1455,6 +1455,8 @@
     <ClCompile Include="ClipFnc.cpp" />
     <ClCompile Include="CopyCode.cpp" />
     <ClCompile Include="cpu.cpp" />
+    <ClCompile Include="GoldenDump.cpp" />
+    <ClCompile Include="GpuBackend.cpp" />
     <ClCompile Include="DCTFactory.cpp" />
     <ClCompile Include="DCTFFTW.cpp" />
     <ClCompile Include="DCTINT.cpp" />
