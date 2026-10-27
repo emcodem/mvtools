@@ -438,6 +438,7 @@ MVRecalculate::MVRecalculate(
       while ((1 << lx) < xr) lx++;
       while ((1 << ly) < yr) ly++;
       _gpu_effective_chroma_scale = (2 - (lx + ly)) - analysisData.chromaSADScale;
+      GpuBackend::instance().add_user();
     }
   }
 
@@ -462,6 +463,8 @@ MVRecalculate::MVRecalculate(
 
 MVRecalculate::~MVRecalculate()
 {
+  if (_gpu_ok)
+    GpuBackend::instance().remove_user();
   if (outfile != NULL)
   {
     fclose(outfile);
@@ -617,7 +620,7 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
     bool gpu_done = false;
     if (_gpu_ok && fieldShift == 0 && outfile == NULL)
     {
-      gpu_done = gpu_recalc(srd, nsrc, reinterpret_cast <int *> (pDst));
+      gpu_done = gpu_recalc(srd, nsrc, nref, reinterpret_cast <int *> (pDst));
     }
     if (!gpu_done)
     {
@@ -667,7 +670,7 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
 
 
 // GPU version of GroupOfPlanes::RecalculateMVs for the frames loaded into pSrcGOF / pRefGOF.
-bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int *payload)
+bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload)
 {
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = srd._analysis_data;
@@ -732,6 +735,8 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int *payload)
   rp.search_radius = nSearchParam;
   rp.chroma_sad_scale = _gpu_effective_chroma_scale;
   rp.slice_threads = _gpu_slices;
+  rp.src_key = GpuBackend::frame_key((const void *)child.operator->(), nsrc);
+  rp.ref_key = GpuBackend::frame_key((const void *)child.operator->(), nref);
 
   const int n_new = a.nBlkX * a.nBlkY;
   std::vector<int> out_vec(size_t(n_new) * 3);

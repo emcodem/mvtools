@@ -32,10 +32,30 @@ int GpuBackend::slice_threads(bool mt_flag)
   return n > 1 ? n : 24;
 }
 
+unsigned long long GpuBackend::frame_key(const void *clip, int n)
+{
+  unsigned long long k = (unsigned long long)(uintptr_t)clip * 0x9E3779B97F4A7C15ull;
+  k ^= ((unsigned long long)(n + 1) * 0xC2B2AE3D27D4EB4Full) + (k << 6) + (k >> 2);
+  return k | 1ull; // never 0 (0 = uncached)
+}
+
+void GpuBackend::add_user()
+{
+  InterlockedIncrement(&_users);
+}
+
+void GpuBackend::remove_user()
+{
+  if (InterlockedDecrement(&_users) == 0 && cache_clear != nullptr)
+    cache_clear();
+}
+
 GpuBackend::GpuBackend()
   : analyse_host(nullptr)
   , recalc_host(nullptr)
+  , cache_clear(nullptr)
   , _usable(false)
+  , _users(0)
 {
   if (std::getenv("MVTOOLS_GPU_DISABLE") != nullptr)
   {
@@ -72,7 +92,8 @@ GpuBackend::GpuBackend()
   auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
   analyse_host = reinterpret_cast<decltype(analyse_host)>(GetProcAddress(lib, "mvcuda_analyse_host"));
   recalc_host = reinterpret_cast<decltype(recalc_host)>(GetProcAddress(lib, "mvcuda_recalc_host"));
-  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr
+  cache_clear = reinterpret_cast<decltype(cache_clear)>(GetProcAddress(lib, "mvcuda_cache_clear"));
+  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr || cache_clear == nullptr
     || version() != MVCUDA_API_VERSION || count() <= 0)
   {
     if (log_enabled())

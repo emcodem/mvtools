@@ -237,11 +237,6 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
   if (mvcuda_device_count() <= 0)
     return -1;
 
-  int rc = 0;
-  mvc::DevSuper s_src, s_ref;
-  int *d_old = nullptr, *d_out = nullptr;
-  const size_t n_old = (size_t)rp->old_blk_x * rp->old_blk_y, n_new = (size_t)rp->n_blk_x * rp->n_blk_y;
-
   const bool timing = getenv("MVCUDA_TIMING") != nullptr;
   auto t0 = std::chrono::steady_clock::now();
   auto lap = [&](const char *what) {
@@ -251,29 +246,34 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
     fprintf(stderr, "mvcuda recalc: %-22s %7.2f ms\n", what, std::chrono::duration<double, std::milli>(t1 - t0).count());
     t0 = t1;
   };
-  rc = mvc::super_build(*sp, src, src_pitch_bytes, s_src);
+
+  int rc = 0;
+  mvc::StreamLease lease;
+  cudaStream_t st = lease.s;
+  std::shared_ptr<mvc::DevSuper> s_src, s_ref;
+  int *d_old = nullptr, *d_out = nullptr;
+  const size_t n_old = (size_t)rp->old_blk_x * rp->old_blk_y, n_new = (size_t)rp->n_blk_x * rp->n_blk_y;
+  const size_t old_bytes = n_old * 3 * sizeof(int), new_bytes = n_new * 3 * sizeof(int);
+
+  rc = mvc::super_get(*sp, rp->src_key, src, src_pitch_bytes, st, s_src);
   if (!rc)
-    rc = mvc::super_build(*sp, ref, ref_pitch_bytes, s_ref);
-  lap("2 x super build");
+    rc = mvc::super_get(*sp, rp->ref_key, ref, ref_pitch_bytes, st, s_ref);
+  lap("2 x super (cached)");
   if (rc)
-  {
-    mvc::super_free(s_src);
-    mvc::super_free(s_ref);
     return rc;
-  }
 
   KArgs a = {};
   for (int p = 0; p < 3; p++)
   {
-    a.src[p] = s_src.pl[p].sub[0];
+    a.src[p] = s_src->pl[p].sub[0];
     for (int i = 0; i < 4; i++)
-      a.ref[p][i] = s_ref.pl[p].sub[i];
-    a.ew[p] = s_ref.pl[p].d.ew;
-    a.hpad[p] = s_ref.pl[p].d.hpad;
-    a.vpad[p] = s_ref.pl[p].d.vpad;
+      a.ref[p][i] = s_ref->pl[p].sub[i];
+    a.ew[p] = s_ref->pl[p].d.ew;
+    a.hpad[p] = s_ref->pl[p].d.hpad;
+    a.vpad[p] = s_ref->pl[p].d.vpad;
   }
-  a.ext_w0 = s_ref.pl[0].d.ew;
-  a.ext_h0 = s_ref.pl[0].d.eh;
+  a.ext_w0 = s_ref->pl[0].d.ew;
+  a.ext_h0 = s_ref->pl[0].d.eh;
   a.pel = sp->pel;
   a.log_pel = ilog2(sp->pel);
   a.bits = sp->bits_per_pixel;
@@ -317,27 +317,30 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
     } \
   } while (0)
 
-  RC_CHECK(cudaMalloc(&d_old, n_old * 3 * sizeof(int)));
-  RC_CHECK(cudaMalloc(&d_out, n_new * 3 * sizeof(int)));
-  RC_CHECK(cudaMemcpy(d_old, old_vectors, n_old * 3 * sizeof(int), cudaMemcpyHostToDevice));
-  lap("alloc + upload vectors");
+  d_old = (int *)mvc::dev_alloc(old_bytes);
+  d_out = (int *)mvc::dev_alloc(new_bytes);
+  if (!d_old || !d_out)
+  {
+    rc = -2;
+    goto done;
+  }
+  RC_CHECK(cudaMemcpyAsync(d_old, old_vectors, old_bytes, cudaMemcpyHostToDevice, st));
   a.old_vec = d_old;
   a.out = d_out;
   {
     const int warps_per_block = 4;
     const int blocks = (int)((n_new + warps_per_block - 1) / warps_per_block);
-    k_recalc<<<blocks, 32 * warps_per_block>>>(a);
+    k_recalc<<<blocks, 32 * warps_per_block, 0, st>>>(a);
   }
   RC_CHECK(cudaGetLastError());
-  RC_CHECK(cudaDeviceSynchronize());
-  lap("recalc kernel");
-  RC_CHECK(cudaMemcpy(out_vectors, d_out, n_new * 3 * sizeof(int), cudaMemcpyDeviceToHost));
+  RC_CHECK(cudaMemcpyAsync(out_vectors, d_out, new_bytes, cudaMemcpyDeviceToHost, st));
+  RC_CHECK(cudaStreamSynchronize(st));
+  lap("vectors + recalc kernel");
 
 done:
-  lap("download vectors");
-  cudaFree(d_old);
-  cudaFree(d_out);
-  mvc::super_free(s_src);
-  mvc::super_free(s_ref);
+  if (rc)
+    cudaStreamSynchronize(st);
+  mvc::dev_free(d_old, old_bytes);
+  mvc::dev_free(d_out, new_bytes);
   return rc;
 }

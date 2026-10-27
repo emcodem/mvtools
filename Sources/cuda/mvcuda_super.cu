@@ -166,10 +166,10 @@ namespace mvc
   }
   const dim3 BLOCK(32, 8);
 
-  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out)
+  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
+    cudaStream_t st)
   {
     int rc = 0;
-    out = DevSuper();
     out.p = p;
     // supported: 16-bit container, pel 1 or 2, Wiener sharp, cubic reduction (rfilter 4)
     if (p.bits_per_pixel < 9 || p.bits_per_pixel > 16 || (p.pel != 1 && p.pel != 2) || p.levels < 1
@@ -181,6 +181,7 @@ namespace mvc
     const int maxv = (1 << p.bits_per_pixel) - 1;
     const int nplanes = p.chroma ? 3 : 1;
     pix *d_src = nullptr, *d_tmp = nullptr;
+    size_t src_bytes = 0, tmp_bytes = 0;
 
     for (int plane = 0; plane < nplanes; plane++)
     {
@@ -210,9 +211,25 @@ namespace mvc
         }
       }
 
-      CUDA_CHECK(cudaMalloc(&d_src, (size_t)d0.w * d0.h * sizeof(pix)));
+      src_bytes = (size_t)d0.w * d0.h * sizeof(pix);
+      tmp_bytes = tmp_elems * sizeof(pix);
+      d_src = (pix *)dev_alloc(src_bytes);
+      if (!d_src)
+      {
+        rc = -2;
+        goto cleanup;
+      }
       if (tmp_elems)
-        CUDA_CHECK(cudaMalloc(&d_tmp, tmp_elems * sizeof(pix)));
+      {
+        d_tmp = (pix *)dev_alloc(tmp_bytes);
+        if (!d_tmp)
+        {
+          rc = -2;
+          goto cleanup;
+        }
+      }
+      // every element of every plane is written by the kernels below (inner area, padding, interpolation over the
+      // whole extended plane), so the buffers need no clearing
       for (int l = 0; l < p.levels; l++)
       {
         DevPlane &dp = out.pl[l * 3 + plane];
@@ -220,63 +237,64 @@ namespace mvc
         dp.nsub = (l == 0) ? p.pel * p.pel : 1;
         for (int s = 0; s < dp.nsub; s++)
         {
-          const size_t bytes = (size_t)dp.d.ew * dp.d.eh * sizeof(pix);
-          CUDA_CHECK(cudaMalloc(&dp.sub[s], bytes));
-          CUDA_CHECK(cudaMemset(dp.sub[s], 0, bytes));
+          dp.sub[s] = (pix *)dev_alloc((size_t)dp.d.ew * dp.d.eh * sizeof(pix));
+          if (!dp.sub[s])
+          {
+            rc = -2;
+            goto cleanup;
+          }
         }
       }
 
       // level 0: raw plane in (pitch in samples), then the pyramid; level l+1 is padded as soon as it is reduced,
       // level 0 only after the reduction (it is read unpadded, like on the CPU)
-      CUDA_CHECK(cudaMemcpy2D(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
-        cudaMemcpyHostToDevice));
-      k_copy_in<<<grid_for(d0.w, d0.h), BLOCK>>>(out.pl[plane].sub[0], d0, d_src, d0.w);
+      CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
+        cudaMemcpyHostToDevice, st));
+      k_copy_in<<<grid_for(d0.w, d0.h), BLOCK, 0, st>>>(out.pl[plane].sub[0], d0, d_src, d0.w);
       for (int l = 0; l + 1 < p.levels; l++)
       {
         const MvCudaPlaneDims &s = out.pl[l * 3 + plane].d, &d = out.pl[(l + 1) * 3 + plane].d;
         // CPU quirk: MVGroupOfFrames::set_interp only configures level 0, so only the first reduction uses rfilter
         // (cubic); every deeper level keeps the MVPlane constructor default RB2BilinearFiltered
         const int cubic = (l == 0 && p.rfilter == 4) ? 1 : 0;
-        k_reduce_v<<<grid_for(2 * d.w, d.h), BLOCK>>>(d_tmp, out.pl[l * 3 + plane].sub[0], s, d.w, d.h, cubic);
-        k_reduce_h<<<grid_for(d.w, d.h), BLOCK>>>(out.pl[(l + 1) * 3 + plane].sub[0], d, d_tmp, d.w, d.h, cubic);
-        k_pad<<<grid_for(d.ew, d.eh), BLOCK>>>(out.pl[(l + 1) * 3 + plane].sub[0], d);
+        k_reduce_v<<<grid_for(2 * d.w, d.h), BLOCK, 0, st>>>(d_tmp, out.pl[l * 3 + plane].sub[0], s, d.w, d.h, cubic);
+        k_reduce_h<<<grid_for(d.w, d.h), BLOCK, 0, st>>>(out.pl[(l + 1) * 3 + plane].sub[0], d, d_tmp, d.w, d.h, cubic);
+        k_pad<<<grid_for(d.ew, d.eh), BLOCK, 0, st>>>(out.pl[(l + 1) * 3 + plane].sub[0], d);
       }
-      k_pad<<<grid_for(d0.ew, d0.eh), BLOCK>>>(out.pl[plane].sub[0], d0);
+      k_pad<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>(out.pl[plane].sub[0], d0);
 
       if (p.pel == 2)
       {
         pix **sub = out.pl[plane].sub;
         const dim3 g = grid_for(d0.ew, d0.eh);
-        k_wiener_h<<<g, BLOCK>>>(sub[1], sub[0], d0.ew, d0.eh, maxv);
-        k_wiener_v<<<g, BLOCK>>>(sub[2], sub[0], d0.ew, d0.eh, maxv);
-        k_wiener_h<<<g, BLOCK>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
+        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[1], sub[0], d0.ew, d0.eh, maxv);
+        k_wiener_v<<<g, BLOCK, 0, st>>>(sub[2], sub[0], d0.ew, d0.eh, maxv);
+        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
       }
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaDeviceSynchronize());
-      cudaFree(d_src);
-      cudaFree(d_tmp);
+      // d_src / d_tmp are reused by the next plane: wait until this plane's kernels are done with them
+      CUDA_CHECK(cudaStreamSynchronize(st));
+      dev_free(d_src, src_bytes);
+      dev_free(d_tmp, tmp_bytes);
       d_src = d_tmp = nullptr;
     }
     return 0;
 
   cleanup:
-    cudaFree(d_src);
-    cudaFree(d_tmp);
-    super_free(out);
-    return rc;
-  }
-
-  void super_free(DevSuper &s)
-  {
-    for (DevPlane &dp : s.pl)
-    {
+    cudaStreamSynchronize(st);
+    if (d_src)
+      dev_free(d_src, src_bytes);
+    if (d_tmp)
+      dev_free(d_tmp, tmp_bytes);
+    // release what was allocated so far
+    for (DevPlane &dp : out.pl)
       for (pix *&b : dp.sub)
-      {
         if (b)
-          cudaFree(b);
-        b = nullptr;
-      }
-    }
+        {
+          dev_free(b, (size_t)dp.d.ew * dp.d.eh * sizeof(pix));
+          b = nullptr;
+        }
+    return rc;
   }
 }
 
@@ -293,9 +311,9 @@ extern "C" int mvcuda_super_host(const MvCudaSuperParams *p, const void *const s
 {
   if (!p || !src || !src_pitch_bytes || !out)
     return -4;
-  int rc = 0;
+  mvc::StreamLease lease;
   mvc::DevSuper s;
-  rc = mvc::super_build(*p, src, src_pitch_bytes, s);
+  int rc = mvc::super_build(*p, src, src_pitch_bytes, s, lease.s);
   if (rc)
     return rc;
   for (int l = 0; l < p->levels && !rc; l++)
@@ -309,6 +327,5 @@ extern "C" int mvcuda_super_host(const MvCudaSuperParams *p, const void *const s
           rc = -2;
       }
     }
-  mvc::super_free(s);
   return rc;
 }

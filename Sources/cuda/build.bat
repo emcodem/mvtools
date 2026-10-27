@@ -6,7 +6,7 @@ if not defined CUDA_PATH set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing To
 set "PATH=%CUDA_PATH%\bin;%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 if not exist x64\Release mkdir x64\Release
-nvcc -shared -o x64\Release\mvtools_cuda.dll mvcuda.cu mvcuda_super.cu mvcuda_recalc.cu mvcuda_analyse.cu -DMVCUDA_EXPORTS -O3 --std=c++17 ^
+nvcc -shared -o x64\Release\mvtools_cuda.dll mvcuda.cu mvcuda_core.cu mvcuda_super.cu mvcuda_recalc.cu mvcuda_analyse.cu -DMVCUDA_EXPORTS -O3 --std=c++17 ^
   -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120 ^
   -Xcompiler "/MT /O2" || exit /b 1
 echo built x64\Release\mvtools_cuda.dll

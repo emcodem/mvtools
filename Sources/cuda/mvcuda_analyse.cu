@@ -268,73 +268,56 @@ namespace
     int sl[MAX_CAND], sc[MAX_CAND];
     int ring_dx[MAX_CAND], ring_dy[MAX_CAND];
     int nlambda;
-    int best_x, best_y, best_sad;
+    int prev_x, prev_y, prev_sad; // result of the previous block of the row (left predictor), passed without a global round trip
   };
 
-  // luma SAD of the source block in shared memory against the reference displaced to sub-pel position (xp, yp);
-  // lane = column, rows unrolled so that the loads of a batch are in flight together
-  __device__ __forceinline__ int sad_luma(const LevelArgs &a, const pix *s_src, int xp, int yp, int lane)
+  // Luma and chroma SAD of one candidate vector for the source block in shared memory. Lane = column; both loops
+  // are unrolled so that all loads of the candidate are in flight together, the two warp reductions come last.
+  // sc is scaled like ScaleSadChroma. For cw <= 16 U and V share the warp (lanes [0, cw) U, [cw, 2 cw) V).
+  __device__ __forceinline__ void eval_candidate(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, int cx, int cy, int lane, bool pair, int &sl, int &sc)
   {
+    const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
     const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
     const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
-    const int ew = a.ew[0];
-    int s = 0;
+    int sum_l = 0, sum_c = 0;
     if (lane < a.bs_x)
     {
-      const pix *r = a.ref[0][sub] + (size_t)ry * ew + rx + lane;
-      const pix *q = s_src + lane;
-      #pragma unroll 16
+      const pix *r = a.ref[0][sub] + (size_t)ry * a.ew[0] + rx + lane;
+      const pix *q = s_y + lane;
+      #pragma unroll 32
       for (int row = 0; row < a.bs_y; row++)
-        s += abs((int)q[row * a.bs_x] - (int)r[(size_t)row * ew]);
+        sum_l += abs((int)q[row * a.bs_x] - (int)r[(size_t)row * a.ew[0]]);
     }
-    return warp_sum(s);
-  }
-
-  // U + V SAD of the candidate (cx, cy), scaled like ScaleSadChroma. For cw <= 16 both planes share the warp
-  // (lanes [0, cw) U, [cw, 2 cw) V).
-  __device__ __forceinline__ int sad_chroma(const LevelArgs &a, const pix *s_u, const pix *s_v, int x1, int y1,
-    int cx, int cy, int lane, bool pair)
-  {
-    const int xp = x1 * a.pel + (cx >> a.log_x_uv);
-    const int yp = y1 * a.pel + (cy >> a.log_y_uv);
-    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
-    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
-    int s = 0;
+    const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+    const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+    const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
     if (pair)
     {
       const int pl = lane < a.cw ? 1 : 2, col = lane < a.cw ? lane : lane - a.cw;
       if (lane < 2 * a.cw)
       {
-        const pix *r = a.ref[pl][sub] + (size_t)ry * a.ew[pl] + rx + col;
+        const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + col;
         const pix *q = (pl == 1 ? s_u : s_v) + col;
-        #pragma unroll 16
+        #pragma unroll 32
         for (int row = 0; row < a.ch; row++)
-          s += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+          sum_c += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
       }
     }
-    else
+    else if (lane < a.cw)
     {
       for (int pl = 1; pl < 3; pl++)
-        if (lane < a.cw)
-        {
-          const pix *r = a.ref[pl][sub] + (size_t)ry * a.ew[pl] + rx + lane;
-          const pix *q = (pl == 1 ? s_u : s_v) + lane;
-          #pragma unroll 16
-          for (int row = 0; row < a.ch; row++)
-            s += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
-        }
+      {
+        const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + lane;
+        const pix *q = (pl == 1 ? s_u : s_v) + lane;
+        #pragma unroll 32
+        for (int row = 0; row < a.ch; row++)
+          sum_c += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+      }
     }
-    return scale_chroma(warp_sum(s), a.chroma_scale);
+    sl = warp_sum(sum_l);
+    sc = scale_chroma(warp_sum(sum_c), a.chroma_scale);
   }
-
-#ifdef MVCUDA_PROFILE
-  __device__ long long g_prof[12];
-  #define PROF_T(i) long long t##i = clock64();
-  #define PROF_ADD(slot, a_, b_) if (tid == 0 && blockIdx.x == 0 && a.level == 0) g_prof[slot] += (b_) - (a_);
-#else
-  #define PROF_T(i)
-  #define PROF_ADD(slot, a_, b_)
-#endif
 
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
   __global__ void k_search(LevelArgs a)
@@ -377,12 +360,50 @@ namespace
     {
       const int dir = (blky % 2 == 0 || !a.meander) ? 1 : -1;
       const int start = (dir == 1) ? 0 : a.n_blk_x - 1;
+      const bool is_top = (blky == beg), is_bottom = (blky == end - 1);
+
+      // The neighbours that do not depend on the previous block of the row (own prediction, up, bottom-right or
+      // up-right) are loaded one block ahead; only the left predictor comes from the block just searched.
+      int own_n[3] = { 0, 0, 0 }, up_n[3] = { 0, 0, 0 }, p3_n[3] = { 0, 0, 0 };
+      bool have_up = false, have_p3 = false;
+      auto prefetch = [&](int it) {
+        const int bx = start + it * dir;
+        const int id = blky * a.n_blk_x + bx;
+        const bool side = (dir == 1 && bx < a.n_blk_x - 1) || (dir == -1 && bx > 0);
+        const int *o = a.vec + 3 * id;
+        own_n[0] = o[0]; own_n[1] = o[1]; own_n[2] = o[2];
+        have_up = !is_top;
+        if (have_up)
+        {
+          const int *u = a.vec + 3 * (id - a.n_blk_x);
+          up_n[0] = u[0]; up_n[1] = u[1]; up_n[2] = u[2];
+        }
+        have_p3 = false;
+        const int *q = nullptr;
+        if (!is_bottom && !a.smallest && side)
+          q = a.vec + 3 * (id + a.n_blk_x + dir);
+        else if (!is_top && side)
+          q = a.vec + 3 * (id - a.n_blk_x + dir);
+        if (q)
+        {
+          have_p3 = true;
+          p3_n[0] = q[0]; p3_n[1] = q[1]; p3_n[2] = q[2];
+        }
+      };
+      prefetch(0);
+
       for (int it = 0; it < a.n_blk_x; it++)
       {
         const int blkx = start + it * dir;
         const int idx = blky * a.n_blk_x + blkx;
+        // values for this block (prefetched), then start loading the next block's constants
+        const int own_v[3] = { own_n[0], own_n[1], own_n[2] };
+        const int up_v[3] = { up_n[0], up_n[1], up_n[2] };
+        const int p3_v[3] = { p3_n[0], p3_n[1], p3_n[2] };
+        const bool use_up = have_up, use_p3 = have_p3;
+        if (it + 1 < a.n_blk_x)
+          prefetch(it + 1);
 
-        PROF_T(0)
         // ---- geometry (identical in every thread) and the source block into shared memory
         int x0[3], y0[3];
         x0[0] = a.hpad[0] + blkx * step_x;
@@ -392,14 +413,15 @@ namespace
           x0[p] = a.hpad[p] + blkx * (step_x >> a.log_x_uv);
           y0[p] = a.vpad[p] + blky * (step_y >> a.log_y_uv);
         }
-        for (int i = tid; i < a.bs_x * a.bs_y; i += blockDim.x)
-          s_y[i] = a.src[0][(size_t)(y0[0] + i / a.bs_x) * a.ew[0] + x0[0] + i % a.bs_x];
-        for (int i = tid; i < a.cw * a.ch; i += blockDim.x)
-        {
-          const int r = i / a.cw, c = i - r * a.cw;
-          s_u[i] = a.src[1][(size_t)(y0[1] + r) * a.ew[1] + x0[1] + c];
-          s_v[i] = a.src[2][(size_t)(y0[2] + r) * a.ew[2] + x0[2] + c];
-        }
+        for (int row = warp; row < a.bs_y; row += nwarps)
+          if (lane < a.bs_x)
+            s_y[row * a.bs_x + lane] = a.src[0][(size_t)(y0[0] + row) * a.ew[0] + x0[0] + lane];
+        for (int row = warp; row < a.ch; row += nwarps)
+          if (lane < a.cw)
+          {
+            s_u[row * a.cw + lane] = a.src[1][(size_t)(y0[1] + row) * a.ew[1] + x0[1] + lane];
+            s_v[row * a.cw + lane] = a.src[2][(size_t)(y0[2] + row) * a.ew[2] + x0[2] + lane];
+          }
 
         const int dx_max = a.pel * (a.ext_w - x0[0] - a.bs_x - a.hpad[0] + h_scaled);
         const int dy_max = a.pel * (a.ext_h - y0[0] - a.bs_y - a.vpad[0] + v_scaled);
@@ -407,32 +429,17 @@ namespace
         const int dy_min = -a.pel * (y0[0] - a.vpad[0] + v_scaled);
 
         // ---- predictors (FetchPredictors), identical in every thread
-        const bool is_top = (blky == beg), is_bottom = (blky == end - 1);
         const bool side_ok = (dir == 1 && blkx < a.n_blk_x - 1) || (dir == -1 && blkx > 0);
-        const int *own = a.vec + 3 * idx;
-        const Vec own_v = clip_mv(dx_min, dx_max, dy_min, dy_max, own[0], own[1], own[2]);
+        (void)side_ok;
+        const Vec own_c = clip_mv(dx_min, dx_max, dy_min, dy_max, own_v[0], own_v[1], own_v[2]);
         const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0); // field shift 0
         Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
-        if ((dir == 1 && blkx > 0) || (dir == -1 && blkx < a.n_blk_x - 1))
-        {
-          const int *v = a.vec + 3 * (idx - dir);
-          p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
-        }
-        if (!is_top)
-        {
-          const int *v = a.vec + 3 * (idx - a.n_blk_x);
-          p2 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
-        }
-        if (!is_bottom && !a.smallest && side_ok)
-        {
-          const int *v = a.vec + 3 * (idx + a.n_blk_x + dir);
-          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
-        }
-        else if (!is_top && side_ok)
-        {
-          const int *v = a.vec + 3 * (idx - a.n_blk_x + dir);
-          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
-        }
+        if (it > 0)
+          p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, b.prev_x, b.prev_y, b.prev_sad);
+        if (use_up)
+          p2 = clip_mv(dx_min, dx_max, dy_min, dy_max, up_v[0], up_v[1], up_v[2]);
+        if (use_p3)
+          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, p3_v[0], p3_v[1], p3_v[2]);
         if (!is_top)
         {
           p0.x = median3(p1.x, p2.x, p3.x);
@@ -441,10 +448,10 @@ namespace
         }
         else
           p0 = p1;
-        const Vec pred = a.smallest ? p0 : own_v;
+        const Vec pred = a.smallest ? p0 : own_c;
         if (tid == 0)
         {
-          int nlambda = (blky == beg) ? 0 : a.lambda_level;
+          int nlambda = is_top ? 0 : a.lambda_level;
           if (a.lsad == 0)
             nlambda = 0;
           else
@@ -457,9 +464,8 @@ namespace
           b.nlambda = nlambda;
         }
         const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel, 0);
-        __syncthreads(); // source block and nLambda in shared memory; the previous block's vector is visible
+        __syncthreads(); // source block and nLambda in shared memory; the previous block's result is visible
         const int nlambda = b.nlambda;
-        PROF_T(1)
 
         // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
         for (int c = warp; c < 7; c += nwarps)
@@ -475,17 +481,15 @@ namespace
           case 5: cx = p2.x; cy = p2.y; break;
           default: cx = p3.x; cy = p3.y; break;
           }
-          const int sl = sad_luma(a, s_y, x0[0] * a.pel + cx, y0[0] * a.pel + cy, lane);
-          const int sc = sad_chroma(a, s_u, s_v, x0[1], y0[1], cx, cy, lane, pair_chroma);
+          int sl, sc;
+          eval_candidate(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
           if (lane == 0)
           {
             b.sl[c] = sl;
             b.sc[c] = sc;
           }
         }
-        PROF_T(2)
         __syncthreads();
-        PROF_T(3)
 
         // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
         int best_x, best_y, best_sad, min_cost;
@@ -536,7 +540,6 @@ namespace
           }
         }
         __syncthreads(); // everybody has read the phase A results before phase B overwrites them
-        PROF_T(4)
 
         // ---- phase B: SADs of the ring candidates around the best vector so far
         for (int c = warp; c < ring_n; c += nwarps)
@@ -544,17 +547,15 @@ namespace
           const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
           if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
             continue; // never read: the fold below skips invalid vectors
-          const int sl = sad_luma(a, s_y, x0[0] * a.pel + cx, y0[0] * a.pel + cy, lane);
-          const int sc = sad_chroma(a, s_u, s_v, x0[1], y0[1], cx, cy, lane, pair_chroma);
+          int sl, sc;
+          eval_candidate(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
           if (lane == 0)
           {
             b.sl[c] = sl;
             b.sc[c] = sc;
           }
         }
-        PROF_T(5)
         __syncthreads();
-        PROF_T(6)
 
         // ---- fold the ring (CheckMV, with penaltyNew) in warp 0, one lane per candidate. The sequential CPU rule
         // "accept if cost < running minimum" ends at the earliest candidate with the smallest cost below the
@@ -602,17 +603,12 @@ namespace
             a.vec[3 * idx + 0] = best_x;
             a.vec[3 * idx + 1] = best_y;
             a.vec[3 * idx + 2] = best_sad;
+            b.prev_x = best_x; // left predictor of the next block
+            b.prev_y = best_y;
+            b.prev_sad = best_sad;
           }
         }
-        __syncthreads(); // the next block reads this vector
-        PROF_T(7)
-        PROF_ADD(0, t0, t1)  // setup (loads, predictors) incl. sync
-        PROF_ADD(1, t1, t2)  // phase A warp work (thread 0's share)
-        PROF_ADD(2, t2, t3)  // wait for phase A at the sync
-        PROF_ADD(3, t3, t4)  // fold A + sync
-        PROF_ADD(4, t4, t5)  // phase B warp work (thread 0's share)
-        PROF_ADD(5, t5, t6)  // wait at the sync
-        PROF_ADD(6, t6, t7)  // fold B (thread 0) + write + sync
+        __syncthreads(); // the next block reads b.prev_*; the global vector is read by later rows / levels
       }
     }
   }
@@ -634,7 +630,7 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
   // supported: chroma on, pel 1 or 2, exhaustive search everywhere, field shift 0
   if (!sp->chroma || sp->levels != ap->n_levels || ap->n_levels < 1 || ap->n_levels > MVCUDA_MAX_LEVELS
     || ap->search_param < 1 || ap->pel_search < 1 || ap->search_param > 3 || ap->pel_search > 3 || ap->n_blk_x < 1
-    || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2)
+    || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2 || ap->blk_x > 32)
     return -4;
   if (mvcuda_device_count() <= 0)
     return -1;
@@ -668,18 +664,19 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
   };
 
   int rc = 0;
-  mvc::DevSuper s_src, s_ref;
+  mvc::StreamLease lease;
+  cudaStream_t st = lease.s;
+  std::shared_ptr<mvc::DevSuper> s_src, s_ref;
   int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr;
-  rc = mvc::super_build(*sp, src, src_pitch_bytes, s_src);
+  const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
+  std::vector<int> host;
+
+  rc = mvc::super_get(*sp, ap->src_key, src, src_pitch_bytes, st, s_src);
   if (!rc)
-    rc = mvc::super_build(*sp, ref, ref_pitch_bytes, s_ref);
-  lap("2 x super build");
+    rc = mvc::super_get(*sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
+  lap("2 x super (cached)");
   if (rc)
-  {
-    mvc::super_free(s_src);
-    mvc::super_free(s_ref);
     return rc;
-  }
 
 #define AN_CHECK(call) \
   do { \
@@ -691,20 +688,24 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
     } \
   } while (0)
 
+  d_pay = (int *)mvc::dev_alloc(pay_bytes);
+  d_freq = (int *)mvc::dev_alloc(freq_bytes);
+  d_glob = (int *)mvc::dev_alloc(2 * sizeof(int));
+  d_bad = (int *)mvc::dev_alloc(sizeof(int));
+  if (!d_pay || !d_freq || !d_glob || !d_bad)
   {
-    std::vector<int> host(words, 0);
+    rc = -2;
+    goto done;
+  }
+  {
+    host.assign(words, 0);
     host[0] = words;
     host[1] = 1;
     for (int l = nl - 1; l >= 0; l--)
       host[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
-
-    AN_CHECK(cudaMalloc(&d_pay, words * sizeof(int)));
-    AN_CHECK(cudaMalloc(&d_freq, 2 * 2 * FREQ_HALF * sizeof(int)));
-    AN_CHECK(cudaMalloc(&d_glob, 2 * sizeof(int)));
-    AN_CHECK(cudaMalloc(&d_bad, sizeof(int)));
-    AN_CHECK(cudaMemcpy(d_pay, host.data(), words * sizeof(int), cudaMemcpyHostToDevice));
-    AN_CHECK(cudaMemset(d_bad, 0, sizeof(int)));
-    AN_CHECK(cudaMemset(d_glob, 0, 2 * sizeof(int)));
+    AN_CHECK(cudaMemcpyAsync(d_pay, host.data(), pay_bytes, cudaMemcpyHostToDevice, st));
+    AN_CHECK(cudaMemsetAsync(d_bad, 0, sizeof(int), st));
+    AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
 
     for (int l = nl - 1; l >= 0; l--)
     {
@@ -727,16 +728,16 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
       a.ch = a.bs_y >> a.log_y_uv;
       for (int p = 0; p < 3; p++)
       {
-        const mvc::DevPlane &dr = s_ref.pl[l * 3 + p];
-        a.src[p] = s_src.pl[l * 3 + p].sub[0];
+        const mvc::DevPlane &dr = s_ref->pl[l * 3 + p];
+        a.src[p] = s_src->pl[l * 3 + p].sub[0];
         for (int i = 0; i < 4; i++)
           a.ref[p][i] = dr.sub[i];
         a.ew[p] = dr.d.ew;
         a.hpad[p] = dr.d.hpad;
         a.vpad[p] = dr.d.vpad;
       }
-      a.ext_w = s_ref.pl[l * 3].d.ew;
-      a.ext_h = s_ref.pl[l * 3].d.eh;
+      a.ext_w = s_ref->pl[l * 3].d.ew;
+      a.ext_h = s_ref->pl[l * 3].d.eh;
       // _lambda_level = lambda / (pel * pel) * nScale (plevel 1) or * nScale^2 (plevel 2)
       a.lambda_level = ap->lambda / (a.pel * a.pel);
       if (ap->plevel == 1)
@@ -766,45 +767,33 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
       if (l < nl - 1)
       {
         // global MV estimate from the coarser plane (doubled), then the interpolated prediction for this plane
-        k_global<<<1, 1024>>>(d_pay + offs[l + 1], nbx[l + 1] * nby[l + 1], d_freq, d_glob, ap->use_global);
+        k_global<<<1, 1024, 0, st>>>(d_pay + offs[l + 1], nbx[l + 1] * nby[l + 1], d_freq, d_glob, ap->use_global);
         const int total = a.n_blk_x * a.n_blk_y;
-        k_interp<<<(total + 127) / 128, 128>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], 0);
+        k_interp<<<(total + 127) / 128, 128, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], 0);
       }
       else
-        AN_CHECK(cudaMemset(d_glob, 0, 2 * sizeof(int)));
+        AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
       {
         const size_t shm = ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix);
-        k_search<<<a.n_slices, 768, shm>>>(a);
+        k_search<<<a.n_slices, 768, shm, st>>>(a);
       }
       AN_CHECK(cudaGetLastError());
     }
-    AN_CHECK(cudaDeviceSynchronize());
-    lap("analysis kernels");
-    AN_CHECK(cudaMemcpy(payload, d_pay, words * sizeof(int), cudaMemcpyDeviceToHost));
+    AN_CHECK(cudaMemcpyAsync(payload, d_pay, pay_bytes, cudaMemcpyDeviceToHost, st));
     int bad = 0;
-    AN_CHECK(cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost));
+    AN_CHECK(cudaMemcpyAsync(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost, st));
+    AN_CHECK(cudaStreamSynchronize(st));
+    lap("analysis kernels");
     if (bad)
       rc = MVCUDA_NEEDS_CPU;
   }
 
 done:
-  cudaFree(d_pay);
-  cudaFree(d_freq);
-  cudaFree(d_glob);
-  cudaFree(d_bad);
-  mvc::super_free(s_src);
-  mvc::super_free(s_ref);
+  if (rc)
+    cudaStreamSynchronize(st);
+  mvc::dev_free(d_pay, pay_bytes);
+  mvc::dev_free(d_freq, freq_bytes);
+  mvc::dev_free(d_glob, 2 * sizeof(int));
+  mvc::dev_free(d_bad, sizeof(int));
   return rc;
 }
-
-#ifdef MVCUDA_PROFILE
-extern "C" __declspec(dllexport) void mvcuda_profile_dump()
-{
-  long long h[12] = {};
-  cudaMemcpyFromSymbol(h, g_prof, sizeof(h));
-  const char *names[10] = { "setup+predictors+sync", "phase A (thread 0 warp)", "wait A", "fold A + sync", "phase B (thread 0 warp)",
-    "wait B", "fold B + write + sync", "  fold B loop", "  bad check + store", "  final barrier" };
-  for (int i = 0; i < 10; i++)
-    fprintf(stderr, "prof %-26s %12lld cycles\n", names[i], h[i]);
-}
-#endif

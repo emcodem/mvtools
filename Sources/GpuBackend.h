@@ -18,6 +18,7 @@ public:
     const void *const[3], const int[3], int *, int);
   int (*recalc_host)(const MvCudaSuperParams *, const MvCudaRecalcParams *, const void *const[3], const int[3],
     const void *const[3], const int[3], const int *, int *);
+  void (*cache_clear)();
 
   // number of block-row slices to use: the CPU thread count when mt is on (so the result equals the CPU result with
   // that many threads), 1 without mt; 24 when mt is on but no thread pool is available (the GPU needs slices)
@@ -26,9 +27,18 @@ public:
   // MVTOOLS_GPU_LOG=1 prints every GPU call / fallback to stderr
   static bool log_enabled();
 
+  // identifier of the content of frame n of the clip c (same clip object and frame number = same pixels), for the
+  // library's super frame cache
+  static unsigned long long frame_key(const void *clip, int n);
+
+  // filters that use the GPU register here; when the last one is gone the library's frame cache is dropped
+  void add_user();
+  void remove_user();
+
 private:
   GpuBackend();
   bool _usable;
+  long _users;
 };
 
 #endif

@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 2
+#define MVCUDA_API_VERSION 3
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -83,6 +83,7 @@ typedef struct
   int search_radius;                      // exhaustive search radius (searchparam)
   int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left)
   int slice_threads;                      // 1: CPU single-thread result; N: CPU result with N threads (nLambda is 0 on the first row of every slice)
+  unsigned long long src_key, ref_key;    // 0, or an identifier of the frame content (see mvcuda_analyse_host)
 } MvCudaRecalcParams;
 
 // Recalculates the vectors of one frame on the GPU. The super frames (level 0, chroma, pel 1 or 2) are built from the
@@ -112,6 +113,8 @@ typedef struct
   int pel_search;                         // exhaustive search radius at level 0 (pelsearch), 1..3
   int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left)
   int slice_threads;                      // 1: single-slice CPU result; N: CPU result with N threads (see file)
+  unsigned long long src_key, ref_key;    // 0, or an identifier of the frame content: the library keeps built super frames
+                                          // by (key, geometry) and reuses them; same key must always mean the same pixels
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are
@@ -120,6 +123,9 @@ typedef struct
 // its capacity. Returns like mvcuda_super_host, or MVCUDA_NEEDS_CPU.
 MVCUDA_API int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words);
+
+// drops all cached super frames and pooled device memory (call when the last user of the library goes away)
+MVCUDA_API void mvcuda_cache_clear();
 
 #ifdef __cplusplus
 }

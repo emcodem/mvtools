@@ -442,6 +442,7 @@ MVAnalyse::MVAnalyse(
       while ((1 << ly) < yr) ly++;
       _gpu_effective_chroma_scale = (2 - (lx + ly)) - analysisData.chromaSADScale;
       _gpu_super_levels = nSuperLevels;
+      GpuBackend::instance().add_user();
     }
   }
 
@@ -536,6 +537,8 @@ MVAnalyse::MVAnalyse(
 
 MVAnalyse::~MVAnalyse()
 {
+  if (_gpu_ok)
+    GpuBackend::instance().remove_user();
   if (outfile != NULL)
   {
     fclose(outfile);
@@ -676,7 +679,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
     bool gpu_done = false;
     if (_gpu_ok && fieldShift == 0 && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
     {
-      gpu_done = gpu_search(nsrc, reinterpret_cast<int*>(pDst));
+      gpu_done = gpu_search(nsrc, nref, reinterpret_cast<int*>(pDst));
     }
     if (!gpu_done)
     {
@@ -742,9 +745,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
 // Runs the whole search on the GPU for the frames already loaded into pSrcGOF / pRefGOF (raw level-0 planes of the
 // super frames). Returns false (nothing written that matters) when the CPU has to do it.
-bool MVAnalyse::gpu_search(int nsrc, int *payload)
+bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
 {
-  (void)nsrc;
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
@@ -796,6 +798,8 @@ bool MVAnalyse::gpu_search(int nsrc, int *payload)
   ap.pel_search = nPelSearch;
   ap.chroma_sad_scale = _gpu_effective_chroma_scale;
   ap.slice_threads = _gpu_slices;
+  ap.src_key = GpuBackend::frame_key((const void *)child.operator->(), nsrc);
+  ap.ref_key = GpuBackend::frame_key((const void *)child.operator->(), nref);
 
   const int words = _vectorfields_aptr->GetArraySize();
   int rc = -1;

@@ -140,7 +140,7 @@ public:
 
 private:
 
-  bool gpu_search(int nsrc, int *payload);
+  bool gpu_search(int nsrc, int nref, int *payload);
   void load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data);
 };
 
