@@ -1,6 +1,7 @@
 // Optional CUDA helper library for MVTools. See mvcuda.h.
 
 #include "mvcuda.h"
+#include "mvcuda_internal.h"
 
 #include <cuda_runtime.h>
 
@@ -56,13 +57,10 @@ extern "C" int mvcuda_api_version()
   return MVCUDA_API_VERSION;
 }
 
+// number of usable devices: compute capability 8.0 or newer (the kernels need cp.async); 0 = none
 extern "C" int mvcuda_device_count()
 {
-  int n = 0;
-  cudaError_t err = cudaGetDeviceCount(&n);
-  if (err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver)
-    return 0;
-  return (err == cudaSuccess) ? n : -1;
+  return mvc::usable_device_count();
 }
 
 extern "C" int mvcuda_device_info(int device, char *name, int name_len, int *cc_major, int *cc_minor,
@@ -133,4 +131,55 @@ extern "C" int mvcuda_selftest()
   cudaFree(d_out);
 
   return (got == expected) ? 0 : -3;
+}
+
+// ---- public entry points: dispatch on the sample type (8-bit -> *_8, 9..16 bit -> *_16) ------------------------------
+
+extern "C" int mvcuda_super_host_8(const MvCudaSuperParams *, const void *const[3], const int[3], void *const[]);
+extern "C" int mvcuda_super_host_16(const MvCudaSuperParams *, const void *const[3], const int[3], void *const[]);
+extern "C" int mvcuda_recalc_host_8(const MvCudaSuperParams *, const MvCudaRecalcParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], const int *, int *);
+extern "C" int mvcuda_recalc_host_16(const MvCudaSuperParams *, const MvCudaRecalcParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], const int *, int *);
+extern "C" int mvcuda_analyse_host_8(const MvCudaSuperParams *, const MvCudaAnalyseParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], int *, int);
+extern "C" int mvcuda_analyse_host_16(const MvCudaSuperParams *, const MvCudaAnalyseParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], int *, int);
+
+extern "C" int mvcuda_super_plane_dims(const MvCudaSuperParams *p, int level, int plane, MvCudaPlaneDims *d)
+{
+  if (!p || !d || level < 0 || level >= p->levels || plane < 0 || plane > 2)
+    return -4;
+  mvc::plane_dims(*p, level, plane, *d);
+  return 0;
+}
+
+extern "C" int mvcuda_super_host(const MvCudaSuperParams *p, const void *const src[3], const int src_pitch_bytes[3],
+  void *const out[])
+{
+  if (!p)
+    return -4;
+  return p->bits_per_pixel <= 8 ? mvcuda_super_host_8(p, src, src_pitch_bytes, out)
+                                : mvcuda_super_host_16(p, src, src_pitch_bytes, out);
+}
+
+extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], const int *old_vectors,
+  int *out_vectors)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_recalc_host_8(sp, rp, src, src_pitch_bytes, ref, ref_pitch_bytes, old_vectors, out_vectors)
+    : mvcuda_recalc_host_16(sp, rp, src, src_pitch_bytes, ref, ref_pitch_bytes, old_vectors, out_vectors);
+}
+
+extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_analyse_host_8(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words)
+    : mvcuda_analyse_host_16(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words);
 }

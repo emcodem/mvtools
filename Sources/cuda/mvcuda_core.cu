@@ -15,6 +15,49 @@ namespace mvc
 {
   namespace
   {
+    struct DeviceChoice
+    {
+      int index = -1;
+      int count = 0;
+    };
+
+    const DeviceChoice &device_choice()
+    {
+      static const DeviceChoice c = [] {
+        DeviceChoice r;
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess)
+          return r;
+        const char *e = std::getenv("MVCUDA_DEVICE");
+        const int wanted = e ? std::atoi(e) : -1;
+        for (int i = 0; i < n; i++)
+        {
+          cudaDeviceProp p;
+          if (cudaGetDeviceProperties(&p, i) != cudaSuccess || p.major < 8)
+            continue;
+          r.count++;
+          if (r.index < 0 && (wanted < 0 || wanted == i))
+            r.index = i;
+        }
+        return r;
+      }();
+      return c;
+    }
+  }
+
+  int usable_device_count()
+  {
+    return device_choice().index >= 0 ? device_choice().count : 0;
+  }
+
+  bool use_device()
+  {
+    const int d = device_choice().index;
+    return d >= 0 && cudaSetDevice(d) == cudaSuccess;
+  }
+
+  namespace
+  {
     std::mutex g_pool_mutex;
     std::multimap<size_t, void *> g_pool;           // free buffers by size
     std::mutex g_stream_mutex;
@@ -87,10 +130,10 @@ namespace mvc
   DevSuper::~DevSuper()
   {
     for (DevPlane &dp : pl)
-      for (pix *&b : dp.sub)
+      for (void *&b : dp.sub)
         if (b)
         {
-          dev_free(b, (size_t)dp.d.ew * dp.d.eh * sizeof(pix));
+          dev_free(b, (size_t)dp.d.ew * dp.d.eh * esize);
           b = nullptr;
         }
   }
@@ -101,11 +144,12 @@ namespace mvc
     struct CacheKey
     {
       unsigned long long key;
-      int width, height, xr, yr, hpad, vpad, pel, levels, bits, chroma;
+      int width, height, xr, yr, hpad, vpad, pel, levels, bits, chroma, esize;
       bool operator==(const CacheKey &o) const
       {
         return key == o.key && width == o.width && height == o.height && xr == o.xr && yr == o.yr && hpad == o.hpad
-          && vpad == o.vpad && pel == o.pel && levels == o.levels && bits == o.bits && chroma == o.chroma;
+          && vpad == o.vpad && pel == o.pel && levels == o.levels && bits == o.bits && chroma == o.chroma
+          && esize == o.esize;
       }
     };
     struct CacheKeyHash
@@ -141,19 +185,19 @@ namespace mvc
     }
   }
 
-  int super_get(const MvCudaSuperParams &p, unsigned long long key, const void *const src[3], const int src_pitch_bytes[3],
-    cudaStream_t s, std::shared_ptr<DevSuper> &out)
+  int super_get(SuperBuildFn build, const MvCudaSuperParams &p, unsigned long long key, const void *const src[3],
+    const int src_pitch_bytes[3], cudaStream_t s, std::shared_ptr<DevSuper> &out)
   {
     if (key == 0)
     {
       auto sp = std::make_shared<DevSuper>();
-      const int rc = super_build(p, src, src_pitch_bytes, *sp, s);
+      const int rc = build(p, src, src_pitch_bytes, *sp, s);
       if (rc == 0)
         out = sp;
       return rc;
     }
     const CacheKey ck = { key, p.width, p.height, p.x_ratio_uv, p.y_ratio_uv, p.hpad, p.vpad, p.pel, p.levels,
-      p.bits_per_pixel, p.chroma };
+      p.bits_per_pixel, p.chroma, p.bits_per_pixel <= 8 ? 1 : 2 };
     std::unique_lock<std::mutex> lk(g_cache_mutex);
     for (;;)
     {
@@ -179,7 +223,7 @@ namespace mvc
     lk.unlock();
 
     auto sp = std::make_shared<DevSuper>();
-    const int rc = super_build(p, src, src_pitch_bytes, *sp, s);
+    const int rc = build(p, src, src_pitch_bytes, *sp, s);
 
     lk.lock();
     auto it = g_cache.find(ck);

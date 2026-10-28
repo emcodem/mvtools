@@ -427,7 +427,7 @@ MVAnalyse::MVAnalyse(
     const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 /* rfilter */
       && ((params.param >> 3) & 3) == 2 /* sharp */ && !(params.param & 0x20) /* no pelclip */;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
-    _gpu_ok = GpuBackend::instance().usable() && super_ok && pixelsize == 2 && !vi.IsYUY2() && vi.IsPlanar()
+    _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
       && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && !temporal_flag && !_tryMany && !multi_flag
       && searchType == EXHAUSTIVE && nSearchParam >= 1 && nSearchParam <= 3 && nPelSearch >= 1 && nPelSearch <= 3
       && (nSuperPel == 1 || nSuperPel == 2) && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2)

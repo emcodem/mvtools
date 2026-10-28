@@ -18,7 +18,7 @@
 
 namespace
 {
-  using mvc::pix;
+  typedef mvc_pix pix;
 
   struct KArgs
   {
@@ -224,7 +224,7 @@ namespace
   }
 }
 
-extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
+extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], const int *old_vectors,
   int *out_vectors)
 {
@@ -234,7 +234,7 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
   if (sp->levels != 1 || !sp->chroma || rp->smooth < 0 || rp->smooth > 1 || rp->search_radius < 1 || rp->old_pel < 1
     || rp->n_blk_x < 1 || rp->n_blk_y < 1 || rp->old_blk_x < 1 || rp->old_blk_y < 1 || rp->lambda_level < 0)
     return -4;
-  if (mvcuda_device_count() <= 0)
+  if (!mvc::use_device())
     return -1;
 
   const bool timing = getenv("MVCUDA_TIMING") != nullptr;
@@ -255,9 +255,9 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
   const size_t n_old = (size_t)rp->old_blk_x * rp->old_blk_y, n_new = (size_t)rp->n_blk_x * rp->n_blk_y;
   const size_t old_bytes = n_old * 3 * sizeof(int), new_bytes = n_new * 3 * sizeof(int);
 
-  rc = mvc::super_get(*sp, rp->src_key, src, src_pitch_bytes, st, s_src);
+  rc = mvc::super_get(&MVC_NS::super_build, *sp, rp->src_key, src, src_pitch_bytes, st, s_src);
   if (!rc)
-    rc = mvc::super_get(*sp, rp->ref_key, ref, ref_pitch_bytes, st, s_ref);
+    rc = mvc::super_get(&MVC_NS::super_build, *sp, rp->ref_key, ref, ref_pitch_bytes, st, s_ref);
   lap("2 x super (cached)");
   if (rc)
     return rc;
@@ -265,9 +265,9 @@ extern "C" int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecal
   KArgs a = {};
   for (int p = 0; p < 3; p++)
   {
-    a.src[p] = s_src->pl[p].sub[0];
+    a.src[p] = (const pix *)s_src->pl[p].sub[0];
     for (int i = 0; i < 4; i++)
-      a.ref[p][i] = s_ref->pl[p].sub[i];
+      a.ref[p][i] = (const pix *)s_ref->pl[p].sub[i];
     a.ew[p] = s_ref->pl[p].d.ew;
     a.hpad[p] = s_ref->pl[p].d.hpad;
     a.vpad[p] = s_ref->pl[p].d.vpad;

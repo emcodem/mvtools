@@ -416,7 +416,7 @@ MVRecalculate::MVRecalculate(
     const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 && ((params.param >> 3) & 3) == 2
       && !(params.param & 0x20);
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
-    _gpu_ok = GpuBackend::instance().usable() && super_ok && pixelsize == 2 && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
+    _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
       && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && _nbr_srd == 1 && searchType == EXHAUSTIVE
       && nSearchParam >= 1 && nSearchParam <= 3 && (nSuperPel == 1 || nSuperPel == 2) && smooth >= 0 && smooth <= 1
       && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2) && lstrlen(_outfilename) == 0;

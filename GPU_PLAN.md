@@ -115,14 +115,14 @@ the core count (more slices = shorter chains = lower GPU latency, slightly more 
 ## Status 2026-10-28 (M1-M5 done for the production case)
 
 **Done, all bit-exact against the CPU:** M1 golden data, M2 `MSuper`, M3 `MAnalyse` search, M4 `MRecalculate`, M5 plugin integration
-(`gpu=true` on `MAnalyse` and `MRecalculate`, `GpuBackend`, per-frame CPU fallback). Scope: 16-bit container (10-bit and up),
+(`gpu=true` on `MAnalyse` and `MRecalculate`, `GpuBackend`, per-frame CPU fallback). Scope: 8-bit and 16-bit container (9..16 bit data, both bit-exact, same tests with 8-bit golden dumps incl. a clipping stress frame),
 chroma on, pel 1 or 2, `search=3` radius 1-3, block width <= 32, default `MSuper` settings (`rfilter=4`, `sharp=2`, no pelclip). Not covered
-(silently CPU): 8-bit (the default `frc_8bit=true` path!), pel 4 / HD, `divide`, `dct`, `temporal`, `trymany`, `outfile`, field shift,
+(silently CPU): pel 4 / HD, `divide`, `dct`, `temporal`, `trymany`, `outfile`, field shift,
 and frames that need the CPU's bad-vector wide search (`MVCUDA_NEEDS_CPU`).
 
 ### Use
 
-- Build `Sources\cuda\build.bat` -> `mvtools_cuda.dll` (CUDA 13.x toolkit, sm_120 only so far, static runtime: only the driver is needed at run time) and
+- Build `Sources\cuda\build.bat` -> `mvtools_cuda.dll` (CUDA 13.x toolkit; machine code for compute capability 8.0, 8.6, 8.9, 9.0, 12.0 plus PTX for 8.0, so RTX 30xx and newer; static runtime: only the driver is needed at run time; the PTX path was checked on the RTX 5090 with `CUDA_FORCE_PTX_JIT=1`, the 30/40 series machine code itself is untested on real hardware; `MVCUDA_DEVICE=n` picks a device, default the first one with cc >= 8.0) and
   the plugin as before; put `mvtools_cuda.dll` next to `mvtools2.dll`.
 - `MAnalyse(..., gpu=true)` and `MRecalculate(..., gpu=true)`; `uconvert.avsi`: `global uc_frc_gpu = true` after the Import (default false).
 - The vectors equal the CPU **multi-threaded** result for the same slice count: the GPU uses the avstp thread count (24 if mt is on but no thread
@@ -160,8 +160,19 @@ share the candidates of one block), early-out of the chroma SAD like the CPU, ev
 instances), skipping the CPU `MSuper` pyramid when the GPU rebuilds it (about 12 of the 97 remaining CPU-s), sharing results between cloned
 `Prefetch` chains (duplicate analysis), GPU `MFlowFps` (M7, the real wall-time limiter now), 8-bit kernels.
 
+### 8-bit result (2026-10-28)
+
+All three GPU stages are bit-exact in 8-bit (kernel files compiled twice, `mvcuda_*_8.cu` / `_16.cu`, shared type-independent core). End to end, 240 frames
+`Prefetch(3)`, final frames identical to the CPU. Honest numbers: the 8-bit chain is already fast on the CPU (7.5 s wall, 113 CPU-s); with the GPU it is
+8.5 s wall and 63 CPU-s, so again the saving is CPU time, not wall time. The coarsest levels use a plain (not cp.async) source copy because 8-bit plane rows
+there are not 4-byte aligned.
+
+Portability notes: thread-block clusters (several SMs per slice) need Hopper (cc 9.0) or newer and would not run on a 3060, so that idea is dropped; packed
+SAD (`__vsadu2`) works on every supported card. A 3060 has 28 SMs (24 slices fit), 100 KB shared memory per SM (the kernel uses about 9 KB) and 64K registers
+(the kernel is capped at 80 per thread for 768 threads).
+
 ## Next step
 
-1. 8-bit (uint8) variants of M2-M4: the default FRC path. 2. M6 measurements still open: R9 (4 concurrent jobs, GPU contention), R2-R8 timing matrix for the
+1. GPU `MFlowFps` (M7), now the wall-time limiter. 2. M6 measurements still open: R9 (4 concurrent jobs, GPU contention), R2-R8 timing matrix for the
 GPU variant, R10 (user's side-by-side), R12 soak. 3. M7: GPU `MFlowFps`. 4. Commit hygiene: `Sources\cuda\x64` is git-ignored, the dump hooks stay compiled out
 (`/DMV_GOLDEN_DUMP`).

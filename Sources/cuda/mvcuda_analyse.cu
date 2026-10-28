@@ -26,7 +26,8 @@
 
 namespace
 {
-  using mvc::pix;
+  typedef mvc_pix pix;
+  static constexpr int SPW = 4 / (int)sizeof(mvc_pix); // samples per 4-byte word (cp.async granularity)
 
   const int FREQ_HALF = 8192; // PlaneOfBlocks: freqArray size 8192 * pel * 2, coarse levels have pel 1
   const int MAX_CAND = 64;
@@ -41,6 +42,7 @@ namespace
     const pix *ref[3][4];
     int lambda_level, lsad, pnew, pzero, pglobal, bits, chroma_scale, radius, meander, use_global;
     int bad_sad, n_slices;
+    int async_src;   // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
     const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
     int *vec;          // device: (vx, vy, sad) triples of this level
     int *bad_flag;
@@ -395,7 +397,7 @@ namespace
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
   __global__ void __launch_bounds__(768, 1) k_search(LevelArgs a)
   {
-    extern __shared__ pix s_dyn[];
+    extern __shared__ __align__(16) pix s_dyn[];
     __shared__ BlockShared b;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
     const int slice = blockIdx.x;
@@ -409,13 +411,29 @@ namespace
     auto issue_src = [&](pix *dst, int bx, int by) {
       const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
       const int xc = a.hpad[1] + bx * (step_x >> a.log_x_uv), yc = a.vpad[1] + by * (step_y >> a.log_y_uv);
-      const int wl = (a.bs_x * a.bs_y) >> 1, wc = (a.cw * a.ch) >> 1;     // 4-byte words (two samples)
-      const int rl = a.bs_x >> 1, rc = a.cw >> 1;                          // words per row
+      if (!a.async_src)
+      {
+        // plane rows not 4-byte aligned (8-bit, small coarse levels): plain copy
+        for (int i = tid; i < a.bs_x * a.bs_y; i += blockDim.x)
+        {
+          const int row = i / a.bs_x, col = i - row * a.bs_x;
+          dst[i] = a.src[0][(size_t)(ys + row) * a.ew[0] + xs + col];
+        }
+        for (int i = tid; i < a.cw * a.ch; i += blockDim.x)
+        {
+          const int row = i / a.cw, col = i - row * a.cw;
+          dst[a.bs_x * a.bs_y + i] = a.src[1][(size_t)(yc + row) * a.ew[1] + xc + col];
+          dst[a.bs_x * a.bs_y + a.cw * a.ch + i] = a.src[2][(size_t)(yc + row) * a.ew[2] + xc + col];
+        }
+        return;
+      }
+      const int wl = (a.bs_x * a.bs_y) / SPW, wc = (a.cw * a.ch) / SPW;     // 4-byte words
+      const int rl = a.bs_x / SPW, rc = a.cw / SPW;                          // words per row
       for (int i = tid; i < wl + 2 * wc; i += blockDim.x)
       {
         if (i < wl)
         {
-          const int row = i / rl, col = 2 * (i - row * rl);
+          const int row = i / rl, col = SPW * (i - row * rl);
           cp_async4(dst + row * a.bs_x + col, a.src[0] + (size_t)(ys + row) * a.ew[0] + xs + col);
         }
         else
@@ -424,7 +442,7 @@ namespace
           const int pl = j >= wc ? 2 : 1;
           if (j >= wc)
             j -= wc;
-          const int row = j / rc, col = 2 * (j - row * rc);
+          const int row = j / rc, col = SPW * (j - row * rc);
           pix *d = dst + a.bs_x * a.bs_y + (pl - 1) * a.cw * a.ch;
           cp_async4(d + row * a.cw + col, a.src[pl] + (size_t)(yc + row) * a.ew[pl] + (pl == 1 ? 0 : 0) + xc + col);
         }
@@ -722,7 +740,7 @@ namespace
   }
 }
 
-extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
+extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
 {
   if (!sp || !ap || !src || !ref || !payload)
@@ -732,8 +750,18 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
     || ap->search_param < 1 || ap->pel_search < 1 || ap->search_param > 3 || ap->pel_search > 3 || ap->n_blk_x < 1
     || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2 || ap->blk_x > 32)
     return -4;
-  if (mvcuda_device_count() <= 0)
+  if (!mvc::use_device())
     return -1;
+
+  // the asynchronous source-block copy moves 4-byte words: everything it touches must be a multiple of SPW samples
+  {
+    const int lx = ilog2(sp->x_ratio_uv), step_x = ap->blk_x - ap->overlap_x;
+    bool ok = ap->blk_x % SPW == 0 && (ap->blk_x >> lx) % SPW == 0 && step_x % SPW == 0 && (step_x >> lx) % SPW == 0
+      && sp->hpad % SPW == 0 && (sp->hpad / sp->x_ratio_uv) % SPW == 0
+      && ((size_t)ap->blk_x * ap->blk_y) % SPW == 0 && ((size_t)(ap->blk_x >> lx) * (ap->blk_y >> ilog2(sp->y_ratio_uv))) % SPW == 0;
+    if (!ok)
+      return -4;
+  }
 
   const int nl = ap->n_levels;
   int nbx[MVCUDA_MAX_LEVELS], nby[MVCUDA_MAX_LEVELS];
@@ -771,9 +799,9 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
   std::vector<int> host;
 
-  rc = mvc::super_get(*sp, ap->src_key, src, src_pitch_bytes, st, s_src);
+  rc = mvc::super_get(&MVC_NS::super_build, *sp, ap->src_key, src, src_pitch_bytes, st, s_src);
   if (!rc)
-    rc = mvc::super_get(*sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
+    rc = mvc::super_get(&MVC_NS::super_build, *sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
   lap("2 x super (cached)");
   if (rc)
     return rc;
@@ -829,13 +857,14 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
       for (int p = 0; p < 3; p++)
       {
         const mvc::DevPlane &dr = s_ref->pl[l * 3 + p];
-        a.src[p] = s_src->pl[l * 3 + p].sub[0];
+        a.src[p] = (const pix *)s_src->pl[l * 3 + p].sub[0];
         for (int i = 0; i < 4; i++)
-          a.ref[p][i] = dr.sub[i];
+          a.ref[p][i] = (const pix *)dr.sub[i];
         a.ew[p] = dr.d.ew;
         a.hpad[p] = dr.d.hpad;
         a.vpad[p] = dr.d.vpad;
       }
+      a.async_src = (a.ew[0] % SPW == 0 && a.ew[1] % SPW == 0 && a.ew[2] % SPW == 0) ? 1 : 0;
       a.ext_w = s_ref->pl[l * 3].d.ew;
       a.ext_h = s_ref->pl[l * 3].d.eh;
       // _lambda_level = lambda / (pel * pel) * nScale (plevel 1) or * nScale^2 (plevel 2)
