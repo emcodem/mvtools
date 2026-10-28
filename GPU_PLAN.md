@@ -216,6 +216,15 @@ have separate CUDA contexts and the GPU time-slices between them (no MPS on Wind
 Not done, with reasons: more slices (changes the vectors relative to the CPU result at its thread count), packed SAD (the analysis kernel is latency-bound on its serial block chain, earlier unrolling / prefetch tricks gave only about 6%),
 concurrent bv/fv analysis (Prefetch already overlaps frames), recalc upload cut (recalc kernel is 1 ms, uploads are cached in the device cache and average a few ms).
 
+### Where the time goes now (2026-10-28 night, quiet machine, 10-bit UHD, ~115 output frames, all-GPU lite chain)
+
+- Decode alone (LWLibav, 149 frames) is about 1.9 s of ffmpeg wall time; the full chain is 4.9-5.4 s at Prefetch(6). Half of the current time is not reachable by optimising our code.
+- **LWLibavVideoSource default decoder threads burn CPU**: `threads=4` gives the same wall time with 15.5 instead of 36 CPU-s (Prefetch(6): 4.85-5.2 s vs 6.3-6.4 s). It is set where the source is opened (production scripts, not uconvert.avsi).
+- Nsight Systems (`nsys`, no admin needed; Nsight Compute counters are NOT available without admin): k_search is 96% of GPU kernel time; kernels from different streams overlap rarely in the real run (union busy 4.5-5 s of 6.3-7.4 s span), although a microbenchmark (`profile/golden/bench_analyse.py`) shows 4 concurrent analyses give 2.3x throughput. The threads simply do not ask for the GPU at the same time.
+- k_search per block at the finest level: about 24k cycles (start + predictors 4.7k, phase A 7 candidates 5.3k, fold A 1.3k, phase B 24 ring candidates 11.5k, fold B 1.4k). Build `Sources/cuda/build_prof.bat` (`-DMVC_PHASE_PROF`) prints these. With the reference loads removed it is still 15k, so about 9k is memory and 15k is instructions / barriers. Tried and no gain: nLambda (FP64 division) moved off the critical path, next-block vector loads by one thread into shared memory, loads moved later (the stall just moves to the next phase). Left: packed 16-bit SAD (`__vsadu2`) and wide loads, expected 20-30% of the kernel, a few percent to 20% of the run.
+- Pinned upload staging is in (`MVCUDA_NOPIN=1` disables it); A/B on a quiet machine: median 5.47 s pinned vs 5.72 s pageable, within noise. Upload of one frame (memcpy into pinned) is DRAM-bound, 5-8 ms per 33 MB.
+- `MVCUDA_TIMING=1` prints per-call phases, `MVTOOLS_GPU_PROFILE=1` prints thread-time per filter step.
+
 ### Portability
 
 The build targets compute capability 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX (RTX 30xx and newer; older cards report "no usable device", `MVCUDA_DEVICE` selects a device). The PTX path

@@ -394,6 +394,16 @@ namespace
       eval_candidate<0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
   }
 
+#ifdef MVC_PHASE_PROF
+  // per-phase cycle counters of the block loop (development aid, build with -DMVC_PHASE_PROF): [log2(blocks per row)][phase]
+  __device__ unsigned long long g_prof[16][8];
+#define PH_START() ph_t = clock64()
+#define PH(i) do { if (tid == 0) { long long n_ = clock64(); atomicAdd(&g_prof[bk][i], (unsigned long long)(n_ - ph_t)); ph_t = n_; } } while (0)
+#else
+#define PH_START() do {} while (0)
+#define PH(i) do {} while (0)
+#endif
+
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
   __global__ void __launch_bounds__(768, 1) k_search(LevelArgs a)
   {
@@ -401,6 +411,10 @@ namespace
     __shared__ BlockShared b;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
     const int slice = blockIdx.x;
+#ifdef MVC_PHASE_PROF
+    const int bk = 31 - __clz(a.n_blk_x);
+    long long ph_t = 0;
+#endif
     const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
     const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
     const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
@@ -513,6 +527,7 @@ namespace
 
       for (int it = 0; it < a.n_blk_x; it++)
       {
+        PH_START();
         const int blkx = start + it * dir;
         const int idx = blky * a.n_blk_x + blkx;
         // values for this block (prefetched), then start loading the next block's constants
@@ -584,6 +599,7 @@ namespace
         const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel, 0);
         __syncthreads(); // source block and nLambda in shared memory; the previous block's result is visible
         const int nlambda = b.nlambda;
+        PH(0);
 
         // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
         for (int c = warp; c < 7; c += nwarps)
@@ -608,6 +624,7 @@ namespace
           }
         }
         __syncthreads();
+        PH(1);
 
         // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
         int best_x, best_y, best_sad, min_cost;
@@ -658,6 +675,7 @@ namespace
           }
         }
         __syncthreads(); // everybody has read the phase A results before phase B overwrites them
+        PH(2);
 
         // ---- phase B: SADs of the ring candidates around the best vector so far
         for (int c = warp; c < ring_n; c += nwarps)
@@ -674,6 +692,7 @@ namespace
           }
         }
         __syncthreads();
+        PH(3);
 
         // ---- fold the ring (CheckMV, with penaltyNew) in warp 0, one lane per candidate. The sequential CPU rule
         // "accept if cost < running minimum" ends at the earliest candidate with the smallest cost below the
@@ -727,6 +746,11 @@ namespace
           }
         }
         __syncthreads(); // the next block reads b.prev_*; the global vector is read by later rows / levels
+        PH(4);
+#ifdef MVC_PHASE_PROF
+        if (tid == 0)
+          atomicAdd(&g_prof[bk][5], 1ull);
+#endif
       }
     }
   }
@@ -913,6 +937,16 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
     AN_CHECK(cudaMemcpyAsync(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost, st));
     AN_CHECK(cudaStreamSynchronize(st));
     lap("analysis kernels");
+#ifdef MVC_PHASE_PROF
+    {
+      unsigned long long h[16][8];
+      cudaMemcpyFromSymbol(h, g_prof, sizeof(h));
+      for (int k = 0; k < 16; k++)
+        if (h[k][5])
+          std::fprintf(stderr, "phase cycles/block, blocks-per-row 2^%d: wait+pred %.0f  A %.0f  foldA %.0f  B %.0f  foldB %.0f  (n=%llu)\n", k,
+            (double)h[k][0] / h[k][5], (double)h[k][1] / h[k][5], (double)h[k][2] / h[k][5], (double)h[k][3] / h[k][5], (double)h[k][4] / h[k][5], h[k][5]);
+    }
+#endif
     if (bad)
       rc = MVCUDA_NEEDS_CPU;
   }
