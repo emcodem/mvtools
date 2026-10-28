@@ -380,6 +380,7 @@ MVDegrainX::MVDegrainX(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &vi_super.num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MDegrain", env_ptr);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
   int nSuperVPad = params.nVPad;

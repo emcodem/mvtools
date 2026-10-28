@@ -120,6 +120,7 @@ protected:
 
   // GPU recalculation (GpuBackend / mvtools_cuda.dll): decided at construction, falls back to the CPU per frame
   bool _gpu_ok;
+  bool _super_lite; // super clip made by MSuper(gpu=true): picture only, completed by MVSuper::CompleteLite for the CPU search
   int _gpu_slices;
   int _gpu_effective_chroma_scale;
 

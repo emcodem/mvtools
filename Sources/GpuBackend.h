@@ -7,6 +7,33 @@
 
 #include "cuda/mvcuda.h"
 
+#include <chrono>
+
+// MVTOOLS_GPU_PROFILE=1: wall time per named phase (sum, count), printed to stderr when the process ends
+void gpu_prof_add(const char *name, double ms);
+bool gpu_prof_enabled();
+
+class GpuScope
+{
+public:
+  explicit GpuScope(const char *name)
+    : _name(name), _on(gpu_prof_enabled()), _t(_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point())
+  {
+  }
+  ~GpuScope()
+  {
+    if (_on)
+      gpu_prof_add(_name, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count());
+  }
+  GpuScope(const GpuScope &) = delete;
+  GpuScope &operator=(const GpuScope &) = delete;
+
+private:
+  const char *_name;
+  bool _on;
+  std::chrono::steady_clock::time_point _t;
+};
+
 class GpuBackend
 {
 public:
@@ -29,6 +56,7 @@ public:
 
   // MVTOOLS_GPU_LOG=1 prints every GPU call / fallback to stderr
   static bool log_enabled();
+  static bool force_fallback(); // MVTOOLS_GPU_FORCE_FALLBACK: every GPU call reports "use the CPU" (test of the fallback paths)
 
   // identifier of the content of frame n of the clip c (same clip object and frame number = same pixels), for the
   // library's super frame cache

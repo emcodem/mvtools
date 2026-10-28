@@ -98,6 +98,7 @@ MVBlockFps::MVBlockFps(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MBlockFps", env);
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
   nSuperVPad = params.nVPad;

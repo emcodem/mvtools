@@ -8,9 +8,49 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+namespace
+{
+  struct ProfTable
+  {
+    std::mutex m;
+    std::map<std::string, std::pair<double, long>> t;
+    ~ProfTable()
+    {
+      if (t.empty())
+        return;
+      std::fprintf(stderr, "mvtools gpu profile (wall ms summed over all threads, calls, average):\n");
+      for (auto &e : t)
+        std::fprintf(stderr, "  %-44s %10.1f ms %7ld calls %8.3f ms\n", e.first.c_str(), e.second.first, e.second.second,
+          e.second.first / e.second.second);
+    }
+  };
+  ProfTable &prof_table()
+  {
+    static ProfTable p;
+    return p;
+  }
+}
+
+bool gpu_prof_enabled()
+{
+  static const bool on = (std::getenv("MVTOOLS_GPU_PROFILE") != nullptr);
+  return on;
+}
+
+void gpu_prof_add(const char *name, double ms)
+{
+  ProfTable &p = prof_table();
+  std::lock_guard<std::mutex> lk(p.m);
+  auto &e = p.t[name];
+  e.first += ms;
+  e.second++;
+}
 
 GpuBackend &GpuBackend::instance()
 {
@@ -21,6 +61,12 @@ GpuBackend &GpuBackend::instance()
 bool GpuBackend::log_enabled()
 {
   static const bool on = (std::getenv("MVTOOLS_GPU_LOG") != nullptr);
+  return on;
+}
+
+bool GpuBackend::force_fallback()
+{
+  static const bool on = (std::getenv("MVTOOLS_GPU_FORCE_FALLBACK") != nullptr);
   return on;
 }
 

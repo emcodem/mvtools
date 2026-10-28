@@ -30,6 +30,7 @@
 #include "MVRecalculate.h"
 #include "profile.h"
 #include "SuperParams64Bits.h"
+#include "MVSuper.h"
 #include "GoldenDump.h"
 #include "GpuBackend.h"
 #include "MVFrame.h"
@@ -56,6 +57,7 @@ MVRecalculate::MVRecalculate(
   , _nbr_srd((trad > 0) ? trad * 2 : 1)
   , _mt_flag(mt_flag)
   , _gpu_ok(false)
+  , _super_lite(false)
   , _gpu_slices(1)
   , _gpu_effective_chroma_scale(0)
 {
@@ -105,6 +107,7 @@ MVRecalculate::MVRecalculate(
   const int nSuperPel = params.nPel;
   const int nSuperModeYUV = params.nModeYUV;
   const int nSuperLevels = params.nLevels;
+  _super_lite = MV_SUPER_IS_LITE(params);
 
   if (vi.IsY())
     chroma = false; // silent fallback
@@ -489,8 +492,12 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
   SrcRefData &	srd = _srd_arr[srd_index];
 
   // get pointer to vectors
-  ::PVideoFrame	mvn = srd._clip_sptr->GetFrame(nsrc, env);
-  srd._clip_sptr->Update(mvn, env);	// force calulation of vectors
+  ::PVideoFrame	mvn;
+  {
+    GpuScope sc("recalc: vector clip GetFrame+Update");
+    mvn = srd._clip_sptr->GetFrame(nsrc, env);
+    srd._clip_sptr->Update(mvn, env);	// force calulation of vectors
+  }
 
   srd._analysis_data.nDeltaFrame = srd._clip_sptr->GetDeltaFrame();
   srd._analysis_data.isBackward = srd._clip_sptr->IsBackward();
@@ -570,12 +577,20 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
   else
   {
     //		DebugPrintf ("MVRecalculate: Get src frame %d",nsrc);
-    PVideoFrame src = child->GetFrame(nsrc, env); // v2.0
+    PVideoFrame src;
+    {
+      GpuScope sc("recalc: child GetFrame x2 (CPU MSuper)");
+      src = child->GetFrame(nsrc, env); // v2.0
+    }
     if (has_at_least_v8) env->copyFrameProps(src, dst); // frame prop copy support v8
     load_src_frame(*pSrcGOF, src, srd._analysis_data);
 
     //		DebugPrintf("MVRecalculate: Get ref frame %d", nref);
-    ::PVideoFrame	ref = child->GetFrame(nref, env); // v2.0
+    ::PVideoFrame	ref;
+    {
+      GpuScope sc("recalc: child GetFrame x2 (CPU MSuper)");
+      ref = child->GetFrame(nref, env); // v2.0
+    }
     load_src_frame(*pRefGOF, ref, srd._analysis_data);
 
     const int		fieldShift = ClipFnc::compute_fieldshift(
@@ -624,6 +639,14 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
     }
     if (!gpu_done)
     {
+    if (_super_lite)
+    {
+      GpuScope sc_c("recalc: complete lite super (CPU fallback)");
+      src = MVSuper::CompleteLite(src, child->GetVideoInfo(), _mt_flag, env);
+      load_src_frame(*pSrcGOF, src, srd._analysis_data);
+      ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt_flag, env);
+      load_src_frame(*pRefGOF, ref, srd._analysis_data);
+    }
     _vectorfields_aptr->RecalculateMVs(
       *(srd._clip_sptr), pSrcGOF, pRefGOF,
       searchType, nSearchParam, nLambda, lsad, pnew,
@@ -672,6 +695,9 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
 // GPU version of GroupOfPlanes::RecalculateMVs for the frames loaded into pSrcGOF / pRefGOF.
 bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload)
 {
+  if (GpuBackend::force_fallback())
+    return false;
+  GpuScope sc_total("recalc: gpu_recalc total");
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = srd._analysis_data;
 
@@ -743,6 +769,7 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
   int rc = -1;
   try
   {
+    GpuScope sc_call("recalc: recalc_host call");
     rc = gpu.recalc_host(&sp, &rp, src_p, src_pitch, ref_p, ref_pitch, old_vec.data(), out_vec.data());
   }
   catch (...)

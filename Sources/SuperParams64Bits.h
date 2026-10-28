@@ -31,8 +31,14 @@ public:
   unsigned char nPel;
   unsigned char nModeYUV;
   unsigned char nLevels;
-  unsigned char param; // MSuper: 0x80 | rfilter | sharp << 3 | pelclip << 5 (see MVSuper.cpp); 0 / garbage = unknown
+  unsigned char param; // MSuper: 0x80 | rfilter | sharp << 3 | pelclip << 5 | lite << 6 (see MVSuper.cpp); 0 / garbage = unknown
 };
+
+// MSuper(gpu=true) "lite" clips hold only the picture (no padding, pyramid or sub-pel planes); only MAnalyse, MRecalculate
+// and MFlowFps know how to use them
+#define MV_SUPER_IS_LITE(p) (((p).param & 0xC0) == 0xC0)
+#define MV_REJECT_LITE_SUPER(p, who, env) \
+  do { if (MV_SUPER_IS_LITE(p)) (env)->ThrowError(who ": the super clip was made with MSuper(gpu=true) (picture only, for MAnalyse / MRecalculate / MFlowFps); make a super clip without gpu=true for this filter"); } while (0)
 
 
 

@@ -637,6 +637,7 @@ MDegrainN::MDegrainN(
 // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &vi_super.num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MDegrainN", env_ptr);
   const int nHeightS = params.nHeight;
   const int nSuperHPad = params.nHPad;
   const int nSuperVPad = params.nVPad;

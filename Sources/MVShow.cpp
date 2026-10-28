@@ -62,6 +62,7 @@ mvClip(vectors, nSCD1, nSCD2, env, 1, 0)
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &vi.num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MShow", env);
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
   nSuperVPad = params.nVPad;

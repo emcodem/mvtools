@@ -138,13 +138,14 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
     env->ThrowError("MFlowFps : wrong super frame clip");
   }
 
-  if (nPel == 1)
+  const bool super_lite = MV_SUPER_IS_LITE(params); // MSuper(gpu=true): MVFinest completes it where the CPU path needs the real thing
+  if (nPel == 1 && !super_lite)
   {
     finest = super; // v2.0.9.1
   }
   else
   {
-    finest = new MVFinest(super, _isse, env);
+    finest = new MVFinest(super, _isse, env, true);
     AVSValue cache_args[1] = { finest };
     finest = env->Invoke("InternalCache", AVSValue(cache_args, 1)).AsClip(); // add cache for speed
   }
@@ -519,6 +520,9 @@ void MVFlowFps::process_slice(Slicer::TaskData &td)
 bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, IScriptEnvironment *env)
 {
   GpuBackend &gpu = GpuBackend::instance();
+  if (GpuBackend::force_fallback())
+    return false;
+  GpuScope sc_total("flow: gpu_flow total");
   const int nb = nBlkX * nBlkY;
   std::vector<int> vb(size_t(nb) * 3), vf(size_t(nb) * 3), vbb(size_t(nb) * 3), vff(size_t(nb) * 3);
   auto grab = [&](MVClip &c, std::vector<int> &v) {
@@ -530,11 +534,15 @@ bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, I
       v[3 * i + 2] = (int)m.sad;
     }
   };
-  grab(mvClipB, vb);
-  grab(mvClipF, vf);
+  {
+    GpuScope sc("flow: grab B,F vectors");
+    grab(mvClipB, vb);
+    grab(mvClipF, vf);
+  }
 
   bool ok = false;
   {
+    GpuScope sc("flow: FF/BB GetFrame+Update+grab");
     PVideoFrame mvFF = mvClipF.GetFrame(nleft, env);
     mvClipF.Update(mvFF, env); // forward vectors of the left frame
     PVideoFrame mvBB = mvClipB.GetFrame(nright, env);
@@ -552,8 +560,13 @@ bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, I
   {
     try
     {
-      PVideoFrame sl = _super_clip->GetFrame(nleft, env), sr = _super_clip->GetFrame(nright, env);
-      PVideoFrame src0 = child->GetFrame(nleft, env);
+      PVideoFrame sl, sr, src0;
+      {
+        GpuScope sc("flow: super+child GetFrame (CPU MSuper)");
+        sl = _super_clip->GetFrame(nleft, env);
+        sr = _super_clip->GetFrame(nright, env);
+        src0 = child->GetFrame(nleft, env);
+      }
       dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src0) : env->NewVideoFrame(vi);
       const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
       const void *lp[3], *rp[3];
@@ -607,6 +620,7 @@ bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, I
       fp.src_key = GpuBackend::frame_key((const void *)_super_clip.operator->(), nleft);
       fp.ref_key = GpuBackend::frame_key((const void *)_super_clip.operator->(), nright);
 
+      GpuScope sc_call("flow: flow_host call");
       rc = gpu.flow_host(&sp, &fp, lp, lpitch, rp, rpitch, vb.data(), vf.data(), vbb.data(), vff.data(), dp, dpitch, nullptr);
     }
     catch (...)
@@ -635,6 +649,7 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
     env->ThrowError("MFlowFps: error in frame %d: Previous GetFrame did not finished properly. There was a crash or filter was set to reentrant multithread mode!", n);
   }
   reentrancy_check = true;
+  GpuScope sc_getframe("flow: GetFrame total");
 
 #ifndef _M_X64
   _mm_empty();
@@ -689,13 +704,19 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
   }
 
   _RPT3(0, "Before mvClipF GetFrame frame %d, nright=%d id=%d\n", n, nright, _instance_id);
-  PVideoFrame mvF = mvClipF.GetFrame(nright, env);
-  mvClipF.Update(mvF, env);// forward from current to next
-  mvF = 0;
+  {
+    GpuScope sc("flow: vector GetFrame F (upstream analysis+recalc)");
+    PVideoFrame mvF = mvClipF.GetFrame(nright, env);
+    mvClipF.Update(mvF, env);// forward from current to next
+    mvF = 0;
+  }
   _RPT3(0, "Before mvClipB GetFrame frame %d, nleft=%d id=%d\n", n, nleft, _instance_id);
-  PVideoFrame mvB = mvClipB.GetFrame(nleft, env);
-  mvClipB.Update(mvB, env);// backward from next to current
-  mvB = 0;
+  {
+    GpuScope sc("flow: vector GetFrame B (upstream analysis+recalc)");
+    PVideoFrame mvB = mvClipB.GetFrame(nleft, env);
+    mvClipB.Update(mvB, env);// backward from next to current
+    mvB = 0;
+  }
 
   // Checked here instead of the constructor to allow using multi-vector
   // clips, because the backward flag is not reliable before the vector

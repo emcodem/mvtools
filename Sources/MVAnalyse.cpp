@@ -31,6 +31,7 @@
 #include "MVSuper.h"
 #include "profile.h"
 #include "SuperParams64Bits.h"
+#include "MVSuper.h"
 #include "GoldenDump.h"
 #include "GpuBackend.h"
 #include "MVFrame.h"
@@ -59,6 +60,7 @@ MVAnalyse::MVAnalyse(
   , _dct_pool()
   , _delta_max(0)
   , _gpu_ok(false)
+  , _super_lite(false)
   , _gpu_slices(1)
   , _gpu_effective_chroma_scale(0)
   , _gpu_super_levels(0)
@@ -108,6 +110,7 @@ MVAnalyse::MVAnalyse(
   const int		nSuperPel = params.nPel;
   const int		nSuperModeYUV = params.nModeYUV;
   const int		nSuperLevels = params.nLevels;
+  _super_lite = MV_SUPER_IS_LITE(params);
 
   if (nHeight <= 0
     || nSuperHPad < 0
@@ -626,7 +629,11 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 //		DebugPrintf ("MVAnalyse: Get src frame %d",nsrc);
     _RPT3(0, "MAnalyze GetFrame, frame_nsrc=%d nref=%d id=%d\n", nsrc, nref, _instance_id);
 
-    PVideoFrame	src = child->GetFrame(nsrc, env); // v2.0
+    PVideoFrame	src;
+    {
+      GpuScope sc("analyse: child GetFrame x2 (CPU MSuper)");
+      src = child->GetFrame(nsrc, env); // v2.0
+    }
     // if(has_at_least_v8) env->copyFrameProps(src, dst); // frame property support
     // The result clip is a special MV clip. It does not need to inherit the frame props of source
 
@@ -634,7 +641,11 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
 //		DebugPrintf ("MVAnalyse: Get ref frame %d", nref);
 //		DebugPrintf ("MVAnalyse frame %i backward=%i", nsrc, srd._analysis_data.isBackward);
-    ::PVideoFrame	ref = child->GetFrame(nref, env); // v2.0
+    ::PVideoFrame	ref;
+    {
+      GpuScope sc("analyse: child GetFrame x2 (CPU MSuper)");
+      ref = child->GetFrame(nref, env); // v2.0
+    }
     load_src_frame(*pRefGOF, ref, srd._analysis_data);
 
     const int		fieldShift = ClipFnc::compute_fieldshift(
@@ -683,6 +694,14 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
     }
     if (!gpu_done)
     {
+    if (_super_lite)
+    {
+      GpuScope sc_c("analyse: complete lite super (CPU fallback)");
+      src = MVSuper::CompleteLite(src, child->GetVideoInfo(), _mt_flag, env);
+      load_src_frame(*pSrcGOF, src, srd._analysis_data);
+      ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt_flag, env);
+      load_src_frame(*pRefGOF, ref, srd._analysis_data);
+    }
     _vectorfields_aptr->SearchMVs(
       pSrcGOF, pRefGOF,
       searchType, nSearchParam, nPelSearch, nLambda, lsad, pnew, plevel,
@@ -747,6 +766,9 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 // super frames). Returns false (nothing written that matters) when the CPU has to do it.
 bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
 {
+  if (GpuBackend::force_fallback())
+    return false;
+  GpuScope sc_total("analyse: gpu_search total");
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
@@ -805,6 +827,7 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
   int rc = -1;
   try
   {
+    GpuScope sc_call("analyse: analyse_host call");
     rc = gpu.analyse_host(&sp, &ap, src_p, src_pitch, ref_p, ref_pitch, payload, words);
   }
   catch (...)

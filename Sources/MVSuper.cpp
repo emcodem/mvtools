@@ -27,6 +27,7 @@
 #include "MVSuper.h"
 #include	"profile.h"
 #include "SuperParams64Bits.h"
+#include "GpuBackend.h"
 #include <stdint.h>
 #include "CopyCode.h"
 
@@ -43,11 +44,12 @@ int64_t ProfCumulatedResults[MOTION_PROFILE_COUNT * 2];
 MVSuper::MVSuper(
   PClip _child, int _hPad, int _vPad, int _pel, int _levels, bool _chroma,
   int _sharp, int _rfilter, PClip _pelclip, bool _isse, bool _planar,
-  bool mt_flag, IScriptEnvironment* env
+  bool mt_flag, bool gpu_flag, IScriptEnvironment* env
 )
   : GenericVideoFilter(_child)
   , pelclip(_pelclip)
   , _mt_flag(mt_flag)
+  , _lite(false)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -133,6 +135,21 @@ MVSuper::MVSuper(
   vi.width = nSuperWidth;
   vi.height = nSuperHeight;
 
+  // gpu=true: when the GPU filters downstream can do all the work from the plain picture (the same configuration check as
+  // MAnalyse / MRecalculate / MFlowFps), skip the CPU pyramid and sub-pel planes: the frame then holds only the picture
+  // with its padding rows. Any filter that needs the full thing completes it itself (CompleteLite), bit-identical.
+  if (gpu_flag)
+  {
+    _lite = GpuBackend::instance().usable() && !usePelClip && (nPel == 1 || nPel == 2) && sharp == 2 && rfilter == 4
+      && chroma && nModeYUV == YUVPLANES && vi.IsPlanar() && vi.IsYUV() && !vi.IsY() && !vi.IsYUY2()
+      && (pixelsize == 1 || pixelsize == 2) && (xRatioUV == 1 || xRatioUV == 2) && (yRatioUV == 1 || yRatioUV == 2)
+      && nHPad % xRatioUV == 0 && nVPad % yRatioUV == 0 && nHeight % yRatioUV == 0;
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MSuper gpu requested: %s\n", _lite ? "lite (picture only)" : "not supported here, normal CPU super");
+    if (_lite)
+      vi.height = nHeight + 2 * nVPad;
+  }
+
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
   {
     SrcPlanes = new YUY2Planes(nWidth, nHeight);
@@ -153,7 +170,7 @@ MVSuper::MVSuper(
   params.nLevels = nLevels;
   // spare byte: bit 7 = "set by this MSuper", bits 0-2 rfilter, bits 3-4 sharp, bit 5 pelclip used. The GPU path of
   // MAnalyse / MRecalculate rebuilds the super frame from the raw plane and only does so for matching settings.
-  params.param = (unsigned char)(0x80 | (rfilter & 7) | ((sharp & 3) << 3) | (usePelClip ? 0x20 : 0));
+  params.param = (unsigned char)(0x80 | (rfilter & 7) | ((sharp & 3) << 3) | (usePelClip ? 0x20 : 0) | (_lite ? 0x40 : 0));
 
 
   // pack parameters to fake audio properties
@@ -199,7 +216,27 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
   
     //DebugPrintf("MSuper: Get src frame %d clip %d",n,child);
 
-  PVideoFrame src = child->GetFrame(n, env);
+  PVideoFrame src;
+  {
+    GpuScope sc("msuper: child GetFrame (decode+RemoveGrain)");
+    src = child->GetFrame(n, env);
+  }
+  if (_lite)
+  {
+    GpuScope sc_lite("msuper: lite copy");
+    PVideoFrame lite = has_at_least_v8 ? env->NewVideoFrameP(vi, &src) : env->NewVideoFrame(vi);
+    const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+    for (int p = 0; p < 3; ++p)
+    {
+      const int plane = planes_l[p];
+      const int hp = p == 0 ? nHPad : nHPad / xRatioUV;
+      const int vp = p == 0 ? nVPad : nVPad / yRatioUV;
+      BYTE *d = lite->GetWritePtr(plane) + size_t(vp) * lite->GetPitch(plane) + size_t(hp) * pixelsize;
+      env->BitBlt(d, lite->GetPitch(plane), src->GetReadPtr(plane), src->GetPitch(plane), src->GetRowSize(plane), src->GetHeight(plane));
+    }
+    return lite;
+  }
+  GpuScope sc_build("msuper: build pyramid+subpel (CPU)");
   PVideoFrame srcPel;
   if (usePelClip)
     srcPel = pelclip->GetFrame(n, env);
@@ -345,5 +382,60 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
 
   PROFILE_CUMULATE();
 
+  return dst;
+}
+
+
+// Rebuilds, from a lite super frame (picture inside its padding rows), the frame the normal MSuper makes. Same steps and
+// same GroupOfFrames code as GetFrame / the constructor, so the result is bit-identical.
+PVideoFrame MVSuper::CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env)
+{
+  SuperParams64Bits params;
+  memcpy(&params, &lite_vi.num_audio_samples, 8);
+  const int rfilter = params.param & 7;
+  const int sharp = (params.param >> 3) & 3;
+  const int hpad = params.nHPad, vpad = params.nVPad;
+
+  bool v8 = true;
+  try { env->CheckVersion(8); }
+  catch (const AvisynthError&) { v8 = false; }
+
+  const int xr = 1 << lite_vi.GetPlaneWidthSubsampling(PLANAR_U);
+  const int yr = 1 << lite_vi.GetPlaneHeightSubsampling(PLANAR_U);
+  const int pixelsize = lite_vi.ComponentSize();
+  const int bits = lite_vi.BitsPerComponent();
+  const int width = lite_vi.width - 2 * hpad;
+  const int super_width = lite_vi.width;
+
+  VideoInfo vi = lite_vi;
+  int super_height = PlaneSuperOffset(false, params.nHeight, params.nLevels, params.nPel, vpad, super_width * pixelsize, yr) / (super_width * pixelsize);
+  if (yr == 2 && (super_height & 1)) super_height++;
+  vi.height = super_height;
+  PVideoFrame dst = v8 ? env->NewVideoFrameP(vi, &lite) : env->NewVideoFrame(vi);
+
+  MVGroupOfFrames gof(params.nLevels, width, params.nHeight, params.nPel, hpad, vpad, YUVPLANES, env->GetCPUFlags(), xr, yr, pixelsize, bits, mt_flag);
+  gof.set_interp((MVPlaneSet)params.nModeYUV, rfilter, sharp);
+
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  BYTE *pDst[3];
+  int dpitch[3];
+  const BYTE *pSrc[3];
+  int spitch[3];
+  for (int p = 0; p < 3; ++p)
+  {
+    pDst[p] = dst->GetWritePtr(planes_l[p]);
+    dpitch[p] = dst->GetPitch(planes_l[p]);
+    spitch[p] = lite->GetPitch(planes_l[p]);
+    const int hp = p == 0 ? hpad : hpad / xr;
+    const int vp = p == 0 ? vpad : vpad / yr;
+    pSrc[p] = lite->GetReadPtr(planes_l[p]) + size_t(vp) * spitch[p] + size_t(hp) * pixelsize;
+  }
+  gof.Update(YUVPLANES, pDst[0], dpitch[0], pDst[1], dpitch[1], pDst[2], dpitch[2]);
+  const MVPlaneSet planes[3] = { YPLANE, UPLANE, VPLANE };
+  for (int p = 0; p < 3; ++p)
+    gof.SetPlane(pSrc[p], spitch[p], planes[p]);
+  gof.Reduce((MVPlaneSet)params.nModeYUV);
+  gof.Pad((MVPlaneSet)params.nModeYUV);
+  gof.Refine((MVPlaneSet)params.nModeYUV);
   return dst;
 }

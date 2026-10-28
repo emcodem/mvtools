@@ -49,6 +49,7 @@ MVFlowBlur::MVFlowBlur(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int 
 
   SuperParams64Bits params;
   memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MFlowBlur", env);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
   //int nSuperVPad = params.nVPad;

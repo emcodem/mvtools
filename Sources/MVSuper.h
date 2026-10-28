@@ -22,6 +22,7 @@
 #define __MV_SUPER__
 
 #include "commonfunctions.h"
+#include "MVFrame.h"
 #include "yuy2planes.h"
 #include	"avisynth.h"
 #include "stdint.h"
@@ -127,15 +128,20 @@ protected:
   bool           isPelClipPadded;
 
   bool           _mt_flag; // PF maybe 2.6.0.5
+  bool           _lite;    // MSuper(gpu=true): only the picture (level 0, no padding / pyramid / sub-pel planes)
 
 public:
 
   MVSuper(
     PClip _child, int _hpad, int _vpad, int pel, int _levels, bool _chroma,
     int _sharp, int _rfilter, PClip _pelclip, bool _isse, bool _planar,
-    bool mt_flag, IScriptEnvironment* env
+    bool mt_flag, bool gpu_flag, IScriptEnvironment* env
   );
   ~MVSuper();
+
+  // Turns a frame of a "lite" super clip (MSuper(gpu=true): picture plus padding rows only) into the frame the normal
+  // MSuper would have made, bit for bit. lite_vi is the video info of the lite super clip.
+  static PVideoFrame CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env);
 
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

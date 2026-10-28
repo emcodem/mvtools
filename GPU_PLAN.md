@@ -184,7 +184,7 @@ All stages were also tested in 8-bit, 4:2:0 (10 and 8 bit) and 4:4:4: `python -I
 analysis single/24 slices, recalc single/24 slices, flow 3 frames): 85 of 85 exact. Plugin end to end (60 frames, `Prefetch(3)`, GPU analysis + recalc + flow vs CPU) identical
 for 4:2:0, 4:4:4, 8-bit 4:2:0.
 
-### Measurements, all stages on the GPU (this PC, RTX 5090, seg1 UHD, 240 frames, `Prefetch(3)`, final frames identical to the CPU)
+### Measurements, all stages on the GPU (this PC, RTX 5090, seg1 UHD, `Prefetch(3)`, final frames identical to the CPU; CORRECTION: the clip has only 149 source frames, so these runs render about 111-119 output frames, not 240: roughly 138 ms/frame CPU vs 84 ms/frame GPU)
 
 | | CPU | GPU analysis only | **GPU analysis + MFlowFps** |
 |---|---|---|---|
@@ -195,7 +195,17 @@ What got the last 2 s: the CUDA context in blocking-sync mode (`MVCUDA_SPIN=1` r
 Per output frame the GPU side costs about 83 ms of latency per prefetch thread (analysis 2 x 27 ms, recalc 2 x 11 ms mostly frame uploads, flow 6 ms); with three
 threads that is the wall time. More `Prefetch` threads make it worse (the cloned filter chains duplicate work and CPU time grows: 4 threads 11.0 s, 5 threads 11.5 s, 8 threads 20 s).
 What is still on the CPU (40 CPU-s): decode, `RemoveGrain`, the two `MSuper` (about 12-18 CPU-s; the GPU rebuilds the pyramid anyway), vector clip updates and the
-host-side vector copies. A "lite" `MSuper` that skips the CPU pyramid is unsafe without a lazy CPU rebuild in every consumer (MAnalyse / MRecalculate / MFlowFps CPU fallback paths, MDegrain...), so it was not done.
+host-side vector copies. The profile showed the CPU pyramid + sub-pel build was 36% of the thread time, which led to the lite MSuper below.
+
+### Lite MSuper (`MSuper(gpu=true)`, 2026-10-28)
+
+When the GPU filters downstream can do everything from the plain picture (pel 1/2, sharp 2, rfilter 4, planar YUV with chroma, 8..16 bit, no pelclip, GPU backend usable) MSuper only copies the picture
+into a frame of height `nHeight + 2*vpad` and sets bit 6 of the spare byte in the pseudo-audio params (`MV_SUPER_IS_LITE`). MAnalyse / MRecalculate / MFlowFps use the picture on the GPU; whenever
+they fall back to the CPU (bad-vector UMH search, field shift, unsupported option, no GPU) they rebuild the full frame with `MVSuper::CompleteLite` (same GroupOfFrames code, bit-identical).
+`MVFinest` completes lite frames for pel 2 (and copies the rows for pel 1) when called from MFlowFps; MCompensate, MDegrain*, MBlockFps, MFlow, MFlowBlur, MFlowInter, MShow throw a clear error on a lite super.
+`MVTOOLS_GPU_FORCE_FALLBACK=1` forces every GPU call to report "use the CPU" (tests the completion paths).
+Checked: final frames identical to the CPU (10-bit 4:2:2 and 8-bit, GPU and forced fallback) and through `UConvertClip` with `uc_frc_gpu` true/false. All-GPU run, 10-bit: 8.6 s vs 10.2-11.4 s without lite on the same day
+(8-bit: 7.3 s vs 8.1 s); the machine was slower than at the earlier 9.3 s measurement.
 
 ### Portability
 
@@ -205,5 +215,5 @@ The build targets compute capability 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX (RTX 
 ## Next step
 
 1. M6 measurements still open: R9 (4 concurrent jobs, GPU contention, memory: each prefetch thread keeps frames in the 24-entry device cache, about 150 MB per UHD 10-bit super frame), R2-R8 matrix for the GPU variant, R10 (side-by-side by you), R12 soak.
-2. Speed ideas left (GPU_PLAN "Speed work done"): the analysis kernel (2 x 23 ms per frame), recalc frame uploads (pageable copies), packed SAD, sharing results between cloned prefetch chains, lite `MSuper`.
+2. Speed ideas left (GPU_PLAN "Speed work done"): the analysis kernel (2 x 23 ms per frame), recalc frame uploads (pageable copies), packed SAD, sharing results between cloned prefetch chains, (lite MSuper is done).
 3. Deployment: `mvtools_cuda.dll` next to `mvtools2.dll`, `global uc_frc_gpu = true` (now also switches `MFlowFps`).

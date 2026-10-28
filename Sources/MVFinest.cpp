@@ -21,6 +21,7 @@
 #include "CopyCode.h"
 #include "MaskFun.h"
 #include "MVFinest.h"
+#include "MVSuper.h"
 #include "MVFrame.h"
 #include "MVGroupOfFrames.h"
 #include "MVPlane.h"
@@ -28,8 +29,8 @@
 #include "SuperParams64Bits.h"
 
 
-MVFinest::MVFinest(PClip _super, bool _isse, IScriptEnvironment* env) :
-GenericVideoFilter(_super)
+MVFinest::MVFinest(PClip _super, bool _isse, IScriptEnvironment* env, bool allow_lite) :
+GenericVideoFilter(_super), _lite(false), _mt(true)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -40,6 +41,9 @@ GenericVideoFilter(_super)
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &child->GetVideoInfo().num_audio_samples, 8);
+  _lite = MV_SUPER_IS_LITE(params);
+  if (_lite && !allow_lite)
+    env->ThrowError("MFinest: the super clip was made with MSuper(gpu=true) (picture only, for MAnalyse / MRecalculate / MFlowFps); make a super clip without gpu=true for this filter");
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
   nSuperVPad = params.nVPad;
@@ -85,6 +89,9 @@ MVFinest::~MVFinest()
 PVideoFrame __stdcall MVFinest::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame	ref	= child->GetFrame(n, env);
+  // a lite super frame (MSuper gpu=true) only holds the picture: nPel 1 just copies its top rows, anything else needs the real thing
+  if (_lite && nPel != 1)
+    ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt, env);
    BYTE *pDst[3];
   const BYTE *pRef[3];
   int nDstPitches[3], nRefPitches[3];

@@ -34,7 +34,9 @@ private:
 
 
 public:
-  MVFinest(PClip _super, bool isse, IScriptEnvironment* env);
+  bool _lite;
+  bool _mt;
+  MVFinest(PClip _super, bool isse, IScriptEnvironment* env, bool allow_lite = false);
   ~MVFinest();
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

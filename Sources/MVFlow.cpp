@@ -44,6 +44,7 @@ MVFlow::MVFlow(PClip _child, PClip super, PClip _mvec, int _time256, int _mode, 
 
   SuperParams64Bits params;
   memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  MV_REJECT_LITE_SUPER(params, "MFlow", env);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
   //int nSuperVPad = params.nVPad;
