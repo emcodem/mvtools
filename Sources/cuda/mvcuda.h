@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 3
+#define MVCUDA_API_VERSION 4
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -123,6 +123,37 @@ typedef struct
 // its capacity. Returns like mvcuda_super_host, or MVCUDA_NEEDS_CPU.
 MVCUDA_API int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words);
+
+// ---- GPU MFlowFps (M7), see mvcuda_flow.cu -----------------------------------------------------------------------
+
+#define MVCUDA_FLOW_DEBUG_SLOTS 40
+
+typedef struct
+{
+  int width, height;                       // frame size (luma)
+  int x_ratio_uv, y_ratio_uv;              // chroma subsampling (1 or 2)
+  int chroma_distinct;                     // 1: chroma planes have their own vector/mask upsizing (4:2:2, 4:2:0), 0: 4:4:4
+  int n_blk_x, n_blk_y;                    // vector blocks
+  int n_blk_xp, n_blk_yp;                  // blocks padded to cover the frame
+  int blk_step_x, blk_step_y;              // block size - overlap
+  int width_p, height_p;                   // luma size of the padded block grid (n_blk_xp * step + overlap)
+  int width_p_uv, height_p_uv;             // same for chroma
+  int time256;                             // interpolation position, 1..255
+  double occ_norm;                         // 10 / ml / pel as MFlowFps computes it
+  int mode;                                // 2 (extra frames), the only one implemented
+  unsigned long long src_key, ref_key;     // frame cache keys of the left / right frame (0 = uncached)
+} MvCudaFlowParams;
+
+// Renders one interpolated frame (MFlowFps mask=2 path) on the GPU. The super frames (level 0, chroma, pel 1 or 2) of the
+// left and the right frame come from the frame cache or are built from the raw planes. vec_b / vec_f / vec_bb / vec_ff
+// are (vx, vy, sad) int triples per block: backward vectors of the left frame, forward vectors of the right frame
+// (MFlowFps names: mvClipB at nleft, mvClipF at nright), forward vectors of the left frame, backward vectors of the right
+// frame. dst[plane] / dst_pitch_bytes[plane]: host frame planes to fill. dbg: NULL or MVCUDA_FLOW_DEBUG_SLOTS host
+// pointers (entries may be NULL) that receive intermediate arrays for the tests (see mvcuda_flow.cu).
+MVCUDA_API int mvcuda_flow_host(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, const void *const src_raw[3],
+  const int src_pitch_bytes[3], const void *const ref_raw[3], const int ref_pitch_bytes[3], const int *vec_b,
+  const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3], const int dst_pitch_bytes[3],
+  void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS]);
 
 // drops all cached super frames and pooled device memory (call when the last user of the library goes away)
 MVCUDA_API void mvcuda_cache_clear();

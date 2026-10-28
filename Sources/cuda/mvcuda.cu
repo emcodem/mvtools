@@ -183,3 +183,22 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
     ? mvcuda_analyse_host_8(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words)
     : mvcuda_analyse_host_16(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words);
 }
+
+extern "C" int mvcuda_flow_host_8(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], const int *, const int *, const int *, const int *, void *const[3], const int[3],
+  void *const[]);
+extern "C" int mvcuda_flow_host_16(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
+  const void *const[3], const int[3], const int *, const int *, const int *, const int *, void *const[3], const int[3],
+  void *const[]);
+
+extern "C" int mvcuda_flow_host(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, const void *const src_raw[3],
+  const int src_pitch_bytes[3], const void *const ref_raw[3], const int ref_pitch_bytes[3], const int *vec_b,
+  const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3], const int dst_pitch_bytes[3],
+  void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS])
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_flow_host_8(sp, fp, src_raw, src_pitch_bytes, ref_raw, ref_pitch_bytes, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes, dbg)
+    : mvcuda_flow_host_16(sp, fp, src_raw, src_pitch_bytes, ref_raw, ref_pitch_bytes, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes, dbg);
+}

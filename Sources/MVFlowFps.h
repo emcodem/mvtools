@@ -132,6 +132,11 @@ private:
 
   bool _mt_flag;
 
+  // GPU rendering (GpuBackend / mvtools_cuda.dll) of the mask=2 path: decided at construction, CPU fallback per frame
+  bool _gpu_ok;
+  PClip _super_clip;
+  bool gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, IScriptEnvironment *env);
+
   // Per-frame state read by process_slice()
   BYTE *_cpPDst[3];
   const BYTE *_cpPRef[3];
@@ -144,7 +149,7 @@ private:
 
 public:
   MVFlowFps(PClip _child, PClip _super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
-    bool _blend, sad_t nSCD1, int nSCD2, bool isse, bool _planar, int _optDebug, bool mt_flag, IScriptEnvironment* env);
+    bool _blend, sad_t nSCD1, int nSCD2, bool isse, bool _planar, int _optDebug, bool mt_flag, bool gpu_flag, IScriptEnvironment* env);
   ~MVFlowFps();
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

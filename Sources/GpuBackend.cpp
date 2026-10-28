@@ -61,6 +61,7 @@ void GpuBackend::remove_user()
 GpuBackend::GpuBackend()
   : analyse_host(nullptr)
   , recalc_host(nullptr)
+  , flow_host(nullptr)
   , cache_clear(nullptr)
   , _usable(false)
   , _users(0)
@@ -100,8 +101,9 @@ GpuBackend::GpuBackend()
   auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
   analyse_host = reinterpret_cast<decltype(analyse_host)>(GetProcAddress(lib, "mvcuda_analyse_host"));
   recalc_host = reinterpret_cast<decltype(recalc_host)>(GetProcAddress(lib, "mvcuda_recalc_host"));
+  flow_host = reinterpret_cast<decltype(flow_host)>(GetProcAddress(lib, "mvcuda_flow_host"));
   cache_clear = reinterpret_cast<decltype(cache_clear)>(GetProcAddress(lib, "mvcuda_cache_clear"));
-  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr || cache_clear == nullptr
+  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr || flow_host == nullptr || cache_clear == nullptr
     || version() != MVCUDA_API_VERSION || count() <= 0)
   {
     if (log_enabled())

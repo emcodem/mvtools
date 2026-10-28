@@ -18,24 +18,45 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #include <cstdio>
+#include <cstring>
 #include "ClipFnc.h"
 #include "commonfunctions.h"
 #include "MaskFun.h"
 #include "MVFinest.h"
 #include "MVFlowFps.h"
 #include "profile.h"
+#include "GoldenDump.h"
+#include <vector>
+
+#ifdef MV_GOLDEN_DUMP
+// golden-data dump of one vector field: (vx, vy, sad) int triples per block
+static void golden_dump_vectors(const char *name, MVClip &clip, int blk_x, int blk_y)
+{
+  std::vector<int> v(size_t(blk_x) * blk_y * 3);
+  for (int i = 0; i < blk_x * blk_y; i++)
+  {
+    const VECTOR m = clip.GetBlock(0, i).GetMV();
+    v[3 * i] = m.x;
+    v[3 * i + 1] = m.y;
+    v[3 * i + 2] = (int)m.sad;
+  }
+  golden::write_bin(name, v.data(), v.size() * sizeof(int));
+}
+#endif
 #include "SuperParams64Bits.h"
 #include "info.h"
+#include "GpuBackend.h"
 
 
 MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
-  bool _blend, sad_t nSCD1, int nSCD2, bool _isse, bool _planar, int _optDebug, bool mt_flag, IScriptEnvironment* env) :
+  bool _blend, sad_t nSCD1, int nSCD2, bool _isse, bool _planar, int _optDebug, bool mt_flag, bool gpu_flag, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
   MVFilter(_mvfw, "MFlowFps", env, 1, 0),
   mvClipB(_mvbw, nSCD1, nSCD2, env, 1, 0),
   mvClipF(_mvfw, nSCD1, nSCD2, env, 1, 0),
   optDebug(_optDebug),
-  _mt_flag(mt_flag)
+  _mt_flag(mt_flag),
+  _gpu_ok(false)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -180,6 +201,22 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
   isRGB = vi.IsPlanarRGB() || vi.IsPlanarRGBA(); // planar only
   needDistinctChroma = !is444 && !isGrey && !isRGB;
 
+  // ---- GPU rendering: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
+  if (gpu_flag)
+  {
+    const bool sharp_ok = (params.param & 0x80) && ((params.param >> 3) & 3) == 2 && !(params.param & 0x20);
+    _gpu_ok = GpuBackend::instance().usable() && sharp_ok && (pixelsize_super == 1 || pixelsize_super == 2)
+      && vi.IsPlanar() && !vi.IsYUY2() && !isGrey && !isRGB && planecount == 3 && maskmode == 2 && (nPel == 1 || nPel == 2)
+      && (xRatioUVs[1] == 1 || xRatioUVs[1] == 2) && (yRatioUVs[1] == 1 || yRatioUVs[1] == 2);
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MFlowFps gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
+    if (_gpu_ok)
+    {
+      _super_clip = super;
+      GpuBackend::instance().add_user();
+    }
+  }
+
   // 2*: sizeof(short)
   VXFullYB = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
   VYFullYB = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
@@ -267,6 +304,8 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
 
 MVFlowFps::~MVFlowFps()
 {
+  if (_gpu_ok)
+    GpuBackend::instance().remove_user();
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
   {
     delete DstPlanes;
@@ -474,6 +513,122 @@ void MVFlowFps::process_slice(Slicer::TaskData &td)
 }
 
 //-------------------------------------------------------------------------
+// GPU version of the mask=2 path. The vector clips are in the state "B at nleft, F at nright" when this is called; it
+// reads the four vector fields, renders the frame on the GPU and returns true. On any problem it restores that state
+// and returns false, and the CPU code renders the frame.
+bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, IScriptEnvironment *env)
+{
+  GpuBackend &gpu = GpuBackend::instance();
+  const int nb = nBlkX * nBlkY;
+  std::vector<int> vb(size_t(nb) * 3), vf(size_t(nb) * 3), vbb(size_t(nb) * 3), vff(size_t(nb) * 3);
+  auto grab = [&](MVClip &c, std::vector<int> &v) {
+    for (int i = 0; i < nb; i++)
+    {
+      const VECTOR m = c.GetBlock(0, i).GetMV();
+      v[3 * i] = m.x;
+      v[3 * i + 1] = m.y;
+      v[3 * i + 2] = (int)m.sad;
+    }
+  };
+  grab(mvClipB, vb);
+  grab(mvClipF, vf);
+
+  bool ok = false;
+  {
+    PVideoFrame mvFF = mvClipF.GetFrame(nleft, env);
+    mvClipF.Update(mvFF, env); // forward vectors of the left frame
+    PVideoFrame mvBB = mvClipB.GetFrame(nright, env);
+    mvClipB.Update(mvBB, env); // backward vectors of the right frame
+    if (mvClipB.IsUsable() && mvClipF.IsUsable())
+    {
+      grab(mvClipF, vff);
+      grab(mvClipB, vbb);
+      ok = true;
+    }
+  }
+
+  int rc = -1;
+  if (ok)
+  {
+    try
+    {
+      PVideoFrame sl = _super_clip->GetFrame(nleft, env), sr = _super_clip->GetFrame(nright, env);
+      PVideoFrame src0 = child->GetFrame(nleft, env);
+      dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src0) : env->NewVideoFrame(vi);
+      const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+      const void *lp[3], *rp[3];
+      int lpitch[3], rpitch[3];
+      void *dp[3];
+      int dpitch[3];
+      for (int p = 0; p < 3; p++)
+      {
+        const int hp = nHPadding / xRatioUVs[p], vp = nVPadding / yRatioUVs[p];
+        lpitch[p] = sl->GetPitch(planes_y[p]);
+        rpitch[p] = sr->GetPitch(planes_y[p]);
+        lp[p] = sl->GetReadPtr(planes_y[p]) + size_t(vp) * lpitch[p] + size_t(hp) * pixelsize_super;
+        rp[p] = sr->GetReadPtr(planes_y[p]) + size_t(vp) * rpitch[p] + size_t(hp) * pixelsize_super;
+        dp[p] = dst->GetWritePtr(planes_y[p]);
+        dpitch[p] = dst->GetPitch(planes_y[p]);
+      }
+
+      MvCudaSuperParams sp = {};
+      sp.width = nWidth;
+      sp.height = nHeight;
+      sp.x_ratio_uv = xRatioUVs[1];
+      sp.y_ratio_uv = yRatioUVs[1];
+      sp.hpad = nHPadding;
+      sp.vpad = nVPadding;
+      sp.pel = nPel;
+      sp.levels = 1;
+      sp.bits_per_pixel = bits_per_pixel_super;
+      sp.chroma = 1;
+      sp.rfilter = 4; // irrelevant for level 0
+      sp.sharp = 2;
+
+      MvCudaFlowParams fp = {};
+      fp.width = nWidth;
+      fp.height = nHeight;
+      fp.x_ratio_uv = xRatioUVs[1];
+      fp.y_ratio_uv = yRatioUVs[1];
+      fp.chroma_distinct = needDistinctChroma ? 1 : 0;
+      fp.n_blk_x = nBlkX;
+      fp.n_blk_y = nBlkY;
+      fp.n_blk_xp = nBlkXP;
+      fp.n_blk_yp = nBlkYP;
+      fp.blk_step_x = nBlkSizeX - nOverlapX;
+      fp.blk_step_y = nBlkSizeY - nOverlapY;
+      fp.width_p = nWidthP;
+      fp.height_p = nHeightP;
+      fp.width_p_uv = nWidthPUV;
+      fp.height_p_uv = nHeightPUV;
+      fp.time256 = time256;
+      fp.occ_norm = 10 / ml / nPel;
+      fp.mode = 2;
+      fp.src_key = GpuBackend::frame_key((const void *)_super_clip.operator->(), nleft);
+      fp.ref_key = GpuBackend::frame_key((const void *)_super_clip.operator->(), nright);
+
+      rc = gpu.flow_host(&sp, &fp, lp, lpitch, rp, rpitch, vb.data(), vf.data(), vbb.data(), vff.data(), dp, dpitch, nullptr);
+    }
+    catch (...)
+    {
+      rc = -2;
+    }
+  }
+  if (GpuBackend::log_enabled())
+    std::fprintf(stderr, "MFlowFps gpu frames %d/%d t=%d rc=%d%s\n", nleft, nright, time256, ok ? rc : -9, (ok && rc == 0) ? "" : " -> CPU");
+  if (ok && rc == 0)
+    return true;
+
+  // restore the state the CPU path starts from: B at nleft, F at nright
+  PVideoFrame mvF = mvClipF.GetFrame(nright, env);
+  mvClipF.Update(mvF, env);
+  PVideoFrame mvB = mvClipB.GetFrame(nleft, env);
+  mvClipB.Update(mvB, env);
+  dst = PVideoFrame();
+  return false;
+}
+
+//-------------------------------------------------------------------------
 PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
 {
   if (reentrancy_check) {
@@ -550,6 +705,16 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
   if (mvClipF.IsBackward())
     env->ThrowError("MFlowFps: wrong forward vectors");
 
+  if (_gpu_ok && mvClipB.IsUsable() && mvClipF.IsUsable())
+  {
+    PVideoFrame gdst;
+    if (gpu_flow(nleft, nright, time256, gdst, env))
+    {
+      reentrancy_check = false;
+      return gdst;
+    }
+  }
+
   PVideoFrame	src = finest->GetFrame(nleft, env); // move here - v2.0
   PVideoFrame ref = finest->GetFrame(nright, env);//  right frame for  compensation
 
@@ -560,6 +725,18 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
 
   if (isUsableB && isUsableF)
   {
+#ifdef MV_GOLDEN_DUMP
+    const bool golden_on = golden::begin("MFlowFps", n, false);
+    if (golden_on)
+    {
+      golden::logf("call n %d nleft %d nright %d time256 %d off %d fa %lld fb %lld", n, nleft, nright, time256, off, (long long)fa, (long long)fb);
+      golden::logf("geometry width %d height %d blkX %d blkY %d blkXP %d blkYP %d blkSizeX %d blkSizeY %d overlapX %d overlapY %d pel %d", nWidth, nHeight, nBlkX, nBlkY, nBlkXP, nBlkYP, nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY, nPel);
+      golden::logf("geometry2 widthP %d heightP %d widthPUV %d heightPUV %d widthUV %d heightUV %d hpad %d vpad %d vpitchY %d vpitchUV %d xratioUV %d yratioUV %d distinctChroma %d pixelsize %d bits %d", nWidthP, nHeightP, nWidthPUV, nHeightPUV, nWidthUV, nHeightUV, nHPadding, nVPadding, VPitchY, VPitchUV, xRatioUVs[1], yRatioUVs[1], needDistinctChroma ? 1 : 0, pixelsize_super, bits_per_pixel_super);
+      golden::logf("params maskmode %d ml %.17g blend %d mt %d", maskmode, ml, blend ? 1 : 0, _mt_flag ? 1 : 0);
+      golden_dump_vectors("vec_B.bin", mvClipB, nBlkX, nBlkY);
+      golden_dump_vectors("vec_F.bin", mvClipF, nBlkX, nBlkY);
+    }
+#endif
 
     PROFILE_START(MOTION_PROFILE_YUY2CONVERT);
 
@@ -685,6 +862,13 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
     mvClipB.Update(mvBB, env);// backward from next next to next
     mvBB = 0;
 
+#ifdef MV_GOLDEN_DUMP
+    if (golden_on)
+    {
+      golden_dump_vectors("vec_FF.bin", mvClipF, nBlkX, nBlkY); // forward vectors of the left frame
+      golden_dump_vectors("vec_BB.bin", mvClipB, nBlkX, nBlkY); // backward vectors of the right frame
+    }
+#endif
     bool isUsableB = mvClipB.IsUsable();
     bool isUsableF = mvClipF.IsUsable();
     _RPT5(0, "part#2 IsUsableB=%d IsUsableF=%d frame=%d,nleft=%d,nright=%d\n", isUsableB ? 1 : 0, isUsableF ? 1 : 0, n, nleft, nright);
@@ -737,6 +921,94 @@ PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
       slicer.wait();
     }
     PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
+
+#ifdef MV_GOLDEN_DUMP
+    if (golden_on)
+    {
+      golden::logf("interMode %d usableB %d usableF %d", interMode, isUsableB ? 1 : 0, isUsableF ? 1 : 0);
+      // small arrays (pitch nBlkXP) and full arrays (pitch VPitchY / VPitchUV, nHeightP rows); the full arrays are
+      // the upsized vectors / masks that the interpolation reads
+      golden::write_bin("small_vxB.bin", VXSmallYB, 2 * nBlkXP * nBlkYP);
+      golden::write_bin("small_vyB.bin", VYSmallYB, 2 * nBlkXP * nBlkYP);
+      golden::write_bin("small_vxF.bin", VXSmallYF, 2 * nBlkXP * nBlkYP);
+      golden::write_bin("small_vyF.bin", VYSmallYF, 2 * nBlkXP * nBlkYP);
+      golden::write_bin("small_maskB.bin", MaskSmallB, nBlkXP * nBlkYP);
+      golden::write_bin("small_maskF.bin", MaskSmallF, nBlkXP * nBlkYP);
+      if (interMode == 2)
+      {
+        golden::write_bin("small_vxBB.bin", VXSmallYBB, 2 * nBlkXP * nBlkYP);
+        golden::write_bin("small_vyBB.bin", VYSmallYBB, 2 * nBlkXP * nBlkYP);
+        golden::write_bin("small_vxFF.bin", VXSmallYFF, 2 * nBlkXP * nBlkYP);
+        golden::write_bin("small_vyFF.bin", VYSmallYFF, 2 * nBlkXP * nBlkYP);
+      }
+      const size_t fy = size_t(VPitchY) * nHeightP;
+      golden::write_bin("full_vxB_Y.bin", VXFullYB, 2 * fy);
+      golden::write_bin("full_vyB_Y.bin", VYFullYB, 2 * fy);
+      golden::write_bin("full_vxF_Y.bin", VXFullYF, 2 * fy);
+      golden::write_bin("full_vyF_Y.bin", VYFullYF, 2 * fy);
+      golden::write_bin("full_maskB_Y.bin", MaskFullYB, fy);
+      golden::write_bin("full_maskF_Y.bin", MaskFullYF, fy);
+      if (interMode == 2)
+      {
+        golden::write_bin("full_vxBB_Y.bin", VXFullYBB, 2 * fy);
+        golden::write_bin("full_vyBB_Y.bin", VYFullYBB, 2 * fy);
+        golden::write_bin("full_vxFF_Y.bin", VXFullYFF, 2 * fy);
+        golden::write_bin("full_vyFF_Y.bin", VYFullYFF, 2 * fy);
+      }
+      if (needDistinctChroma)
+      {
+        const size_t fuv = size_t(VPitchUV) * nHeightPUV;
+        golden::write_bin("full_vxB_UV.bin", VXFullUVB, 2 * fuv);
+        golden::write_bin("full_vyB_UV.bin", VYFullUVB, 2 * fuv);
+        golden::write_bin("full_vxF_UV.bin", VXFullUVF, 2 * fuv);
+        golden::write_bin("full_vyF_UV.bin", VYFullUVF, 2 * fuv);
+        golden::write_bin("full_maskB_UV.bin", MaskFullUVB, fuv);
+        golden::write_bin("full_maskF_UV.bin", MaskFullUVF, fuv);
+        if (interMode == 2)
+        {
+          golden::write_bin("full_vxBB_UV.bin", VXFullUVBB, 2 * fuv);
+          golden::write_bin("full_vyBB_UV.bin", VYFullUVBB, 2 * fuv);
+          golden::write_bin("full_vxFF_UV.bin", VXFullUVFF, 2 * fuv);
+          golden::write_bin("full_vyFF_UV.bin", VYFullUVFF, 2 * fuv);
+        }
+      }
+      // the rendered frame, planes without the pitch gap
+      for (int p = 0; p < planecount; p++)
+      {
+        const bool uv = (p > 0 && needDistinctChroma);
+        const int w = uv ? nWidthUV : nWidth, h = uv ? nHeightUV : nHeight;
+        std::vector<unsigned char> plane(size_t(w) * h * pixelsize_super);
+        for (int y = 0; y < h; y++)
+          std::memcpy(&plane[size_t(y) * w * pixelsize_super], pDst[p] + size_t(y) * nDstPitches[p], size_t(w) * pixelsize_super);
+        char name[32];
+        std::snprintf(name, sizeof(name), "out_plane%d.bin", p);
+        golden::write_bin(name, plane.data(), plane.size());
+      }
+      // the raw source frames the interpolation starts from (the super clip's level 0 is a copy of them)
+      {
+        PVideoFrame fl = child->GetFrame(nleft, env), fr = child->GetFrame(nright, env);
+        const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+        for (int side = 0; side < 2; side++)
+        {
+          PVideoFrame &f = side == 0 ? fl : fr;
+          for (int p = 0; p < planecount; p++)
+          {
+            const bool uv = (p > 0 && needDistinctChroma);
+            const int w = uv ? nWidthUV : nWidth, h = uv ? nHeightUV : nHeight;
+            const unsigned char *rp = f->GetReadPtr(planes_y[p]);
+            const int pitch = f->GetPitch(planes_y[p]);
+            std::vector<unsigned char> plane(size_t(w) * h * pixelsize_super);
+            for (int y = 0; y < h; y++)
+              std::memcpy(&plane[size_t(y) * w * pixelsize_super], rp + size_t(y) * pitch, size_t(w) * pixelsize_super);
+            char name[32];
+            std::snprintf(name, sizeof(name), "%s_raw_plane%d.bin", side == 0 ? "left" : "right", p);
+            golden::write_bin(name, plane.data(), plane.size());
+          }
+        }
+      }
+      golden::end();
+    }
+#endif
 
     if (optDebug > 0) {
       if (interMode == 2) {

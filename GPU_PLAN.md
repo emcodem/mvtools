@@ -171,8 +171,39 @@ Portability notes: thread-block clusters (several SMs per slice) need Hopper (cc
 SAD (`__vsadu2`) works on every supported card. A 3060 has 28 SMs (24 slices fit), 100 KB shared memory per SM (the kernel uses about 9 KB) and 64K registers
 (the kernel is capped at 80 per thread for 768 threads).
 
+### MFlowFps on the GPU (M7, 2026-10-28)
+
+`MFlowFps(..., gpu=true)`: the mask=2 path (`mvcuda_flow.cu`, `Sources\MVFlowFps.cpp gpu_flow`): small vector fields and occlusion masks, the bilinear
+upsizing evaluated on the fly (no 220 MB of full-size arrays per frame), and `FlowInterExtra` per pixel through the pel-interleaved layout of the cached super
+frames. Bit-exact stage by stage against golden data from the instrumented CPU build (`profile\golden\test_flow.py`: small arrays, all upsized vectors / masks,
+final frame) for 10-bit, 8-bit, 4:2:2, 4:2:0, 4:4:4. The kernel renders a UHD frame in about 6 ms. Other mask modes, `blend`, non-planar formats and frames whose
+vectors are unusable (scene change) stay on the CPU (the vector-clip state is restored before the CPU path runs). The raw planes come from the super clip's frame
+(so the result is right even if the super is not made from the source clip), usually a frame-cache hit on the device.
+
+All stages were also tested in 8-bit, 4:2:0 (10 and 8 bit) and 4:4:4: `python -I profile\golden\run_all.py 10 f8 f420 f420b8 f444` runs 17 checks per format (super src/ref,
+analysis single/24 slices, recalc single/24 slices, flow 3 frames): 85 of 85 exact. Plugin end to end (60 frames, `Prefetch(3)`, GPU analysis + recalc + flow vs CPU) identical
+for 4:2:0, 4:4:4, 8-bit 4:2:0.
+
+### Measurements, all stages on the GPU (this PC, RTX 5090, seg1 UHD, 240 frames, `Prefetch(3)`, final frames identical to the CPU)
+
+| | CPU | GPU analysis only | **GPU analysis + MFlowFps** |
+|---|---|---|---|
+| 10-bit (16-bit path) wall / CPU time | 15.0-15.6 s / 168-179 CPU-s | 14.7 s / 98 CPU-s | **9.3-9.5 s / 40-41 CPU-s** |
+| 8-bit wall / CPU time | 7.4-7.6 s / 111-116 CPU-s | 8.5 s / 63 CPU-s | **6.7-7.1 s / 26-29 CPU-s** |
+
+What got the last 2 s: the CUDA context in blocking-sync mode (`MVCUDA_SPIN=1` restores spinning): waiting threads no longer burn a core, 11.7 s -> 9.6 s and 61 -> 43 CPU-s.
+Per output frame the GPU side costs about 83 ms of latency per prefetch thread (analysis 2 x 27 ms, recalc 2 x 11 ms mostly frame uploads, flow 6 ms); with three
+threads that is the wall time. More `Prefetch` threads make it worse (the cloned filter chains duplicate work and CPU time grows: 4 threads 11.0 s, 5 threads 11.5 s, 8 threads 20 s).
+What is still on the CPU (40 CPU-s): decode, `RemoveGrain`, the two `MSuper` (about 12-18 CPU-s; the GPU rebuilds the pyramid anyway), vector clip updates and the
+host-side vector copies. A "lite" `MSuper` that skips the CPU pyramid is unsafe without a lazy CPU rebuild in every consumer (MAnalyse / MRecalculate / MFlowFps CPU fallback paths, MDegrain...), so it was not done.
+
+### Portability
+
+The build targets compute capability 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX (RTX 30xx and newer; older cards report "no usable device", `MVCUDA_DEVICE` selects a device). The PTX path
+(`CUDA_FORCE_PTX_JIT=1`) passes the exactness tests on the 5090; the 30/40-series machine code itself has not been run on such a card.
+
 ## Next step
 
-1. GPU `MFlowFps` (M7), now the wall-time limiter. 2. M6 measurements still open: R9 (4 concurrent jobs, GPU contention), R2-R8 timing matrix for the
-GPU variant, R10 (user's side-by-side), R12 soak. 3. M7: GPU `MFlowFps`. 4. Commit hygiene: `Sources\cuda\x64` is git-ignored, the dump hooks stay compiled out
-(`/DMV_GOLDEN_DUMP`).
+1. M6 measurements still open: R9 (4 concurrent jobs, GPU contention, memory: each prefetch thread keeps frames in the 24-entry device cache, about 150 MB per UHD 10-bit super frame), R2-R8 matrix for the GPU variant, R10 (side-by-side by you), R12 soak.
+2. Speed ideas left (GPU_PLAN "Speed work done"): the analysis kernel (2 x 23 ms per frame), recalc frame uploads (pageable copies), packed SAD, sharing results between cloned prefetch chains, lite `MSuper`.
+3. Deployment: `mvtools_cuda.dll` next to `mvtools2.dll`, `global uc_frc_gpu = true` (now also switches `MFlowFps`).

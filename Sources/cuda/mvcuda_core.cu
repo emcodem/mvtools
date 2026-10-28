@@ -53,7 +53,17 @@ namespace mvc
   bool use_device()
   {
     const int d = device_choice().index;
-    return d >= 0 && cudaSetDevice(d) == cudaSuccess;
+    if (d < 0)
+      return false;
+    // waiting for a stream spins a CPU core by default; blocking sync lets the thread sleep (set once, before the
+    // context is created). MVCUDA_SPIN=1 keeps the spinning mode.
+    static const bool flags_set = [] {
+      if (!std::getenv("MVCUDA_SPIN"))
+        cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+      return true;
+    }();
+    (void)flags_set;
+    return cudaSetDevice(d) == cudaSuccess;
   }
 
   namespace

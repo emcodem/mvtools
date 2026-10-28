@@ -18,6 +18,9 @@ public:
     const void *const[3], const int[3], int *, int);
   int (*recalc_host)(const MvCudaSuperParams *, const MvCudaRecalcParams *, const void *const[3], const int[3],
     const void *const[3], const int[3], const int *, int *);
+  int (*flow_host)(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
+    const void *const[3], const int[3], const int *, const int *, const int *, const int *, void *const[3], const int[3],
+    void *const[]);
   void (*cache_clear)();
 
   // number of block-row slices to use: the CPU thread count when mt is on (so the result equals the CPU result with
