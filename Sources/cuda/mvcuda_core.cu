@@ -109,6 +109,9 @@ namespace mvc
 
   void *pin_alloc(size_t bytes)
   {
+    static const bool off = std::getenv("MVCUDA_NOPIN") != nullptr; // A/B test switch: pageable copies as before
+    if (off)
+      return nullptr;
     {
       std::lock_guard<std::mutex> lk(g_pin_mutex);
       auto it = g_pin.find(bytes);
