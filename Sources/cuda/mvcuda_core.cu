@@ -70,6 +70,8 @@ namespace mvc
   {
     std::mutex g_pool_mutex;
     std::multimap<size_t, void *> g_pool;           // free buffers by size
+    std::mutex g_pin_mutex;
+    std::multimap<size_t, void *> g_pin;            // free pinned staging buffers by size
     std::mutex g_stream_mutex;
     std::vector<cudaStream_t> g_streams;            // free streams
   }
@@ -105,12 +107,47 @@ namespace mvc
     g_pool.emplace(bytes, p);
   }
 
+  void *pin_alloc(size_t bytes)
+  {
+    {
+      std::lock_guard<std::mutex> lk(g_pin_mutex);
+      auto it = g_pin.find(bytes);
+      if (it != g_pin.end())
+      {
+        void *p = it->second;
+        g_pin.erase(it);
+        return p;
+      }
+    }
+    void *p = nullptr;
+    if (std::getenv("MVCUDA_TIMING"))
+      std::fprintf(stderr, "mvcuda pin_alloc miss %zu bytes\n", bytes);
+    if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable) != cudaSuccess)
+    {
+      cudaGetLastError();
+      return nullptr;
+    }
+    return p;
+  }
+
+  void pin_free(void *p, size_t bytes)
+  {
+    if (!p)
+      return;
+    std::lock_guard<std::mutex> lk(g_pin_mutex);
+    g_pin.emplace(bytes, p);
+  }
+
   void pool_trim()
   {
     std::lock_guard<std::mutex> lk(g_pool_mutex);
     for (auto &e : g_pool)
       cudaFree(e.second);
     g_pool.clear();
+    std::lock_guard<std::mutex> lk2(g_pin_mutex);
+    for (auto &e : g_pin)
+      cudaFreeHost(e.second);
+    g_pin.clear();
   }
 
   StreamLease::StreamLease()

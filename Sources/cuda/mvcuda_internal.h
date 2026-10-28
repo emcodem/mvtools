@@ -36,6 +36,10 @@ namespace mvc
   // so they are kept in a pool by exact size and reused. Thread safe.
   void *dev_alloc(size_t bytes);              // nullptr on failure
   void dev_free(void *p, size_t bytes);
+  // page-locked host staging buffers (pageable cudaMemcpy runs at about 3 GB/s and blocks the thread; a plain memcpy into
+  // pinned memory plus a DMA is several times faster); nullptr when none can be had, the caller then copies directly
+  void *pin_alloc(size_t bytes);
+  void pin_free(void *p, size_t bytes);
   void pool_trim();                           // returns all pooled (free) buffers to the driver
 
   // one stream per running call, from a pool (non-blocking streams: concurrent calls overlap on the GPU)

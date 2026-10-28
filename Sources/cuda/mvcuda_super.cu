@@ -10,8 +10,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #define CUDA_CHECK(call) \
@@ -165,6 +168,11 @@ namespace MVC_NS
     const int maxv = (1 << p.bits_per_pixel) - 1;
     const int nplanes = p.chroma ? 3 : 1;
     pix *d_src = nullptr, *d_tmp = nullptr;
+    void *pin = nullptr;
+    const bool timing = std::getenv("MVCUDA_TIMING") != nullptr;
+    double t_alloc = 0, t_copy = 0, t_sync = 0;
+    auto now = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    const double t_start = now();
     size_t src_bytes = 0, tmp_bytes = 0;
 
     for (int plane = 0; plane < nplanes; plane++)
@@ -197,6 +205,7 @@ namespace MVC_NS
 
       src_bytes = (size_t)d0.w * d0.h * sizeof(pix);
       tmp_bytes = tmp_elems * sizeof(pix);
+      double t0 = now();
       d_src = (pix *)dev_alloc(src_bytes);
       if (!d_src)
       {
@@ -232,8 +241,20 @@ namespace MVC_NS
 
       // level 0: raw plane in (pitch in samples), then the pyramid; level l+1 is padded as soon as it is reduced,
       // level 0 only after the reduction (it is read unpadded, like on the CPU)
-      CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
-        cudaMemcpyHostToDevice, st));
+      t_alloc += now() - t0;
+      t0 = now();
+      pin = pin_alloc(src_bytes);
+      if (pin)
+      {
+        // rows into the pinned buffer (plain memcpy), then one DMA; the buffer goes back once this plane has synchronised
+        for (int y = 0; y < d0.h; y++)
+          std::memcpy((char *)pin + (size_t)y * d0.w * sizeof(pix), (const char *)src[plane] + (size_t)y * src_pitch_bytes[plane], d0.w * sizeof(pix));
+        CUDA_CHECK(cudaMemcpyAsync(d_src, pin, src_bytes, cudaMemcpyHostToDevice, st));
+      }
+      else
+        CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
+          cudaMemcpyHostToDevice, st));
+      t_copy += now() - t0;
       k_copy_in<<<grid_for(d0.w, d0.h), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, d_src, d0.w);
       for (int l = 0; l + 1 < p.levels; l++)
       {
@@ -259,15 +280,23 @@ namespace MVC_NS
       }
       CUDA_CHECK(cudaGetLastError());
       // d_src / d_tmp are reused by the next plane: wait until this plane's kernels are done with them
+      t0 = now();
       CUDA_CHECK(cudaStreamSynchronize(st));
+      t_sync += now() - t0;
+      pin_free(pin, src_bytes);
+      pin = nullptr;
       dev_free(d_src, src_bytes);
       dev_free(d_tmp, tmp_bytes);
       d_src = d_tmp = nullptr;
     }
+    if (timing)
+      std::fprintf(stderr, "mvcuda super_build: total %.2f ms (alloc %.2f, host copy+pin %.2f, sync %.2f)\n", now() - t_start, t_alloc, t_copy, t_sync);
     return 0;
 
   cleanup:
     cudaStreamSynchronize(st);
+    if (pin)
+      pin_free(pin, src_bytes);
     if (d_src)
       dev_free(d_src, src_bytes);
     if (d_tmp)
