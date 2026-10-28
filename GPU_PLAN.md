@@ -207,6 +207,15 @@ they fall back to the CPU (bad-vector UMH search, field shift, unsupported optio
 Checked: final frames identical to the CPU (10-bit 4:2:2 and 8-bit, GPU and forced fallback) and through `UConvertClip` with `uc_frc_gpu` true/false. All-GPU run, 10-bit: 8.6 s vs 10.2-11.4 s without lite on the same day
 (8-bit: 7.3 s vs 8.1 s); the machine was slower than at the earlier 9.3 s measurement.
 
+### Prefetch and concurrent jobs with lite MSuper (2026-10-28, ~115 output frames, 10-bit, High priority)
+
+With the CPU pyramid gone, more prefetch threads now help (before lite they made things worse): Prefetch 2/3/4/5/6/8/10/12 = 9.6 / 8.5 / 7.7 / 7.4 / 7.05 / 7.6 / 8.5 / 9.5 s.
+Best is about 6. Measured with `-benchmark`: CPU variant Prefetch(3) 16.0 s / 180 CPU-s; all-GPU lite Prefetch(3) 7.8 s / 27 CPU-s; all-GPU lite Prefetch(6) 6.5 s / 32 CPU-s.
+Four ffmpeg jobs at once (R9): GPU lite Prefetch(3) 22.6 s total (one job alone 8.5 s), CPU variant 41.9 s total, GPU lite Prefetch(6) 20.7 s. So concurrent throughput is about 1.9x the CPU, less than the single-job gain: separate processes
+have separate CUDA contexts and the GPU time-slices between them (no MPS on Windows), so kernels of different jobs do not overlap. VRAM used by 4 jobs: about 3 GB.
+Not done, with reasons: more slices (changes the vectors relative to the CPU result at its thread count), packed SAD (the analysis kernel is latency-bound on its serial block chain, earlier unrolling / prefetch tricks gave only about 6%),
+concurrent bv/fv analysis (Prefetch already overlaps frames), recalc upload cut (recalc kernel is 1 ms, uploads are cached in the device cache and average a few ms).
+
 ### Portability
 
 The build targets compute capability 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX (RTX 30xx and newer; older cards report "no usable device", `MVCUDA_DEVICE` selects a device). The PTX path
