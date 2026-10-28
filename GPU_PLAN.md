@@ -58,7 +58,7 @@ to the GPU, without making the picture worse and with an automatic CPU fallback.
 | M3 | GPU search for one level in reference order: predictors, `MotionDistorsion` + SAD + `penaltyNew` + chroma cost with the CPU's tie rule (first strictly lower cost wins), 3x3 exhaustive window, precomputed dependency levels. Then coarse-to-fine over all levels incl. `InterpolatePrediction` and the global MV estimate | vector fields bit-exact vs the single-thread CPU for the golden frames, 8 and 10-bit paths |
 |   | **M3 status 2026-10-28: done for the production case** (10-bit 4:2:2, 32x32 / overlap 16, 7 levels, exhaustive radius 2, global MV, meander): `Sources\cuda\mvcuda_analyse.cu`, `mvcuda_analyse_host()`. Bit-exact payload (all 7 levels) vs the **single-thread** CPU with `slice_threads=1`, and vs the **24-thread** CPU with `slice_threads=24`, both directions, 2 frames incl. the clipping stress frame; negative controls differ (19210 blocks). The parallelism is the CPU's own slicing (see "Dependency chain" below); frames that would need the CPU's bad-vector wide search return `MVCUDA_NEEDS_CPU` (-5; verified with a tiny badSAD). Kernel time per frame and direction, 24 slices: 325 ms first version, 60 ms after unrolled SADs + shared source block, **25 ms** after parallel candidate fold and one-thread FP64 nLambda; per block about 14 us. Not done: 8-bit, pel 4, divide, dct, temporal, trymany, fieldShift != 0 |
 | M4 | GPU `MRecalculate` (`RecalculateMVs`, `thSAD`, own search). M1 showed its blocks are independent (each starts from the interpolated old vector, no neighbour predictors), so it is plain data-parallel work and could be done **before** M3 | bit-exact vs golden. **Done 2026-10-28** for the production case (16x16 blocks, overlap 8, smooth 1, exhaustive radius 2, 10-bit 4:2:2, pel 2): `Sources\cuda\mvcuda_recalc.cu`, `mvcuda_recalc_host()`; 128851 of 128851 blocks exact for 4 real-frame dumps (forward/backward, 2 frames incl. the clipping stress frame); negative control (smooth=0) differs in 35214 blocks, and 17% of blocks are above thSAD so the search path is exercised (`profile\golden\test_recalc.py`). Cost: kernel 0.7 ms per frame; the two super builds with per-call cudaMalloc and pageable copies take 26 ms in steady state (first call 120-150 ms: context creation), so the integration needs persistent device buffers and pinned memory |
-| M5 | Plugin integration: `gpu` parameter, DLL discovery, pinned host buffers, streams, fallback, thread-safety across `Prefetch` instances | R11 (fallback) and R1 pass; output of `gpu=true` equals the CPU `mt=false` output |
+| M5 | Plugin integration: `gpu` parameter, DLL discovery, pinned host buffers, streams, fallback, thread-safety across `Prefetch` instances | R11 (fallback) and R1 pass; output of `gpu=true` equals the CPU `mt=false` output. **Done 2026-10-28** for the 16-bit path: output equals the CPU **multi-threaded** result with the same slice count (240 frames, `Prefetch(3)`), fallbacks identical; pooled memory, streams and a (clip, frame) super-frame cache instead of pinned buffers; see "Status" |
 | M6 | Measure: full test suite R2-R12 from `RESULTS.md`, including 4 concurrent jobs and GPU contention | numbers in `RESULTS.md` |
 | M7 (only if M6 says so) | Faster, non-bit-exact search order (e.g. start each block from the coarser level only), GPU interpolation/upsizing (`FlowInter*`, `SimpleResize`), fusing stages so data stays on the GPU | judged with R4-R7, not byte comparison |
 
@@ -112,12 +112,56 @@ the core count (more slices = shorter chains = lower GPU latency, slightly more 
 - The vertical Wiener SSE path writes past the row end for 16-bit (loop bound `nWidth*sizeof(pixel_t)`); the overwritten
   data is recomputed later, so the final planes equal the clean C semantics (checked bit-exact).
 
+## Status 2026-10-28 (M1-M5 done for the production case)
+
+**Done, all bit-exact against the CPU:** M1 golden data, M2 `MSuper`, M3 `MAnalyse` search, M4 `MRecalculate`, M5 plugin integration
+(`gpu=true` on `MAnalyse` and `MRecalculate`, `GpuBackend`, per-frame CPU fallback). Scope: 16-bit container (10-bit and up),
+chroma on, pel 1 or 2, `search=3` radius 1-3, block width <= 32, default `MSuper` settings (`rfilter=4`, `sharp=2`, no pelclip). Not covered
+(silently CPU): 8-bit (the default `frc_8bit=true` path!), pel 4 / HD, `divide`, `dct`, `temporal`, `trymany`, `outfile`, field shift,
+and frames that need the CPU's bad-vector wide search (`MVCUDA_NEEDS_CPU`).
+
+### Use
+
+- Build `Sources\cuda\build.bat` -> `mvtools_cuda.dll` (CUDA 13.x toolkit, sm_120 only so far, static runtime: only the driver is needed at run time) and
+  the plugin as before; put `mvtools_cuda.dll` next to `mvtools2.dll`.
+- `MAnalyse(..., gpu=true)` and `MRecalculate(..., gpu=true)`; `uconvert.avsi`: `global uc_frc_gpu = true` after the Import (default false).
+- The vectors equal the CPU **multi-threaded** result for the same slice count: the GPU uses the avstp thread count (24 if mt is on but no thread
+  pool exists, 1 if `mt=false`). Environment: `MVTOOLS_GPU_LOG=1` (log every call / fallback reason to stderr), `MVTOOLS_GPU_DISABLE=1`,
+  `MVTOOLS_GPU_SLICES=n` (more slices = shorter GPU chains but a different vector field), `MVCUDA_TIMING=1`, `MVCUDA_CACHE_FRAMES=n` (device
+  frame cache, default 24 super frames, about 150 MB each at UHD 10-bit).
+- Tests: `profile\golden\test_super.py`, `test_recalc.py`, `test_analyse.py` (golden dumps), end to end `profile\avs\golden\e2e*.avs` +
+  `profile\run_e2e.ps1` (framemd5 of the final `MFlowFps` frames, `gpu=false` vs `gpu=true`).
+
+### Measurements (this PC, RTX 5090, 24 threads, seg1 UHD 10-bit 4:2:2, High priority)
+
+| | CPU | GPU |
+|---|---|---|
+| Final frames, 240 frames, `Prefetch(3)` | reference | **identical** (also 60 frames, with/without prefetch; both fallbacks R11 identical to CPU) |
+| Wall time, 240 frames, `Prefetch(3)` (3 runs each) | 15.5-16.7 s | 15.2-16.2 s |
+| CPU time, same run | 169.6 CPU-s (10.9 cores) | **97.6 CPU-s** (6.4 cores) |
+| `MAnalyse` search, one frame and direction | about 8-10 ms wall at 24 threads, 200 CPU-ms | kernels 22 ms (24 slices), 15-16 ms (33 slices); call about 27 ms incl. super |
+| `MRecalculate`, one frame | about 85 CPU-s / 240 frames | kernel 0.8 ms, call 3-9 ms incl. uploads |
+
+So the GPU path removes 42% of the CPU work but does **not** make this chain faster in wall time: with `Prefetch(3)` the wall time is the per-frame
+latency of the remaining CPU stages (`MFlowFps` upsizing and interpolation, two CPU `MSuper`, decode) plus the GPU call latency; deeper
+`Prefetch` makes both variants slower (the cloned filter chains duplicate work). The win is CPU headroom for other jobs (R9, 4 concurrent jobs, not
+measured yet) and the base for M7.
+
+### Speed work done and what is left (kernel `k_search` in `mvcuda_analyse.cu`)
+
+325 ms -> 22 ms per frame and direction (24 slices). What worked: unrolled SAD loops with the source block in shared memory (325 -> 60), parallel
+(cost, index) fold of the 24 ring candidates and one-thread FP64 `nLambda` (60 -> 25), compile-time row counts + async source copy one block ahead
++ L1 prefetch (25 -> 22). What did not: staging the reference windows in shared memory with plain loads (twice as slow, 46 ms; the staging loop
+itself is expensive), more prefetching. Ablation (one frame, ms): without the reference loads 16.7 (so global loads are only about 25%), without
+both candidate phases 6.7, floor with barriers and folds about 4.7. The serial chain is ~2300 blocks per frame (L0: 1334 per slice); a block costs
+about 21k cycles = 10 us of which SAD evaluation is ~13k (shared-memory issue bound, about 350 instructions per candidate x 31 candidates). Ideas
+not done: packed 16-bit SAD (`__vsadu2`, 2 pixels per instruction, needs 4-byte alignment handling), a thread-block cluster per slice (several SMs
+share the candidates of one block), early-out of the chroma SAD like the CPU, evaluating bv and fv in one call (they are separate filter
+instances), skipping the CPU `MSuper` pyramid when the GPU rebuilds it (about 12 of the 97 remaining CPU-s), sharing results between cloned
+`Prefetch` chains (duplicate analysis), GPU `MFlowFps` (M7, the real wall-time limiter now), 8-bit kernels.
+
 ## Next step
 
-M2 is done (see the table). M1 is done: `Sources\GoldenDump.{h,cpp}` (compiled only with `/DMV_GOLDEN_DUMP`, via the `CL` environment variable), hooks in
-`MVAnalyse.cpp`, `MVRecalculate.cpp`, `GroupOfPlanes.cpp`, `PlaneOfBlocks.cpp`; data and loader in `profile\golden`. Production
-parameter set and the findings that change this plan (MRecalculate independence, global-MV sad -1, non-reproducible vector
-header) are in `profile\golden\README.md`.
-
-M4 is done too. Next: M3 (the dependency-chain search of `MAnalyse`, the other ~99 CPU-s). Both M3 and M5 need the super planes to stay on the device: M2's host
-round trip is only the test interface.
+1. 8-bit (uint8) variants of M2-M4: the default FRC path. 2. M6 measurements still open: R9 (4 concurrent jobs, GPU contention), R2-R8 timing matrix for the
+GPU variant, R10 (user's side-by-side), R12 soak. 3. M7: GPU `MFlowFps`. 4. Commit hygiene: `Sources\cuda\x64` is git-ignored, the dump hooks stay compiled out
+(`/DMV_GOLDEN_DUMP`).

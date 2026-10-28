@@ -28,6 +28,14 @@ int GpuBackend::slice_threads(bool mt_flag)
 {
   if (!mt_flag)
     return 1;
+  // MVTOOLS_GPU_SLICES overrides the slice count (more slices = shorter serial chains on the GPU, but a different
+  // vector field than the CPU with the default thread count; the CPU result depends on its thread count as well)
+  if (const char *e = std::getenv("MVTOOLS_GPU_SLICES"))
+  {
+    const int v = std::atoi(e);
+    if (v >= 1)
+      return v;
+  }
   const int n = AvstpWrapper::use_instance().get_nbr_threads();
   return n > 1 ? n : 24;
 }

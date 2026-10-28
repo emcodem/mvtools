@@ -271,9 +271,23 @@ namespace
     int prev_x, prev_y, prev_sad; // result of the previous block of the row (left predictor), passed without a global round trip
   };
 
-  // Luma and chroma SAD of one candidate vector for the source block in shared memory. Lane = column; both loops
-  // are unrolled so that all loads of the candidate are in flight together, the two warp reductions come last.
-  // sc is scaled like ScaleSadChroma. For cw <= 16 U and V share the warp (lanes [0, cw) U, [cw, 2 cw) V).
+  // 4-byte asynchronous global -> shared copy (no registers, completes in the background)
+  __device__ __forceinline__ void cp_async4(void *dst_shared, const void *src_global)
+  {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(dst_shared);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(src_global));
+  }
+  __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::); }
+  __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::); }
+  __device__ __forceinline__ void prefetch_l1(const void *p) { asm volatile("prefetch.global.L1 [%0];" :: "l"(p)); }
+
+  // Luma and chroma SAD of one candidate vector for the source block in shared memory. Lane = column. BSY / CHH are
+  // the compile-time row counts of the luma block and of one chroma block (0 = unknown, runtime loops): with known
+  // counts every reference sample of the candidate is loaded into registers before the arithmetic starts, so all loads
+  // are in flight together (the measured cost of one candidate is dominated by the load latency). The two warp
+  // reductions come last. sc is scaled like ScaleSadChroma. For cw <= 16 U and V share the warp (lanes [0, cw) U,
+  // [cw, 2 cw) V).
+  template <int BSY, int CHH>
   __device__ __forceinline__ void eval_candidate(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
     int x0, int y0, int x1, int y1, int cx, int cy, int lane, bool pair, int &sl, int &sc)
   {
@@ -281,17 +295,47 @@ namespace
     const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
     const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
     int sum_l = 0, sum_c = 0;
+    const int rows_l = BSY ? BSY : a.bs_y, rows_c = CHH ? CHH : a.ch;
+    const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+    const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+    const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+    if constexpr (CHH > 0)
+    {
+      // the chroma rows are consumed after the luma rows: pull them into L1 now, without using registers, so that
+      // the second batch of loads is an L1 hit instead of a second round trip
+      if (pair)
+      {
+        const int pl = lane < a.cw ? 1 : 2, col = lane < a.cw ? lane : lane - a.cw;
+        if (lane < 2 * a.cw)
+        {
+          const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + col;
+          #pragma unroll
+          for (int row = 0; row < CHH; row++)
+            prefetch_l1(r + (size_t)row * a.ew[pl]);
+        }
+      }
+    }
     if (lane < a.bs_x)
     {
       const pix *r = a.ref[0][sub] + (size_t)ry * a.ew[0] + rx + lane;
       const pix *q = s_y + lane;
-      #pragma unroll 32
-      for (int row = 0; row < a.bs_y; row++)
-        sum_l += abs((int)q[row * a.bs_x] - (int)r[(size_t)row * a.ew[0]]);
+      if constexpr (BSY > 0)
+      {
+        int rv[BSY];
+        #pragma unroll
+        for (int row = 0; row < BSY; row++)
+          rv[row] = r[(size_t)row * a.ew[0]];
+        #pragma unroll
+        for (int row = 0; row < BSY; row++)
+          sum_l += abs((int)q[row * a.bs_x] - rv[row]);
+      }
+      else
+      {
+        #pragma unroll 32
+        for (int row = 0; row < rows_l; row++)
+          sum_l += abs((int)q[row * a.bs_x] - (int)r[(size_t)row * a.ew[0]]);
+      }
     }
-    const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
-    const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
-    const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
     if (pair)
     {
       const int pl = lane < a.cw ? 1 : 2, col = lane < a.cw ? lane : lane - a.cw;
@@ -299,9 +343,22 @@ namespace
       {
         const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + col;
         const pix *q = (pl == 1 ? s_u : s_v) + col;
-        #pragma unroll 32
-        for (int row = 0; row < a.ch; row++)
-          sum_c += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+        if constexpr (CHH > 0)
+        {
+          int rv[CHH];
+          #pragma unroll
+          for (int row = 0; row < CHH; row++)
+            rv[row] = r[(size_t)row * a.ew[pl]];
+          #pragma unroll
+          for (int row = 0; row < CHH; row++)
+            sum_c += abs((int)q[row * a.cw] - rv[row]);
+        }
+        else
+        {
+          #pragma unroll 32
+          for (int row = 0; row < rows_c; row++)
+            sum_c += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
+        }
       }
     }
     else if (lane < a.cw)
@@ -311,7 +368,7 @@ namespace
         const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + lane;
         const pix *q = (pl == 1 ? s_u : s_v) + lane;
         #pragma unroll 32
-        for (int row = 0; row < a.ch; row++)
+        for (int row = 0; row < rows_c; row++)
           sum_c += abs((int)q[row * a.cw] - (int)r[(size_t)row * a.ew[pl]]);
       }
     }
@@ -319,8 +376,24 @@ namespace
     sc = scale_chroma(warp_sum(sum_c), a.chroma_scale);
   }
 
+  // picks the compile-time row counts for the common block sizes
+  __device__ __forceinline__ void eval_dispatch(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, int cx, int cy, int lane, bool pair, int &sl, int &sc)
+  {
+    if (a.bs_y == 32 && a.ch == 32)
+      eval_candidate<32, 32>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.bs_y == 16 && a.ch == 16)
+      eval_candidate<16, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.bs_y == 32 && a.ch == 16)
+      eval_candidate<32, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.bs_y == 16 && a.ch == 8)
+      eval_candidate<16, 8>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else
+      eval_candidate<0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+  }
+
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
-  __global__ void k_search(LevelArgs a)
+  __global__ void __launch_bounds__(768, 1) k_search(LevelArgs a)
   {
     extern __shared__ pix s_dyn[];
     __shared__ BlockShared b;
@@ -330,7 +403,34 @@ namespace
     const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
     const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
     const int ring_n = 4 * a.radius * (a.radius + 1);
-    pix *s_y = s_dyn, *s_u = s_dyn + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
+    const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
+    pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
+    // asynchronous copy of the source block of block column bx in row by into the shared buffer dst
+    auto issue_src = [&](pix *dst, int bx, int by) {
+      const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
+      const int xc = a.hpad[1] + bx * (step_x >> a.log_x_uv), yc = a.vpad[1] + by * (step_y >> a.log_y_uv);
+      const int wl = (a.bs_x * a.bs_y) >> 1, wc = (a.cw * a.ch) >> 1;     // 4-byte words (two samples)
+      const int rl = a.bs_x >> 1, rc = a.cw >> 1;                          // words per row
+      for (int i = tid; i < wl + 2 * wc; i += blockDim.x)
+      {
+        if (i < wl)
+        {
+          const int row = i / rl, col = 2 * (i - row * rl);
+          cp_async4(dst + row * a.bs_x + col, a.src[0] + (size_t)(ys + row) * a.ew[0] + xs + col);
+        }
+        else
+        {
+          int j = i - wl;
+          const int pl = j >= wc ? 2 : 1;
+          if (j >= wc)
+            j -= wc;
+          const int row = j / rc, col = 2 * (j - row * rc);
+          pix *d = dst + a.bs_x * a.bs_y + (pl - 1) * a.cw * a.ch;
+          cp_async4(d + row * a.cw + col, a.src[pl] + (size_t)(yc + row) * a.ew[pl] + (pl == 1 ? 0 : 0) + xc + col);
+        }
+      }
+      cp_async_commit();
+    };
     const bool pair_chroma = (2 * a.cw <= 32);
 
     // ring offsets in ExpandingSearch order (sides without corners, then the corners), relative to the centre
@@ -391,6 +491,7 @@ namespace
         }
       };
       prefetch(0);
+      issue_src(s_dyn, start, blky); // the first block of the row (buffer 0); later ones are issued a block ahead
 
       for (int it = 0; it < a.n_blk_x; it++)
       {
@@ -413,15 +514,14 @@ namespace
           x0[p] = a.hpad[p] + blkx * (step_x >> a.log_x_uv);
           y0[p] = a.vpad[p] + blky * (step_y >> a.log_y_uv);
         }
-        for (int row = warp; row < a.bs_y; row += nwarps)
-          if (lane < a.bs_x)
-            s_y[row * a.bs_x + lane] = a.src[0][(size_t)(y0[0] + row) * a.ew[0] + x0[0] + lane];
-        for (int row = warp; row < a.ch; row += nwarps)
-          if (lane < a.cw)
-          {
-            s_u[row * a.cw + lane] = a.src[1][(size_t)(y0[1] + row) * a.ew[1] + x0[1] + lane];
-            s_v[row * a.cw + lane] = a.src[2][(size_t)(y0[2] + row) * a.ew[2] + x0[2] + lane];
-          }
+        // the source block of this block was copied by cp.async during the previous block (or before the row);
+        // wait for our own copies, the barrier below makes everybody's visible
+        cp_async_wait_all();
+        s_y = s_dyn + (it & 1) * blk_el;
+        s_u = s_y + a.bs_x * a.bs_y;
+        s_v = s_u + a.cw * a.ch;
+        if (it + 1 < a.n_blk_x)
+          issue_src(s_dyn + ((it + 1) & 1) * blk_el, start + (it + 1) * dir, blky);
 
         const int dx_max = a.pel * (a.ext_w - x0[0] - a.bs_x - a.hpad[0] + h_scaled);
         const int dy_max = a.pel * (a.ext_h - y0[0] - a.bs_y - a.vpad[0] + v_scaled);
@@ -482,7 +582,7 @@ namespace
           default: cx = p3.x; cy = p3.y; break;
           }
           int sl, sc;
-          eval_candidate(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+          eval_dispatch(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
           if (lane == 0)
           {
             b.sl[c] = sl;
@@ -548,7 +648,7 @@ namespace
           if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
             continue; // never read: the fold below skips invalid vectors
           int sl, sc;
-          eval_candidate(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+          eval_dispatch(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
           if (lane == 0)
           {
             b.sl[c] = sl;
@@ -774,7 +874,7 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
       else
         AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
       {
-        const size_t shm = ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix);
+        const size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
         k_search<<<a.n_slices, 768, shm, st>>>(a);
       }
       AN_CHECK(cudaGetLastError());
