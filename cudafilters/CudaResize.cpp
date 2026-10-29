@@ -120,7 +120,7 @@ namespace
         PVideoFrame f0 = child->GetFrame(0, env);
         const AVSMap *props = env->getFramePropsRO(f0);
         if (env->propNumElements(props, "_ChromaLocation") > 0)
-          cplace = (int)env->propGetIntSaturated(props, "_ChromaLocation", 0, nullptr);
+          cplace = (int)env->propGetInt(props, "_ChromaLocation", 0, nullptr); // V8; propGetIntSaturated is V11 and breaks AviSynth+ 3.7.3
       }
       int named;
       if (!(placement[0] == 0 || _stricmp(placement, "auto") == 0) && chroma_location_by_name(placement, named))
