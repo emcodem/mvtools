@@ -60,6 +60,7 @@ MVRecalculate::MVRecalculate(
   , _super_lite(false)
   , _gpu_slices(1)
   , _gpu_effective_chroma_scale(0)
+  , _gpu_rfilter(4)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -416,13 +417,15 @@ MVRecalculate::MVRecalculate(
   // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
   if (gpu_flag)
   {
-    const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 && ((params.param >> 3) & 3) == 2
+    _gpu_rfilter = params.param & 7;
+    const bool super_ok = (params.param & 0x80) && (_gpu_rfilter == 4 || _gpu_rfilter == 2) && ((params.param >> 3) & 3) == 2
       && !(params.param & 0x20);
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
-      && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && _nbr_srd == 1 && searchType == EXHAUSTIVE
-      && nSearchParam >= 1 && nSearchParam <= 3 && (nSuperPel == 1 || nSuperPel == 2) && smooth >= 0 && smooth <= 1
-      && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2) && lstrlen(_outfilename) == 0;
+      && !divideExtra && !_dctmode && _nbr_srd == 1
+      && GpuBackend::search_supported((int)searchType, nSearchParam, nSearchParam, 1)
+      && (nSuperPel == 1 || nSuperPel == 2) && smooth >= 0 && smooth <= 1
+      && analysisData.nBlkSizeX <= 32 && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2))) && lstrlen(_outfilename) == 0;
     if (GpuBackend::log_enabled())
     {
       std::fprintf(stderr, "MRecalculate gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
@@ -702,9 +705,9 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
   const MVAnalysisData &a = srd._analysis_data;
 
   const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
-  const void *src_p[3], *ref_p[3];
-  int src_pitch[3], ref_pitch[3];
-  for (int p = 0; p < 3; p++)
+  const void *src_p[3] = { 0, 0, 0 }, *ref_p[3] = { 0, 0, 0 };
+  int src_pitch[3] = { 0, 0, 0 }, ref_pitch[3] = { 0, 0, 0 };
+  for (int p = 0; p < (nModeYUV == YUVPLANES ? 3 : 1); p++) // luma-only recalculation: the chroma planes are not touched
   {
     MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
     MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
@@ -713,6 +716,10 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
     src_pitch[p] = ps->GetPitch();
     ref_pitch[p] = pr->GetPitch();
   }
+  // a GPU search clip (token frames) as super source: this path takes host pictures, the CPU path downloads them
+  MvCudaTokenHeader tok;
+  if (_super_lite && (GpuBackend::read_token(src_p[0], a.nWidth * a.pixelsize, tok) || GpuBackend::read_token(ref_p[0], a.nWidth * a.pixelsize, tok)))
+    return false;
 
   // the old vectors: finest plane of the vector clip, (vx, vy, sad) per block
   const FakePlaneOfBlocks &old = srd._clip_sptr->GetPlane(0);
@@ -736,11 +743,12 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
   sp.pel = a.nPel;
   sp.levels = 1;
   sp.bits_per_pixel = a.bits_per_pixel;
-  sp.chroma = 1;
-  sp.rfilter = 4;
+  sp.chroma = nModeYUV == YUVPLANES ? 1 : 0;
+  sp.rfilter = _gpu_rfilter;
   sp.sharp = 2;
 
   MvCudaRecalcParams rp = {};
+  rp.search_type = (int)searchType;
   rp.blk_x = a.nBlkSizeX;
   rp.blk_y = a.nBlkSizeY;
   rp.overlap_x = a.nOverlapX;

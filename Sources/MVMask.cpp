@@ -19,6 +19,7 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #include "ClipFnc.h"
+#include "ProfSkip.h"
 #include "CopyCode.h"
 #include "MaskFun.h"
 #include "MVClip.h"
@@ -273,6 +274,8 @@ PVideoFrame __stdcall MVMask::GetFrame(int n, IScriptEnvironment* env)
 
   PVideoFrame mvn = mvClip.GetFrame(n, env);
   mvClip.Update(mvn, env);
+  if (mv_prof_skip("mask"))
+    return dst;
 #ifndef _M_X64
   _mm_empty();
 #endif

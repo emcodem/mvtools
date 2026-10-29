@@ -184,6 +184,19 @@ extern "C" int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
     : mvcuda_analyse_host_16(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words);
 }
 
+extern "C" int mvcuda_analyse_token_8(const MvCudaSuperParams *, const MvCudaAnalyseParams *, unsigned long long, unsigned long long, int *, int);
+extern "C" int mvcuda_analyse_token_16(const MvCudaSuperParams *, const MvCudaAnalyseParams *, unsigned long long, unsigned long long, int *, int);
+
+extern "C" int mvcuda_analyse_token(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, unsigned long long src_token,
+  unsigned long long ref_token, int *payload, int payload_words)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_analyse_token_8(sp, ap, src_token, ref_token, payload, payload_words)
+    : mvcuda_analyse_token_16(sp, ap, src_token, ref_token, payload, payload_words);
+}
+
 extern "C" int mvcuda_flow_host_8(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
   const void *const[3], const int[3], const int *, const int *, const int *, const int *, void *const[3], const int[3],
   void *const[]);

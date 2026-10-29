@@ -100,6 +100,51 @@ namespace MVC_NS
     dst[(size_t)(y + dd.vpad) * dd.ew + (x + dd.hpad)] = (pix)v;
   }
 
+  // Level 0 with its padding in one pass: every sample of the extended plane takes the source sample at the clamped
+  // inner position (PadReferenceFrame replicates the edge samples; the reduction below reads only the inner area).
+  __global__ void k_level0(pix *dst, MvCudaPlaneDims d, const pix *src, int src_pitch)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= d.ew || y >= d.eh)
+      return;
+    const int cx = min(max(x - d.hpad, 0), d.w - 1), cy = min(max(y - d.vpad, 0), d.h - 1);
+    dst[(size_t)y * d.ew + x] = src[(size_t)cy * src_pitch + cx];
+  }
+
+  // the vertical pass of k_reduce_v for one sample (rounded to the sample type, as the CPU's temporary rows)
+  __device__ __forceinline__ int reduce_v_at(const pix *src, const MvCudaPlaneDims &sd, int x, int y, int nh, int cubic)
+  {
+    if (y == 0 || y == nh - 1)
+      return (at(src, sd, x, 2 * y) + at(src, sd, x, 2 * y + 1) + 1) >> 1;
+    if (!cubic)
+      return (at(src, sd, x, 2 * y - 1) + at(src, sd, x, 2 * y) * 3 + at(src, sd, x, 2 * y + 1) * 3 + at(src, sd, x, 2 * y + 2) + 4) >> 3;
+    return (at(src, sd, x, 2 * y - 2) + at(src, sd, x, 2 * y - 1) * 5 + at(src, sd, x, 2 * y) * 10 + at(src, sd, x, 2 * y + 1) * 10
+      + at(src, sd, x, 2 * y + 2) * 5 + at(src, sd, x, 2 * y + 3) + 16) >> 5;
+  }
+
+  // One reduction level with its padding in one pass (k_reduce_v + k_reduce_h + k_pad): each sample of the extended
+  // plane of level l + 1 computes the reduced sample at its clamped inner position from level l's inner area.
+  __global__ void k_level(pix *dst, MvCudaPlaneDims dd, const pix *src, MvCudaPlaneDims sd, int cubic)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dd.ew || y >= dd.eh)
+      return;
+    const int nw = dd.w, nh = dd.h;
+    const int cx = min(max(x - dd.hpad, 0), nw - 1), cy = min(max(y - dd.vpad, 0), nh - 1);
+#define RV(c) reduce_v_at(src, sd, (c), cy, nh, cubic)
+    int v;
+    if (cx == 0 || cx == nw - 1)
+      v = (RV(2 * cx) + RV(2 * cx + 1) + 1) >> 1;
+    else if (!cubic)
+      v = (RV(2 * cx - 1) + RV(2 * cx) * 3 + RV(2 * cx + 1) * 3 + RV(2 * cx + 2) + 4) >> 3;
+    else
+      v = (RV(2 * cx - 2) + RV(2 * cx - 1) * 5 + RV(2 * cx) * 10 + RV(2 * cx + 1) * 10 + RV(2 * cx + 2) * 5 + RV(2 * cx + 3) + 16) >> 5;
+#undef RV
+    dst[(size_t)y * dd.ew + x] = (pix)v;
+  }
+
   __device__ __forceinline__ int wiener6(int a, int b, int c, int d, int e, int f, int maxv)
   {
     const int v = (a + (-b + (c << 2) + (d << 2) - e) * 5 + f + 16) >> 5;
@@ -152,15 +197,17 @@ namespace MVC_NS
   }
   const dim3 BLOCK(32, 8);
 
-  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
-    cudaStream_t st)
+  // src_device: src[] are device pointers (planes of a device frame, pitch in bytes), already ordered before st by the
+  // caller; otherwise host planes that are uploaded through pinned staging
+  static int super_build_impl(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], bool src_device,
+    DevSuper &out, cudaStream_t st)
   {
     int rc = 0;
     out.p = p;
     out.esize = (int)sizeof(pix);
     // supported: pel 1 or 2, Wiener sharp, cubic reduction (rfilter 4); bit depth matches the sample type
     if ((sizeof(pix) == 1 ? (p.bits_per_pixel != 8) : (p.bits_per_pixel < 9 || p.bits_per_pixel > 16))
-      || (p.pel != 1 && p.pel != 2) || p.levels < 1 || p.levels > MVCUDA_MAX_LEVELS || p.rfilter != 4 || p.sharp != 2)
+      || (p.pel != 1 && p.pel != 2) || p.levels < 1 || p.levels > MVCUDA_MAX_LEVELS || (p.rfilter != 4 && p.rfilter != 2) || p.sharp != 2)
       return -4;
     if (!use_device())
       return -1;
@@ -206,16 +253,10 @@ namespace MVC_NS
       src_bytes = (size_t)d0.w * d0.h * sizeof(pix);
       tmp_bytes = tmp_elems * sizeof(pix);
       double t0 = now();
-      d_src = (pix *)dev_alloc(src_bytes);
-      if (!d_src)
+      if (!src_device)
       {
-        rc = -2;
-        goto cleanup;
-      }
-      if (tmp_elems)
-      {
-        d_tmp = (pix *)dev_alloc(tmp_bytes);
-        if (!d_tmp)
+        d_src = (pix *)dev_alloc(src_bytes);
+        if (!d_src)
         {
           rc = -2;
           goto cleanup;
@@ -239,23 +280,32 @@ namespace MVC_NS
         }
       }
 
-      // level 0: raw plane in (pitch in samples), then the pyramid; level l+1 is padded as soon as it is reduced,
-      // level 0 only after the reduction (it is read unpadded, like on the CPU)
+      // level 0 with its padding, then each pyramid level with its padding (one kernel per level, k_level0 / k_level:
+      // the reduction reads only the inner area of the level above, so padding it first changes nothing)
       t_alloc += now() - t0;
       t0 = now();
-      pin = pin_alloc(src_bytes);
-      if (pin)
+      if (src_device)
       {
-        // rows into the pinned buffer (plain memcpy), then one DMA; the buffer goes back once this plane has synchronised
-        for (int y = 0; y < d0.h; y++)
-          std::memcpy((char *)pin + (size_t)y * d0.w * sizeof(pix), (const char *)src[plane] + (size_t)y * src_pitch_bytes[plane], d0.w * sizeof(pix));
-        CUDA_CHECK(cudaMemcpyAsync(d_src, pin, src_bytes, cudaMemcpyHostToDevice, st));
+        // a device frame (token): straight into the padded level-0 plane
+        k_level0<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, (const pix *)src[plane],
+          src_pitch_bytes[plane] / (int)sizeof(pix));
       }
       else
-        CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
-          cudaMemcpyHostToDevice, st));
+      {
+        pin = pin_alloc(src_bytes);
+        if (pin)
+        {
+          // rows into the pinned buffer (plain memcpy), then one DMA; the buffer goes back once this plane has synchronised
+          for (int y = 0; y < d0.h; y++)
+            std::memcpy((char *)pin + (size_t)y * d0.w * sizeof(pix), (const char *)src[plane] + (size_t)y * src_pitch_bytes[plane], d0.w * sizeof(pix));
+          CUDA_CHECK(cudaMemcpyAsync(d_src, pin, src_bytes, cudaMemcpyHostToDevice, st));
+        }
+        else
+          CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
+            cudaMemcpyHostToDevice, st));
+        k_level0<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, d_src, d0.w);
+      }
       t_copy += now() - t0;
-      k_copy_in<<<grid_for(d0.w, d0.h), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, d_src, d0.w);
       for (int l = 0; l + 1 < p.levels; l++)
       {
         const MvCudaPlaneDims &s = out.pl[l * 3 + plane].d, &d = out.pl[(l + 1) * 3 + plane].d;
@@ -263,11 +313,8 @@ namespace MVC_NS
         // CPU quirk: MVGroupOfFrames::set_interp only configures level 0, so only the first reduction uses rfilter
         // (cubic); every deeper level keeps the MVPlane constructor default RB2BilinearFiltered
         const int cubic = (l == 0 && p.rfilter == 4) ? 1 : 0;
-        k_reduce_v<<<grid_for(2 * d.w, d.h), BLOCK, 0, st>>>(d_tmp, cur, s, d.w, d.h, cubic);
-        k_reduce_h<<<grid_for(d.w, d.h), BLOCK, 0, st>>>(next, d, d_tmp, d.w, d.h, cubic);
-        k_pad<<<grid_for(d.ew, d.eh), BLOCK, 0, st>>>(next, d);
+        k_level<<<grid_for(d.ew, d.eh), BLOCK, 0, st>>>(next, d, cur, s, cubic);
       }
-      k_pad<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0);
 
       if (p.pel == 2)
       {
@@ -279,15 +326,27 @@ namespace MVC_NS
         k_wiener_h<<<g, BLOCK, 0, st>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
       }
       CUDA_CHECK(cudaGetLastError());
-      // d_src / d_tmp are reused by the next plane: wait until this plane's kernels are done with them
-      t0 = now();
-      CUDA_CHECK(cudaStreamSynchronize(st));
-      t_sync += now() - t0;
-      pin_free(pin, src_bytes);
-      pin = nullptr;
-      dev_free(d_src, src_bytes);
-      dev_free(d_tmp, tmp_bytes);
-      d_src = d_tmp = nullptr;
+      if (!src_device)
+      {
+        // the pinned staging buffer and d_src go back to their pools (other threads' streams): wait for this plane
+        t0 = now();
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        t_sync += now() - t0;
+        pin_free(pin, src_bytes);
+        pin = nullptr;
+        dev_free(d_src, src_bytes);
+        d_src = nullptr;
+      }
+    }
+    // from a device frame nothing was waited for: readers on other streams wait for this event (super_get)
+    if (src_device)
+    {
+      out.ready = event_get();
+      if (!out.ready || cudaEventRecord(out.ready, st) != cudaSuccess)
+      {
+        rc = -2;
+        goto cleanup;
+      }
     }
     if (timing)
       std::fprintf(stderr, "mvcuda super_build: total %.2f ms (alloc %.2f, host copy+pin %.2f, sync %.2f)\n", now() - t_start, t_alloc, t_copy, t_sync);
@@ -310,6 +369,18 @@ namespace MVC_NS
           b = nullptr;
         }
     return rc;
+  }
+
+  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
+    cudaStream_t st)
+  {
+    return super_build_impl(p, src, src_pitch_bytes, false, out, st);
+  }
+
+  int super_build_dev(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
+    cudaStream_t st)
+  {
+    return super_build_impl(p, src, src_pitch_bytes, true, out, st);
   }
 }
 

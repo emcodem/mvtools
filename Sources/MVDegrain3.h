@@ -8,6 +8,8 @@
 #include "yuy2planes.h"
 #include <stdint.h>
 #include "def.h"
+#include "GpuBackend.h"
+#include <mutex>
 #include	<emmintrin.h>
 #include	<smmintrin.h> // SSE4.1
 
@@ -106,7 +108,7 @@ public:
     PClip _mvbw, PClip _mvfw, PClip _mvbw2, PClip _mvfw2, PClip _mvbw3, PClip _mvfw3, PClip _mvbw4, PClip _mvfw4, PClip _mvbw5, PClip _mvfw5, PClip _mvbw6, PClip _mvfw6,
     sad_t _thSAD, sad_t _thSADC, int _YUVplanes, float _nLimit, float _nLimitC,
     sad_t _nSCD1, int _nSCD2, bool _isse2, bool _planar, bool _lsb_flag,
-    bool _mt_flag, bool _out16_flag, bool _out32_flag,
+    bool _mt_flag, bool _out16_flag, bool _out32_flag, bool _gpu_flag,
     int _level, 
     IScriptEnvironment* env_ptr);
   ~MVDegrainX();
@@ -124,6 +126,16 @@ private:
   MV_FORCEINLINE void use_block_y(const BYTE * &p, int &np, int &WRef, bool isUsable, const MVClip &mvclip, int i, const MVPlane *pPlane, const BYTE *pSrcCur, int xx, int nSrcPitch);
   MV_FORCEINLINE void use_block_uv(const BYTE * &p, int &np, int &WRef, bool isUsable, const MVClip &mvclip, int i, const MVPlane *pPlane, const BYTE *pSrcCur, int xx, int nSrcPitch);
   Denoise1to6Function *get_denoise123_function(int BlockX, int BlockY, int _bits_per_pixel, bool _lsb_flag, bool _out16_flag, bool _out32_flag, int _level, arch_t _arch);
+
+  // GPU path (MDegrain1 gpu=true, GPU_PIPELINE_PLAN.md section 20): source and super from token clips, token output.
+  // One lock per instance: a token regeneration can call in from another thread.
+  bool _super_lite = false;
+  bool _gpu_ok = false;
+  int _gpu_hpad = 0, _gpu_vpad = 0; // padding of the super clip (pel-2 sub-pel planes)
+  unsigned long long _producer = 0;
+  std::mutex _gpu_mutex;
+  int gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src);
+  static int gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
 };
 
 #pragma warning( push )

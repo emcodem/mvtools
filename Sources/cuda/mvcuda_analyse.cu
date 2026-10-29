@@ -15,6 +15,7 @@
 // slices) are not supported: the call returns MVCUDA_NEEDS_CPU and the caller falls back to the CPU.
 
 #include "mvcuda_internal.h"
+#include "mvcuda_refine.cuh"
 
 #include <cuda_runtime.h>
 
@@ -22,6 +23,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -42,11 +45,62 @@ namespace
     const pix *ref[3][4];
     int lambda_level, lsad, pnew, pzero, pglobal, bits, chroma_scale, radius, meander, use_global;
     int bad_sad, n_slices;
-    int async_src;   // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
+    int search_type;  // mvc_refine::S_*: the refine step of this level (exhaustive levels use the ring fold below)
+    int has_chroma;   // 0: luma-only search, cw = ch = 0
+    int async_src;  // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
     const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
     int *vec;          // device: (vx, vy, sad) triples of this level
     int *bad_flag;
+    // wavefront kernel (k_wave) only
+    int *prog;         // device: per block row, number of finished blocks of that row
+    int *ticket;       // device: next block row to hand out
+    int *nlam;         // device: nLambda per block (k_interp writes it, k_wave reads it); unused on the smallest level
+    int *rowbad;       // device: per block row, number of blocks that took the wide "bad vector" search
+    int bad_range;     // MAnalyse badrange (> 0 UMH, < 0 exhaustive rings, 0 none)
   };
+
+  // One whole analysis call for the wavefront kernel (one launch for all levels): the rows of all levels, coarsest level
+  // first, form one ticket sequence. A row of a finer level starts when the coarser level is complete and its global MV
+  // estimate is known; the CTA that finishes the last row of a level makes that estimate. Predictors are interpolated
+  // per block from the coarser level's vectors as they are needed (no separate pass).
+  struct WaveCall
+  {
+    LevelArgs lv[MVCUDA_MAX_LEVELS];
+    int nl;            // number of levels, lv[nl - 1] is the coarsest
+    int use_global;
+    int *ticket;       // device: next row ticket
+    int *level_done;   // device, per level: finished rows
+    int *level_ready;  // device, per level: 1 once lv[l].glob is written (not used for the coarsest level)
+    int *freq;         // device scratch of glob_estimate
+    int *payload;      // device payload: its header words are written here (total words, 1, per level the size word)
+    int words;
+    unsigned long long *tim; // MVC_WAVE_TIMING builds: per level first row start, last row end (%globaltimer ns)
+    // When host_out is set, the CTA that finishes last copies the payload and the bad flag (state[bad_word]) to host_out
+    // (pinned host memory, same layout as payload + state) and clears the state (state_words, finished included) for the
+    // next call on this buffer: no memset before and no copy after the launch.
+    int *host_out;
+    int *state;
+    unsigned *finished; // device: CTAs done (in the state)
+    int state_words, bad_word;
+  };
+
+  __device__ __forceinline__ unsigned long long global_ns()
+  {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+  }
+
+  // nLambda of a block whose predictor SAD is pred_sad (PlaneOfBlocks::search_mv_slice): 0 on the first row of a slice,
+  // else lambda_level * (lsad / (lsad + pred_sad / 2))^2 in IEEE double (no fused operations, like the CPU code)
+  __device__ __forceinline__ int calc_nlambda(int lambda_level, int lsad, int pred_sad, bool first_row)
+  {
+    int nlambda = first_row ? 0 : lambda_level;
+    if (lsad == 0)
+      return 0;
+    const double factor = __ddiv_rn((double)lsad, (double)(lsad + (pred_sad >> 1)));
+    return (int)__dmul_rn(__dmul_rn((double)nlambda, factor), factor);
+  }
 
   __device__ __forceinline__ int warp_sum(int v)
   {
@@ -77,12 +131,15 @@ namespace
     return warp_sum(s);
   }
 
-  // InterpolatePrediction<bigsad_t, bigsad_t> for 16-bit data
-  __global__ void k_interp(LevelArgs a, const int *coarse, int c_blk_x, int c_blk_y, int log_pel_coarse)
+  struct Vec
   {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= a.n_blk_x * a.n_blk_y)
-      return;
+    int x, y, sad;
+  };
+
+  // InterpolatePrediction<bigsad_t, bigsad_t> for 16-bit data: the predictor of block index of this level from the
+  // vectors of the coarser one (read with ld.global.cg: the wavefront kernel reads vectors other CTAs just wrote)
+  __device__ __forceinline__ Vec interp_pred(const LevelArgs &a, const int *coarse, int c_blk_x, int c_blk_y, int log_pel_coarse, int index)
+  {
     int norm_factor = 3 - a.log_pel + log_pel_coarse;
     const int mul_factor = norm_factor < 0 ? -norm_factor : 0;
     norm_factor = norm_factor < 0 ? 0 : norm_factor;
@@ -100,31 +157,33 @@ namespace
       j = 2 * c_blk_y - 1;
     const int offy = -1 + 2 * (j % 2), offx = -1 + 2 * (i % 2);
     const int iper2 = i / 2, jper2 = j / 2;
-    const int *v1, *v2, *v3, *v4;
+    const int *q1, *q2, *q3, *q4;
 #define CV(ix, iy) (coarse + 3 * ((ix) + (iy) * c_blk_x))
     if (i == 0 || i >= 2 * c_blk_x - 1)
     {
       if (j == 0 || j >= 2 * c_blk_y - 1)
-        v1 = v2 = v3 = v4 = CV(iper2, jper2);
+        q1 = q2 = q3 = q4 = CV(iper2, jper2);
       else
       {
-        v1 = v2 = CV(iper2, jper2);
-        v3 = v4 = CV(iper2, jper2 + offy);
+        q1 = q2 = CV(iper2, jper2);
+        q3 = q4 = CV(iper2, jper2 + offy);
       }
     }
     else if (j == 0 || j >= 2 * c_blk_y - 1)
     {
-      v1 = v2 = CV(iper2, jper2);
-      v3 = v4 = CV(iper2 + offx, jper2);
+      q1 = q2 = CV(iper2, jper2);
+      q3 = q4 = CV(iper2 + offx, jper2);
     }
     else
     {
-      v1 = CV(iper2, jper2);
-      v2 = CV(iper2 + offx, jper2);
-      v3 = CV(iper2, jper2 + offy);
-      v4 = CV(iper2 + offx, jper2 + offy);
+      q1 = CV(iper2, jper2);
+      q2 = CV(iper2 + offx, jper2);
+      q3 = CV(iper2, jper2 + offy);
+      q4 = CV(iper2 + offx, jper2 + offy);
     }
 #undef CV
+    const int v1[3] = { __ldcg(q1), __ldcg(q1 + 1), __ldcg(q1 + 2) }, v2[3] = { __ldcg(q2), __ldcg(q2 + 1), __ldcg(q2 + 2) };
+    const int v3[3] = { __ldcg(q3), __ldcg(q3 + 1), __ldcg(q3 + 2) }, v4[3] = { __ldcg(q4), __ldcg(q4 + 1), __ldcg(q4 + 2) };
     int x, y;
     long long tmp_sad;
     if (no_overlap)
@@ -150,42 +209,51 @@ namespace
       y = (v1[1] + v2[1] + v3[1] + v4[1]) << 2;
       tmp_sad = ((long long)v1[2] + v2[2] + v3[2] + v4[2] + 2) << 2;
     }
-    a.vec[3 * index + 0] = (x >> norm_factor) << mul_factor;
-    a.vec[3 * index + 1] = (y >> norm_factor) << mul_factor;
-    a.vec[3 * index + 2] = (int)(tmp_sad >> 4);
+    return Vec{ (x >> norm_factor) << mul_factor, (y >> norm_factor) << mul_factor, (int)(tmp_sad >> 4) };
   }
 
-  // PlaneOfBlocks::estimate_global_mv_doubled_slice on the vectors of the coarser plane; one CUDA block.
-  // freq: device scratch of 2 * 2 * FREQ_HALF ints.
-  __global__ void k_global(const int *vec, int n_blk, int *freq, int *glob_out, int use_global)
+  __global__ void k_interp(LevelArgs a, const int *coarse, int c_blk_x, int c_blk_y, int log_pel_coarse)
+  {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= a.n_blk_x * a.n_blk_y)
+      return;
+    const Vec v = interp_pred(a, coarse, c_blk_x, c_blk_y, log_pel_coarse, index);
+    a.vec[3 * index + 0] = v.x;
+    a.vec[3 * index + 1] = v.y;
+    a.vec[3 * index + 2] = v.sad;
+  }
+
+  // PlaneOfBlocks::estimate_global_mv_doubled_slice on the vectors of the coarser plane, by one CTA of nt threads (tid =
+  // thread index; all of them call it). freq: device scratch of 2 * 2 * FREQ_HALF ints. Vectors read with ld.global.cg.
+  __device__ void glob_estimate(const int *vec, int n_blk, int *freq, int *glob_out, int use_global, int tid, int nt)
   {
     __shared__ int s_min[2], s_max[2], s_best[2], s_sum[2], s_num;
     const int freq_size = 2 * FREQ_HALF; // coarse planes have pel 1
     if (!use_global)
     {
-      if (threadIdx.x == 0)
+      if (tid == 0)
       {
         glob_out[0] = 0;
         glob_out[1] = 0;
       }
       return;
     }
-    for (int i = threadIdx.x; i < 2 * freq_size; i += blockDim.x)
+    for (int i = tid; i < 2 * freq_size; i += nt)
       freq[i] = 0;
-    if (threadIdx.x < 2)
+    if (tid < 2)
     {
-      s_min[threadIdx.x] = freq_size - 1;
-      s_max[threadIdx.x] = 0;
-      s_sum[threadIdx.x] = 0;
+      s_min[tid] = freq_size - 1;
+      s_max[tid] = 0;
+      s_sum[tid] = 0;
     }
-    if (threadIdx.x == 0)
+    if (tid == 0)
       s_num = 0;
     __syncthreads();
-    for (int i = threadIdx.x; i < n_blk; i += blockDim.x)
+    for (int i = tid; i < n_blk; i += nt)
     {
       for (int c = 0; c < 2; c++)
       {
-        const int ind = (freq_size >> 1) + vec[3 * i + c];
+        const int ind = (freq_size >> 1) + __ldcg(vec + 3 * i + c);
         if (ind >= 0 && ind < freq_size)
         {
           atomicAdd(&freq[c * freq_size + ind], 1);
@@ -195,32 +263,49 @@ namespace
       }
     }
     __syncthreads();
-    if (threadIdx.x < 2)
+    // most frequent value, the first (lowest) one on ties, as the CPU's ascending scan: one warp per component, each
+    // lane over a stride of the occupied range, then a warp reduction (the loads go to L2, a one-thread scan would take
+    // an L2 round trip per entry)
+    if (tid < 64)
     {
-      const int c = threadIdx.x;
+      const int c = tid >> 5, ln = tid & 31;
       const int *f = freq + c * freq_size;
-      int count = f[s_min[c]], index = s_min[c];
-      for (int i = s_min[c] + 1; i <= s_max[c]; i++)
-        if (f[i] > count)
+      int count = -1, index = s_min[c];
+      for (int i = s_min[c] + ln; i <= s_max[c]; i += 32)
+      {
+        const int v = __ldcg(f + i);
+        if (v > count)
         {
-          count = f[i];
+          count = v;
           index = i;
         }
-      s_best[c] = index - (freq_size >> 1);
+      }
+      for (int o = 16; o > 0; o >>= 1)
+      {
+        const int oc = __shfl_xor_sync(0xffffffffu, count, o), oi = __shfl_xor_sync(0xffffffffu, index, o);
+        if (oc > count || (oc == count && oi < index))
+        {
+          count = oc;
+          index = oi;
+        }
+      }
+      if (ln == 0)
+        s_best[c] = index - (freq_size >> 1);
     }
     __syncthreads();
     const int medx = s_best[0], medy = s_best[1];
-    for (int i = threadIdx.x; i < n_blk; i += blockDim.x)
+    for (int i = tid; i < n_blk; i += nt)
     {
-      if (abs(vec[3 * i] - medx) < 6 && abs(vec[3 * i + 1] - medy) < 6)
+      const int vx = __ldcg(vec + 3 * i), vy = __ldcg(vec + 3 * i + 1);
+      if (abs(vx - medx) < 6 && abs(vy - medy) < 6)
       {
-        atomicAdd(&s_sum[0], vec[3 * i]);
-        atomicAdd(&s_sum[1], vec[3 * i + 1]);
+        atomicAdd(&s_sum[0], vx);
+        atomicAdd(&s_sum[1], vy);
         atomicAdd(&s_num, 1);
       }
     }
     __syncthreads();
-    if (threadIdx.x == 0)
+    if (tid == 0)
     {
       if (s_num > 0)
       {
@@ -233,12 +318,13 @@ namespace
         glob_out[1] = 2 * medy;
       }
     }
+    __syncthreads(); // the shared state may be used again
   }
 
-  struct Vec
+  __global__ void k_global(const int *vec, int n_blk, int *freq, int *glob_out, int use_global)
   {
-    int x, y, sad;
-  };
+    glob_estimate(vec, n_blk, freq, glob_out, use_global, threadIdx.x, blockDim.x);
+  }
 
   __device__ __forceinline__ int median3(int a, int b, int c)
   {
@@ -267,7 +353,7 @@ namespace
 
   struct BlockShared
   {
-    int sl[MAX_CAND], sc[MAX_CAND];
+    int sl[mvc_refine::MAX_BATCH], sc[mvc_refine::MAX_BATCH]; // SADs of the candidates of one batch (phase A, ring, mvc_refine batches)
     int ring_dx[MAX_CAND], ring_dy[MAX_CAND];
     int nlambda;
     int prev_x, prev_y, prev_sad; // result of the previous block of the row (left predictor), passed without a global round trip
@@ -390,6 +476,12 @@ namespace
       eval_candidate<32, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
     else if (a.bs_y == 16 && a.ch == 8)
       eval_candidate<16, 8>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.ch == 0 && a.bs_y == 16)
+      eval_candidate<16, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.ch == 0 && a.bs_y == 32)
+      eval_candidate<32, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if (a.ch == 0 && a.bs_y == 8)
+      eval_candidate<8, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
     else
       eval_candidate<0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
   }
@@ -404,12 +496,81 @@ namespace
 #define PH(i) do {} while (0)
 #endif
 
+  // Candidate checker for mvc_refine (PlaneOfBlocks::CheckMV / CheckMV2 / CheckMVdir) on the block currently in shared
+  // memory. Run by one warp: eval_dispatch spreads the SAD of one candidate over the lanes and returns it in every lane.
+  struct AnaChecker
+  {
+    int bx, by, min_cost, best_sad;
+    int dx_min, dx_max, dy_min, dy_max, pred_x, pred_y, nlambda;
+    const LevelArgs *a;
+    const pix *s_y, *s_u, *s_v;
+    int x0, y0, x1, y1;
+    int lane, warp, nwarps;
+    bool pair;
+    BlockShared *b;
+    __device__ bool ok(int cx, int cy) const { return cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max; }
+
+    // One batch of candidates (see mvcuda_refine.cuh); called by every thread of the CUDA block with identical arguments.
+    // The SADs of the valid candidates are computed by the warps in parallel, then every thread folds them in the CPU's
+    // order: a candidate is accepted when its full cost chain (vector cost, luma, chroma, each with penaltyNew) stays
+    // strictly below the minimum so far. The partial sums only grow, so this accepts exactly what the CPU's early-exit
+    // chain accepts. Not inlined: mvc_refine calls it from many places and the SAD code behind it is large.
+    __device__ __noinline__ void run_batch(int mode, int n, const int *xs, const int *ys, const int *vals, int &dir)
+    {
+      for (int c = warp; c < n; c += nwarps)
+      {
+        const int cx = xs[c], cy = ys[c];
+        if (!ok(cx, cy))
+          continue;
+        int sl, sc;
+        eval_dispatch(*a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+        if (lane == 0)
+        {
+          b->sl[c] = sl;
+          b->sc[c] = sc;
+        }
+      }
+      __syncthreads();
+      for (int c = 0; c < n; c++)
+      {
+        const int cx = xs[c], cy = ys[c];
+        if (!ok(cx, cy))
+          continue;
+        const int dxp = pred_x - cx, dyp = pred_y - cy;
+        const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+        int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a->bits);
+        if (cost >= min_cost)
+          continue;
+        const int sl = b->sl[c], sc = b->sc[c];
+        cost += sl + (int)(((long long)a->pnew * sl) >> 8);
+        if (cost >= min_cost)
+          continue;
+        cost += sc + (int)(((long long)a->pnew * sc) >> 8);
+        if (cost >= min_cost)
+          continue;
+        if (mode != mvc_refine::M_CHECKDIR)
+        {
+          bx = cx;
+          by = cy;
+        }
+        min_cost = cost;
+        best_sad = sl + sc;
+        if (mode != mvc_refine::M_CHECK)
+          dir = vals[c];
+      }
+      __syncthreads(); // the next batch overwrites b->sl / b->sc
+    }
+  };
+
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
   __global__ void __launch_bounds__(768, 1) k_search(LevelArgs a)
   {
     extern __shared__ __align__(16) pix s_dyn[];
     __shared__ BlockShared b;
+    __shared__ LevelArgs s_args; // copy of the kernel argument for the mvc_refine path: taking the address of the by-value argument would make every field access a slow generic load
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+    if (a.search_type != mvc_refine::S_EXHAUSTIVE && tid == 0)
+      s_args = a;
     const int slice = blockIdx.x;
 #ifdef MVC_PHASE_PROF
     const int bk = 31 - __clz(a.n_blk_x);
@@ -418,7 +579,8 @@ namespace
     const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
     const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
     const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
-    const int ring_n = 4 * a.radius * (a.radius + 1);
+    const int ring_radius = (a.search_type == mvc_refine::S_EXHAUSTIVE) ? a.radius : 0; // the ring tables are for the exhaustive fold only
+    const int ring_n = 4 * ring_radius * (ring_radius + 1);
     const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
     pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
     // asynchronous copy of the source block of block column bx in row by into the shared buffer dst
@@ -469,7 +631,7 @@ namespace
     if (tid == 0)
     {
       int n = 0;
-      for (int r = 1; r <= a.radius; r++)
+      for (int r = 1; r <= ring_radius; r++)
       {
         for (int i = -r + 1; i < r; i++)
         {
@@ -677,6 +839,59 @@ namespace
         __syncthreads(); // everybody has read the phase A results before phase B overwrites them
         PH(2);
 
+        if (a.search_type != mvc_refine::S_EXHAUSTIVE)
+        {
+          // any other search type: the CPU control flow of PlaneOfBlocks::Refine, run by every thread of the block with
+          // identical scalar state; the candidate SADs of each batch are spread over the warps, see mvcuda_refine.cuh
+          AnaChecker ck;
+          ck.bx = best_x;
+          ck.by = best_y;
+          ck.min_cost = min_cost;
+          ck.best_sad = best_sad;
+          ck.dx_min = dx_min;
+          ck.dx_max = dx_max;
+          ck.dy_min = dy_min;
+          ck.dy_max = dy_max;
+          ck.pred_x = pred.x;
+          ck.pred_y = pred.y;
+          ck.nlambda = nlambda;
+          ck.a = &s_args; // written by thread 0 before the first barrier of the block loop
+          ck.s_y = s_y;
+          ck.s_u = s_u;
+          ck.s_v = s_v;
+          ck.x0 = x0[0];
+          ck.y0 = y0[0];
+          ck.x1 = x0[1];
+          ck.y1 = y0[1];
+          ck.lane = lane;
+          ck.warp = warp;
+          ck.nwarps = nwarps;
+          ck.pair = pair_chroma;
+          ck.b = &b;
+          mvc_refine::refine(ck, a.search_type, a.radius);
+          best_x = ck.bx;
+          best_y = ck.by;
+          best_sad = ck.best_sad;
+          if (tid == 0)
+          {
+            if (idx > 1 + beg * a.n_blk_x && best_sad > a.bad_sad)
+              atomicExch(a.bad_flag, 1);
+            a.vec[3 * idx + 0] = best_x;
+            a.vec[3 * idx + 1] = best_y;
+            a.vec[3 * idx + 2] = best_sad;
+            b.prev_x = best_x;
+            b.prev_y = best_y;
+            b.prev_sad = best_sad;
+          }
+          __syncthreads(); // the next block reads b.prev_*
+          PH(4);
+#ifdef MVC_PHASE_PROF
+          if (tid == 0)
+            atomicAdd(&g_prof[bk][5], 1ull);
+#endif
+          continue;
+        }
+
         // ---- phase B: SADs of the ring candidates around the best vector so far
         for (int c = warp; c < ring_n; c += nwarps)
         {
@@ -755,6 +970,1031 @@ namespace
     }
   }
 
+  // ================================================================================================================
+  // Wavefront search (GPU_PIPELINE_PLAN.md W): meander=false and one slice, i.e. the CPU result of
+  // MAnalyse(meander=false, mt=false). Without meander a block depends on its left neighbour, on the block above and,
+  // on the smallest level and on the last row, on the block above-right (FetchPredictors); the bottom-right predictor
+  // of the other rows is the not yet searched (interpolated) vector. So block (x, y) can run as soon as row y - 1 has
+  // finished block x (x + 1 for the up-right predictor): one warp per block row, rows handed out in order by an atomic
+  // ticket, a progress counter per row (release / acquire). A row only waits for a row with a smaller ticket, whose warp
+  // is already running, so this cannot deadlock for any grid size. The critical path is about n_blk_x + n_blk_y blocks
+  // instead of a whole slice.
+  //
+  // Inside a warp the candidates of a batch are spread over groups of GW lanes (GW = block width rounded up to a power
+  // of two; lane = column), 32 / GW candidates at a time; no block-wide barriers. The fold over the candidates runs
+  // in every lane with identical values, in the CPU order (same code as the slice kernel and AnaChecker).
+
+  __device__ __forceinline__ int ld_acquire(const int *p)
+  {
+    int v;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+  }
+  __device__ __forceinline__ void st_release(int *p, int v)
+  {
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+  }
+
+  // SAD of one candidate, computed by the GW lanes of a group (col = lane inside the group) and summed over the group;
+  // every lane of the group returns the sums. Lanes of an invalid candidate contribute 0. Chroma: for cw <= GW / 2 the
+  // lanes [0, cw) take U and [cw, 2 cw) V, else each lane < cw takes both. BSY / CHH: compile-time row counts of the
+  // luma block and of one chroma block (0 = runtime loop), as in eval_candidate. The reference planes are read with
+  // __ldg: the pointers come from shared memory (WaveState), and plain dereferences compiled to generic loads that the
+  // compiler issued one at a time (each row waited for the previous one); explicit global read-only loads go out together.
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ void eval_group(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, int cx, int cy, int col, bool valid, int &sl, int &sc)
+  {
+    int sum_l = 0, sum_c = 0;
+    if (valid)
+    {
+      const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
+      const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+      const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+      if (col < a.bs_x)
+      {
+        const pix *r = a.ref[0][sub] + (size_t)ry * a.ew[0] + rx + col;
+        const pix *q = s_y + col;
+        if constexpr (BSY > 0)
+        {
+          int rv[BSY];
+          #pragma unroll
+          for (int row = 0; row < BSY; row++)
+            rv[row] = __ldg(r + (size_t)row * a.ew[0]);
+          #pragma unroll
+          for (int row = 0; row < BSY; row++)
+            sum_l += abs((int)q[row * a.bs_x] - rv[row]);
+        }
+        else
+        {
+          for (int row = 0; row < a.bs_y; row++)
+            sum_l += abs((int)q[row * a.bs_x] - (int)__ldg(r + (size_t)row * a.ew[0]));
+        }
+      }
+      if (a.cw)
+      {
+        const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+        const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+        const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+        if (2 * a.cw <= GW)
+        {
+          if (col < 2 * a.cw)
+          {
+            const int pl = col < a.cw ? 1 : 2, cc = col < a.cw ? col : col - a.cw;
+            const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + cc;
+            const pix *q = (pl == 1 ? s_u : s_v) + cc;
+            if constexpr (CHH > 0)
+            {
+              int rv[CHH];
+              #pragma unroll
+              for (int row = 0; row < CHH; row++)
+                rv[row] = __ldg(r + (size_t)row * a.ew[pl]);
+              #pragma unroll
+              for (int row = 0; row < CHH; row++)
+                sum_c += abs((int)q[row * a.cw] - rv[row]);
+            }
+            else
+            {
+              for (int row = 0; row < a.ch; row++)
+                sum_c += abs((int)q[row * a.cw] - (int)__ldg(r + (size_t)row * a.ew[pl]));
+            }
+          }
+        }
+        else if (col < a.cw)
+        {
+          for (int pl = 1; pl < 3; pl++)
+          {
+            const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + col;
+            const pix *q = (pl == 1 ? s_u : s_v) + col;
+            for (int row = 0; row < a.ch; row++)
+              sum_c += abs((int)q[row * a.cw] - (int)__ldg(r + (size_t)row * a.ew[pl]));
+          }
+        }
+      }
+    }
+    #pragma unroll
+    for (int o = GW / 2; o > 0; o >>= 1)
+    {
+      sum_l += __shfl_xor_sync(0xffffffffu, sum_l, o);
+      sum_c += __shfl_xor_sync(0xffffffffu, sum_c, o);
+    }
+    sl = sum_l;
+    sc = scale_chroma(sum_c, a.chroma_scale);
+  }
+
+  // State of the one warp of a k_wave CTA, in static shared memory: the candidate list, the SADs and the geometry are
+  // exchanged through these __shared__ variables (plain shared loads, no generic pointers). The SAD evaluator is inlined
+  // everywhere: as a noinline function ptxas issued its loads one at a time (about 5x slower). Each k_wave instance has
+  // exactly one SAD variant, which keeps the inlined copies in the mvc_refine call sites affordable to compile.
+  const int WAVE_SRC_MAX = 32 * 32 * 3; // a 32x32 luma block and two 32x32 chroma blocks
+
+  struct WaveState
+  {
+    LevelArgs a;                              // copy of the kernel argument
+    int x0, y0, x1, y1;                       // source block position (luma, chroma) in the padded planes
+    int dx_min, dx_max, dy_min, dy_max;       // search range of the current block
+    int n;                                    // number of candidates in xs / ys
+    int xs[mvc_refine::MAX_BATCH], ys[mvc_refine::MAX_BATCH];
+    int sl[mvc_refine::MAX_BATCH], sc[mvc_refine::MAX_BATCH];
+    int ring_dx[48], ring_dy[48];             // exhaustive search offsets (ExpandingSearch order, radius <= 3)
+    int bc[20];                               // values thread 0 hands to the whole CTA (row, neighbours, nLambda, level)
+    long long key[4];                         // per-warp minimum of the parallel fold
+  };
+  const int WAVE_NW = 4;                      // warps per block row (one CTA)
+  const int WAVE_NT = 32 * WAVE_NW;
+  __shared__ WaveState g_ws;
+  __shared__ __align__(16) pix g_wsrc[WAVE_SRC_MAX]; // source block: luma, then U, then V
+  // interpolated predictors of the current row and the row below, made by the whole CTA at the start of a row (one
+  // block's inline interpolation would put two L2 round trips on the wavefront's critical path); rows of more blocks
+  // interpolate inline
+  const int WAVE_IP_MAX = 512;
+  __shared__ int g_ip[2][WAVE_IP_MAX][3];          // (x, y, sad): [0] this row, [1] the row below
+  __shared__ int g_ipl[WAVE_IP_MAX];               // nLambda of this row's blocks
+
+  // SADs of the g_ws.n candidates g_ws.xs / ys into g_ws.sl / sc, 32 / GW candidates at a time. With range_test,
+  // candidates outside the search range are skipped (their entries are never read). Called by all 32 lanes.
+  // Split form of eval_group for the compile-time sizes with paired chroma (CHH == 0 or 2 * cw <= GW): eg_load reads the
+  // reference rows of one candidate into registers, eg_sum forms the sums. wave_eval_inl loads several candidates per
+  // lane before summing any of them, so the memory latency is paid once per R rounds instead of once per round.
+  template <int BSY, int CHH>
+  struct EvalRegs
+  {
+    int l[BSY];
+    int c[CHH > 0 ? CHH : 1];
+  };
+
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ void eg_load(const LevelArgs &a, int x0, int y0, int x1, int y1, int cx, int cy, int col,
+    bool valid, EvalRegs<BSY, CHH> &e)
+  {
+    if (!valid)
+      return;
+    const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    if (col < a.bs_x)
+    {
+      const pix *r = a.ref[0][sub] + (size_t)ry * a.ew[0] + rx + col;
+      #pragma unroll
+      for (int row = 0; row < BSY; row++)
+        e.l[row] = __ldg(r + (size_t)row * a.ew[0]);
+    }
+    if constexpr (CHH > 0)
+    {
+      if (col < 2 * a.cw)
+      {
+        const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+        const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+        const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+        const int pl = col < a.cw ? 1 : 2, cc = col < a.cw ? col : col - a.cw;
+        const pix *r = a.ref[pl][subc] + (size_t)ryc * a.ew[pl] + rxc + cc;
+        #pragma unroll
+        for (int row = 0; row < CHH; row++)
+          e.c[row] = __ldg(r + (size_t)row * a.ew[pl]);
+      }
+    }
+  }
+
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ void eg_sum(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v, int col,
+    bool valid, const EvalRegs<BSY, CHH> &e, int &sl, int &sc)
+  {
+    int sum_l = 0, sum_c = 0;
+    if (valid)
+    {
+      if (col < a.bs_x)
+      {
+        const pix *q = s_y + col;
+        #pragma unroll
+        for (int row = 0; row < BSY; row++)
+          sum_l += abs((int)q[row * a.bs_x] - e.l[row]);
+      }
+      if constexpr (CHH > 0)
+      {
+        if (col < 2 * a.cw)
+        {
+          const int pl = col < a.cw ? 1 : 2, cc = col < a.cw ? col : col - a.cw;
+          const pix *q = (pl == 1 ? s_u : s_v) + cc;
+          #pragma unroll
+          for (int row = 0; row < CHH; row++)
+            sum_c += abs((int)q[row * a.cw] - e.c[row]);
+        }
+      }
+    }
+    #pragma unroll
+    for (int o = GW / 2; o > 0; o >>= 1)
+    {
+      sum_l += __shfl_xor_sync(0xffffffffu, sum_l, o);
+      if constexpr (CHH > 0)
+        sum_c += __shfl_xor_sync(0xffffffffu, sum_c, o);
+    }
+    sl = sum_l;
+    sc = scale_chroma(sum_c, a.chroma_scale);
+  }
+
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ void wave_eval_inl(int lane, bool range_test)
+  {
+    const LevelArgs &a = g_ws.a;
+    constexpr int G = WAVE_NT / GW; // candidate groups in the CTA
+    const int grp = lane / GW, col = lane % GW;
+    const pix *s_y = g_wsrc, *s_u = g_wsrc + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
+    const int n = g_ws.n;
+    // the split form needs paired chroma (U and V columns side by side in one group): no chroma, 4:2:0, 4:2:2
+    if constexpr (BSY > 0)
+    if (CHH == 0 || 2 * a.cw <= GW)
+    {
+      // R rounds of G candidates with their loads in flight together (about 64 registers of reference samples)
+      constexpr int R = (64 / (BSY + CHH)) < 1 ? 1 : 64 / (BSY + CHH);
+      for (int base = 0; base < n; base += G * R)
+      {
+        EvalRegs<BSY, CHH> e[R];
+        bool v[R];
+        int cs[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++)
+        {
+          const int c = base + r * G + grp;
+          cs[r] = c;
+          const int cx = c < n ? g_ws.xs[c] : 0, cy = c < n ? g_ws.ys[c] : 0;
+          v[r] = c < n && (!range_test || (cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max));
+          eg_load<GW, BSY, CHH>(a, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, v[r], e[r]);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++)
+        {
+          if (base + r * G < n) // some group has a candidate in this round (uniform over the warp; no break, so the loop
+          {                     // stays unrolled and e[] stays in registers)
+            int sl, sc;
+            eg_sum<GW, BSY, CHH>(a, s_y, s_u, s_v, col, v[r], e[r], sl, sc);
+            if (v[r] && col == 0)
+            {
+              g_ws.sl[cs[r]] = sl;
+              g_ws.sc[cs[r]] = sc;
+            }
+          }
+        }
+      }
+      __syncthreads();
+      return;
+    }
+    for (int base = 0; base < n; base += G)
+    {
+      const int c = base + grp;
+      const int cx = c < n ? g_ws.xs[c] : 0, cy = c < n ? g_ws.ys[c] : 0;
+      const bool valid = c < n
+        && (!range_test || (cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max));
+      int sl, sc;
+      eval_group<GW, BSY, CHH>(a, s_y, s_u, s_v, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, valid, sl, sc);
+      if (valid && col == 0)
+      {
+        g_ws.sl[c] = sl;
+        g_ws.sc[c] = sc;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Folds the evaluated candidates in the CPU order with the semantics of CheckMV / CheckMV2 / CheckMVdir (see
+  // AnaChecker::run_batch); every lane runs it with identical values.
+  __device__ __forceinline__ void wave_fold(int mode, int n, const int *vals, int &dir, int &bx, int &by, int &min_cost,
+    int &best_sad, int pred_x, int pred_y, int nlambda)
+  {
+    const LevelArgs &a = g_ws.a;
+    for (int c = 0; c < n; c++)
+    {
+      const int cx = g_ws.xs[c], cy = g_ws.ys[c];
+      if (!(cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max))
+        continue;
+      const int dxp = pred_x - cx, dyp = pred_y - cy;
+      const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+      int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+      if (cost >= min_cost)
+        continue;
+      const int sl = g_ws.sl[c], sc = g_ws.sc[c];
+      cost += sl + (int)(((long long)a.pnew * sl) >> 8);
+      if (cost >= min_cost)
+        continue;
+      cost += sc + (int)(((long long)a.pnew * sc) >> 8);
+      if (cost >= min_cost)
+        continue;
+      if (mode != mvc_refine::M_CHECKDIR)
+      {
+        bx = cx;
+        by = cy;
+      }
+      min_cost = cost;
+      best_sad = sl + sc;
+      if (mode != mvc_refine::M_CHECK)
+        dir = vals[c];
+    }
+  }
+
+  // Parallel form of wave_fold, called by every thread of the CTA. When every part of every candidate's cost (vector
+  // cost, luma term, chroma term) is non-negative and the sum fits an int, the CPU's sequential "accept while the cost
+  // chain stays below the running minimum" ends at the first candidate with the smallest final cost below the minimum
+  // before the batch, so a minimum over (cost, index) gives exactly its result. Otherwise (an overflowed vector cost, a
+  // negative pnew) the sequential fold runs.
+  __device__ __forceinline__ void wave_fold_par(int tid, int mode, int n, const int *vals, int &dir, int &bx, int &by,
+    int &min_cost, int &best_sad, int pred_x, int pred_y, int nlambda)
+  {
+    const LevelArgs &a = g_ws.a;
+    const long long none = 0x7fffffffffffffffLL;
+    long long key = none;
+    int odd = 0;
+    for (int c = tid; c < n; c += WAVE_NT)
+    {
+      const int cx = g_ws.xs[c], cy = g_ws.ys[c];
+      if (!(cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max))
+        continue;
+      const int dxp = pred_x - cx, dyp = pred_y - cy;
+      const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+      const int lam = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+      const int sl = g_ws.sl[c], sc = g_ws.sc[c];
+      const int tl = (int)(((long long)a.pnew * sl) >> 8), tc = (int)(((long long)a.pnew * sc) >> 8);
+      const long long cost = (long long)lam + sl + tl + sc + tc;
+      if (lam < 0 || tl < 0 || tc < 0 || cost > 0x7fffffffLL)
+        odd = 1;
+      if (cost < min_cost)
+      {
+        const long long k = (cost << 8) | c;
+        key = k < key ? k : key;
+      }
+    }
+    if (__syncthreads_or(odd))
+    {
+      wave_fold(mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
+      return;
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+      const long long other = __shfl_xor_sync(0xffffffffu, key, o);
+      key = other < key ? other : key;
+    }
+    if ((tid & 31) == 0)
+      g_ws.key[tid >> 5] = key;
+    __syncthreads();
+    key = g_ws.key[0];
+    for (int w = 1; w < WAVE_NW; w++)
+      key = g_ws.key[w] < key ? g_ws.key[w] : key;
+    if (key != none)
+    {
+      const int c = (int)(key & 255);
+      if (mode != mvc_refine::M_CHECKDIR)
+      {
+        bx = g_ws.xs[c];
+        by = g_ws.ys[c];
+      }
+      min_cost = (int)(key >> 8);
+      best_sad = g_ws.sl[c] + g_ws.sc[c];
+      if (mode != mvc_refine::M_CHECK)
+        dir = vals[c];
+    }
+  }
+
+  // evaluation and fold of one batch for the runtime-size kernels: one copy per GW instead of one per call site of
+  // mvc_refine (inlining it there made those kernels take about 20 minutes to compile per architecture)
+  template <int GW>
+  __device__ __noinline__ void wave_batch_call(int tid, int mode, int n, const int *vals, int &dir, int &bx, int &by,
+    int &min_cost, int &best_sad, int pred_x, int pred_y, int nlambda)
+  {
+    wave_eval_inl<GW, 0, 0>(tid, true);
+    wave_fold_par(tid, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
+  }
+
+  // Candidate checker for mvc_refine run by the threads of a k_wave CTA
+  template <int GW, int BSY, int CHH>
+  struct WaveChecker
+  {
+    int bx, by, min_cost, best_sad, pred_x, pred_y, nlambda, lane;
+    __device__ bool ok(int cx, int cy) const
+    {
+      return cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max;
+    }
+    __device__ __forceinline__ void run_batch(int mode, int n, const int *xs, const int *ys, const int *vals, int &dir)
+    {
+      for (int c = lane; c < n; c += WAVE_NT)
+      {
+        g_ws.xs[c] = xs[c];
+        g_ws.ys[c] = ys[c];
+      }
+      if (lane == 0)
+        g_ws.n = n;
+      __syncthreads();
+      if constexpr (BSY == 0)
+        wave_batch_call<GW>(lane, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
+      else
+      {
+        wave_eval_inl<GW, BSY, CHH>(lane, true);
+        wave_fold_par(lane, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
+      }
+      __syncthreads(); // the next batch overwrites the candidate list and the SADs
+    }
+  };
+
+  // The wide search PseudoEPZSearch runs for a "bad" block (SAD above the badSAD threshold): UMHSearch(badrange * pel)
+  // around (0, 0) for badrange > 0, ExpandingSearch rings around (0, 0) until a good vector is found for badrange < 0,
+  // then the small sub-pel rings around the result. Rare, so it uses the runtime-size SAD code and is not inlined
+  // (one copy per GW). The candidate lists are cut into batches of at most MAX_BATCH in the CPU order, which keeps
+  // the sequential semantics (the UMH list exceeds one batch for pel 2). Called by every thread of the CTA.
+  template <int GW>
+  __device__ __noinline__ void wave_bad_search(int tid, int &bx, int &by, int &min_cost, int &best_sad, int pred_x,
+    int pred_y, int nlambda)
+  {
+    const LevelArgs &a = g_ws.a;
+    WaveChecker<GW, 0, 0> ck;
+    ck.bx = bx;
+    ck.by = by;
+    ck.min_cost = min_cost;
+    ck.best_sad = best_sad;
+    ck.pred_x = pred_x;
+    ck.pred_y = pred_y;
+    ck.nlambda = nlambda;
+    ck.lane = tid;
+    const int found = best_sad;
+    const int range = a.bad_range * a.pel; // badrange * nPel (negative for the exhaustive variant)
+    int xs[mvc_refine::MAX_BATCH], ys[mvc_refine::MAX_BATCH], n = 0, dummy = 0;
+    auto flush = [&]() {
+      if (n)
+        ck.run_batch(mvc_refine::M_CHECK, n, xs, ys, nullptr, dummy);
+      n = 0;
+    };
+    auto add = [&](int x, int y) {
+      xs[n] = x;
+      ys[n++] = y;
+      if (n == mvc_refine::MAX_BATCH)
+        flush();
+    };
+    // ExpandingSearch(r, s, mvx, mvy) in the order of mvc_refine::add_expanding
+    auto ring = [&](int r, int s, int mvx, int mvy) {
+      for (int i = -r + s; i < r; i += s)
+      {
+        add(mvx + i, mvy - r);
+        add(mvx + i, mvy + r);
+      }
+      for (int j = -r + s; j < r; j += s)
+      {
+        add(mvx - r, mvy + j);
+        add(mvx + r, mvy + j);
+      }
+      add(mvx - r, mvy - r);
+      add(mvx - r, mvy + r);
+      add(mvx + r, mvy - r);
+      add(mvx + r, mvy + r);
+      flush();
+    };
+    if (a.bad_range > 0)
+    {
+      // UMHSearch(range, 0, 0) as mvc_refine::umh: CrossSearch, the hex grid rings, then Hex2Search(range)
+      for (int i = 1; i < range; i += 2)
+      {
+        add(-i, 0);
+        add(i, 0);
+      }
+      for (int j = 1; j < range; j += 2)
+      {
+        add(0, j);
+        add(0, -j);
+      }
+      const int hex4[16][2] = { {-4, 2}, {-4, 1}, {-4, 0}, {-4,-1}, {-4,-2}, { 4,-2}, { 4,-1}, { 4, 0}, { 4, 1}, { 4, 2},
+                                { 2, 3}, { 0, 4}, {-2, 3}, {-2,-3}, { 0,-4}, { 2,-3} };
+      int i = 1;
+      do
+      {
+        for (int j = 0; j < 16; j++)
+          add(hex4[j][0] * i, hex4[j][1] * i);
+      } while (++i <= range / 4);
+      flush();
+      mvc_refine::hex2(ck, range);
+    }
+    else if (a.bad_range < 0)
+    {
+      for (int i = 1; i < -range; i += a.pel)
+      {
+        ring(i, a.pel, 0, 0);
+        if (ck.best_sad < found / 4)
+          break; // a rather good vector is found
+      }
+    }
+    const int mvx = ck.bx, mvy = ck.by; // refine in a small area
+    for (int i = 1; i < a.pel; i++)
+      ring(i, 1, mvx, mvy);
+    bx = ck.bx;
+    by = ck.by;
+    min_cost = ck.min_cost;
+    best_sad = ck.best_sad;
+  }
+
+#ifdef MVC_PHASE_PROF
+  // k_wave phase cycles (development aid): [log2(blocks per row)][issue, wait, predictors, A eval, A fold, ring / refine eval,
+  // ring fold, store, count]
+  __device__ unsigned long long g_wprof[16][12];
+#define WPH_START() long long wt_ = clock64()
+#define WPH(i) do { if (lane == 0) { long long n_ = clock64(); atomicAdd(&g_wprof[wbk][i], (unsigned long long)(n_ - wt_)); wt_ = n_; } } while (0)
+#else
+#define WPH_START() do {} while (0)
+#define WPH(i) do {} while (0)
+#endif
+
+  // Radius of the refine step when it is a single batch of rings around the best vector so far, else 0: exhaustive search
+  // (every coarse level) and Hex2Search with range <= 1, which is only its closing ExpandingSearch(1, 1) (QTGMC's
+  // pelsearch=1 at level 0). Both are CheckMV batches in ExpandingSearch order.
+  __host__ __device__ inline int ring_radius_of(int search_type, int radius)
+  {
+    if (search_type == mvc_refine::S_EXHAUSTIVE)
+      return radius;
+    if (search_type == mvc_refine::S_HEX2 && radius <= 1)
+      return 1;
+    return 0;
+  }
+
+  // GEN = false: only the ring refine of ring_radius_of (no mvc_refine code: small and fast to compile);
+  // GEN = true: every search type through mvc_refine
+  template <int GW, int BSY, int CHH, bool GEN>
+  __global__ void __maxnreg__(255) k_wave(const __grid_constant__ WaveCall c)
+  {
+    const int lane = threadIdx.x; // thread index in the CTA (all WAVE_NW warps work on one block row)
+    int cur = -1;                 // level of the previous row of this CTA
+    int ring_n = 0;
+
+    for (;;)
+    {
+      if (lane == 0)
+      {
+        const int t = atomicAdd(c.ticket, 1);
+        if (t == 0)
+        {
+          // payload header: total words, 1, and per level the size word in front of its vectors
+          c.payload[0] = c.words;
+          c.payload[1] = 1;
+          for (int l = 0; l < c.nl; l++)
+            c.lv[l].vec[-1] = c.lv[l].n_blk_x * c.lv[l].n_blk_y * 3 + 1;
+        }
+        int level = -1, row = 0;
+        for (int l = c.nl - 1, first = 0; l >= 0; first += c.lv[l].n_blk_y, l--)
+          if (t < first + c.lv[l].n_blk_y)
+          {
+            level = l;
+            row = t - first;
+            break;
+          }
+        g_ws.bc[0] = row;
+        g_ws.bc[13] = level;
+      }
+      __syncthreads();
+      const int row = g_ws.bc[0], level = g_ws.bc[13];
+      if (level < 0)
+      {
+        if (c.host_out)
+        {
+          if (lane == 0)
+          {
+            __threadfence(); // this CTA's vectors before its count
+            g_ws.bc[17] = atomicAdd(c.finished, 1u) == gridDim.x - 1 ? 1 : 0;
+            __threadfence();
+          }
+          __syncthreads();
+          if (g_ws.bc[17])
+          {
+            // the last CTA: every vector of every CTA is written (fenced before their counts)
+            for (int i = lane; i < c.words; i += WAVE_NT)
+              c.host_out[i] = __ldcg(c.payload + i);
+            if (lane == 0)
+              c.host_out[c.words + c.bad_word] = __ldcg(c.state + c.bad_word);
+            for (int i = lane; i < c.state_words; i += WAVE_NT)
+              c.state[i] = 0;
+          }
+        }
+        return;
+      }
+      // the level's arguments, copied to shared memory once per level: c.lv[level] with a run-time index would be a
+      // memory load at every use instead of a constant-bank operand
+      const LevelArgs &a = g_ws.a;
+      if (level != cur)
+      {
+        // a new level for this CTA: wait until the coarser level is complete and the global MV estimate is written
+        if (lane == 0)
+        {
+          if (level < c.nl - 1)
+            while (ld_acquire(c.level_ready + level) == 0)
+              __nanosleep(256);
+          g_ws.a = c.lv[level];
+          const int ring_r = ring_radius_of(a.search_type, a.radius);
+          int n = 0;
+          for (int r = 1; r <= ring_r; r++)
+            n = mvc_refine::add_expanding(g_ws.ring_dx, g_ws.ring_dy, n, r, 1, 0, 0);
+          g_ws.bc[14] = 4 * ring_r * (ring_r + 1);
+        }
+        __syncthreads();
+        ring_n = g_ws.bc[14];
+        cur = level;
+      }
+#ifdef MVC_PHASE_PROF
+      const int wbk = 31 - __clz(a.n_blk_x);
+#endif
+      const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
+      const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
+      pix *const s_y = g_wsrc, *const s_u = g_wsrc + a.bs_x * a.bs_y, *const s_v = s_u + a.cw * a.ch;
+      const int nbx = a.n_blk_x;
+      const bool coarser = level < c.nl - 1; // predictors interpolated from the coarser level (else zero)
+      const LevelArgs &ca = c.lv[coarser ? level + 1 : level];
+      const bool is_top = row == 0, is_bottom = row == a.n_blk_y - 1;
+      const int lag = (a.smallest || is_bottom) ? 2 : 1;
+      int seen = 0; // progress of the row above as last read (lane 0)
+      int left_x = 0, left_y = 0, left_sad = 0;
+      int row_bad = 0; // blocks of this row that took the wide search (same value in every thread)
+#ifdef MVC_WAVE_TIMING
+      if (lane == 0)
+        atomicMin(c.tim + 2 * level, global_ns());
+#endif
+      const bool ip_shared = coarser && nbx <= WAVE_IP_MAX;
+      if (ip_shared)
+      {
+        const int rows = is_bottom ? 1 : 2;
+        for (int i = lane; i < rows * nbx; i += WAVE_NT)
+        {
+          const int below = i >= nbx ? 1 : 0, bx = i - below * nbx;
+          const Vec v = interp_pred(a, ca.vec, ca.n_blk_x, ca.n_blk_y, 0, (row + below) * nbx + bx);
+          g_ip[below][bx][0] = v.x;
+          g_ip[below][bx][1] = v.y;
+          g_ip[below][bx][2] = v.sad;
+          if (!below)
+            g_ipl[bx] = calc_nlambda(a.lambda_level, a.lsad, v.sad, is_top);
+        }
+        __syncthreads();
+      }
+
+      for (int blkx = 0; blkx < nbx; blkx++)
+      {
+        WPH_START();
+        const int idx = row * nbx + blkx;
+        int x0[3], y0[3];
+        x0[0] = a.hpad[0] + blkx * step_x;
+        y0[0] = a.vpad[0] + row * step_y;
+        for (int p = 1; p < 3; p++)
+        {
+          x0[p] = a.hpad[p] + blkx * (step_x >> a.log_x_uv);
+          y0[p] = a.vpad[p] + row * (step_y >> a.log_y_uv);
+        }
+        // source block into shared memory (asynchronous where the geometry allows it); completes while we wait
+        if (a.async_src)
+        {
+          const int wl = (a.bs_x * a.bs_y) / SPW, wc = (a.cw * a.ch) / SPW;
+          const int rl = a.bs_x / SPW, rc = a.cw / SPW;
+          for (int i = lane; i < wl + 2 * wc; i += WAVE_NT)
+          {
+            if (i < wl)
+            {
+              const int r = i / rl, c = SPW * (i - r * rl);
+              cp_async4(s_y + r * a.bs_x + c, a.src[0] + (size_t)(y0[0] + r) * a.ew[0] + x0[0] + c);
+            }
+            else
+            {
+              int j = i - wl;
+              const int pl = j >= wc ? 2 : 1;
+              if (j >= wc)
+                j -= wc;
+              const int r = j / rc, c = SPW * (j - r * rc);
+              cp_async4((pl == 1 ? s_u : s_v) + r * a.cw + c, a.src[pl] + (size_t)(y0[pl] + r) * a.ew[pl] + x0[pl] + c);
+            }
+          }
+          cp_async_commit();
+        }
+        else
+        {
+          for (int i = lane; i < a.bs_x * a.bs_y; i += WAVE_NT)
+          {
+            const int r = i / a.bs_x, c = i - r * a.bs_x;
+            s_y[i] = a.src[0][(size_t)(y0[0] + r) * a.ew[0] + x0[0] + c];
+          }
+          for (int i = lane; i < a.cw * a.ch; i += WAVE_NT)
+          {
+            const int r = i / a.cw, c = i - r * a.cw;
+            s_u[i] = a.src[1][(size_t)(y0[1] + r) * a.ew[1] + x0[1] + c];
+            s_v[i] = a.src[2][(size_t)(y0[2] + r) * a.ew[2] + x0[2] + c];
+          }
+        }
+
+        // neighbours: own and bottom-right are not searched yet (interpolated, or zero on the smallest level), the
+        // up / up-right ones come from the row above once its counter has passed them
+        const bool side = blkx < nbx - 1;
+        int v[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // own, up, p3
+        int use_p3 = 0;
+        int own_nlambda = 0;
+        if (lane == 0)
+        {
+          // not the smallest level: the predictor is this block's own interpolated vector (clipping changes x / y only),
+          // so nLambda does not depend on the search
+          if (ip_shared)
+          {
+            v[0] = g_ip[0][blkx][0]; v[1] = g_ip[0][blkx][1]; v[2] = g_ip[0][blkx][2];
+            own_nlambda = g_ipl[blkx];
+          }
+          else if (coarser)
+          {
+            const Vec o = interp_pred(a, ca.vec, ca.n_blk_x, ca.n_blk_y, 0, idx);
+            v[0] = o.x; v[1] = o.y; v[2] = o.sad;
+            own_nlambda = calc_nlambda(a.lambda_level, a.lsad, o.sad, is_top);
+          }
+          const bool p3_below = !is_bottom && !a.smallest && side;
+          if (p3_below)
+          {
+            if (ip_shared)
+            {
+              v[6] = g_ip[1][blkx + 1][0]; v[7] = g_ip[1][blkx + 1][1]; v[8] = g_ip[1][blkx + 1][2];
+            }
+            else
+            {
+              const Vec q = interp_pred(a, ca.vec, ca.n_blk_x, ca.n_blk_y, 0, idx + nbx + 1);
+              v[6] = q.x; v[7] = q.y; v[8] = q.sad;
+            }
+            use_p3 = 1;
+          }
+          WPH(0);
+          if (!is_top)
+          {
+            const int need = blkx + lag < nbx ? blkx + lag : nbx;
+            while (seen < need)
+              seen = ld_acquire(a.prog + row - 1);
+            WPH(1);
+            const int *u = a.vec + 3 * (idx - nbx);
+            v[3] = __ldcg(u); v[4] = __ldcg(u + 1); v[5] = __ldcg(u + 2);
+            if (!p3_below && side)
+            {
+              const int *q = a.vec + 3 * (idx - nbx + 1);
+              v[6] = __ldcg(q); v[7] = __ldcg(q + 1); v[8] = __ldcg(q + 2);
+              use_p3 = 1;
+            }
+          }
+        }
+        if (lane == 0)
+        {
+          for (int i = 0; i < 9; i++)
+            g_ws.bc[1 + i] = v[i];
+          g_ws.bc[10] = use_p3;
+          g_ws.bc[15] = own_nlambda;
+        }
+        __syncthreads();
+        for (int i = 0; i < 9; i++)
+          v[i] = g_ws.bc[1 + i];
+        use_p3 = g_ws.bc[10];
+        own_nlambda = g_ws.bc[15];
+
+        const int dx_max = a.pel * (a.ext_w - x0[0] - a.bs_x - a.hpad[0] + h_scaled);
+        const int dy_max = a.pel * (a.ext_h - y0[0] - a.bs_y - a.vpad[0] + v_scaled);
+        const int dx_min = -a.pel * (x0[0] - a.hpad[0] + h_scaled);
+        const int dy_min = -a.pel * (y0[0] - a.vpad[0] + v_scaled);
+
+        // predictors (FetchPredictors), identical in every lane
+        const Vec own_c = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
+        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0);
+        Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
+        if (blkx > 0)
+          p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, left_x, left_y, left_sad);
+        if (!is_top)
+          p2 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[3], v[4], v[5]);
+        if (use_p3)
+          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, v[6], v[7], v[8]);
+        if (!is_top)
+        {
+          p0.x = median3(p1.x, p2.x, p3.x);
+          p0.y = median3(p1.y, p2.y, p3.y);
+          p0.sad = max(p1.sad, max(p2.sad, p3.sad));
+        }
+        else
+          p0 = p1;
+        const Vec pred = a.smallest ? p0 : own_c;
+        int nlambda;
+        if (!a.smallest)
+          nlambda = own_nlambda;
+        else
+        {
+          if (lane == 0)
+            g_ws.bc[11] = calc_nlambda(a.lambda_level, a.lsad, pred.sad, is_top);
+          __syncthreads();
+          nlambda = g_ws.bc[11];
+        }
+        // the global estimate was written by another CTA of this launch (level_ready orders it before this row)
+        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, __ldcg(a.glob) * a.pel, __ldcg(a.glob + 1) * a.pel, 0);
+
+        WPH(2);
+        // phase A: zero, global, predictor, predictors[0..3], all evaluated without a range test as in the slice
+        // kernel (the CPU uses the first three unconditionally; CheckMV0 below tests the other four)
+        if (lane < 7)
+        {
+          const Vec cv = lane == 0 ? Vec{ 0, 0, 0 } : lane == 1 ? glob : lane == 2 ? pred : lane == 3 ? p0 : lane == 4 ? p1 : lane == 5 ? p2 : p3;
+          g_ws.xs[lane] = cv.x;
+          g_ws.ys[lane] = cv.y;
+        }
+        if (lane == 0)
+        {
+          g_ws.n = 7;
+          g_ws.x0 = x0[0];
+          g_ws.y0 = y0[0];
+          g_ws.x1 = x0[1];
+          g_ws.y1 = y0[1];
+          g_ws.dx_min = dx_min;
+          g_ws.dx_max = dx_max;
+          g_ws.dy_min = dy_min;
+          g_ws.dy_max = dy_max;
+        }
+        if (a.async_src)
+          cp_async_wait_all();
+        __syncthreads(); // source block, candidate list and geometry visible to every lane
+        wave_eval_inl<GW, BSY, CHH>(lane, false);
+        WPH(3);
+
+        int best_x, best_y, best_sad, min_cost;
+        {
+          const int sad = g_ws.sl[0] + g_ws.sc[0];
+          best_x = 0;
+          best_y = 0;
+          best_sad = sad;
+          min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
+          const int sadg = g_ws.sl[1] + g_ws.sc[1];
+          const int costg = sadg + (int)(((long long)a.pglobal * sadg) >> 8);
+          if (costg < min_cost)
+          {
+            best_x = glob.x;
+            best_y = glob.y;
+            best_sad = sadg;
+            min_cost = costg;
+          }
+          const int sadp = g_ws.sl[2] + g_ws.sc[2];
+          if (sadp < min_cost)
+          {
+            best_x = pred.x;
+            best_y = pred.y;
+            best_sad = sadp;
+            min_cost = sadp;
+          }
+          const Vec pv[4] = { p0, p1, p2, p3 };
+          for (int i = 0; i < 4; i++) // CheckMV0
+          {
+            const int cx = pv[i].x, cy = pv[i].y;
+            if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+              continue;
+            const int dxp = pred.x - cx, dyp = pred.y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+            if (cost >= min_cost)
+              continue;
+            cost += g_ws.sl[3 + i];
+            if (cost >= min_cost)
+              continue;
+            cost += g_ws.sc[3 + i];
+            if (cost >= min_cost)
+              continue;
+            best_x = cx;
+            best_y = cy;
+            best_sad = g_ws.sl[3 + i] + g_ws.sc[3 + i];
+            min_cost = cost;
+          }
+        }
+        __syncthreads(); // everybody has read the phase A results
+        WPH(4);
+
+        if (!GEN || ring_n > 0)
+        {
+          // all rings around the vector found so far: one batch (the hot path of every coarse level)
+          for (int c = lane; c < ring_n; c += WAVE_NT)
+          {
+            g_ws.xs[c] = best_x + g_ws.ring_dx[c];
+            g_ws.ys[c] = best_y + g_ws.ring_dy[c];
+          }
+          if (lane == 0)
+            g_ws.n = ring_n;
+          __syncthreads();
+          wave_eval_inl<GW, BSY, CHH>(lane, true);
+          WPH(5);
+          int dummy = 0;
+          wave_fold_par(lane, mvc_refine::M_CHECK, ring_n, nullptr, dummy, best_x, best_y, min_cost, best_sad, pred.x, pred.y, nlambda);
+          __syncthreads();
+          WPH(6);
+        }
+        else if constexpr (GEN)
+        {
+          WaveChecker<GW, BSY, CHH> ck;
+          ck.bx = best_x;
+          ck.by = best_y;
+          ck.min_cost = min_cost;
+          ck.best_sad = best_sad;
+          ck.pred_x = pred.x;
+          ck.pred_y = pred.y;
+          ck.nlambda = nlambda;
+          ck.lane = lane;
+          mvc_refine::refine(ck, a.search_type, a.radius);
+          best_x = ck.bx;
+          best_y = ck.by;
+          best_sad = ck.best_sad;
+          min_cost = ck.min_cost;
+          WPH(5);
+        }
+        // Bad vector (PseudoEPZSearch): the threshold grows with badcount, the number of earlier bad blocks in raster order
+        // (one slice). Only a block above badSAD can be bad; such a block waits until the rows above are finished, so
+        // their bad counts are known, and then decides exactly as the CPU does.
+        if (idx > 1 && best_sad > a.bad_sad)
+        {
+          if (lane == 0)
+          {
+            int cnt = row_bad;
+            if (row > 0)
+            {
+              while (ld_acquire(a.prog + row - 1) < nbx) // rows finish in order: then every row above is complete
+                ;
+              for (int r = 0; r < row; r++)
+                cnt += __ldcg(a.rowbad + r);
+            }
+            g_ws.bc[12] = cnt;
+          }
+          __syncthreads();
+          const int badcount = g_ws.bc[12];
+          if (best_sad > a.bad_sad + a.bad_sad * badcount / 16) // BADCOUNT_LIMIT
+          {
+            row_bad++;
+            wave_bad_search<GW>(lane, best_x, best_y, min_cost, best_sad, pred.x, pred.y, nlambda);
+          }
+        }
+        left_x = best_x;
+        left_y = best_y;
+        left_sad = best_sad;
+        if (lane == 0)
+        {
+          if (blkx == nbx - 1)
+            a.rowbad[row] = row_bad; // published by the release below (the row's last one)
+          int *o = a.vec + 3 * idx;
+          o[0] = best_x;
+          o[1] = best_y;
+          o[2] = best_sad;
+          st_release(a.prog + row, blkx + 1); // orders the vector stores above before the counter
+        }
+        WPH(7);
+#ifdef MVC_PHASE_PROF
+        if (lane == 0)
+          atomicAdd(&g_wprof[wbk][8], 1ull);
+#endif
+        __syncthreads(); // the next block overwrites the shared source block
+      }
+
+      // the CTA that finishes the last row of a level estimates the global MV of the next finer level from it
+      if (lane == 0)
+      {
+#ifdef MVC_WAVE_TIMING
+        atomicMax(c.tim + 2 * level + 1, global_ns());
+#endif
+        __threadfence(); // this row's vectors before the count
+        g_ws.bc[16] = atomicAdd(c.level_done + level, 1) == a.n_blk_y - 1 ? 1 : 0;
+        __threadfence(); // every other row's vectors (fenced before their counts) after it
+      }
+      __syncthreads();
+      if (g_ws.bc[16] && level > 0)
+      {
+        glob_estimate(a.vec, a.n_blk_x * a.n_blk_y, c.freq, const_cast<int *>(c.lv[level - 1].glob), c.use_global, lane, WAVE_NT);
+        if (lane == 0)
+        {
+          __threadfence();
+          st_release(c.level_ready + level - 1, 1);
+        }
+      }
+    }
+  }
+
+  // Picks the k_wave instance: the ring-only kernels (no mvc_refine) with compile-time row counts for the square 16 and
+  // 32 blocks (the QTGMC sizes); the general kernels (mvc_refine inlined at about 20 call sites) only with runtime row
+  // loops, which keeps their compile time bounded. gen: some level needs mvc_refine. One CTA per row of the finest level
+  // (every level has at most as many rows); CTAs take rows by ticket until all levels are done.
+  template <int GW>
+  void launch_wave(const WaveCall &c, bool gen, cudaStream_t st)
+  {
+    const LevelArgs &a = c.lv[0];
+    const int grid = a.n_blk_y;
+#ifdef MVC_DEV_FASTONLY
+    // development builds (-DMVC_DEV_FASTONLY): no general kernels, the host refuses such levels before launching
+    if (gen)
+      return;
+    if constexpr (GW < 16)
+      k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+#else
+    if constexpr (GW < 16)
+    {
+      if (gen)
+        k_wave<GW, 0, 0, true><<<grid, WAVE_NT, 0, st>>>(c);
+      else
+        k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+    }
+    else if (gen)
+      k_wave<GW, 0, 0, true><<<grid, WAVE_NT, 0, st>>>(c);
+#endif
+    else if (a.bs_y == GW && a.ch == 0)
+      k_wave<GW, GW, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+    else if (a.bs_y == GW && a.ch == GW / 2)
+      k_wave<GW, GW, GW / 2, false><<<grid, WAVE_NT, 0, st>>>(c);
+    else if (a.bs_y == GW && a.ch == GW)
+      k_wave<GW, GW, GW, false><<<grid, WAVE_NT, 0, st>>>(c);
+    else
+      k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+  }
+
   int ilog2(int v)
   {
     int l = 0;
@@ -764,27 +2004,75 @@ namespace
   }
 }
 
-extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
-  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
+// Payload + wave-state buffers whose state part is zero (k_wave clears it at the end of every completed call), by size.
+// fresh: a new buffer, its state still to be cleared once.
+namespace
+{
+  std::mutex g_wave_mutex;
+  std::multimap<size_t, void *> *g_wave_free = new std::multimap<size_t, void *>; // never destroyed (static destruction order)
+
+  int *wave_buf_get(size_t bytes, bool &fresh)
+  {
+    {
+      std::lock_guard<std::mutex> lk(g_wave_mutex);
+      auto it = g_wave_free->find(bytes);
+      if (it != g_wave_free->end())
+      {
+        void *p = it->second;
+        g_wave_free->erase(it);
+        fresh = false;
+        return (int *)p;
+      }
+    }
+    fresh = true;
+    return (int *)mvc::dev_alloc(bytes);
+  }
+
+  void wave_buf_put(int *p, size_t bytes)
+  {
+    std::lock_guard<std::mutex> lk(g_wave_mutex);
+    g_wave_free->emplace(bytes, p);
+  }
+}
+
+// src_device: src / ref are the device planes of two device frames (tokens, see mvcuda_analyse_token); otherwise host
+// planes that the super builder uploads
+static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words, bool src_device,
+  unsigned long long dev_seq = 0)
 {
   if (!sp || !ap || !src || !ref || !payload)
     return -4;
-  // supported: chroma on, pel 1 or 2, exhaustive search everywhere, field shift 0
-  if (!sp->chroma || sp->levels != ap->n_levels || ap->n_levels < 1 || ap->n_levels > MVCUDA_MAX_LEVELS
-    || ap->search_param < 1 || ap->pel_search < 1 || ap->search_param > 3 || ap->pel_search > 3 || ap->n_blk_x < 1
+  // supported: luma only or luma + chroma, pel 1 or 2, field shift 0, every search type of mvcuda_refine.cuh
+  // (the coarse levels are exhaustive, as on the CPU, except for the horizontal / vertical types)
+  const int user_type = ap->search_type ? ap->search_type : mvc_refine::S_EXHAUSTIVE;
+  if (sp->levels != ap->n_levels || ap->n_levels < 1 || ap->n_levels > MVCUDA_MAX_LEVELS
+    || ap->search_param < 1 || ap->pel_search < 1 || ap->n_blk_x < 1 || !mvc_refine::supported_type(user_type)
     || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2 || ap->blk_x > 32)
     return -4;
+  const bool horv = user_type == mvc_refine::S_HORIZONTAL || user_type == mvc_refine::S_VERTICAL;
+  int lvl_type[MVCUDA_MAX_LEVELS];
+  for (int l = 0; l < ap->n_levels; l++)
+  {
+    lvl_type[l] = (l == 0 || horv) ? user_type : mvc_refine::S_EXHAUSTIVE;
+    if ((l == 0 ? ap->pel_search : ap->search_param) > mvc_refine::max_param(lvl_type[l]))
+      return -4;
+  }
   if (!mvc::use_device())
     return -1;
 
-  // the asynchronous source-block copy moves 4-byte words: everything it touches must be a multiple of SPW samples
+  // the asynchronous source-block copy moves 4-byte words: everything it touches must be a multiple of SPW samples;
+  // otherwise the kernel copies the block with plain loads
+  bool async_geo = true;
   {
-    const int lx = ilog2(sp->x_ratio_uv), step_x = ap->blk_x - ap->overlap_x;
-    bool ok = ap->blk_x % SPW == 0 && (ap->blk_x >> lx) % SPW == 0 && step_x % SPW == 0 && (step_x >> lx) % SPW == 0
-      && sp->hpad % SPW == 0 && (sp->hpad / sp->x_ratio_uv) % SPW == 0
-      && ((size_t)ap->blk_x * ap->blk_y) % SPW == 0 && ((size_t)(ap->blk_x >> lx) * (ap->blk_y >> ilog2(sp->y_ratio_uv))) % SPW == 0;
-    if (!ok)
-      return -4;
+    const int step_x = ap->blk_x - ap->overlap_x;
+    async_geo = ap->blk_x % SPW == 0 && step_x % SPW == 0 && sp->hpad % SPW == 0 && ((size_t)ap->blk_x * ap->blk_y) % SPW == 0;
+    if (sp->chroma)
+    {
+      const int lx = ilog2(sp->x_ratio_uv);
+      async_geo = async_geo && (ap->blk_x >> lx) % SPW == 0 && (step_x >> lx) % SPW == 0 && (sp->hpad / sp->x_ratio_uv) % SPW == 0
+        && ((size_t)(ap->blk_x >> lx) * (ap->blk_y >> ilog2(sp->y_ratio_uv))) % SPW == 0;
+    }
   }
 
   const int nl = ap->n_levels;
@@ -804,6 +2092,31 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
   }
   if (payload_words < words)
     return -4;
+  // meander=false: wavefront kernel = CPU result with meander=false, mt=false (slice_threads is ignored); meander=true:
+  // slice kernel = CPU result with slice_threads threads. MVCUDA_WAVE=0 forces the slice kernel (comparisons only).
+  static const bool wave_allowed = [] { const char *e = getenv("MVCUDA_WAVE"); return !(e && e[0] == '0'); }();
+  const bool wave = !ap->meander && wave_allowed;
+  int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
+  for (int l = 0; l < nl; l++)
+  {
+    row_off[l] = rows_total;
+    rows_total += nby[l];
+  }
+  int wave_gw = 4;
+  while (wave_gw < ap->blk_x)
+    wave_gw *= 2;
+  if (wave)
+  {
+    // the source block must fit the static shared buffer of k_wave (always true for blk_x <= 32 and blk_y <= 32)
+    const int cw = sp->chroma ? ap->blk_x / sp->x_ratio_uv : 0, ch = sp->chroma ? ap->blk_y / sp->y_ratio_uv : 0;
+    if (ap->blk_x * ap->blk_y + 2 * cw * ch > WAVE_SRC_MAX)
+      return -4;
+#ifdef MVC_DEV_FASTONLY
+    for (int l = 0; l < nl; l++)
+      if (ring_radius_of(lvl_type[l], l == 0 ? ap->pel_search : ap->search_param) == 0)
+        return -4;
+#endif
+  }
 
   const bool timing = getenv("MVCUDA_TIMING") != nullptr;
   auto t0 = std::chrono::steady_clock::now();
@@ -819,45 +2132,83 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
   mvc::StreamLease lease;
   cudaStream_t st = lease.s;
   std::shared_ptr<mvc::DevSuper> s_src, s_ref;
-  int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr;
+  int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr, *d_wave = nullptr;
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
+  // wavefront, all cleared per call: [row progress, all levels][bad blocks per row, all levels][ticket][finished rows per
+  // level][global estimate ready per level][global estimate (x, y) per level][bad flag]
+  const size_t w_rowbad = rows_total, w_ticket = 2 * (size_t)rows_total, w_done = w_ticket + 1, w_ready = w_done + MVCUDA_MAX_LEVELS;
+  const size_t w_glob = w_ready + MVCUDA_MAX_LEVELS, w_bad = w_glob + 2 * MVCUDA_MAX_LEVELS, w_fin = w_bad + 1, wave_words = w_fin + 1;
+  const size_t wave_bytes = wave ? wave_words * sizeof(int) : 0;
+  // wavefront: the wave state follows the payload in one buffer, so one copy brings back the vectors and the bad flag
+  const size_t pay_alloc = pay_bytes + wave_bytes;
+  int *h_stage = nullptr; // pinned copy of that buffer (a copy to pageable memory blocks inside the driver)
   std::vector<int> host;
+  WaveCall wc = {};
 
-  rc = mvc::super_get(&MVC_NS::super_build, *sp, ap->src_key, src, src_pitch_bytes, st, s_src);
-  if (!rc)
-    rc = mvc::super_get(&MVC_NS::super_build, *sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
-  lap("2 x super (cached)");
-  if (rc)
-    return rc;
-
+  int bad = 0;
+  bool self_finish = false, fresh = false;
+  // Everything up to the copy of the result, queued without a host wait: the super frames (cache), the buffers, the
+  // kernels, the copy. 0 or the error.
+  auto issue = [&]() -> int {
 #define AN_CHECK(call) \
   do { \
     cudaError_t e_ = (call); \
     if (e_ != cudaSuccess) { \
       fprintf(stderr, "mvcuda: %s failed: %s\n", #call, cudaGetErrorString(e_)); \
-      rc = -2; \
-      goto done; \
+      return -2; \
     } \
   } while (0)
-
-  d_pay = (int *)mvc::dev_alloc(pay_bytes);
-  d_freq = (int *)mvc::dev_alloc(freq_bytes);
-  d_glob = (int *)mvc::dev_alloc(2 * sizeof(int));
-  d_bad = (int *)mvc::dev_alloc(sizeof(int));
-  if (!d_pay || !d_freq || !d_glob || !d_bad)
   {
-    rc = -2;
-    goto done;
+    const mvc::SuperBuildFn build = src_device ? &MVC_NS::super_build_dev : &MVC_NS::super_build;
+    int r = mvc::super_get(build, *sp, ap->src_key, src, src_pitch_bytes, st, s_src);
+    if (!r)
+      r = mvc::super_get(build, *sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
+    if (r)
+      return r;
   }
+  lap("2 x super (cached)");
+
+  d_freq = (int *)mvc::dev_alloc(freq_bytes);
+  if (wave)
   {
-    host.assign(words, 0);
-    host[0] = words;
-    host[1] = 1;
-    for (int l = nl - 1; l >= 0; l--)
-      host[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
-    AN_CHECK(cudaMemcpyAsync(d_pay, host.data(), pay_bytes, cudaMemcpyHostToDevice, st));
-    AN_CHECK(cudaMemsetAsync(d_bad, 0, sizeof(int), st));
-    AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
+    // one launch for the whole call (WaveCall): the kernel writes the payload header and every vector, and with the
+    // pinned buffer also hands them over and clears its state (self_finish)
+    h_stage = (int *)mvc::pin_alloc(pay_alloc);
+    self_finish = h_stage != nullptr;
+    d_pay = self_finish ? wave_buf_get(pay_alloc, fresh) : (int *)mvc::dev_alloc(pay_alloc);
+    d_wave = d_pay ? d_pay + words : nullptr;
+    if (d_wave)
+    {
+      d_glob = d_wave + w_glob;
+      d_bad = d_wave + w_bad;
+    }
+  }
+  else
+  {
+    d_pay = (int *)mvc::dev_alloc(pay_alloc);
+    d_glob = (int *)mvc::dev_alloc(2 * sizeof(int));
+    d_bad = (int *)mvc::dev_alloc(sizeof(int));
+  }
+  if (!d_pay || !d_freq || !d_glob || !d_bad || (wave && !d_wave))
+    return -2;
+  {
+    if (wave)
+    {
+      if (!self_finish || fresh) // a self-finishing call leaves the state cleared for the next one
+        AN_CHECK(cudaMemsetAsync(d_wave, 0, wave_bytes, st));
+    }
+    else
+    {
+      host.assign(words, 0);
+      host[0] = words;
+      host[1] = 1;
+      for (int l = nl - 1; l >= 0; l--)
+        host[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
+      AN_CHECK(cudaMemcpyAsync(d_pay, host.data(), pay_bytes, cudaMemcpyHostToDevice, st));
+      AN_CHECK(cudaMemsetAsync(d_bad, 0, sizeof(int), st));
+      AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
+    }
+    bool wave_gen = false;
 
     for (int l = nl - 1; l >= 0; l--)
     {
@@ -874,10 +2225,12 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
       a.bs_y = ap->blk_y;
       a.ov_x = ap->overlap_x;
       a.ov_y = ap->overlap_y;
-      a.log_x_uv = ilog2(sp->x_ratio_uv);
-      a.log_y_uv = ilog2(sp->y_ratio_uv);
-      a.cw = a.bs_x >> a.log_x_uv;
-      a.ch = a.bs_y >> a.log_y_uv;
+      a.has_chroma = sp->chroma ? 1 : 0;
+      a.search_type = lvl_type[l];
+      a.log_x_uv = a.has_chroma ? ilog2(sp->x_ratio_uv) : 0;
+      a.log_y_uv = a.has_chroma ? ilog2(sp->y_ratio_uv) : 0;
+      a.cw = a.has_chroma ? a.bs_x >> a.log_x_uv : 0;
+      a.ch = a.has_chroma ? a.bs_y >> a.log_y_uv : 0;
       for (int p = 0; p < 3; p++)
       {
         const mvc::DevPlane &dr = s_ref->pl[l * 3 + p];
@@ -888,7 +2241,7 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
         a.hpad[p] = dr.d.hpad;
         a.vpad[p] = dr.d.vpad;
       }
-      a.async_src = (a.ew[0] % SPW == 0 && a.ew[1] % SPW == 0 && a.ew[2] % SPW == 0) ? 1 : 0;
+      a.async_src = (async_geo && a.ew[0] % SPW == 0 && a.ew[1] % SPW == 0 && a.ew[2] % SPW == 0) ? 1 : 0;
       a.ext_w = s_ref->pl[l * 3].d.ew;
       a.ext_h = s_ref->pl[l * 3].d.eh;
       // _lambda_level = lambda / (pel * pel) * nScale (plevel 1) or * nScale^2 (plevel 2)
@@ -907,7 +2260,7 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
       a.meander = ap->meander;
       a.use_global = ap->use_global;
       a.bad_sad = ap->bad_sad;
-      a.glob = d_glob;
+      a.glob = wave ? d_glob + 2 * l : d_glob;
       a.vec = d_pay + offs[l];
       a.bad_flag = d_bad;
       int slices = ap->slice_threads;
@@ -916,6 +2269,15 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
       if (slices > a.n_blk_y / 4)
         slices = a.n_blk_y / 4;
       a.n_slices = slices < 1 ? 1 : slices;
+      if (wave)
+      {
+        a.prog = d_wave + row_off[l];
+        a.rowbad = d_wave + w_rowbad + row_off[l];
+        a.bad_range = ap->bad_range;
+        wave_gen = wave_gen || ring_radius_of(a.search_type, a.radius) == 0;
+        wc.lv[l] = a;
+        continue; // launched once for all levels below
+      }
 
       if (l < nl - 1)
       {
@@ -932,11 +2294,119 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
       }
       AN_CHECK(cudaGetLastError());
     }
-    AN_CHECK(cudaMemcpyAsync(payload, d_pay, pay_bytes, cudaMemcpyDeviceToHost, st));
-    int bad = 0;
-    AN_CHECK(cudaMemcpyAsync(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost, st));
-    AN_CHECK(cudaStreamSynchronize(st));
-    lap("analysis kernels");
+    if (wave)
+    {
+      wc.nl = nl;
+      wc.use_global = ap->use_global;
+      wc.ticket = d_wave + w_ticket;
+      wc.level_done = d_wave + w_done;
+      wc.level_ready = d_wave + w_ready;
+      wc.freq = d_freq;
+      wc.payload = d_pay;
+      wc.words = words;
+      if (self_finish)
+      {
+        wc.host_out = h_stage;
+        wc.state = d_wave;
+        wc.finished = (unsigned *)(d_wave + w_fin);
+        wc.state_words = (int)wave_words;
+        wc.bad_word = (int)w_bad;
+      }
+#ifdef MVC_WAVE_TIMING
+      unsigned long long *d_tim = nullptr;
+      {
+        unsigned long long h_tim[2 * MVCUDA_MAX_LEVELS];
+        for (int l = 0; l < MVCUDA_MAX_LEVELS; l++)
+        {
+          h_tim[2 * l] = ~0ull;
+          h_tim[2 * l + 1] = 0;
+        }
+        cudaMalloc(&d_tim, sizeof(h_tim));
+        cudaMemcpy(d_tim, h_tim, sizeof(h_tim), cudaMemcpyHostToDevice);
+        wc.tim = d_tim;
+      }
+#endif
+      switch (wave_gw)
+      {
+      case 4: launch_wave<4>(wc, wave_gen, st); break;
+      case 8: launch_wave<8>(wc, wave_gen, st); break;
+      case 16: launch_wave<16>(wc, wave_gen, st); break;
+      default: launch_wave<32>(wc, wave_gen, st); break;
+      }
+      AN_CHECK(cudaGetLastError());
+#ifdef MVC_WAVE_TIMING
+      {
+        // per level: duration (first row start to last row end) and the gap before it, averaged, every 200 calls
+        unsigned long long h_tim[2 * MVCUDA_MAX_LEVELS];
+        cudaStreamSynchronize(st);
+        cudaMemcpy(h_tim, d_tim, sizeof(h_tim), cudaMemcpyDeviceToHost);
+        cudaFree(d_tim);
+        static std::mutex m;
+        static double dur[MVCUDA_MAX_LEVELS], gap[MVCUDA_MAX_LEVELS], total;
+        static long calls;
+        std::lock_guard<std::mutex> lk(m);
+        for (int l = 0; l < nl; l++)
+        {
+          dur[l] += (double)(h_tim[2 * l + 1] - h_tim[2 * l]) / 1000.0;
+          if (l < nl - 1)
+            gap[l] += ((double)h_tim[2 * l] - (double)h_tim[2 * (l + 1) + 1]) / 1000.0;
+        }
+        total += (double)(h_tim[1] - h_tim[2 * (nl - 1)]) / 1000.0;
+        if (++calls % 200 == 0)
+        {
+          fprintf(stderr, "wave timing, %ld calls, us per call: total %.1f |", calls, total / calls);
+          for (int l = nl - 1; l >= 0; l--)
+            fprintf(stderr, " L%d %.1f (gap %.1f)", l, dur[l] / calls, l < nl - 1 ? gap[l] / calls : 0.0);
+          fprintf(stderr, "\n");
+        }
+      }
+#endif
+    }
+    if (self_finish)
+      ; // k_wave hands the result over itself
+    else if (h_stage)
+      AN_CHECK(cudaMemcpyAsync(h_stage, d_pay, pay_alloc, cudaMemcpyDeviceToHost, st));
+    else
+    {
+      AN_CHECK(cudaMemcpyAsync(payload, d_pay, pay_bytes, cudaMemcpyDeviceToHost, st));
+      AN_CHECK(cudaMemcpyAsync(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost, st));
+    }
+  }
+  return 0;
+#undef AN_CHECK
+  };
+
+  if (src_device && wave)
+  {
+    // The device frames are results of pipeline ops (up to dev_seq). The calls are issued by the pipeline submitter (one
+    // thread for all launches, mvcuda_internal.h), this stream ordered after the op that made the frames.
+    mvc::mark_request(dev_seq);
+    mvc::pipe_call([&](cudaStream_t ps) {
+      cudaEvent_t e = mvc::mark_in_op(dev_seq, ps);
+      rc = (e && cudaStreamWaitEvent(st, e, 0) != cudaSuccess) ? -2 : issue();
+    });
+  }
+  else
+  {
+    if (src_device && !mvc::pipeline_order(st, dev_seq))
+      return -2;
+    rc = issue();
+  }
+  if (rc)
+    goto done;
+  if (cudaStreamSynchronize(st) != cudaSuccess)
+  {
+    fprintf(stderr, "mvcuda: analysis failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    rc = -2;
+    goto done;
+  }
+  if (h_stage)
+  {
+    memcpy(payload, h_stage, pay_bytes);
+    bad = h_stage[words + w_bad];
+  }
+  lap("analysis kernels");
+  {
 #ifdef MVC_PHASE_PROF
     {
       unsigned long long h[16][8];
@@ -945,6 +2415,15 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
         if (h[k][5])
           std::fprintf(stderr, "phase cycles/block, blocks-per-row 2^%d: wait+pred %.0f  A %.0f  foldA %.0f  B %.0f  foldB %.0f  (n=%llu)\n", k,
             (double)h[k][0] / h[k][5], (double)h[k][1] / h[k][5], (double)h[k][2] / h[k][5], (double)h[k][3] / h[k][5], (double)h[k][4] / h[k][5], h[k][5]);
+      unsigned long long hw[16][12];
+      cudaMemcpyFromSymbol(hw, g_wprof, sizeof(hw));
+      for (int k = 0; k < 16; k++)
+        if (hw[k][8])
+        {
+          const double n = (double)hw[k][8];
+          std::fprintf(stderr, "wave cycles/block, blocks-per-row 2^%d: issue %.0f  wait %.0f  pred %.0f  A-eval %.0f  A-fold %.0f  R-eval %.0f  R-fold %.0f  store %.0f  (n=%llu)\n",
+            k, hw[k][0] / n, hw[k][1] / n, hw[k][2] / n, hw[k][3] / n, hw[k][4] / n, hw[k][5] / n, hw[k][6] / n, hw[k][7] / n, hw[k][8]);
+        }
     }
 #endif
     if (bad)
@@ -953,10 +2432,56 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
 
 done:
   if (rc)
-    cudaStreamSynchronize(st);
-  mvc::dev_free(d_pay, pay_bytes);
+    cudaStreamSynchronize(st); // queued work may still use the buffers (and the super frames) released below
+  // a buffer of a completed self-finishing call has its state cleared: back to the wave pool (else the general pool)
+  if (self_finish && d_pay && (rc == 0 || rc == MVCUDA_NEEDS_CPU))
+    wave_buf_put(d_pay, pay_alloc);
+  else
+    mvc::dev_free(d_pay, pay_alloc);
   mvc::dev_free(d_freq, freq_bytes);
-  mvc::dev_free(d_glob, 2 * sizeof(int));
-  mvc::dev_free(d_bad, sizeof(int));
+  mvc::pin_free(h_stage, pay_alloc);
+  if (!wave)
+  {
+    mvc::dev_free(d_glob, 2 * sizeof(int));
+    mvc::dev_free(d_bad, sizeof(int));
+  }
   return rc;
+}
+
+extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
+{
+  return analyse_impl(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words, false);
+}
+
+// The same search with the source and reference pictures given as device frames (tokens of the cudafilters pipeline):
+// the super frames are built from device memory, no upload. MVCUDA_TOKEN_GONE when a token was evicted.
+extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, unsigned long long src_token,
+  unsigned long long ref_token, int *payload, int payload_words)
+{
+  if (!sp || !ap || !payload)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fs = mvc::frame_get(src_token), fr = mvc::frame_get(ref_token);
+  if (!fs || !fr)
+    return MVCUDA_TOKEN_GONE;
+  // the frames must be the pictures the super parameters describe
+  auto fits = [&](const mvc::DevFrame &f) {
+    return f.f.width == sp->width && f.f.height == sp->height && f.f.bits_per_sample == sp->bits_per_pixel
+      && f.f.bytes_per_sample == (int)sizeof(mvc_pix)
+      && (!sp->chroma || (f.f.planes == 3 && f.f.x_ratio_uv == sp->x_ratio_uv && f.f.y_ratio_uv == sp->y_ratio_uv));
+  };
+  if (!fits(*fs) || !fits(*fr))
+    return -4;
+  const void *src[3] = {}, *ref[3] = {};
+  int src_pitch[3] = {}, ref_pitch[3] = {};
+  for (int p = 0; p < fs->f.planes; p++)
+  {
+    src[p] = fs->plane[p];
+    src_pitch[p] = (int)fs->pitch[p];
+    ref[p] = fr->plane[p];
+    ref_pitch[p] = (int)fr->pitch[p];
+  }
+  return analyse_impl(sp, ap, src, src_pitch, ref, ref_pitch, payload, payload_words, true, fs->seq > fr->seq ? fs->seq : fr->seq);
 }

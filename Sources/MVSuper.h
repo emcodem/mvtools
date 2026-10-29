@@ -142,6 +142,9 @@ public:
   // Turns a frame of a "lite" super clip (MSuper(gpu=true): picture plus padding rows only) into the frame the normal
   // MSuper would have made, bit for bit. lite_vi is the video info of the lite super clip.
   static PVideoFrame CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env);
+  // A lite frame whose picture is a token (GPU search clip, see GpuBackend::read_token) with the picture downloaded into
+  // it; any other frame unchanged.
+  static PVideoFrame ResolveToken(PVideoFrame lite, const VideoInfo &lite_vi, IScriptEnvironment* env);
 
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

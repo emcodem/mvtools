@@ -19,12 +19,14 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #include	"ClipFnc.h"
+#include	"ProfSkip.h"
 #include "commonfunctions.h"
 #include "MaskFun.h"
 #include "MVCompensate.h"
 #include "MVFrame.h"
 #include	"MVGroupOfFrames.h"
 #include "MVPlane.h"
+#include "MVSuper.h"
 #include "profile.h"
 #include "SuperParams64Bits.h"
 #include "Time256ProviderCst.h"
@@ -36,7 +38,7 @@
 MVCompensate::MVCompensate(
   PClip _child, PClip _super, PClip vectors, bool sc, double _recursionPercent,
   sad_t _thsad, bool _fields, double _time100, sad_t _nSCD1, int _nSCD2, bool _isse2, bool _planar,
-  bool mt_flag, int trad, bool center_flag, PClip cclip_sptr, sad_t _thsad2,
+  bool mt_flag, int trad, bool center_flag, PClip cclip_sptr, sad_t _thsad2, bool gpu_flag,
   IScriptEnvironment* env_ptr
 )
   : GenericVideoFilter(_child)
@@ -51,6 +53,9 @@ MVCompensate::MVCompensate(
   //,	nLogxRatioUV (( xRatioUV == 2) ? 1 : 0) MVFilter has nLogxRatioUV
   //,	nLogyRatioUV ((yRatioUV == 2) ? 1 : 0)
   , _boundary_cnt_arr()
+  , _super_lite(false)
+  , _gpu_ok(false)
+  , _producer(0)
 {
   has_at_least_v8 = true;
   try { env_ptr->CheckVersion(8); }
@@ -179,7 +184,8 @@ MVCompensate::MVCompensate(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
-  MV_REJECT_LITE_SUPER(params, "MCompensate", env_ptr);
+  // a lite super (MSuper(gpu=true)): the GPU path reads its token pictures, the CPU path completes the frames
+  _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
   nSuperVPad = params.nVPad;
@@ -230,6 +236,18 @@ MVCompensate::MVCompensate(
     _boundary_cnt_arr.resize(nBlkY);
   }
 
+  // GPU path: 8 bit planar, pel 1 or 2, single compensation, no recursion / fields, super from a token clip
+  if (gpu_flag)
+  {
+    GpuBackend &gpu = GpuBackend::instance();
+    _gpu_ok = gpu.usable() && _super_lite && pixelsize_super == 1 && (nPel == 1 || nPel == 2) && recursion == 0 && !fields && !_multi_flag
+      && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || planecount == 3) && vi.width >= (int)sizeof(MvCudaTokenHeader);
+    if (_gpu_ok)
+      _producer = gpu.producer_register(&MVCompensate::gpu_regen, this);
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MCompensate gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, CPU");
+  }
+
   if (recursion > 0)
   {
     if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
@@ -257,6 +275,8 @@ MVCompensate::MVCompensate(
 
 MVCompensate::~MVCompensate()
 {
+  if (_producer)
+    GpuBackend::instance().producer_unregister(_producer);
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
   {
     delete DstPlanes;
@@ -286,8 +306,106 @@ MVCompensate::~MVCompensate()
   }
 }
 
+int MVCompensate::gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
+{
+  MVCompensate *self = static_cast<MVCompensate *>(user);
+  std::lock_guard<std::mutex> lk(self->_gpu_mutex);
+  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr);
+}
+
+// The compensated frame as a device frame: 0 and the token in h; 3 = not a compensated frame (CPU path returns the
+// centre clip); other = the CPU path. props_src receives the frame whose properties the CPU path would copy.
+int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src)
+{
+  int nsrc, nvec, vindex;
+  if (!compute_src_frame(nsrc, nvec, vindex, n))
+    return 3;
+  MvClipInfo &info = _mv_clip_arr[vindex];
+  MVClip *clip = info._clip_sptr.get();
+  const sad_t thsad = info._thsad;
+  {
+    PVideoFrame mvn = clip->GetFrame(nvec, env);
+    clip->Update(mvn, env);
+  }
+  const VideoInfo &svi = super->GetVideoInfo();
+  PVideoFrame src = super->GetFrame(nsrc, env);
+  bool usable = clip->IsUsable();
+  int nref;
+  clip->use_ref_frame(nref, usable, super, nsrc, env);
+  MvCudaTokenHeader ts;
+  if (!GpuBackend::lite_token(src, svi, ts))
+    return -1;
+  if (props_src)
+    *props_src = src;
+  if (!usable)
+  {
+    // the CPU copies the picture of the source (or with scbehavior=false of the reference) frame: the same token
+    if (!scBehavior && nref < vi.num_frames && nref >= 0)
+    {
+      PVideoFrame r = super->GetFrame(nref, env);
+      if (!GpuBackend::lite_token(r, svi, h))
+        return -1;
+      if (props_src)
+        *props_src = r;
+    }
+    else
+      h = ts;
+    return 0;
+  }
+  PVideoFrame ref = super->GetFrame(nref, env);
+  MvCudaTokenHeader tr;
+  if (!GpuBackend::lite_token(ref, svi, tr))
+    return -1;
+  const int nb = nBlkX * nBlkY;
+  std::vector<int> blocks((size_t)3 * nb);
+  for (int i = 0; i < nb; i++)
+  {
+    const FakeBlockData &block = clip->GetBlock(0, i);
+    blocks[3 * i] = block.GetMV().x * time256 / 256; // as compensate_slice_*: blx = GetX() * nPel + mv.x * time256 / 256 (pel units)
+    blocks[3 * i + 1] = block.GetMV().y * time256 / 256;
+    blocks[3 * i + 2] = block.GetSAD() < thsad ? 1 : 0;
+  }
+  MvCudaBlockGeom g = {};
+  g.blk_x = nBlkSizeX;
+  g.blk_y = nBlkSizeY;
+  g.ov_x = nOverlapX;
+  g.ov_y = nOverlapY;
+  g.n_blk_x = nBlkX;
+  g.n_blk_y = nBlkY;
+  g.pel = nPel;
+  g.hpad = nSuperHPad;
+  g.vpad = nSuperVPad;
+  if (nOverlapX > 0 || nOverlapY > 0)
+  {
+    g.win_luma = OverWins->GetWindow(0);
+    g.win_chroma = vi.IsY() ? nullptr : OverWinsUV->GetWindow(0);
+  }
+  const MvCudaTokenHeader hs[3] = { ts, tr, scBehavior ? ts : tr };
+  GpuBackend &gpu = GpuBackend::instance();
+  return gpu.with_tokens(hs, 3, env, [&](const unsigned long long *tk) {
+    return gpu.compensate(&g, tk[0], tk[1], tk[2], blocks.data(), _producer, n, &h);
+  });
+}
+
 PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
 {
+  std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
+  if (_gpu_ok)
+  {
+    MvCudaTokenHeader h;
+    PVideoFrame props;
+    const int rc = gpu_make(n, env_ptr, h, &props);
+    if (rc == 0)
+    {
+      PVideoFrame dst = env_ptr->NewVideoFrame(vi);
+      if (has_at_least_v8 && props)
+        env_ptr->copyFrameProps(props, dst);
+      GpuBackend::write_token(dst, h);
+      return dst;
+    }
+    if (rc != 3 && GpuBackend::log_enabled())
+      std::fprintf(stderr, "MCompensate gpu frame %d rc=%d -> CPU\n", n, rc);
+  }
   int nsrc;
   int nvec;
   int vindex;
@@ -319,6 +437,8 @@ PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
   mvn = 0; // free
 
   PVideoFrame src = super->GetFrame(nsrc, env_ptr);
+  if (_super_lite)
+    src = MVSuper::CompleteLite(src, super->GetVideoInfo(), _mt_flag, env_ptr);
   PVideoFrame dst = env_ptr->NewVideoFrame(vi); // frame property support later
   bool usable_flag = _mv_clip_ptr->IsUsable();
   int nref;
@@ -373,6 +493,11 @@ PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
     }
 
     PVideoFrame ref = super->GetFrame(nref, env_ptr);
+    if (_super_lite)
+      ref = MVSuper::CompleteLite(ref, super->GetVideoInfo(), _mt_flag, env_ptr);
+
+    if (mv_prof_skip("compensate"))
+      return src;
 
     if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
     {
@@ -568,6 +693,8 @@ PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
     {
       src = super->GetFrame(nsrc, env_ptr);
     }
+    if (_super_lite)
+      src = MVSuper::ResolveToken(src, super->GetVideoInfo(), env_ptr); // only the picture is read below
     if (has_at_least_v8) env_ptr->copyFrameProps(src, dst); // frame property support v8
 
     if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)

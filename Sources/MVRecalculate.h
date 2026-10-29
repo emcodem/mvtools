@@ -123,6 +123,7 @@ protected:
   bool _super_lite; // super clip made by MSuper(gpu=true): picture only, completed by MVSuper::CompleteLite for the CPU search
   int _gpu_slices;
   int _gpu_effective_chroma_scale;
+  int _gpu_rfilter; // MSuper rfilter of the super clip (2 or 4 on the GPU)
 
 public :
 

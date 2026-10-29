@@ -7,6 +7,7 @@
 // selects exactly the same candidate, which is what is done here, with the same early exits only to save work.
 
 #include "mvcuda_internal.h"
+#include "mvcuda_refine.cuh"
 
 #include <cuda_runtime.h>
 
@@ -33,6 +34,8 @@ namespace
     int blk_x, blk_y, ov_x, ov_y, n_blk_x, n_blk_y;
     int old_n_x, old_n_y, old_size_x, old_size_y, old_ov_x, old_ov_y, log_pel_old;
     int lambda_level, pnew, th_sad, smooth, radius, chroma_scale, n_slices;
+    int search_type; // SearchType.h value (mvc_refine::S_*)
+    int has_chroma;  // 0: luma-only search (MRecalculate chroma=false)
     const int *old_vec; // 3 ints per block
     int *out;           // 3 ints per block
   };
@@ -148,64 +151,96 @@ namespace
       first_row |= (t * a.n_blk_y / a.n_slices == blky);
     const int nlambda = first_row ? 0 : a.lambda_level;
 
-    // SAD (luma, and scaled chroma) of a candidate vector
-    auto luma_sad = [&](int cx, int cy) {
-      return block_sad(a, 0, x0[0], y0[0], a.blk_x, a.blk_y, x0[0] * a.pel + cx, y0[0] * a.pel + cy);
-    };
-    auto chroma_sad = [&](int cx, int cy) {
-      int s = 0;
-      for (int p = 1; p < 3; p++)
-        s += block_sad(a, p, x0[p], y0[p], cw, ch, x0[p] * a.pel + (cx >> a.log_x_uv), y0[p] * a.pel + (cy >> a.log_y_uv));
-      return scale_chroma(s, a.chroma_scale);
-    };
-
-    int best_x = pred_x, best_y = pred_y;
-    int best_sad = luma_sad(pred_x, pred_y) + chroma_sad(pred_x, pred_y);
-    int min_cost = best_sad;
-
-    if (best_sad > a.th_sad)
+    // The CPU search routines (PlaneOfBlocks::Refine) run over this checker, see mvcuda_refine.cuh. Every lane of the
+    // warp executes the same scalar program; the SAD helpers do the parallel work.
+    struct Checker
     {
-      const int mvx = best_x, mvy = best_y;
-      auto check = [&](int cx, int cy) {
-        if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
-          return;
+      int bx, by, min_cost, best_sad;
+      int dx_min, dx_max, dy_min, dy_max, pred_x, pred_y, nlambda, pnew, bits;
+      bool has_chroma;
+      const KArgs *a;
+      const int *x0, *y0;
+      int cw, ch;
+      __device__ bool ok(int cx, int cy) const { return cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max; }
+      __device__ int luma(int cx, int cy) const
+      {
+        return block_sad(*a, 0, x0[0], y0[0], a->blk_x, a->blk_y, x0[0] * a->pel + cx, y0[0] * a->pel + cy);
+      }
+      __device__ int chroma(int cx, int cy) const
+      {
+        int s = 0;
+        for (int p = 1; p < 3; p++)
+          s += block_sad(*a, p, x0[p], y0[p], cw, ch, x0[p] * a->pel + (cx >> a->log_x_uv), y0[p] * a->pel + (cy >> a->log_y_uv));
+        return scale_chroma(s, a->chroma_scale);
+      }
+      // CheckMV cost chain. The partial sums only grow, so "full cost < minimum" accepts exactly the CPU's candidates.
+      // not inlined: mvc_refine calls this from dozens of places and the SAD code behind it is large
+      __device__ __noinline__ bool test(int cx, int cy, int &cost_out, int &sad_out) const
+      {
+        if (!ok(cx, cy))
+          return false;
         const int dxp = pred_x - cx, dyp = pred_y - cy;
         const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
-        int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+        int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - bits);
         if (cost >= min_cost)
-          return;
-        const int sl = luma_sad(cx, cy);
-        cost += sl + (int)(((long long)a.pnew * sl) >> 8);
+          return false;
+        const int sl = luma(cx, cy);
+        cost += sl + (int)(((long long)pnew * sl) >> 8);
         if (cost >= min_cost)
-          return;
-        const int sc = chroma_sad(cx, cy);
-        cost += sc + (int)(((long long)a.pnew * sc) >> 8);
+          return false;
+        const int sc = has_chroma ? chroma(cx, cy) : 0;
+        cost += sc + (int)(((long long)pnew * sc) >> 8);
         if (cost >= min_cost)
-          return;
-        best_x = cx;
-        best_y = cy;
-        min_cost = cost;
-        best_sad = sl + sc;
-      };
-      // ExpandingSearch: sides without corners, then the corners
-      for (int r = 1; r <= a.radius; r++)
-      {
-        for (int i = -r + 1; i < r; i++)
-        {
-          check(mvx + i, mvy - r);
-          check(mvx + i, mvy + r);
-        }
-        for (int j = -r + 1; j < r; j++)
-        {
-          check(mvx - r, mvy + j);
-          check(mvx + r, mvy + j);
-        }
-        check(mvx - r, mvy - r);
-        check(mvx - r, mvy + r);
-        check(mvx + r, mvy - r);
-        check(mvx + r, mvy + r);
+          return false;
+        cost_out = cost;
+        sad_out = sl + sc;
+        return true;
       }
-    }
+      // a batch of candidates (mvcuda_refine.cuh): tested one after the other, exactly like the CPU
+      __device__ void run_batch(int mode, int n, const int *xs, const int *ys, const int *vals, int &dir)
+      {
+        for (int i = 0; i < n; i++)
+        {
+          int cost, sad;
+          if (test(xs[i], ys[i], cost, sad))
+          {
+            if (mode != mvc_refine::M_CHECKDIR)
+            {
+              bx = xs[i];
+              by = ys[i];
+            }
+            min_cost = cost;
+            best_sad = sad;
+            if (mode != mvc_refine::M_CHECK)
+              dir = vals[i];
+          }
+        }
+      }
+    };
+    Checker ck;
+    ck.bx = pred_x;
+    ck.by = pred_y;
+    ck.dx_min = dx_min;
+    ck.dx_max = dx_max;
+    ck.dy_min = dy_min;
+    ck.dy_max = dy_max;
+    ck.pred_x = pred_x;
+    ck.pred_y = pred_y;
+    ck.nlambda = nlambda;
+    ck.pnew = a.pnew;
+    ck.bits = a.bits;
+    ck.has_chroma = a.has_chroma != 0;
+    ck.a = &a;
+    ck.x0 = x0;
+    ck.y0 = y0;
+    ck.cw = cw;
+    ck.ch = ch;
+    ck.best_sad = ck.luma(pred_x, pred_y) + (ck.has_chroma ? ck.chroma(pred_x, pred_y) : 0);
+    ck.min_cost = ck.best_sad;
+
+    if (ck.best_sad > a.th_sad)
+      mvc_refine::refine(ck, a.search_type, a.radius);
+    const int best_x = ck.bx, best_y = ck.by, best_sad = ck.best_sad;
 
     if (lane == 0)
     {
@@ -230,9 +265,12 @@ extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const Mv
 {
   if (!sp || !rp || !src || !ref || !old_vectors || !out_vectors)
     return -4;
-  // supported: level-0-only super, chroma on, pel 1 or 2, exhaustive search, 16-bit, smooth 0/1
-  if (sp->levels != 1 || !sp->chroma || rp->smooth < 0 || rp->smooth > 1 || rp->search_radius < 1 || rp->old_pel < 1
-    || rp->n_blk_x < 1 || rp->n_blk_y < 1 || rp->old_blk_x < 1 || rp->old_blk_y < 1 || rp->lambda_level < 0)
+  // supported: level-0-only super, luma only or luma + chroma, pel 1 or 2, every search type of mvcuda_refine.cuh
+  // (0 = exhaustive), smooth 0/1
+  const int search_type = rp->search_type ? rp->search_type : mvc_refine::S_EXHAUSTIVE;
+  if (sp->levels != 1 || rp->smooth < 0 || rp->smooth > 1 || rp->search_radius < 1 || rp->old_pel < 1
+    || rp->n_blk_x < 1 || rp->n_blk_y < 1 || rp->old_blk_x < 1 || rp->old_blk_y < 1 || rp->lambda_level < 0
+    || !mvc_refine::supported_type(search_type) || rp->search_radius > mvc_refine::max_param(search_type))
     return -4;
   if (!mvc::use_device())
     return -1;
@@ -297,6 +335,8 @@ extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const Mv
   a.th_sad = rp->th_sad;
   a.smooth = rp->smooth;
   a.radius = rp->search_radius;
+  a.search_type = search_type;
+  a.has_chroma = sp->chroma ? 1 : 0;
   a.chroma_scale = rp->chroma_sad_scale;
   {
     int slices = rp->slice_threads < 1 ? 1 : rp->slice_threads;

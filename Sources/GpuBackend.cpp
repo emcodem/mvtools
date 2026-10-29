@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -98,6 +99,71 @@ void GpuBackend::add_user()
   InterlockedIncrement(&_users);
 }
 
+bool GpuBackend::read_token(const void *p, int row_bytes, MvCudaTokenHeader &h)
+{
+  if (p == nullptr || row_bytes < (int)sizeof(h))
+    return false;
+  std::memcpy(&h, p, sizeof(h));
+  return h.magic == MVCUDA_TOKEN_MAGIC && h.layout == MVCUDA_TOKEN_LAYOUT;
+}
+
+bool GpuBackend::download_token(const MvCudaTokenHeader &h, void *const dst[3], const int dst_pitch[3], void *env)
+{
+  if (!_usable)
+    return false;
+  int rc = frame_download(h.token, dst, dst_pitch);
+  if (rc == MVCUDA_TOKEN_GONE && h.producer != 0)
+  {
+    MvCudaTokenHeader again;
+    if (token_regenerate(h.producer, h.frame, env, &again) == 0)
+      rc = frame_download(again.token, dst, dst_pitch);
+  }
+  if (log_enabled())
+    std::fprintf(stderr, "mvtools gpu: token frame %d downloaded, rc=%d\n", h.frame, rc);
+  return rc == 0;
+}
+
+bool GpuBackend::lite_token(const PVideoFrame &f, const VideoInfo &super_vi, MvCudaTokenHeader &h)
+{
+  if (!super_vi.IsPlanar())
+    return false;
+  int64_t packed;
+  std::memcpy(&packed, &super_vi.num_audio_samples, 8);
+  const unsigned char hpad = (unsigned char)((packed >> 16) & 0xff), vpad = (unsigned char)((packed >> 24) & 0xff);
+  const int pixelsize = super_vi.ComponentSize();
+  const int pic_row = (super_vi.width - 2 * hpad) * pixelsize;
+  return read_token(f->GetReadPtr(PLANAR_Y) + (size_t)vpad * f->GetPitch(PLANAR_Y) + (size_t)hpad * pixelsize, pic_row, h);
+}
+
+bool GpuBackend::frame_token(const PVideoFrame &f, const VideoInfo &vi, MvCudaTokenHeader &h)
+{
+  return vi.IsPlanar() && read_token(f->GetReadPtr(PLANAR_Y), f->GetRowSize(PLANAR_Y), h);
+}
+
+PVideoFrame GpuBackend::resolve_frame(const PVideoFrame &f, const VideoInfo &vi, IScriptEnvironment *env)
+{
+  MvCudaTokenHeader h;
+  if (!frame_token(f, vi, h))
+    return f;
+  PVideoFrame pic = env->NewVideoFrame(vi);
+  const int planes[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  void *d[3] = { 0, 0, 0 };
+  int dp[3] = { 0, 0, 0 };
+  for (int p = 0; p < (vi.IsY() ? 1 : 3); p++)
+  {
+    d[p] = pic->GetWritePtr(planes[p]);
+    dp[p] = pic->GetPitch(planes[p]);
+  }
+  if (!download_token(h, d, dp, env))
+    env->ThrowError("mvtools: GPU frame %d is no longer available on the device", h.frame);
+  return pic;
+}
+
+void GpuBackend::write_token(PVideoFrame &dst, const MvCudaTokenHeader &h)
+{
+  std::memcpy(dst->GetWritePtr(PLANAR_Y), &h, sizeof(h));
+}
+
 void GpuBackend::remove_user()
 {
   if (InterlockedDecrement(&_users) == 0 && cache_clear != nullptr)
@@ -109,6 +175,15 @@ GpuBackend::GpuBackend()
   , recalc_host(nullptr)
   , flow_host(nullptr)
   , cache_clear(nullptr)
+  , analyse_token(nullptr)
+  , frame_download(nullptr)
+  , token_regenerate(nullptr)
+  , token_pin(nullptr)
+  , token_unpin(nullptr)
+  , producer_register(nullptr)
+  , producer_unregister(nullptr)
+  , compensate(nullptr)
+  , degrain(nullptr)
   , _usable(false)
   , _users(0)
 {
@@ -149,7 +224,17 @@ GpuBackend::GpuBackend()
   recalc_host = reinterpret_cast<decltype(recalc_host)>(GetProcAddress(lib, "mvcuda_recalc_host"));
   flow_host = reinterpret_cast<decltype(flow_host)>(GetProcAddress(lib, "mvcuda_flow_host"));
   cache_clear = reinterpret_cast<decltype(cache_clear)>(GetProcAddress(lib, "mvcuda_cache_clear"));
+  analyse_token = reinterpret_cast<decltype(analyse_token)>(GetProcAddress(lib, "mvcuda_analyse_token"));
+  frame_download = reinterpret_cast<decltype(frame_download)>(GetProcAddress(lib, "mvcuda_frame_download"));
+  token_regenerate = reinterpret_cast<decltype(token_regenerate)>(GetProcAddress(lib, "mvcuda_token_regenerate"));
+  token_pin = reinterpret_cast<decltype(token_pin)>(GetProcAddress(lib, "mvcuda_token_pin"));
+  token_unpin = reinterpret_cast<decltype(token_unpin)>(GetProcAddress(lib, "mvcuda_token_unpin"));
+  producer_register = reinterpret_cast<decltype(producer_register)>(GetProcAddress(lib, "mvcuda_producer_register"));
+  producer_unregister = reinterpret_cast<decltype(producer_unregister)>(GetProcAddress(lib, "mvcuda_producer_unregister"));
+  compensate = reinterpret_cast<decltype(compensate)>(GetProcAddress(lib, "mvcuda_compensate"));
+  degrain = reinterpret_cast<decltype(degrain)>(GetProcAddress(lib, "mvcuda_degrain"));
   if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr || flow_host == nullptr || cache_clear == nullptr
+    || analyse_token == nullptr || frame_download == nullptr || token_regenerate == nullptr || token_pin == nullptr || token_unpin == nullptr || producer_register == nullptr || producer_unregister == nullptr || compensate == nullptr || degrain == nullptr
     || version() != MVCUDA_API_VERSION || count() <= 0)
   {
     if (log_enabled())

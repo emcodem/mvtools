@@ -117,6 +117,7 @@ protected:
   bool _super_lite; // super clip made by MSuper(gpu=true): picture only, completed by MVSuper::CompleteLite for the CPU search
   int _gpu_slices;
   int _gpu_effective_chroma_scale;
+  int _gpu_rfilter; // MSuper rfilter of the super clip (2 or 4 on the GPU)
   int _gpu_super_levels;
 
 public:
@@ -141,7 +142,7 @@ public:
 
 private:
 
-  bool gpu_search(int nsrc, int nref, int *payload);
+  bool gpu_search(int nsrc, int nref, int *payload, IScriptEnvironment *env);
   void load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data);
 };
 

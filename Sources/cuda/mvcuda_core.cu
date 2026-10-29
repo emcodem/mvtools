@@ -179,6 +179,7 @@ namespace mvc
 
   DevSuper::~DevSuper()
   {
+    event_put(ready);
     for (DevPlane &dp : pl)
       for (void *&b : dp.sub)
         if (b)
@@ -194,12 +195,12 @@ namespace mvc
     struct CacheKey
     {
       unsigned long long key;
-      int width, height, xr, yr, hpad, vpad, pel, levels, bits, chroma, esize;
+      int width, height, xr, yr, hpad, vpad, pel, levels, bits, chroma, esize, rfilter;
       bool operator==(const CacheKey &o) const
       {
         return key == o.key && width == o.width && height == o.height && xr == o.xr && yr == o.yr && hpad == o.hpad
           && vpad == o.vpad && pel == o.pel && levels == o.levels && bits == o.bits && chroma == o.chroma
-          && esize == o.esize;
+          && esize == o.esize && rfilter == o.rfilter;
       }
     };
     struct CacheKeyHash
@@ -247,7 +248,7 @@ namespace mvc
       return rc;
     }
     const CacheKey ck = { key, p.width, p.height, p.x_ratio_uv, p.y_ratio_uv, p.hpad, p.vpad, p.pel, p.levels,
-      p.bits_per_pixel, p.chroma, p.bits_per_pixel <= 8 ? 1 : 2 };
+      p.bits_per_pixel, p.chroma, p.bits_per_pixel <= 8 ? 1 : 2, p.rfilter };
     std::unique_lock<std::mutex> lk(g_cache_mutex);
     for (;;)
     {
@@ -258,6 +259,10 @@ namespace mvc
       {
         g_lru.splice(g_lru.begin(), g_lru, it->second.lru);
         out = it->second.super;
+        lk.unlock();
+        // built by another thread without a host wait: this stream starts after the build
+        if (out->ready && cudaStreamWaitEvent(s, out->ready, 0) != cudaSuccess)
+          return -2;
         return 0;
       }
       if (it->second.failed)

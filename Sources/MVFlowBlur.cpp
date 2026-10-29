@@ -18,6 +18,7 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #include "ClipFnc.h"
+#include "ProfSkip.h"
 #include "MaskFun.h"
 #include "MVFinest.h"
 #include "MVFlowBlur.h"
@@ -313,6 +314,8 @@ PVideoFrame __stdcall MVFlowBlur::GetFrame(int n, IScriptEnvironment* env)
   if (mvClipB.IsUsable() && mvClipF.IsUsable())
   {
     PVideoFrame ref = finest->GetFrame(n, env);//  ref for  compensation
+    if (mv_prof_skip("flowblur"))
+      return ref;
     dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &ref) : env->NewVideoFrame(vi); // frame property support
 
     if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)

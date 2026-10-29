@@ -20,6 +20,7 @@
 #include "ClipFnc.h"
 #include "Interpolation.h"
 #include "MVDegrain3.h"
+#include "ProfSkip.h"
 #include "MVDegrain3_avx2.h"
 #include "MVFrame.h"
 #include "MVGroupOfFrames.h"
@@ -32,6 +33,9 @@
 #include <stdint.h>
 #include <commonfunctions.h>
 #include "def.h"
+#include "yuy2planes.h"
+#include "MVSuper.h"
+#include <vector>
 
 //#include	<mmintrin.h>
 
@@ -247,7 +251,7 @@ MVDegrainX::MVDegrainX(
   PClip _mvbw, PClip _mvfw, PClip _mvbw2, PClip _mvfw2, PClip _mvbw3, PClip _mvfw3, PClip _mvbw4, PClip _mvfw4, PClip _mvbw5, PClip _mvfw5, PClip _mvbw6, PClip _mvfw6,
   sad_t _thSAD, sad_t _thSADC, int _YUVplanes, float _nLimit, float _nLimitC,
   sad_t _nSCD1, int _nSCD2, bool _isse2, bool _planar, bool _lsb_flag,
-  bool _mt_flag, bool _out16_flag, bool _out32_flag,
+  bool _mt_flag, bool _out16_flag, bool _out32_flag, bool _gpu_flag,
   int _level, 
   IScriptEnvironment* env_ptr
 ) : GenericVideoFilter(_child)
@@ -380,7 +384,8 @@ MVDegrainX::MVDegrainX(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &vi_super.num_audio_samples, 8);
-  MV_REJECT_LITE_SUPER(params, "MDegrain", env_ptr);
+  // a lite super (MSuper(gpu=true)): the GPU path reads its token pictures, the CPU path completes the frames
+  _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
   int nSuperVPad = params.nVPad;
@@ -537,6 +542,22 @@ MVDegrainX::MVDegrainX(
     vi.height <<= 1;
   }
 
+  // GPU path: MDegrain1..6, 8 bit planar, pel 1 or 2, no limit / lsb / out16 / out32, super from a token clip
+  if (_gpu_flag)
+  {
+    GpuBackend &gpu = GpuBackend::instance();
+    _gpu_hpad = nSuperHPad;
+    _gpu_vpad = nSuperVPad;
+    _gpu_ok = gpu.usable() && level >= 1 && level <= MVCUDA_MAX_DEGRAIN && _super_lite && pixelsize_super == 1 && (nPel == 1 || nPel == 2)
+      && !lsb_flag && !out16_flag && !out32_flag
+      && nLimit >= 255 && nLimitC >= 255 && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || vi.NumComponents() >= 3)
+      && vi.width >= (int)sizeof(MvCudaTokenHeader);
+    if (_gpu_ok)
+      _producer = gpu.producer_register(&MVDegrainX::gpu_regen, this);
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MDegrain%d gpu requested: %s\n", level, _gpu_ok ? "using the GPU" : "not supported here, CPU");
+  }
+
   if (out16_flag) {
     if (vi.IsY8())
       vi.pixel_type = VideoInfo::CS_Y16;
@@ -552,6 +573,8 @@ MVDegrainX::MVDegrainX(
 
 MVDegrainX::~MVDegrainX()
 {
+  if (_producer)
+    GpuBackend::instance().producer_unregister(_producer);
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
   {
     delete DstPlanes;
@@ -586,8 +609,144 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 
 
 
+int MVDegrainX::gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
+{
+  MVDegrainX *self = static_cast<MVDegrainX *>(user);
+  std::lock_guard<std::mutex> lk(self->_gpu_mutex);
+  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr);
+}
+
+// MDegrain<level> of frame n as a device frame: 0 and the token in h, else the CPU path. props_src: the source frame (the
+// CPU path makes its output frame from it).
+int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src)
+{
+  const int L = level;
+  bool usableF[MAX_DEGRAIN] = {}, usableB[MAX_DEGRAIN] = {};
+  // the vector frames in the CPU path's order
+  for (int j = L - 1; j >= 0; j--)
+  {
+    PVideoFrame mv = mvClipF[j]->GetFrame(n, env);
+    mvClipF[j]->Update(mv, env);
+    usableF[j] = mvClipF[j]->IsUsable();
+  }
+  for (int j = 0; j < L; j++)
+  {
+    PVideoFrame mv = mvClipB[j]->GetFrame(n, env);
+    mvClipB[j]->Update(mv, env);
+    usableB[j] = mvClipB[j]->IsUsable();
+  }
+  PVideoFrame src = child->GetFrame(n, env);
+  if (props_src)
+    *props_src = src;
+  MvCudaTokenHeader ts;
+  if (!GpuBackend::frame_token(src, child->GetVideoInfo(), ts))
+    return -1;
+  PVideoFrame refF[MAX_DEGRAIN], refB[MAX_DEGRAIN];
+  for (int j = L - 1; j >= 0; j--)
+    mvClipF[j]->use_ref_frame(refF[j], usableF[j], super, n, env);
+  for (int j = 0; j < L; j++)
+    mvClipB[j]->use_ref_frame(refB[j], usableB[j], super, n, env);
+  const VideoInfo &svi = super->GetVideoInfo();
+  // hs: source, then backward and forward reference of each radius; an unusable direction has weight 0 (the CPU reads
+  // the source there too)
+  MvCudaTokenHeader hs[1 + 2 * MAX_DEGRAIN];
+  hs[0] = ts;
+  for (int j = 0; j < L; j++)
+  {
+    hs[1 + j] = ts;
+    hs[1 + L + j] = ts;
+    if (usableB[j] && !GpuBackend::lite_token(refB[j], svi, hs[1 + j]))
+      return -1;
+    if (usableF[j] && !GpuBackend::lite_token(refF[j], svi, hs[1 + L + j]))
+      return -1;
+  }
+
+  // per block: vectors and the normalised weights for luma and chroma, as use_block_y / use_block_uv + NORMWEIGHTS
+  const int nb = nBlkX * nBlkY;
+  const int stride = 4 * L + 2 * (1 + 2 * L);
+  std::vector<int> blocks((size_t)stride * nb);
+  for (int i = 0; i < nb; i++)
+  {
+    int *b = &blocks[(size_t)stride * i];
+    int sadB[MAX_DEGRAIN] = {}, sadF[MAX_DEGRAIN] = {};
+    for (int j = 0; j < L; j++)
+    {
+      int *mv = b + 4 * j;
+      mv[0] = mv[1] = mv[2] = mv[3] = 0;
+      if (usableB[j])
+      {
+        const FakeBlockData &blk = mvClipB[j]->GetBlock(0, i);
+        mv[0] = blk.GetMV().x;
+        mv[1] = blk.GetMV().y;
+        sadB[j] = blk.GetSAD();
+      }
+      if (usableF[j])
+      {
+        const FakeBlockData &blk = mvClipF[j]->GetBlock(0, i);
+        mv[2] = blk.GetMV().x;
+        mv[3] = blk.GetMV().y;
+        sadF[j] = blk.GetSAD();
+      }
+    }
+    for (int c = 0; c < 2; c++)
+    {
+      int WSrc, WRefB[MAX_DEGRAIN] = {}, WRefF[MAX_DEGRAIN] = {};
+      for (int j = 0; j < L; j++)
+      {
+        WRefB[j] = usableB[j] ? (c == 0 ? DegrainWeight(thSAD, thSAD_sq, sadB[j]) : DegrainWeight(thSADC, thSADC_sq, sadB[j])) : 0;
+        WRefF[j] = usableF[j] ? (c == 0 ? DegrainWeight(thSAD, thSAD_sq, sadF[j]) : DegrainWeight(thSADC, thSADC_sq, sadF[j])) : 0;
+      }
+      NORMWEIGHTS(WSrc, WRefB, WRefF);
+      int *w = b + 4 * L + c * (1 + 2 * L);
+      w[0] = WSrc;
+      for (int j = 0; j < L; j++)
+      {
+        w[1 + j] = WRefB[j];
+        w[1 + L + j] = WRefF[j];
+      }
+    }
+  }
+  const int mask = ((YUVplanes & YPLANE) ? 1 : 0) | ((YUVplanes & UPLANE & nSuperModeYUV) ? 2 : 0)
+    | ((YUVplanes & VPLANE & nSuperModeYUV) ? 4 : 0);
+
+  MvCudaBlockGeom g = {};
+  g.blk_x = nBlkSizeX;
+  g.blk_y = nBlkSizeY;
+  g.ov_x = nOverlapX;
+  g.ov_y = nOverlapY;
+  g.n_blk_x = nBlkX;
+  g.n_blk_y = nBlkY;
+  g.pel = nPel;
+  g.hpad = _gpu_hpad;
+  g.vpad = _gpu_vpad;
+  if (nOverlapX > 0 || nOverlapY > 0)
+  {
+    g.win_luma = OverWins->GetWindow(0);
+    g.win_chroma = OverWinsUV->GetWindow(0);
+  }
+  GpuBackend &gpu = GpuBackend::instance();
+  return gpu.with_tokens(hs, 1 + 2 * L, env, [&](const unsigned long long *tk) {
+    return gpu.degrain(&g, L, tk[0], tk + 1, tk + 1 + L, blocks.data(), mask, _producer, n, &h);
+  });
+}
+
 PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
 {
+  std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
+  if (_gpu_ok)
+  {
+    MvCudaTokenHeader h;
+    PVideoFrame props;
+    const int rc = gpu_make(n, env, h, &props);
+    if (rc == 0)
+    {
+      PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &props) : env->NewVideoFrame(vi);
+      GpuBackend::write_token(dst, h);
+      return dst;
+    }
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "MDegrain%d gpu frame %d rc=%d -> CPU\n", level, n, rc);
+  }
   int nWidth_B = nBlkX*(nBlkSizeX - nOverlapX) + nOverlapX;
   int nHeight_B = nBlkY*(nBlkSizeY - nOverlapY) + nOverlapY;
 
@@ -630,6 +789,8 @@ PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
   //	if ( mvClipB.IsUsable() && mvClipF.IsUsable() && mvClipB2.IsUsable() && mvClipF2.IsUsable() )
   //	{
   PVideoFrame	src = child->GetFrame(n, env);
+  if (GpuBackend::instance().usable())
+    src = GpuBackend::instance().resolve_frame(src, child->GetVideoInfo(), env); // a token source frame: its picture
   PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src) : env->NewVideoFrame(vi); // frame property support
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
   {
@@ -707,6 +868,17 @@ PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
     mvClipF[j]->use_ref_frame(refF[j], isUsableF[j], super, n, env);
   for (int j = 0; j < level; j++)
     mvClipB[j]->use_ref_frame(refB[j], isUsableB[j], super, n, env);
+  if (_super_lite)
+    for (int j = 0; j < level; j++)
+    {
+      if (isUsableF[j])
+        refF[j] = MVSuper::CompleteLite(refF[j], super->GetVideoInfo(), false, env);
+      if (isUsableB[j])
+        refB[j] = MVSuper::CompleteLite(refB[j], super->GetVideoInfo(), false, env);
+    }
+
+  if (mv_prof_skip("degrain"))
+    return src;
 
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
   {

@@ -10,7 +10,10 @@
 #include "SharedPtr.h"
 #include "yuy2planes.h"
 
+#include	<mutex>
 #include	<vector>
+
+#include "GpuBackend.h"
 
 
 
@@ -29,7 +32,7 @@ public:
   MVCompensate(
     PClip _child, PClip _super, PClip vectors, bool sc, double _recursionPercent,
     sad_t thsad, bool _fields, double _time100, sad_t nSCD1, int nSCD2, bool isse2, bool _planar,
-    bool mt_flag, int trad, bool center_flag, PClip cclip_sptr, sad_t thsad2,
+    bool mt_flag, int trad, bool center_flag, PClip cclip_sptr, sad_t thsad2, bool gpu_flag,
     IScriptEnvironment* env_ptr
   );
   ~MVCompensate();
@@ -140,6 +143,14 @@ private:
   std::vector <conc::AtomicInt <int> >
             _boundary_cnt_arr;
 
+  // GPU path (gpu=true, GPU_PIPELINE_PLAN.md section 20): the super clip is MSuper(gpu=true) of a token clip; output
+  // frames are token frames. One lock per instance: a token regeneration can call in from another thread.
+  bool           _super_lite;
+  bool           _gpu_ok;
+  unsigned long long _producer;
+  std::mutex     _gpu_mutex;
+  int            gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src);
+  static int     gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
 };
 
 #endif

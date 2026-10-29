@@ -24,6 +24,7 @@
 #include "MaskFun.h"
 #include "MVFinest.h"
 #include "MVFlowFps.h"
+#include "MVSuper.h"
 #include "profile.h"
 #include "GoldenDump.h"
 #include <vector>
@@ -566,6 +567,9 @@ bool MVFlowFps::gpu_flow(int nleft, int nright, int time256, PVideoFrame &dst, I
         sl = _super_clip->GetFrame(nleft, env);
         sr = _super_clip->GetFrame(nright, env);
         src0 = child->GetFrame(nleft, env);
+        // a GPU search clip as super source: this path takes host pictures
+        sl = MVSuper::ResolveToken(sl, _super_clip->GetVideoInfo(), env);
+        sr = MVSuper::ResolveToken(sr, _super_clip->GetVideoInfo(), env);
       }
       dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src0) : env->NewVideoFrame(vi);
       const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };

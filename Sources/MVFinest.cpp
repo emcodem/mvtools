@@ -92,6 +92,8 @@ PVideoFrame __stdcall MVFinest::GetFrame(int n, IScriptEnvironment* env)
   // a lite super frame (MSuper gpu=true) only holds the picture: nPel 1 just copies its top rows, anything else needs the real thing
   if (_lite && nPel != 1)
     ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt, env);
+  else if (_lite)
+    ref = MVSuper::ResolveToken(ref, child->GetVideoInfo(), env);
    BYTE *pDst[3];
   const BYTE *pRef[3];
   int nDstPitches[3], nRefPitches[3];

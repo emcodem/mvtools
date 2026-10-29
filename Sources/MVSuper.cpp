@@ -140,8 +140,8 @@ MVSuper::MVSuper(
   // with its padding rows. Any filter that needs the full thing completes it itself (CompleteLite), bit-identical.
   if (gpu_flag)
   {
-    _lite = GpuBackend::instance().usable() && !usePelClip && (nPel == 1 || nPel == 2) && sharp == 2 && rfilter == 4
-      && chroma && nModeYUV == YUVPLANES && vi.IsPlanar() && vi.IsYUV() && !vi.IsY() && !vi.IsYUY2()
+    _lite = GpuBackend::instance().usable() && !usePelClip && (nPel == 1 || nPel == 2) && sharp == 2 && (rfilter == 4 || rfilter == 2)
+      && (nModeYUV == YUVPLANES || nModeYUV == YPLANE) && vi.IsPlanar() && vi.IsYUV() && !vi.IsY() && !vi.IsYUY2()
       && (pixelsize == 1 || pixelsize == 2) && (xRatioUV == 1 || xRatioUV == 2) && (yRatioUV == 1 || yRatioUV == 2)
       && nHPad % xRatioUV == 0 && nVPad % yRatioUV == 0 && nHeight % yRatioUV == 0;
     if (GpuBackend::log_enabled())
@@ -225,6 +225,14 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
   {
     GpuScope sc_lite("msuper: lite copy");
     PVideoFrame lite = has_at_least_v8 ? env->NewVideoFrameP(vi, &src) : env->NewVideoFrame(vi);
+    MvCudaTokenHeader tok;
+    if (GpuBackend::read_token(src->GetReadPtr(PLANAR_Y), src->GetRowSize(PLANAR_Y), tok))
+    {
+      // token frame (picture on the device): pass the header on at the picture position; the GPU filters use the device
+      // frame, CPU paths download it (ResolveToken)
+      memcpy(lite->GetWritePtr(PLANAR_Y) + size_t(nVPad) * lite->GetPitch(PLANAR_Y) + size_t(nHPad) * pixelsize, &tok, sizeof(tok));
+      return lite;
+    }
     const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
     for (int p = 0; p < 3; ++p)
     {
@@ -237,6 +245,23 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
     return lite;
   }
   GpuScope sc_build("msuper: build pyramid+subpel (CPU)");
+  MvCudaTokenHeader tok;
+  if (vi.IsPlanar() && GpuBackend::read_token(src->GetReadPtr(PLANAR_Y), src->GetRowSize(PLANAR_Y), tok))
+  {
+    // token frame from a GPU filter feeding a super the GPU cannot take over: the CPU needs the picture
+    PVideoFrame pic = env->NewVideoFrame(child->GetVideoInfo());
+    const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+    void *d[3] = { 0, 0, 0 };
+    int dp[3] = { 0, 0, 0 };
+    for (int p = 0; p < (vi.IsY() ? 1 : 3); ++p)
+    {
+      d[p] = pic->GetWritePtr(planes_l[p]);
+      dp[p] = pic->GetPitch(planes_l[p]);
+    }
+    if (!GpuBackend::instance().download_token(tok, d, dp, env))
+      env->ThrowError("MSuper: the GPU frame %d is no longer available on the device", tok.frame);
+    src = pic;
+  }
   PVideoFrame srcPel;
   if (usePelClip)
     srcPel = pelclip->GetFrame(n, env);
@@ -388,8 +413,37 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
 
 // Rebuilds, from a lite super frame (picture inside its padding rows), the frame the normal MSuper makes. Same steps and
 // same GroupOfFrames code as GetFrame / the constructor, so the result is bit-identical.
+PVideoFrame MVSuper::ResolveToken(PVideoFrame lite, const VideoInfo &lite_vi, IScriptEnvironment* env)
+{
+  SuperParams64Bits params;
+  memcpy(&params, &lite_vi.num_audio_samples, 8);
+  const int hpad = params.nHPad, vpad = params.nVPad;
+  const int pixelsize = lite_vi.ComponentSize();
+  const int xr = 1 << lite_vi.GetPlaneWidthSubsampling(PLANAR_U);
+  const int yr = 1 << lite_vi.GetPlaneHeightSubsampling(PLANAR_U);
+  const int pic_row = (lite_vi.width - 2 * hpad) * pixelsize;
+  MvCudaTokenHeader tok;
+  if (!GpuBackend::read_token(lite->GetReadPtr(PLANAR_Y) + size_t(vpad) * lite->GetPitch(PLANAR_Y) + size_t(hpad) * pixelsize, pic_row, tok))
+    return lite;
+  PVideoFrame pic = env->NewVideoFrame(lite_vi);
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  void *dst[3];
+  int pitch[3];
+  for (int p = 0; p < 3; ++p)
+  {
+    const int hp = p == 0 ? hpad : hpad / xr;
+    const int vp = p == 0 ? vpad : vpad / yr;
+    pitch[p] = pic->GetPitch(planes_l[p]);
+    dst[p] = pic->GetWritePtr(planes_l[p]) + size_t(vp) * pitch[p] + size_t(hp) * pixelsize;
+  }
+  if (!GpuBackend::instance().download_token(tok, dst, pitch, env))
+    env->ThrowError("MSuper: the GPU search clip frame %d is no longer available on the device", tok.frame);
+  return pic;
+}
+
 PVideoFrame MVSuper::CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env)
 {
+  lite = ResolveToken(lite, lite_vi, env);
   SuperParams64Bits params;
   memcpy(&params, &lite_vi.num_audio_samples, 8);
   const int rfilter = params.param & 7;

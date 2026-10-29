@@ -9,6 +9,7 @@
 #include "MVPlane.h"
 #include "MVFilter.h"
 #include "profile.h"
+#include "ProfSkip.h"
 #include "SuperParams64Bits.h"
 
 #include	<emmintrin.h>
@@ -975,6 +976,9 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
     MVClip &mv_clip = *(_mv_clip_arr[k]._clip_sptr);
     mv_clip.use_ref_frame(ref[k], _usable_flag_arr[k], _super, n, env_ptr);
   }
+
+  if (mv_prof_skip("degrain"))
+    return src;
 
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
   {

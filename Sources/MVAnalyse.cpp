@@ -63,6 +63,7 @@ MVAnalyse::MVAnalyse(
   , _super_lite(false)
   , _gpu_slices(1)
   , _gpu_effective_chroma_scale(0)
+  , _gpu_rfilter(4)
   , _gpu_super_levels(0)
 {
   has_at_least_v8 = true;
@@ -389,7 +390,10 @@ MVAnalyse::MVAnalyse(
     analysisData.pixelsize, // PF
     analysisData.bits_per_pixel,
     (_dct_factory_ptr.get() != 0) ? &_dct_pool : 0,
-    _mt_flag,
+    // gpu=true with meander=false means the single-slice result (the GPU wavefront search, GPU_PIPELINE_PLAN.md W):
+    // the CPU path of such a filter (fallback frames, unsupported settings) searches in one slice too, so the output
+    // does not depend on where a frame was searched
+    _mt_flag && !(gpu_flag && !meander),
     analysisData.chromaSADScale,
     env
   ));
@@ -427,13 +431,15 @@ MVAnalyse::MVAnalyse(
   // stays on the CPU, silently
   if (gpu_flag)
   {
-    const bool super_ok = (params.param & 0x80) && (params.param & 7) == 4 /* rfilter */
+    _gpu_rfilter = params.param & 7;
+    const bool super_ok = (params.param & 0x80) && (_gpu_rfilter == 4 || _gpu_rfilter == 2) /* rfilter */
       && ((params.param >> 3) & 3) == 2 /* sharp */ && !(params.param & 0x20) /* no pelclip */;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
-      && chroma && nModeYUV == YUVPLANES && !divideExtra && !_dctmode && !temporal_flag && !_tryMany && !multi_flag
-      && searchType == EXHAUSTIVE && nSearchParam >= 1 && nSearchParam <= 3 && nPelSearch >= 1 && nPelSearch <= 3
-      && (nSuperPel == 1 || nSuperPel == 2) && analysisData.nBlkSizeX <= 32 && (xr == 1 || xr == 2) && (yr == 1 || yr == 2)
+      && !divideExtra && !_dctmode && !temporal_flag && !_tryMany && !multi_flag
+      && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount)
+      && (nSuperPel == 1 || nSuperPel == 2) && analysisData.nBlkSizeX <= 32
+      && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)))
       && lstrlen(_outfilename) == 0 && analysisData.nLvCount <= 12;
     if (GpuBackend::log_enabled())
       std::fprintf(stderr, "MAnalyse gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
@@ -690,7 +696,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
     bool gpu_done = false;
     if (_gpu_ok && fieldShift == 0 && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
     {
-      gpu_done = gpu_search(nsrc, nref, reinterpret_cast<int*>(pDst));
+      gpu_done = gpu_search(nsrc, nref, reinterpret_cast<int*>(pDst), env);
     }
     if (!gpu_done)
     {
@@ -764,7 +770,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
 // Runs the whole search on the GPU for the frames already loaded into pSrcGOF / pRefGOF (raw level-0 planes of the
 // super frames). Returns false (nothing written that matters) when the CPU has to do it.
-bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
+bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload, IScriptEnvironment *env)
 {
   if (GpuBackend::force_fallback())
     return false;
@@ -773,9 +779,9 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
   const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
-  const void *src_p[3], *ref_p[3];
-  int src_pitch[3], ref_pitch[3];
-  for (int p = 0; p < 3; p++)
+  const void *src_p[3] = { 0, 0, 0 }, *ref_p[3] = { 0, 0, 0 };
+  int src_pitch[3] = { 0, 0, 0 }, ref_pitch[3] = { 0, 0, 0 };
+  for (int p = 0; p < (nModeYUV == YUVPLANES ? 3 : 1); p++) // luma-only analysis: the chroma planes are not touched
   {
     MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
     MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
@@ -795,11 +801,12 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
   sp.pel = a.nPel;
   sp.levels = a.nLvCount;
   sp.bits_per_pixel = a.bits_per_pixel;
-  sp.chroma = 1;
-  sp.rfilter = 4;
+  sp.chroma = nModeYUV == YUVPLANES ? 1 : 0;
+  sp.rfilter = _gpu_rfilter;
   sp.sharp = 2;
 
   MvCudaAnalyseParams ap = {};
+  ap.search_type = (int)searchType;
   ap.blk_x = a.nBlkSizeX;
   ap.blk_y = a.nBlkSizeY;
   ap.overlap_x = a.nOverlapX;
@@ -816,6 +823,7 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
   ap.use_global = global ? 1 : 0;
   ap.meander = meander ? 1 : 0;
   ap.bad_sad = (int)badSAD;
+  ap.bad_range = badrange;
   ap.search_param = nSearchParam;
   ap.pel_search = nPelSearch;
   ap.chroma_sad_scale = _gpu_effective_chroma_scale;
@@ -824,11 +832,57 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload)
   ap.ref_key = GpuBackend::frame_key((const void *)child.operator->(), nref);
 
   const int words = _vectorfields_aptr->GetArraySize();
+  // pictures that are token frames (GPU search clip): the search reads the device frames; one token and one ordinary
+  // picture cannot be mixed here, the CPU path downloads the token
+  MvCudaTokenHeader src_tok, ref_tok;
+  const int pic_row = a.nWidth * a.pixelsize;
+  const bool src_is_tok = _super_lite && GpuBackend::read_token(src_p[0], pic_row, src_tok);
+  const bool ref_is_tok = _super_lite && GpuBackend::read_token(ref_p[0], pic_row, ref_tok);
+  if (src_is_tok != ref_is_tok)
+    return false;
   int rc = -1;
   try
   {
-    GpuScope sc_call("analyse: analyse_host call");
-    rc = gpu.analyse_host(&sp, &ap, src_p, src_pitch, ref_p, ref_pitch, payload, words);
+    if (src_is_tok)
+    {
+      GpuScope sc_call("analyse: analyse_token call");
+      rc = gpu.analyse_token(&sp, &ap, src_tok.token, ref_tok.token, payload, words);
+      if (rc == MVCUDA_TOKEN_GONE)
+      {
+        // evicted: pin the frame still there, let the producer make the other one again (pinned right away, so making
+        // one cannot evict the other under a small budget), then once more
+        MvCudaTokenHeader *const hs[2] = { &src_tok, &ref_tok };
+        unsigned long long tk[2] = { src_tok.token, ref_tok.token };
+        bool pinned[2] = { false, false };
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; i++)
+        {
+          if (gpu.token_pin(tk[i]) == 0)
+          {
+            pinned[i] = true;
+            continue;
+          }
+          MvCudaTokenHeader again;
+          ok = hs[i]->producer != 0 && gpu.token_regenerate(hs[i]->producer, hs[i]->frame, env, &again) == 0
+            && gpu.token_pin(again.token) == 0;
+          if (ok)
+          {
+            tk[i] = again.token;
+            pinned[i] = true;
+          }
+        }
+        if (ok)
+          rc = gpu.analyse_token(&sp, &ap, tk[0], tk[1], payload, words);
+        for (int i = 0; i < 2; i++)
+          if (pinned[i])
+            gpu.token_unpin(tk[i]);
+      }
+    }
+    else
+    {
+      GpuScope sc_call("analyse: analyse_host call");
+      rc = gpu.analyse_host(&sp, &ap, src_p, src_pitch, ref_p, ref_pitch, payload, words);
+    }
   }
   catch (...)
   {
