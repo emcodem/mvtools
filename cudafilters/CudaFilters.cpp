@@ -313,6 +313,10 @@ const AVS_Linkage *AVS_linkage = 0;
 extern "C" __declspec(dllexport) const char *__stdcall AvisynthPluginInit3(IScriptEnvironment *env, const AVS_Linkage *const vectors)
 {
   AVS_linkage = vectors;
+  // frame properties, NewVideoFrameP and GetEnvProperty are interface V8 (AviSynth+ 3.6); on an older core their vtable slots
+  // do not exist and a call would run some unrelated function, so refuse to load
+  try { env->CheckVersion(8); }
+  catch (const AvisynthError &) { env->ThrowError("cudafilters: needs AviSynth+ 3.6 or newer (interface V8); update AviSynth+, 3.7.5 is the tested version"); }
   env->AddFunction("CudaUpload", "c", Create_CudaUpload, 0);
   env->AddFunction("CudaDownload", "c", Create_CudaDownload, 0);
   env->AddFunction("CudaBob", "c[b]f[c]f[height]i", Create_CudaBob, 0);
