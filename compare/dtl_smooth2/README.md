@@ -4,7 +4,43 @@ Full page with A/B viewer: [index.html](https://raw.githack.com/emcodem/mvtools/
 
 Clip: UHD 10-bit 4:2:2, pole and wires against sky (`seg1_wires_pole.mp4`). Chain as in our frame-rate converter:
 MAnalyse 32/16 → MRecalculate 16/8, `thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true`, pel 2 →
-MFlowFps 24000/1001 `mask=2, ml=200`. Scripts in [scripts/](scripts).
+MFlowFps 24000/1001 `mask=2, ml=200`.
+
+## Exact script
+
+[scripts/avs/pinterf_sm1_flow.avs](scripts/avs/pinterf_sm1_flow.avs), as run (smooth=1, our build = pinterf cdf04a5,
+CPU path):
+
+```
+LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
+LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
+LoadPlugin("C:\dev\mvtools\profile\build_m1\mvtools2.dll")
+SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + ".lwi")
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
+return out.Trim(18, 25)
+```
+
+(The missing line break before `out =` is in the file as run; AviSynth parses it as two statements.)
+
+The other scripts in [scripts/avs/](scripts/avs) differ from this one only in:
+
+| script | `LoadPlugin` mvtools2.dll | MRecalculate | last line |
+|---|---|---|---|
+| `pinterf_sm1_flow` | ours | default (smooth=1) | MFlowFps, frames 18–25 |
+| `dtl_sm1_flow` | DTL c688008 | default (smooth=1) | MFlowFps |
+| `dtl_sm2_flow` | DTL c688008 | `smooth=2,` after `thSAD=100,` | MFlowFps |
+| `fix_sm2_flow` | DTL c688008 + patch | `smooth=2,` | MFlowFps |
+| `*_vec` | as above | as above | `return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))` |
+
+Frames, crops, PSNR and maps: [scripts/render.ps1](scripts/render.ps1) (the ffmpeg commands as run; output file names
+unified). The 5-format × 3-chain identity check: [scripts/cmp.ps1](scripts/cmp.ps1) + [scripts/cmp.py](scripts/cmp.py).
 
 ## 1. Same parameters: identical
 
