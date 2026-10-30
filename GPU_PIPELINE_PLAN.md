@@ -1032,3 +1032,32 @@ Speed (PAL 1500 frames, 'gpu all', Prefetch 12, best of 3): Fast 10 bit 3.34 s /
 10 bit is bound by the GPU analysis (unpacked 16-bit SAD in k_wave, B5), not by NNEDI3.
 Left of Part B: lookup tables above 10 bit (B2), NNEDI3 above 10 bit, B5 packed 16-bit SAD, the 4:2:0 + ChromaMotion
 search-clip difference (B4).
+
+**B5 done (2026-10-30, uncommitted, test set `profile\build_b5` = build_b3 + new mvtools_cuda.dll, API unchanged 15):**
+packed SADs for 16-bit samples, in both search kernels. A/B first: 8-bit QTGMC Slower with `MVCUDA_WAVE_PACK=0` took 5.40 s
+(packed 4.35 s), about the 10-bit time (5.61 s): the missing packed form, not the doubled bytes, was the 10-bit gap.
+- k_wave (`pk_load` / `pk_sum`): same lane layout as at 8 bit (4 columns of every 4th row); a row's 4 samples are read as the
+  two aligned 8-byte words around them, picked out by funnel shifts (`pk_row`) and summed with two `__vsadu2`. Half the load
+  instructions of the split form, the same registers. Gate: reference pitches % 4 samples, sub-plane bases 8-byte aligned.
+- k_search (slice kernel, meander=true): new `eval_candidate_pk` (8 and 16 bit) for blksize 32 / 16 with 4:2:2 / 4:2:0
+  chroma or luma only: a lane takes 4 columns of every 4th (bs 32) / 8th (bs 16) row, chroma U in lanes 0..15, V in 16..31;
+  64 -> 32 load instructions per lane for the FRC chain's 32x32 4:2:2 block. Other geometries keep eval_candidate.
+  `MVCUDA_SEARCH_PACK=0` switches it off (A/B).
+- Speed: QTGMC PAL 1500 frames 10 bit Slower 5.61 -> **5.08 s** (8 bit 4.25, unchanged), Fast 1.96 (unchanged: small
+  batches); uc_FRC chain (UHD 4:2:2 10 bit, run_frc.ps1) 7.76 -> **6.85 s**, md5 BFE44775F811 = CPU fallback.
+- Exactness: golden 85/85 (tags 10, f8, f420, f420b8, f444), run_qtgmc_vec 50/50 with and without meander,
+  run_cf_regression 65/65 + tokens 42/42, run_presetcheck -Fallback Fast / Slower / Placebo at 10-bit 4:2:2 and 8 bit ALL
+  PASS, FRC = fallback.
+- Left: 16-bit packed rows need twice the registers of 8-bit ones (the 8-byte window around 4 samples), which is the rest of
+  the 10-bit Slower gap (5.08 vs 4.25 s); a scheme with shuffles from the neighbour lane instead of the second word was not tried.
+
+**Open after B5 (2026-10-30), in the agreed order:**
+1. S2: exhaustive radius > 3 and coarse searchparam > 3 on the GPU (MAnalyse, MRecalculate); today they fall back to the CPU.
+2. S3: trymany.
+3. S4: pel 4 with sub-pel samples computed on the fly.
+4. Part M (M1-M7): MAnalyse / MRecalculate / MFlowFps on the cudafilters model (one upload per picture, pyramids in the
+   registry budget, token in / out, submitter for every call).
+5. QTGMC default meander=true once 'gpu all' with the slice kernel is clearly faster than the CPU (needs M4).
+Smaller Part B leftovers: 10-bit k_wave registers (16-bit packed rows hold an 8-byte window per 4 samples; try neighbour-lane
+shuffles instead of the second word; 10-bit Slower 5.08 s vs 8-bit 4.25 s); lookup tables and NNEDI3 above 10 bit; the 4:2:0
++ ChromaMotion search-clip difference (B4). After all of it: milestone F (FFT3DFilter on the GPU).

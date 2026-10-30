@@ -49,7 +49,8 @@ namespace
     int search_type;  // mvc_refine::S_*: the refine step of this level (exhaustive levels use the ring fold below)
     int has_chroma;   // 0: luma-only search, cw = ch = 0
     int async_src;  // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
-    int packed;     // 1: 8-bit SADs in the packed form of k_wave (pk_load / pk_sum), see analyse_impl
+    int packed;     // 1: SADs in the packed form of k_wave (pk_load / pk_sum), see analyse_impl
+    int packed_s;   // 1: eval_dispatch may use eval_candidate_pk (reference rows aligned for the packed reads)
     const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
     int *vec;          // device: (vx, vy, sad) triples of this level
     int *bad_flag;
@@ -371,6 +372,27 @@ namespace
   __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::); }
   __device__ __forceinline__ void prefetch_l1(const void *p) { asm volatile("prefetch.global.L1 [%0];" :: "l"(p)); }
 
+  // Packed SADs (k_wave pk_load / pk_sum, k_search eval_candidate_pk): a lane takes 4 columns of a row; their reference
+  // samples are read as the aligned words around them (PK_WPR words: 2 x 4 bytes at 8 bit, 4 x 4 bytes at 16 bit).
+  constexpr int PK_WPR = 2 * sizeof(pix);
+
+  // SAD of the 4 samples of one row held in the words w[0 .. WPR) that start sh bytes into w; q = the 4 source samples
+  template <int WPR>
+  __device__ __forceinline__ unsigned pk_row(const unsigned *w, int sh, const unsigned *q, unsigned sum)
+  {
+    if constexpr (WPR == 2)
+      return __vsadu4(__funnelshift_r(w[0], w[1], 8 * sh), q[0]) + sum;
+    else
+    {
+      // sh in {0, 2, 4, 6}: the samples start in word sh / 4, at bit 8 * (sh & 3)
+      const bool hi = sh >= 4;
+      const unsigned a0 = hi ? w[1] : w[0], a1 = hi ? w[2] : w[1], a2 = hi ? w[3] : w[2];
+      const int s = 8 * (sh & 3);
+      sum = __vsadu2(__funnelshift_r(a0, a1, s), q[0]) + sum;
+      return __vsadu2(__funnelshift_r(a1, a2, s), q[1]) + sum;
+    }
+  }
+
   // Luma and chroma SAD of one candidate vector for the source block in shared memory. Lane = column. BSY / CHH are
   // the compile-time row counts of the luma block and of one chroma block (0 = unknown, runtime loops): with known
   // counts every reference sample of the candidate is loaded into registers before the arithmetic starts, so all loads
@@ -466,10 +488,106 @@ namespace
     sc = scale_chroma(warp_sum(sum_c), a.chroma_scale);
   }
 
+  // N rows of 4 samples, step samples apart, from r: the aligned words around each row into w (PK_WPR per row); returns
+  // the byte offset of r in its first word (the same for every row: step keeps the alignment)
+  template <int N>
+  __device__ __forceinline__ int pk_fetch(const pix *r, size_t step, unsigned *w)
+  {
+    constexpr size_t AL = 4 * sizeof(pix) - 1;
+    if constexpr (PK_WPR == 2)
+    {
+      const unsigned *b = (const unsigned *)((size_t)r & ~AL);
+      const size_t sw = step / 4;
+      #pragma unroll
+      for (int i = 0; i < N; i++)
+      {
+        w[2 * i] = __ldg(b + i * sw);
+        w[2 * i + 1] = __ldg(b + i * sw + 1);
+      }
+    }
+    else
+    {
+      const uint2 *b = (const uint2 *)((size_t)r & ~AL);
+      const size_t sw = step / 4;
+      #pragma unroll
+      for (int i = 0; i < N; i++)
+      {
+        const uint2 u0 = __ldg(b + i * sw), u1 = __ldg(b + i * sw + 1);
+        w[4 * i] = u0.x;
+        w[4 * i + 1] = u0.y;
+        w[4 * i + 2] = u1.x;
+        w[4 * i + 3] = u1.y;
+      }
+    }
+    return (int)((size_t)r & AL);
+  }
+
+  // Packed form of eval_candidate (B5; LevelArgs::packed_s: reference rows and sub-plane bases 4-byte (8 bit) / 8-byte
+  // (16 bit) aligned, paired or no chroma). Lane = 4 columns of every RP-th row: luma BX / 4 lanes per row, chroma U in
+  // lanes 0..15 and V in 16..31 with CW / 4 lanes per row. Every reference word of the candidate is loaded before the
+  // sums; the SADs are the same integers as eval_candidate's (only the order of the additions differs).
+  template <int BX, int BSY, int CW, int CHH>
+  __device__ __forceinline__ void eval_candidate_pk(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, int cx, int cy, int lane, int &sl, int &sc)
+  {
+    constexpr int RP = 32 / (BX / 4), NR = BSY / RP;
+    constexpr int CRP = CW > 0 ? 16 / (CW / 4) : 1, NC = CHH / CRP;
+    static_assert(BSY % RP == 0 && (CHH == 0 || (CW <= 16 && CHH % CRP == 0)), "packed layout");
+    const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    unsigned wl[NR * PK_WPR], wc[NC > 0 ? NC * PK_WPR : 1];
+    const int cg = lane % (BX / 4), rg = lane / (BX / 4);
+    const int shl = pk_fetch<NR>(a.ref[0][sub] + (size_t)(ry + rg) * a.ew[0] + rx + 4 * cg, (size_t)RP * a.ew[0], wl);
+    int shc = 0, pl = 1, ccg = 0, crg = 0;
+    if constexpr (CHH > 0)
+    {
+      const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+      const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+      const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+      pl = lane < 16 ? 1 : 2;
+      ccg = (lane & 15) % (CW / 4);
+      crg = (lane & 15) / (CW / 4);
+      shc = pk_fetch<NC>(a.ref[pl][subc] + (size_t)(ryc + crg) * a.ew[pl] + rxc + 4 * ccg, (size_t)CRP * a.ew[pl], wc);
+    }
+    unsigned sum_l = 0, sum_c = 0;
+    {
+      const unsigned *q = (const unsigned *)(s_y + rg * BX + 4 * cg);
+      #pragma unroll
+      for (int i = 0; i < NR; i++)
+        sum_l = pk_row<PK_WPR>(wl + PK_WPR * i, shl, q + i * RP * BX * sizeof(pix) / 4, sum_l);
+    }
+    if constexpr (CHH > 0)
+    {
+      const unsigned *q = (const unsigned *)((pl == 1 ? s_u : s_v) + crg * CW + 4 * ccg);
+      #pragma unroll
+      for (int i = 0; i < NC; i++)
+        sum_c = pk_row<PK_WPR>(wc + PK_WPR * i, shc, q + i * CRP * CW * sizeof(pix) / 4, sum_c);
+    }
+    sl = warp_sum((int)sum_l);
+    sc = scale_chroma(warp_sum((int)sum_c), a.chroma_scale);
+  }
+
   // picks the compile-time row counts for the common block sizes
   __device__ __forceinline__ void eval_dispatch(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
     int x0, int y0, int x1, int y1, int cx, int cy, int lane, bool pair, int &sl, int &sc)
   {
+    if (a.packed_s)
+    {
+      // FRC (4:2:2 / 4:2:0, blksize 32 / 16) and the luma-only searches
+      if (a.bs_x == 32 && a.bs_y == 32 && a.cw == 16 && a.ch == 32)
+        return eval_candidate_pk<32, 32, 16, 32>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+      if (a.bs_x == 32 && a.bs_y == 32 && a.cw == 16 && a.ch == 16)
+        return eval_candidate_pk<32, 32, 16, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 16)
+        return eval_candidate_pk<16, 16, 8, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 8)
+        return eval_candidate_pk<16, 16, 8, 8>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+      if (a.bs_x == 32 && a.bs_y == 32 && a.ch == 0)
+        return eval_candidate_pk<32, 32, 0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.ch == 0)
+        return eval_candidate_pk<16, 16, 0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+    }
     if (a.bs_y == 32 && a.ch == 32)
       eval_candidate<32, 32>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
     else if (a.bs_y == 16 && a.ch == 16)
@@ -1232,12 +1350,16 @@ namespace
   // the first GW / 2 lanes U, the others V, GW / 8 lanes per row), reads each row as the two aligned words around it
   // and forms the SAD of 4 samples with one __vsadu4. Half the loads and half the registers of the byte form; the sums
   // are the same integers (only the order of the additions differs).
+  // 16-bit samples (B5): the same lane layout; the 4 samples of a row (8 bytes) are read as the two aligned 8-byte words
+  // around them (reference pitches and sub-plane bases 8-byte aligned), picked out by funnel shifts and summed with two
+  // __vsadu2. Half the load instructions of the split form, the same registers.
   template <int BSY, int CHH>
   struct PackRegs
   {
-    unsigned l[BSY / 2];                 // BSY / 4 rows x 2 words
-    unsigned c[CHH > 0 ? CHH / 2 : 1];
-    int shl, shc;                        // byte offset of the row start in its first word (same for every row)
+    static constexpr int WPR = PK_WPR;
+    unsigned l[BSY / 4 * WPR];
+    unsigned c[CHH > 0 ? CHH / 4 * WPR : 1];
+    int shl, shc;                        // byte offset of the row start in its first word / 8-byte word (same for every row)
   };
 
   template <int GW, int BSY, int CHH>
@@ -1249,17 +1371,35 @@ namespace
     const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
     const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
     const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    constexpr int WPR = PackRegs<BSY, CHH>::WPR;
+    constexpr size_t AL = 4 * sizeof(pix) - 1; // alignment mask of the words read: 4 (8 bit) or 8 bytes (16 bit)
     {
       const int cg = col % (GW / 4), rg = col / (GW / 4);
       const pix *r = a.ref[0][sub] + (size_t)(ry + rg) * a.ew[0] + rx + 4 * cg;
-      e.shl = (int)((size_t)r & 3);
-      const unsigned *w = (const unsigned *)((size_t)r & ~(size_t)3);
-      const size_t step = (size_t)a.ew[0]; // 4 rows in words
-      #pragma unroll
-      for (int i = 0; i < BSY / 4; i++)
+      e.shl = (int)((size_t)r & AL);
+      const size_t step = (size_t)a.ew[0] * sizeof(pix); // 4 rows in words
+      if constexpr (WPR == 2)
       {
-        e.l[2 * i] = __ldg(w + i * step);
-        e.l[2 * i + 1] = __ldg(w + i * step + 1);
+        const unsigned *w = (const unsigned *)((size_t)r & ~AL);
+        #pragma unroll
+        for (int i = 0; i < BSY / 4; i++)
+        {
+          e.l[2 * i] = __ldg(w + i * step);
+          e.l[2 * i + 1] = __ldg(w + i * step + 1);
+        }
+      }
+      else
+      {
+        const uint2 *w = (const uint2 *)((size_t)r & ~AL);
+        #pragma unroll
+        for (int i = 0; i < BSY / 4; i++)
+        {
+          const uint2 u0 = __ldg(w + i * (step / 2)), u1 = __ldg(w + i * (step / 2) + 1);
+          e.l[4 * i] = u0.x;
+          e.l[4 * i + 1] = u0.y;
+          e.l[4 * i + 2] = u1.x;
+          e.l[4 * i + 3] = u1.y;
+        }
       }
     }
     if constexpr (CHH > 0)
@@ -1269,14 +1409,30 @@ namespace
       const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
       const int pl = col < GW / 2 ? 1 : 2, cc = col % (GW / 2), cg = cc % (GW / 8), rg = cc / (GW / 8);
       const pix *r = a.ref[pl][subc] + (size_t)(ryc + rg) * a.ew[pl] + rxc + 4 * cg;
-      e.shc = (int)((size_t)r & 3);
-      const unsigned *w = (const unsigned *)((size_t)r & ~(size_t)3);
-      const size_t step = (size_t)a.ew[pl];
-      #pragma unroll
-      for (int i = 0; i < CHH / 4; i++)
+      e.shc = (int)((size_t)r & AL);
+      const size_t step = (size_t)a.ew[pl] * sizeof(pix);
+      if constexpr (WPR == 2)
       {
-        e.c[2 * i] = __ldg(w + i * step);
-        e.c[2 * i + 1] = __ldg(w + i * step + 1);
+        const unsigned *w = (const unsigned *)((size_t)r & ~AL);
+        #pragma unroll
+        for (int i = 0; i < CHH / 4; i++)
+        {
+          e.c[2 * i] = __ldg(w + i * step);
+          e.c[2 * i + 1] = __ldg(w + i * step + 1);
+        }
+      }
+      else
+      {
+        const uint2 *w = (const uint2 *)((size_t)r & ~AL);
+        #pragma unroll
+        for (int i = 0; i < CHH / 4; i++)
+        {
+          const uint2 u0 = __ldg(w + i * (step / 2)), u1 = __ldg(w + i * (step / 2) + 1);
+          e.c[4 * i] = u0.x;
+          e.c[4 * i + 1] = u0.y;
+          e.c[4 * i + 2] = u1.x;
+          e.c[4 * i + 3] = u1.y;
+        }
       }
     }
   }
@@ -1284,6 +1440,7 @@ namespace
   template <int GW, int BSY, int CHH>
   __device__ __forceinline__ void pk_sum(const LevelArgs &a, int col, bool valid, const PackRegs<BSY, CHH> &e, int &sl, int &sc)
   {
+    constexpr int WPR = PackRegs<BSY, CHH>::WPR;
     unsigned sum_l = 0, sum_c = 0;
     if (valid)
     {
@@ -1291,8 +1448,8 @@ namespace
         const int cg = col % (GW / 4), rg = col / (GW / 4);
         const unsigned *q = (const unsigned *)(g_wsrc + rg * GW + 4 * cg);
         #pragma unroll
-        for (int i = 0; i < BSY / 4; i++)
-          sum_l = __vsadu4(__funnelshift_r(e.l[2 * i], e.l[2 * i + 1], 8 * e.shl), q[i * GW]) + sum_l;
+        for (int i = 0; i < BSY / 4; i++) // 4 rows down = 4 * GW samples = GW * sizeof(pix) words
+          sum_l = pk_row<WPR>(e.l + WPR * i, e.shl, q + i * GW * sizeof(pix), sum_l);
       }
       if constexpr (CHH > 0)
       {
@@ -1300,7 +1457,7 @@ namespace
         const unsigned *q = (const unsigned *)(g_wsrc + GW * BSY + (pl - 1) * (GW / 2) * CHH + rg * (GW / 2) + 4 * cg);
         #pragma unroll
         for (int i = 0; i < CHH / 4; i++)
-          sum_c = __vsadu4(__funnelshift_r(e.c[2 * i], e.c[2 * i + 1], 8 * e.shc), q[i * (GW / 2)]) + sum_c;
+          sum_c = pk_row<WPR>(e.c + WPR * i, e.shc, q + i * (GW / 2) * sizeof(pix), sum_c);
       }
     }
     int il = (int)sum_l, ic = (int)sum_c;
@@ -1401,10 +1558,10 @@ namespace
     const int grp = lane / GW, col = lane % GW;
     const pix *s_y = g_wsrc, *s_u = g_wsrc + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
     const int n = g_ws.n;
-    if constexpr (BSY > 0 && sizeof(pix) == 1)
+    if constexpr (BSY > 0)
     if (a.packed)
     {
-      constexpr int W = (BSY + CHH) / 2; // registers per candidate
+      constexpr int W = (BSY + CHH) * sizeof(pix) / 2; // registers per candidate
       constexpr int R = (MVC_WAVE_RSAMP / W) < 1 ? 1 : MVC_WAVE_RSAMP / W;
       if (n <= G)
         wave_rounds<GW, BSY, CHH, FOLD, true, 1>(a, n, grp, col, range_test, fa);
@@ -2513,18 +2670,28 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
       }
       a.async_src = (async_geo && a.ew[0] % SPW == 0 && a.ew[1] % SPW == 0 && a.ew[2] % SPW == 0) ? 1 : 0;
       {
-        // packed SADs: 8-bit, the block fills the lane group (bs_x == GW), chroma absent or paired with cw == GW / 2,
-        // rows in groups of 4, every reference row 4-byte aligned (word reads around each row)
+        // packed SADs: the block fills the lane group (bs_x == GW), chroma absent or paired with cw == GW / 2, rows in
+        // groups of 4, every reference row 4-byte (8 bit) / 8-byte (16 bit) aligned (word reads around each row)
         static const bool pack_allowed = [] { const char *e = getenv("MVCUDA_WAVE_PACK"); return !(e && e[0] == '0'); }();
-        bool pk = pack_allowed && sizeof(pix) == 1 && wave && wave_gw >= 16 && ap->blk_x == wave_gw && a.bs_y % 4 == 0
+        bool pk = pack_allowed && wave && wave_gw >= 16 && ap->blk_x == wave_gw && a.bs_y % 4 == 0
           && (!a.has_chroma || (2 * a.cw == wave_gw && a.ch % 4 == 0));
         for (int p = 0; p < (a.has_chroma ? 3 : 1) && pk; p++)
         {
           pk = a.ew[p] % 4 == 0;
           for (int i = 0; i < 4; i++)
-            pk = pk && ((size_t)a.ref[p][i] & 3) == 0;
+            pk = pk && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
         }
         a.packed = pk ? 1 : 0;
+        // the slice kernel's packed form (eval_candidate_pk picks the block geometries it has): alignment only
+        static const bool spack_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_PACK"); return !(e && e[0] == '0'); }();
+        bool pks = spack_allowed;
+        for (int p = 0; p < (a.has_chroma ? 3 : 1) && pks; p++)
+        {
+          pks = a.ew[p] % 4 == 0;
+          for (int i = 0; i < 4; i++)
+            pks = pks && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
+        }
+        a.packed_s = pks ? 1 : 0;
       }
       a.ext_w = s_ref->pl[l * 3].d.ew;
       a.ext_h = s_ref->pl[l * 3].d.eh;
