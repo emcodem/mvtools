@@ -1,0 +1,18 @@
+--- a/Sources/PlaneOfBlocks.cpp
++++ b/Sources/PlaneOfBlocks.cpp
+@@ -3353,6 +3353,7 @@
+       workarea.bestMV.sad = sad;
+       workarea.nMinCost = sad;
+ 
++      const int nSearchParamSaved = nSearchParam; // TEST FIX: per-block radius
+       // if SAD bad and smooth=2 - attempt for adaptive larger radius search
+       if ((workarea.bestMV.sad > _thSAD) && (_smooth == 2))
+       {
+@@ -3451,6 +3452,7 @@
+           }
+         }
+       }	// if bestMV.sad > thSAD
++      nSearchParam = nSearchParamSaved; // TEST FIX
+ 
+       // we store the result
+       vectors[workarea.blkIdx].x = workarea.bestMV.x;
