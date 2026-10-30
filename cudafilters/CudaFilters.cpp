@@ -120,8 +120,8 @@ namespace cf
       return;
     MvCudaFrameStats s;
     lib.stats(&s);
-    std::fprintf(stderr, "%s: device frames %llu (%.1f of %.1f MB), uploads %llu, downloads %llu, evictions %llu, regenerations %llu, lookups of evicted tokens %llu\n",
-      who, s.frames, s.bytes / 1048576.0, s.budget / 1048576.0, s.uploads, s.downloads, s.evictions, s.regenerations, s.lookups_gone);
+    std::fprintf(stderr, "%s: device frames %llu (%.1f of %.1f MB), uploads %llu, downloads %llu, evictions %llu, regenerations %llu, lookups of evicted tokens %llu, redirected %llu\n",
+      who, s.frames, s.bytes / 1048576.0, s.budget / 1048576.0, s.uploads, s.downloads, s.evictions, s.regenerations, s.lookups_gone, s.redirects);
   }
 
   int input_token(const PVideoFrame &src, const VideoInfo &vi, const MvCudaFrameFormat &f, unsigned long long &token)

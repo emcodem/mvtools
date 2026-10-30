@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <unordered_map>
@@ -24,6 +25,8 @@ namespace mvc
     {
       std::shared_ptr<DevFrame> fr;
       std::list<unsigned long long>::iterator lru;
+      unsigned long long used_at; // g_put_bytes at the last put / lookup (reuse distance, budget_on_miss)
+      unsigned long long key;     // frame_key (g_latest)
     };
 
     std::mutex g_mutex;
@@ -60,25 +63,154 @@ namespace mvc
     thread_local Held t_held[HOLDS];
     thread_local unsigned t_held_pos = 0;
 
+    // Byte budget of the registry. MVCUDA_CACHE_MB: fixed. Otherwise it starts at BUDGET_START and grows while frames
+    // have to be made again after their eviction (budget_count_put / budget_count_regen), up to budget_cap(): a chain needs
+    // from about 256 MB (QTGMC Fast PAL) to well over 512 MB (Slower / Placebo HD), and a budget far above the working set
+    // only keeps VRAM (GPU_PIPELINE_PLAN.md sections 23, 24).
+    const size_t BUDGET_START = (size_t)256 << 20;
+    const long long *budget_fixed_mb()
+    {
+      static const long long v = [] {
+        const char *e = std::getenv("MVCUDA_CACHE_MB");
+        return e ? std::atoll(e) : 0LL;
+      }();
+      return v ? &v : nullptr;
+    }
+    size_t budget_cap();
+    std::atomic<size_t> g_budget{ 0 };
+
     size_t budget()
     {
+      size_t b = g_budget.load(std::memory_order_relaxed);
+      if (b)
+        return b;
+      if (const long long *mb = budget_fixed_mb())
+        b = (size_t)(*mb < 1 ? 1 : *mb) << 20;
+      else
+      {
+        const size_t cap = budget_cap();
+        b = BUDGET_START < cap ? BUDGET_START : cap;
+      }
+      size_t expected = 0;
+      g_budget.compare_exchange_strong(expected, b);
+      return g_budget.load();
+    }
+
+    // Growth by reuse distance (under g_mutex). Below the working set frames are made again many times per output frame,
+    // and that feeds itself (every regenerated frame evicts another one): QTGMC Slower HD made 160,000 regenerations and
+    // took 8x the time at 768 MB, 6 regenerations at 1024 MB. The registry remembers evicted tokens ("ghosts") with the
+    // bytes put up to their last use; a lookup of an evicted token gives the bytes put since then, the budget LRU would
+    // have needed to keep it. A few such lookups happen at any budget, with distances that grow with the run time (frames
+    // evicted early, asked for again much later through AviSynth's own caches: about 5 per 512 frames made); growing on
+    // every one ran the budget to the cap. A shortage gives several per frame made, and windows of 512 reacted too late
+    // (HD runs fell into lasting regeneration storms). So per window of BUDGET_WINDOW frames made, at least BUDGET_MISSES
+    // lookups of evicted tokens raise the budget to 1.25 times their median distance, at least by half (the cap if that
+    // is beyond it). Lookups made inside a regeneration (of its inputs) do not count: one late request of an old frame
+    // cascades into many (QTGMC Placebo PAL: 2 regenerations at a fixed 384 MB, 1,200 and the cap when they counted).
+    // The first frame sets the start: at least BUDGET_START_FRAMES frames of its size.
+    const unsigned BUDGET_WINDOW = 64, BUDGET_MISSES = 8, BUDGET_START_FRAMES = 128;
+    unsigned long long g_put_bytes = 0;                       // bytes of all frames put so far
+    unsigned g_window_puts = 0;
+    std::vector<unsigned long long> *g_window_dist = new std::vector<unsigned long long>; // miss distances of the window
+    struct Ghost
+    {
+      unsigned long long used_at, key; // g_put_bytes at the last use; frame_key of its (producer, frame) or 0
+    };
+    std::unordered_map<unsigned long long, Ghost> *g_ghost = new std::unordered_map<unsigned long long, Ghost>;
+    // Newest live token of each (producer, frame): AviSynth's frame caches keep handing out a token frame after its device
+    // frame was evicted; when the frame was made again meanwhile (a regeneration, under a new token), a lookup of the old
+    // token finds the new one. Without this every consumer of the cached frame made it again: once begun, regeneration
+    // storms went on after the budget had grown (QTGMC Placebo HD: up to 60,000 regenerations at a 4 GB budget that,
+    // fixed from the start, needed none). Same content: a producer makes frame n bit-identically every time.
+    std::unordered_map<unsigned long long, unsigned long long> *g_latest = new std::unordered_map<unsigned long long, unsigned long long>;
+    unsigned long long frame_key(unsigned long long producer, int frame)
+    {
+      return producer ? (producer << 32) ^ (unsigned)frame : 0;
+    }
+    std::list<unsigned long long> *g_ghost_order = new std::list<unsigned long long>; // eviction order, oldest first
+    const size_t GHOSTS = 65536;
+    thread_local int t_regen_depth = 0; // regenerations this thread is inside (mvcuda_token_regenerate)
+
+    void ghost_add(unsigned long long token, unsigned long long used_at, unsigned long long key)
+    {
+      (*g_ghost)[token] = Ghost{ used_at, key };
+      g_ghost_order->push_back(token);
+      if (g_ghost_order->size() > GHOSTS)
+      {
+        g_ghost->erase(g_ghost_order->front());
+        g_ghost_order->pop_front();
+      }
+    }
+
+    void budget_on_miss(unsigned long long token)
+    {
+      if (budget_fixed_mb())
+        return;
+      auto it = g_ghost->find(token);
+      if (it != g_ghost->end() && g_window_dist->size() < 4096)
+        g_window_dist->push_back(g_put_bytes - it->second.used_at);
+    }
+
+    // A consumer found its frame near the end of the LRU order (reuse distance above 80% of the budget): the working set
+    // reaches the budget, so grow to 1.5 times that distance before evictions turn into regenerations. Misses come too
+    // late for that (a regeneration storm has begun, and once begun it went on after the budget had grown) and include
+    // the late requests of old frames; hits do not.
+    void budget_on_hit(unsigned long long dist)
+    {
+      if (budget_fixed_mb())
+        return;
+      const size_t b = budget();
+      if (dist * 5 <= (unsigned long long)b * 4)
+        return;
+      const size_t want = (size_t)(dist + dist / 2), cap = budget_cap();
+      if (want > b)
+        g_budget.store(want < cap ? want : cap);
+    }
+
+    void budget_on_put(size_t frame_bytes)
+    {
+      if (budget_fixed_mb())
+        return;
+      if (g_put_bytes == frame_bytes) // the first frame
+      {
+        const size_t start = (size_t)BUDGET_START_FRAMES * frame_bytes, cap = budget_cap();
+        if (start > budget())
+          g_budget.store(start < cap ? start : cap);
+      }
+      if (++g_window_puts < BUDGET_WINDOW)
+        return;
+      std::vector<unsigned long long> &d = *g_window_dist;
+      if (d.size() >= BUDGET_MISSES)
+      {
+        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
+        const unsigned long long med = d[d.size() / 2];
+        const size_t cap = budget_cap(), b = budget();
+        size_t want = (size_t)(med + med / 4);
+        if (want < b + b / 2)
+          want = b + b / 2;
+        g_budget.store(want < cap ? want : cap);
+      }
+      d.clear();
+      g_window_puts = 0;
+    }
+
+    size_t budget_cap()
+    {
       static const size_t b = [] {
-        if (const char *e = std::getenv("MVCUDA_CACHE_MB"))
-        {
-          const long long mb = std::atoll(e);
-          return (size_t)(mb < 1 ? 1 : mb) << 20;
-        }
+        if (const long long *mb = budget_fixed_mb())
+          return (size_t)(*mb < 1 ? 1 : *mb) << 20;
         // Tokens are read shortly after they are made, so the registry needs a few hundred frames, not the whole card:
         // a large budget means freed frames almost never come back to the pipeline pool, and every new frame costs a
         // cudaMalloc, which synchronises the device and stalls every thread's launches (measured: 15900 mallocs and
         // 100 us per launch instead of 13 us in QTGMC Fast). Frames evicted too early are made again by their producers.
-        // 2 GB: with QTGMC's whole output side on the device (about 25 live frames per output frame) 1 GB made HD 4:2:2
-        // regenerate some frames; 2 GB costs PAL nothing measurable (the cudaMallocs happen once, at the start).
+        // The budget grows only as far as a chain needs it (budget_count_put), so the cap is the limit for the largest
+        // chains: QTGMC Placebo HD 4:2:2 needs a little more than 2 GB (35 regenerations at 2 GB, sometimes a lasting
+        // regeneration storm; none at 3 GB). A third of the free memory at first use, at most 4 GB.
         size_t free_b = 0, total_b = 0;
         if (use_device() && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
         {
-          const size_t q = free_b / 4;
-          const size_t cap = (size_t)2048 << 20;
+          const size_t q = free_b / 3;
+          const size_t cap = (size_t)4096 << 20;
           return q < cap ? q : cap;
         }
         return (size_t)256 << 20;
@@ -633,8 +765,13 @@ namespace mvc
     {
       std::lock_guard<std::mutex> lk(g_mutex);
       g_lru.push_front(token);
-      g_frames[token] = Slot{ fr, g_lru.begin() };
+      g_put_bytes += fr->bytes;
+      const unsigned long long key = frame_key(producer, frame);
+      g_frames[token] = Slot{ fr, g_lru.begin(), g_put_bytes, key };
+      if (key)
+        (*g_latest)[key] = token;
       g_bytes += fr->bytes;
+      budget_on_put(fr->bytes);
       // evict the least recently used frames over the budget, never the one just added
       const size_t cap = budget();
       while (g_bytes > cap && g_lru.size() > 1)
@@ -645,6 +782,10 @@ namespace mvc
         {
           g_bytes -= it->second.fr->bytes + it->second.fr->extra_acct;
           it->second.fr->extra_acct = 0;
+          ghost_add(victim, it->second.used_at, it->second.key);
+          auto lt = g_latest->find(it->second.key);
+          if (lt != g_latest->end() && lt->second == victim)
+            g_latest->erase(lt);
           g_frames.erase(it); // the memory goes back to the pool when the last holder lets go
         }
         g_lru.pop_back();
@@ -673,10 +814,32 @@ namespace mvc
       for (const Held &h : t_held)
         if (h.token == token)
           return h.fr; // evicted, but made by this thread a moment ago
+      // evicted: a newer token of the same (producer, frame) serves as well
+      auto gh = g_ghost->find(token);
+      if (gh != g_ghost->end() && gh->second.key)
+      {
+        auto lt = g_latest->find(gh->second.key);
+        if (lt != g_latest->end())
+        {
+          auto nw = g_frames.find(lt->second);
+          if (nw != g_frames.end())
+          {
+            g_lru.splice(g_lru.begin(), g_lru, nw->second.lru);
+            nw->second.used_at = g_put_bytes;
+            g_stats.redirects++;
+            return nw->second.fr;
+          }
+        }
+      }
       g_stats.lookups_gone++;
+      if (t_regen_depth == 0) // a consumer's own lookup, not one of a regeneration cascade
+        budget_on_miss(token);
       return nullptr;
     }
     g_lru.splice(g_lru.begin(), g_lru, it->second.lru);
+    if (t_regen_depth == 0)
+      budget_on_hit(g_put_bytes - it->second.used_at);
+    it->second.used_at = g_put_bytes;
     return it->second.fr;
   }
 
@@ -688,6 +851,7 @@ namespace mvc
       return; // evicted already: the extra data lives as long as the holders of the frame
     fr.extra_acct += bytes;
     g_bytes += bytes; // the next frame_put evicts over the budget
+    g_put_bytes += bytes;
   }
 }
 
@@ -878,7 +1042,9 @@ extern "C" int mvcuda_token_regenerate(unsigned long long producer, int frame, v
   }
   // called outside the lock: the producer makes the frame through the normal upload / kernel paths. A filter is not
   // destroyed while frames of its clip are still being requested, so the entry stays valid for the call.
+  mvc::t_regen_depth++; // lookups inside a regeneration do not count for the budget (budget_on_miss)
   const int rc = pr.fn(pr.user, frame, env, out);
+  mvc::t_regen_depth--;
   if (rc == 0)
   {
     std::lock_guard<std::mutex> lk(mvc::g_mutex);

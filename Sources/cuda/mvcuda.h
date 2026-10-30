@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 13
+#define MVCUDA_API_VERSION 14
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -170,8 +170,8 @@ MVCUDA_API void mvcuda_cache_clear();
 // ---- device frames and tokens (GPU_PIPELINE_PLAN.md section 4, milestone D), see mvcuda_frames.cu ---------------------
 // A token stands for one frame kept in device memory. GPU filters return ordinary AviSynth frames whose first bytes hold a
 // MvCudaTokenHeader instead of the picture ("token frames"); a consumer finds the device frame by the token. The registry
-// has a byte budget (MVCUDA_CACHE_MB; default a quarter of the free device memory at first use, at most 2048 MB) and
-// evicts the least recently used frames. A consumer whose token was evicted asks the producer to make the frame again
+// has a byte budget (MVCUDA_CACHE_MB fixes it; default 256 MB, grown while frames have to be made again, up to a third of
+// the free device memory at first use, at most 4096 MB) and evicts the least recently used frames. A consumer whose token was evicted asks the producer to make the frame again
 // (mvcuda_token_regenerate). All plugins of a process must load the same mvtools_cuda.dll (same folder): the registry
 // is per library instance.
 
@@ -205,6 +205,7 @@ typedef struct
   unsigned long long bytes, budget;          // device bytes held by the registry, byte budget
   unsigned long long frames;                 // frames in the registry
   unsigned long long uploads, downloads, evictions, regenerations, lookups_gone;
+  unsigned long long redirects;               // lookups of evicted tokens served by a newer token of the same frame (API 14)
 } MvCudaFrameStats;
 
 // Copies a host frame (src[plane], pitch in bytes) to the device and registers it. out receives the header to write into
