@@ -258,6 +258,15 @@
         YV16 format.
         This paramenter is ignored for YV12 clips. Note: super clip is always planar.
     </p>
+    <p class="var">gpu (bool, false)</p>
+    <p>
+        <code>MSuper</code>, <code>MAnalyse</code>, <code>MRecalculate</code>, <code>MCompensate</code>,
+        <code>MDegrain1</code> .. <code>MDegrain6</code> and <code>MFlowFps</code> only.
+        Runs the filter on an NVIDIA GPU through <code>mvtools_cuda.dll</code> (next to
+        <code>mvtools2.dll</code>), bit-exact with the CPU result. Settings or formats the GPU does
+        not cover run on the CPU without an error. See <a href="gpu.md">gpu.md</a> for what each
+        filter covers, the GPU filters of <code>cudafilters.dll</code> and the environment variables.
+    </p>
 
     <h3>MSuper</h3>
 <pre class="proto">MSuper (
@@ -272,7 +281,8 @@
 	clip pelclip (undefined),
 	bool isse,
 	bool planar,
-	bool mt (true)
+	bool mt (true),
+	bool gpu (false)
 )</pre>
     <p>
         Get source clip and prepare special "super" clip with multilevel
@@ -411,7 +421,8 @@
 	bool   trymany (false),
 	bool   multi (false),
 	bool   mt (true),
-	int    scaleCSAD (0)
+	int    scaleCSAD (0),
+	bool gpu (false)
 )</pre>
     <p>
         Get prepared multilevel super clip, estimate motion by block-matching
@@ -861,7 +872,8 @@
 	int   tr (0),
 	bool  center (true),
 	clip  cclip (undefined),
-	int   thSAD2 (undefined)
+	int   thSAD2 (undefined),
+	bool gpu (false)
 )</pre>
     <p>
         Do a full motion compensation of the frame.
@@ -1317,7 +1329,8 @@
 	int   thSCD2,
 	bool  isse,
 	bool  planar,
-	bool  mt (true)
+	bool  mt (true),
+	bool gpu (false)
 )</pre>
     <p>
         Will change the framerate (fps) of the clip (and number of frames).
@@ -1513,7 +1526,8 @@
 	bool isse,
 	bool planar,
 	bool lsb (false),
-	bool out16 (false)
+	bool out16 (false),
+	bool gpu (false)
 )</pre>
             </td>
             <td class="n">
@@ -1534,7 +1548,8 @@
 	bool isse,
 	bool planar,
 	bool lsb (false),
-	bool out16 (false)
+	bool out16 (false),
+	bool gpu (false)
 )</pre>
             </td>
         </tr>
@@ -1565,7 +1580,8 @@
 	bool isse,
 	bool planar,
 	bool lsb (false),
-	bool out16 (false)
+	bool out16 (false),
+	bool gpu (false)
 
 
 
@@ -1743,7 +1759,8 @@
 	int  sadx264,
 	bool isse,
 	int  tr
-	int  scaleCSAD (0)
+	int  scaleCSAD (0),
+	bool gpu (false)
 )</pre>
     <p>
         Refines and recalculates motion data of previously estimated (by

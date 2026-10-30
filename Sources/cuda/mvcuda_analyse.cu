@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -48,6 +49,7 @@ namespace
     int search_type;  // mvc_refine::S_*: the refine step of this level (exhaustive levels use the ring fold below)
     int has_chroma;   // 0: luma-only search, cw = ch = 0
     int async_src;  // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
+    int packed;     // 1: 8-bit SADs in the packed form of k_wave (pk_load / pk_sum), see analyse_impl
     const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
     int *vec;          // device: (vx, vy, sad) triples of this level
     int *bad_flag;
@@ -556,7 +558,7 @@ namespace
         min_cost = cost;
         best_sad = sl + sc;
         if (mode != mvc_refine::M_CHECK)
-          dir = vals[c];
+          dir = vals ? vals[c] : c;
       }
       __syncthreads(); // the next batch overwrites b->sl / b->sc
     }
@@ -995,6 +997,23 @@ namespace
     asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
   }
 
+  // Waits until *p >= need (acquire loads) and returns the value read; seen: a value read before (with acquire
+  // semantics) or 0. A relaxed poll followed by one fence.acq_rel was measured slower: the fence sits on the wavefront's
+  // critical path at almost every block (GPU_PIPELINE_PLAN.md section 24). MVC_WAVE_SLEEP: optional pause between polls.
+#ifndef MVC_WAVE_SLEEP
+#define MVC_WAVE_SLEEP 0
+#endif
+  __device__ __forceinline__ int wait_at_least(const int *p, int need, int seen)
+  {
+    while (seen < need)
+    {
+      seen = ld_acquire(p);
+      if (MVC_WAVE_SLEEP > 0 && seen < need)
+        __nanosleep(MVC_WAVE_SLEEP);
+    }
+    return seen;
+  }
+
   // SAD of one candidate, computed by the GW lanes of a group (col = lane inside the group) and summed over the group;
   // every lane of the group returns the sums. Lanes of an invalid candidate contribute 0. Chroma: for cw <= GW / 2 the
   // lanes [0, cw) take U and [cw, 2 cw) V, else each lane < cw takes both. BSY / CHH: compile-time row counts of the
@@ -1097,9 +1116,21 @@ namespace
     int xs[mvc_refine::MAX_BATCH], ys[mvc_refine::MAX_BATCH];
     int sl[mvc_refine::MAX_BATCH], sc[mvc_refine::MAX_BATCH];
     int ring_dx[48], ring_dy[48];             // exhaustive search offsets (ExpandingSearch order, radius <= 3)
+    int fix_dx[26], fix_dy[26];               // offsets of the fixed batches of wave_plan: UMH cross + grid (20), hexagon (6)
     int bc[20];                               // values thread 0 hands to the whole CTA (row, neighbours, nLambda, level)
     long long key[4];                         // per-warp minimum of the parallel fold
+    unsigned long long kmin;                  // fused fold (wave_eval_inl with FOLD): minimum of (cost << 8 | index)
+    int odd;                                  // fused fold: some cost part was negative or the sum overflowed
   };
+  // register cap of the fixed-plan k_wave kernels and the registers of reference samples one lane keeps in flight in
+  // wave_eval_inl. Measured on the RTX 5090 (GPU_PIPELINE_PLAN.md section 24): 96 / 24 beat 255 / 64 by 17-19% in QTGMC
+  // Fast / Slower (more resident CTAs per SM with 6-8 analyses in flight, and less spilling); 80 and 128 were slower.
+#ifndef MVC_WAVE_REGS
+#define MVC_WAVE_REGS 96
+#endif
+#ifndef MVC_WAVE_RSAMP
+#define MVC_WAVE_RSAMP 24
+#endif
   const int WAVE_NW = 4;                      // warps per block row (one CTA)
   const int WAVE_NT = 32 * WAVE_NW;
   __shared__ WaveState g_ws;
@@ -1192,49 +1223,201 @@ namespace
     sc = scale_chroma(sum_c, a.chroma_scale);
   }
 
+  // Packed form for 8-bit samples (LevelArgs::packed: bs_x == GW, chroma absent or cw == GW / 2, all reference pitches
+  // and sub-plane bases 4-byte aligned): a lane takes 4 columns of every 4th row (luma: GW / 4 lanes per row; chroma:
+  // the first GW / 2 lanes U, the others V, GW / 8 lanes per row), reads each row as the two aligned words around it
+  // and forms the SAD of 4 samples with one __vsadu4. Half the loads and half the registers of the byte form; the sums
+  // are the same integers (only the order of the additions differs).
+  template <int BSY, int CHH>
+  struct PackRegs
+  {
+    unsigned l[BSY / 2];                 // BSY / 4 rows x 2 words
+    unsigned c[CHH > 0 ? CHH / 2 : 1];
+    int shl, shc;                        // byte offset of the row start in its first word (same for every row)
+  };
+
   template <int GW, int BSY, int CHH>
-  __device__ __forceinline__ void wave_eval_inl(int lane, bool range_test)
+  __device__ __forceinline__ void pk_load(const LevelArgs &a, int x0, int y0, int x1, int y1, int cx, int cy, int col,
+    bool valid, PackRegs<BSY, CHH> &e)
+  {
+    if (!valid)
+      return;
+    const int xp = x0 * a.pel + cx, yp = y0 * a.pel + cy;
+    const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+    const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+    {
+      const int cg = col % (GW / 4), rg = col / (GW / 4);
+      const pix *r = a.ref[0][sub] + (size_t)(ry + rg) * a.ew[0] + rx + 4 * cg;
+      e.shl = (int)((size_t)r & 3);
+      const unsigned *w = (const unsigned *)((size_t)r & ~(size_t)3);
+      const size_t step = (size_t)a.ew[0]; // 4 rows in words
+      #pragma unroll
+      for (int i = 0; i < BSY / 4; i++)
+      {
+        e.l[2 * i] = __ldg(w + i * step);
+        e.l[2 * i + 1] = __ldg(w + i * step + 1);
+      }
+    }
+    if constexpr (CHH > 0)
+    {
+      const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+      const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+      const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+      const int pl = col < GW / 2 ? 1 : 2, cc = col % (GW / 2), cg = cc % (GW / 8), rg = cc / (GW / 8);
+      const pix *r = a.ref[pl][subc] + (size_t)(ryc + rg) * a.ew[pl] + rxc + 4 * cg;
+      e.shc = (int)((size_t)r & 3);
+      const unsigned *w = (const unsigned *)((size_t)r & ~(size_t)3);
+      const size_t step = (size_t)a.ew[pl];
+      #pragma unroll
+      for (int i = 0; i < CHH / 4; i++)
+      {
+        e.c[2 * i] = __ldg(w + i * step);
+        e.c[2 * i + 1] = __ldg(w + i * step + 1);
+      }
+    }
+  }
+
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ void pk_sum(const LevelArgs &a, int col, bool valid, const PackRegs<BSY, CHH> &e, int &sl, int &sc)
+  {
+    unsigned sum_l = 0, sum_c = 0;
+    if (valid)
+    {
+      {
+        const int cg = col % (GW / 4), rg = col / (GW / 4);
+        const unsigned *q = (const unsigned *)(g_wsrc + rg * GW + 4 * cg);
+        #pragma unroll
+        for (int i = 0; i < BSY / 4; i++)
+          sum_l = __vsadu4(__funnelshift_r(e.l[2 * i], e.l[2 * i + 1], 8 * e.shl), q[i * GW]) + sum_l;
+      }
+      if constexpr (CHH > 0)
+      {
+        const int pl = col < GW / 2 ? 1 : 2, cc = col % (GW / 2), cg = cc % (GW / 8), rg = cc / (GW / 8);
+        const unsigned *q = (const unsigned *)(g_wsrc + GW * BSY + (pl - 1) * (GW / 2) * CHH + rg * (GW / 2) + 4 * cg);
+        #pragma unroll
+        for (int i = 0; i < CHH / 4; i++)
+          sum_c = __vsadu4(__funnelshift_r(e.c[2 * i], e.c[2 * i + 1], 8 * e.shc), q[i * (GW / 2)]) + sum_c;
+      }
+    }
+    int il = (int)sum_l, ic = (int)sum_c;
+    #pragma unroll
+    for (int o = GW / 2; o > 0; o >>= 1)
+    {
+      il += __shfl_xor_sync(0xffffffffu, il, o);
+      if constexpr (CHH > 0)
+        ic += __shfl_xor_sync(0xffffffffu, ic, o);
+    }
+    sl = il;
+    sc = scale_chroma(ic, a.chroma_scale);
+  }
+
+  // Fused fold: the arguments of the CPU cost of a candidate (vector cost against the predictor, CheckMV's minimum before
+  // the batch). The leader of each candidate group adds (cost << 8 | index) to the CTA-wide minimum when the cost is
+  // below that minimum, and flags the batch when a cost part is negative or the sum overflows an int, exactly the
+  // conditions under which wave_fold_par falls back to the sequential fold; wave_fold_take reads the result after the
+  // barrier at the end of wave_eval_inl. Before such a batch g_ws.kmin = ~0 and g_ws.odd = 0 (wave_fold_init).
+  struct FoldArgs
+  {
+    int pred_x, pred_y, nlambda, min_cost;
+  };
+
+  template <bool FOLD>
+  __device__ __forceinline__ void wave_put(int c, int sl, int sc, const FoldArgs &f)
+  {
+    g_ws.sl[c] = sl;
+    g_ws.sc[c] = sc;
+    if constexpr (FOLD)
+    {
+      const LevelArgs &a = g_ws.a;
+      const int dxp = f.pred_x - g_ws.xs[c], dyp = f.pred_y - g_ws.ys[c];
+      const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+      const int lam = (int)((unsigned)f.nlambda * (unsigned)dist) >> (16 - a.bits);
+      const int tl = (int)(((long long)a.pnew * sl) >> 8), tc = (int)(((long long)a.pnew * sc) >> 8);
+      const long long cost = (long long)lam + sl + tl + sc + tc;
+      if (lam < 0 || tl < 0 || tc < 0 || cost > 0x7fffffffLL)
+        atomicOr(&g_ws.odd, 1);
+      else if (cost < f.min_cost)
+        atomicMin(&g_ws.kmin, ((unsigned long long)cost << 8) | (unsigned)c);
+    }
+  }
+
+  __device__ __forceinline__ void wave_fold_init()
+  {
+    g_ws.kmin = ~0ull;
+    g_ws.odd = 0;
+  }
+
+  // Rounds of the packed (PK) or the split byte form: R rounds of G candidates per pass with all their loads in flight
+  // before any sum. R is a compile-time count (registers); wave_eval_inl takes R = 1 for a batch that fits one round
+  // (most batches: phase A, the hexagon, radius-1 rings), so those do not carry the registers of R rounds.
+  template <int GW, int BSY, int CHH, bool FOLD, bool PK, int R>
+  __device__ __forceinline__ void wave_rounds(const LevelArgs &a, int n, int grp, int col, bool range_test, const FoldArgs &fa)
+  {
+    constexpr int G = WAVE_NT / GW;
+    const pix *s_y = g_wsrc, *s_u = g_wsrc + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
+    for (int base = 0; base < n; base += G * R)
+    {
+      typename std::conditional<PK, PackRegs<BSY, CHH>, EvalRegs<BSY, CHH>>::type e[R];
+      bool v[R];
+      int cs[R];
+      #pragma unroll
+      for (int r = 0; r < R; r++)
+      {
+        const int c = base + r * G + grp;
+        cs[r] = c;
+        const int cx = c < n ? g_ws.xs[c] : 0, cy = c < n ? g_ws.ys[c] : 0;
+        v[r] = c < n && (!range_test || (cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max));
+        if constexpr (PK)
+          pk_load<GW, BSY, CHH>(a, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, v[r], e[r]);
+        else
+          eg_load<GW, BSY, CHH>(a, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, v[r], e[r]);
+      }
+      #pragma unroll
+      for (int r = 0; r < R; r++)
+      {
+        if (base + r * G < n) // some group has a candidate in this round (uniform over the warp; no break, so the loop
+        {                     // stays unrolled and e[] stays in registers)
+          int sl, sc;
+          if constexpr (PK)
+            pk_sum<GW, BSY, CHH>(a, col, v[r], e[r], sl, sc);
+          else
+            eg_sum<GW, BSY, CHH>(a, s_y, s_u, s_v, col, v[r], e[r], sl, sc);
+          if (v[r] && col == 0)
+            wave_put<FOLD>(cs[r], sl, sc, fa);
+        }
+      }
+    }
+  }
+
+  template <int GW, int BSY, int CHH, bool FOLD = false>
+  __device__ __forceinline__ void wave_eval_inl(int lane, bool range_test, const FoldArgs &fa = FoldArgs{})
   {
     const LevelArgs &a = g_ws.a;
     constexpr int G = WAVE_NT / GW; // candidate groups in the CTA
     const int grp = lane / GW, col = lane % GW;
     const pix *s_y = g_wsrc, *s_u = g_wsrc + a.bs_x * a.bs_y, *s_v = s_u + a.cw * a.ch;
     const int n = g_ws.n;
+    if constexpr (BSY > 0 && sizeof(pix) == 1)
+    if (a.packed)
+    {
+      constexpr int W = (BSY + CHH) / 2; // registers per candidate
+      constexpr int R = (MVC_WAVE_RSAMP / W) < 1 ? 1 : MVC_WAVE_RSAMP / W;
+      if (n <= G)
+        wave_rounds<GW, BSY, CHH, FOLD, true, 1>(a, n, grp, col, range_test, fa);
+      else
+        wave_rounds<GW, BSY, CHH, FOLD, true, R>(a, n, grp, col, range_test, fa);
+      __syncthreads();
+      return;
+    }
     // the split form needs paired chroma (U and V columns side by side in one group): no chroma, 4:2:0, 4:2:2
     if constexpr (BSY > 0)
     if (CHH == 0 || 2 * a.cw <= GW)
     {
-      // R rounds of G candidates with their loads in flight together (about 64 registers of reference samples)
-      constexpr int R = (64 / (BSY + CHH)) < 1 ? 1 : 64 / (BSY + CHH);
-      for (int base = 0; base < n; base += G * R)
-      {
-        EvalRegs<BSY, CHH> e[R];
-        bool v[R];
-        int cs[R];
-        #pragma unroll
-        for (int r = 0; r < R; r++)
-        {
-          const int c = base + r * G + grp;
-          cs[r] = c;
-          const int cx = c < n ? g_ws.xs[c] : 0, cy = c < n ? g_ws.ys[c] : 0;
-          v[r] = c < n && (!range_test || (cx >= g_ws.dx_min && cy >= g_ws.dy_min && cx < g_ws.dx_max && cy < g_ws.dy_max));
-          eg_load<GW, BSY, CHH>(a, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, v[r], e[r]);
-        }
-        #pragma unroll
-        for (int r = 0; r < R; r++)
-        {
-          if (base + r * G < n) // some group has a candidate in this round (uniform over the warp; no break, so the loop
-          {                     // stays unrolled and e[] stays in registers)
-            int sl, sc;
-            eg_sum<GW, BSY, CHH>(a, s_y, s_u, s_v, col, v[r], e[r], sl, sc);
-            if (v[r] && col == 0)
-            {
-              g_ws.sl[cs[r]] = sl;
-              g_ws.sc[cs[r]] = sc;
-            }
-          }
-        }
-      }
+      constexpr int R = (MVC_WAVE_RSAMP / (BSY + CHH)) < 1 ? 1 : MVC_WAVE_RSAMP / (BSY + CHH);
+      if (n <= G)
+        wave_rounds<GW, BSY, CHH, FOLD, false, 1>(a, n, grp, col, range_test, fa);
+      else
+        wave_rounds<GW, BSY, CHH, FOLD, false, R>(a, n, grp, col, range_test, fa);
       __syncthreads();
       return;
     }
@@ -1247,14 +1430,10 @@ namespace
       int sl, sc;
       eval_group<GW, BSY, CHH>(a, s_y, s_u, s_v, g_ws.x0, g_ws.y0, g_ws.x1, g_ws.y1, cx, cy, col, valid, sl, sc);
       if (valid && col == 0)
-      {
-        g_ws.sl[c] = sl;
-        g_ws.sc[c] = sc;
-      }
+        wave_put<FOLD>(c, sl, sc, fa);
     }
     __syncthreads();
   }
-
   // Folds the evaluated candidates in the CPU order with the semantics of CheckMV / CheckMV2 / CheckMVdir (see
   // AnaChecker::run_batch); every lane runs it with identical values.
   __device__ __forceinline__ void wave_fold(int mode, int n, const int *vals, int &dir, int &bx, int &by, int &min_cost,
@@ -1286,7 +1465,7 @@ namespace
       min_cost = cost;
       best_sad = sl + sc;
       if (mode != mvc_refine::M_CHECK)
-        dir = vals[c];
+        dir = vals ? vals[c] : c;
     }
   }
 
@@ -1348,17 +1527,44 @@ namespace
       min_cost = (int)(key >> 8);
       best_sad = g_ws.sl[c] + g_ws.sc[c];
       if (mode != mvc_refine::M_CHECK)
-        dir = vals[c];
+        dir = vals ? vals[c] : c;
     }
   }
 
-  // evaluation and fold of one batch for the runtime-size kernels: one copy per GW instead of one per call site of
-  // mvc_refine (inlining it there made those kernels take about 20 minutes to compile per architecture)
-  template <int GW>
+  // result of a batch evaluated with the fused fold (wave_eval_inl<..., true>), read by every thread after its barrier;
+  // the same result as wave_fold_par
+  __device__ __forceinline__ void wave_fold_take(int mode, int n, const int *vals, int &dir, int &bx, int &by,
+    int &min_cost, int &best_sad, int pred_x, int pred_y, int nlambda)
+  {
+    if (g_ws.odd)
+    {
+      wave_fold(mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
+      return;
+    }
+    const unsigned long long key = g_ws.kmin;
+    if (key != ~0ull)
+    {
+      const int c = (int)(key & 255);
+      if (mode != mvc_refine::M_CHECKDIR)
+      {
+        bx = g_ws.xs[c];
+        by = g_ws.ys[c];
+      }
+      min_cost = (int)(key >> 8);
+      best_sad = g_ws.sl[c] + g_ws.sc[c];
+      if (mode != mvc_refine::M_CHECK)
+        dir = vals ? vals[c] : c;
+    }
+  }
+
+  // evaluation and fold of one batch for the mvc_refine kernels: one copy per kernel instance instead of one per call
+  // site of mvc_refine (inlining it there made those kernels take about 20 minutes to compile per architecture). With
+  // compile-time sizes (BSY > 0) the evaluation inside still has its loads in flight together.
+  template <int GW, int BSY, int CHH>
   __device__ __noinline__ void wave_batch_call(int tid, int mode, int n, const int *vals, int &dir, int &bx, int &by,
     int &min_cost, int &best_sad, int pred_x, int pred_y, int nlambda)
   {
-    wave_eval_inl<GW, 0, 0>(tid, true);
+    wave_eval_inl<GW, BSY, CHH>(tid, true);
     wave_fold_par(tid, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
   }
 
@@ -1373,21 +1579,16 @@ namespace
     }
     __device__ __forceinline__ void run_batch(int mode, int n, const int *xs, const int *ys, const int *vals, int &dir)
     {
-      for (int c = lane; c < n; c += WAVE_NT)
-      {
-        g_ws.xs[c] = xs[c];
-        g_ws.ys[c] = ys[c];
-      }
+      if (xs != g_ws.xs) // wave_bad_search writes its lists into g_ws itself (lane 0, published by the barrier below)
+        for (int c = lane; c < n; c += WAVE_NT)
+        {
+          g_ws.xs[c] = xs[c];
+          g_ws.ys[c] = ys[c];
+        }
       if (lane == 0)
         g_ws.n = n;
       __syncthreads();
-      if constexpr (BSY == 0)
-        wave_batch_call<GW>(lane, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
-      else
-      {
-        wave_eval_inl<GW, BSY, CHH>(lane, true);
-        wave_fold_par(lane, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
-      }
+      wave_batch_call<GW, BSY, CHH>(lane, mode, n, vals, dir, bx, by, min_cost, best_sad, pred_x, pred_y, nlambda);
       __syncthreads(); // the next batch overwrites the candidate list and the SADs
     }
   };
@@ -1413,15 +1614,21 @@ namespace
     ck.lane = tid;
     const int found = best_sad;
     const int range = a.bad_range * a.pel; // badrange * nPel (negative for the exhaustive variant)
-    int xs[mvc_refine::MAX_BATCH], ys[mvc_refine::MAX_BATCH], n = 0, dummy = 0;
+    // the candidate lists go straight into the shared list (lane 0; run_batch's barrier publishes them): local arrays
+    // of MAX_BATCH entries made k_wave's stack frame, and so the device's local-memory reservation, 1.3 KB per thread larger
+    int n = 0, dummy = 0;
     auto flush = [&]() {
       if (n)
-        ck.run_batch(mvc_refine::M_CHECK, n, xs, ys, nullptr, dummy);
+        ck.run_batch(mvc_refine::M_CHECK, n, g_ws.xs, g_ws.ys, nullptr, dummy);
       n = 0;
     };
     auto add = [&](int x, int y) {
-      xs[n] = x;
-      ys[n++] = y;
+      if (tid == 0)
+      {
+        g_ws.xs[n] = x;
+        g_ws.ys[n] = y;
+      }
+      n++;
       if (n == mvc_refine::MAX_BATCH)
         flush();
     };
@@ -1508,14 +1715,37 @@ namespace
     return 0;
   }
 
-  // GEN = false: only the ring refine of ring_radius_of (no mvc_refine code: small and fast to compile);
+  // Refine steps the ring-only kernel (GEN = false) runs as a fixed sequence of batches, else 0 (mvc_refine needed):
+  // WP_RING: the rings of ring_radius_of; WP_HEX: Hex2Search(2..3) = the radius-2 hexagon (CheckMVdir) around the best
+  // vector, the centre moved to the winner, ExpandingSearch(1, 1) around it (the hexagon walk of larger ranges runs
+  // range / 2 - 1 = 0 times); WP_UMH: UMHSearch(2..3) = CrossSearch (+-1 only) and one hex grid ring around the best
+  // vector in one batch, then WP_HEX. QTGMC's pel-search 2 levels (Slow .. Placebo) are WP_HEX / WP_UMH.
+  enum { WP_GEN = 0, WP_RING = 1, WP_HEX = 2, WP_UMH = 3 };
+  __host__ __device__ inline int wave_plan(int search_type, int radius)
+  {
+    if (ring_radius_of(search_type, radius) > 0)
+      return WP_RING;
+    if (search_type == mvc_refine::S_HEX2 && radius >= 2 && radius <= 3)
+      return WP_HEX;
+    if (search_type == mvc_refine::S_UMH && radius >= 2 && radius <= 3)
+      return WP_UMH;
+    return WP_GEN;
+  }
+  // candidate offsets of the fixed batches in the CPU order (mvc_refine::umh with range 2..3, mvc_refine::hex2) and the
+  // values CheckMVdir hands over (the hexagon direction = index)
+  // (copied to shared memory per level: g_ws.fix_dx / fix_dy, UMH first, then the hexagon)
+  __device__ const int g_fix_dx[26] = { -1, 1, 0, 0, -4, -4, -4, -4, -4, 4, 4, 4, 4, 4, 2, 0, -2, -2, 0, 2, -2, -1, 1, 2, 1, -1 };
+  __device__ const int g_fix_dy[26] = { 0, 0, 1, -1, 2, 1, 0, -1, -2, -2, -1, 0, 1, 2, 3, 4, 3, -3, -4, -3, 0, 2, 2, 0, -2, -2 };
+
+  // GEN = false: only the fixed batches of wave_plan (no mvc_refine code: small and fast to compile);
   // GEN = true: every search type through mvc_refine
   template <int GW, int BSY, int CHH, bool GEN>
-  __global__ void __maxnreg__(255) k_wave(const __grid_constant__ WaveCall c)
+  __global__ void __maxnreg__(GEN ? 255 : MVC_WAVE_REGS) k_wave(const __grid_constant__ WaveCall c)
   {
     const int lane = threadIdx.x; // thread index in the CTA (all WAVE_NW warps work on one block row)
     int cur = -1;                 // level of the previous row of this CTA
     int ring_n = 0;
+    int plan = WP_GEN;            // wave_plan of that level
 
     for (;;)
     {
@@ -1579,14 +1809,22 @@ namespace
             while (ld_acquire(c.level_ready + level) == 0)
               __nanosleep(256);
           g_ws.a = c.lv[level];
-          const int ring_r = ring_radius_of(a.search_type, a.radius);
+          const int pl = wave_plan(a.search_type, a.radius);
+          const int ring_r = pl == WP_RING ? ring_radius_of(a.search_type, a.radius) : pl == WP_GEN ? 0 : 1;
           int n = 0;
           for (int r = 1; r <= ring_r; r++)
             n = mvc_refine::add_expanding(g_ws.ring_dx, g_ws.ring_dy, n, r, 1, 0, 0);
           g_ws.bc[14] = 4 * ring_r * (ring_r + 1);
+          g_ws.bc[18] = pl;
+          for (int i = 0; i < 26; i++)
+          {
+            g_ws.fix_dx[i] = g_fix_dx[i];
+            g_ws.fix_dy[i] = g_fix_dy[i];
+          }
         }
         __syncthreads();
         ring_n = g_ws.bc[14];
+        plan = g_ws.bc[18];
         cur = level;
       }
 #ifdef MVC_PHASE_PROF
@@ -1714,8 +1952,7 @@ namespace
           if (!is_top)
           {
             const int need = blkx + lag < nbx ? blkx + lag : nbx;
-            while (seen < need)
-              seen = ld_acquire(a.prog + row - 1);
+            seen = wait_at_least(a.prog + row - 1, need, seen);
             WPH(1);
             const int *u = a.vec + 3 * (idx - nbx);
             v[3] = __ldcg(u); v[4] = __ldcg(u + 1); v[5] = __ldcg(u + 2);
@@ -1851,26 +2088,45 @@ namespace
             min_cost = cost;
           }
         }
-        __syncthreads(); // everybody has read the phase A results
+        // no barrier here: the phase A fold only reads the SADs, and the next writes to them (the refine batch) follow
+        // the barrier after that batch's candidate list
         WPH(4);
 
-        if (!GEN || ring_n > 0)
+        if (!GEN || plan != WP_GEN)
         {
-          // all rings around the vector found so far: one batch (the hot path of every coarse level)
-          for (int c = lane; c < ring_n; c += WAVE_NT)
+          // fixed batches (wave_plan), one SAD call site: [WP_UMH: cross + hex grid] [WP_HEX, WP_UMH: hexagon] rings
+          // around the vector found so far (all rings of an exhaustive level in one batch: the hot path of every coarse
+          // level; radius 1 after a hexagon)
+          for (int stage = plan == WP_UMH ? 0 : plan == WP_HEX ? 1 : 2;; stage++)
           {
-            g_ws.xs[c] = best_x + g_ws.ring_dx[c];
-            g_ws.ys[c] = best_y + g_ws.ring_dy[c];
+            const int n = stage == 0 ? 20 : stage == 1 ? 6 : ring_n;
+            for (int c = lane; c < n; c += WAVE_NT)
+            {
+              g_ws.xs[c] = best_x + (stage == 2 ? g_ws.ring_dx[c] : g_ws.fix_dx[c + (stage == 1 ? 20 : 0)]);
+              g_ws.ys[c] = best_y + (stage == 2 ? g_ws.ring_dy[c] : g_ws.fix_dy[c + (stage == 1 ? 20 : 0)]);
+            }
+            if (lane == 0)
+            {
+              g_ws.n = n;
+              wave_fold_init();
+            }
+            __syncthreads();
+            wave_eval_inl<GW, BSY, CHH, true>(lane, true, FoldArgs{ pred.x, pred.y, nlambda, min_cost });
+            WPH(5);
+            int dir = -2;
+            wave_fold_take(stage == 1 ? mvc_refine::M_CHECKDIR : mvc_refine::M_CHECK, n, nullptr, dir, best_x, best_y,
+              min_cost, best_sad, pred.x, pred.y, nlambda);
+            WPH(6);
+            if (stage == 2)
+              break; // the end-of-block barrier comes before anything overwrites the candidates and the SADs
+            __syncthreads(); // the next batch overwrites the candidate list and the SADs
+            if (stage == 1 && dir != -2)
+            {
+              // CheckMVdir kept the cost and the SAD of the winner; Hex2Search moves its centre there
+              best_x += g_ws.fix_dx[20 + dir];
+              best_y += g_ws.fix_dy[20 + dir];
+            }
           }
-          if (lane == 0)
-            g_ws.n = ring_n;
-          __syncthreads();
-          wave_eval_inl<GW, BSY, CHH>(lane, true);
-          WPH(5);
-          int dummy = 0;
-          wave_fold_par(lane, mvc_refine::M_CHECK, ring_n, nullptr, dummy, best_x, best_y, min_cost, best_sad, pred.x, pred.y, nlambda);
-          __syncthreads();
-          WPH(6);
         }
         else if constexpr (GEN)
         {
@@ -1900,8 +2156,7 @@ namespace
             int cnt = row_bad;
             if (row > 0)
             {
-              while (ld_acquire(a.prog + row - 1) < nbx) // rows finish in order: then every row above is complete
-                ;
+              wait_at_least(a.prog + row - 1, nbx, 0); // rows finish in order: then every row above is complete
               for (int r = 0; r < row; r++)
                 cnt += __ldcg(a.rowbad + r);
             }
@@ -1918,7 +2173,19 @@ namespace
         left_x = best_x;
         left_y = best_y;
         left_sad = best_sad;
+        WPH(7);
+#ifdef MVC_PHASE_PROF
         if (lane == 0)
+          atomicAdd(&g_wprof[wbk][8], 1ull);
+#endif
+#ifndef MVC_WAVE_STORE_LANE
+#define MVC_WAVE_STORE_LANE 32
+#endif
+        if (MVC_WAVE_STORE_LANE != 0)
+          __syncthreads(); // the next block overwrites the shared source block
+        // warp 1 publishes the vector while warp 0 starts on the next block (its predictors and the wait for the row
+        // above): the release fence is off this row's own chain; the next block's left predictor is in the registers
+        if (lane == MVC_WAVE_STORE_LANE)
         {
           if (blkx == nbx - 1)
             a.rowbad[row] = row_bad; // published by the release below (the row's last one)
@@ -1927,14 +2194,13 @@ namespace
           o[1] = best_y;
           o[2] = best_sad;
           st_release(a.prog + row, blkx + 1); // orders the vector stores above before the counter
+          if (blkx == nbx - 1)
+            __threadfence(); // the row's vectors before the level count below (made by lane 0 after the barrier)
         }
-        WPH(7);
-#ifdef MVC_PHASE_PROF
-        if (lane == 0)
-          atomicAdd(&g_wprof[wbk][8], 1ull);
-#endif
-        __syncthreads(); // the next block overwrites the shared source block
+        if (MVC_WAVE_STORE_LANE == 0)
+          __syncthreads(); // the next block overwrites the shared source block
       }
+      __syncthreads(); // warp 1's last stores of this row are fenced
 
       // the CTA that finishes the last row of a level estimates the global MV of the next finer level from it
       if (lane == 0)
@@ -1967,7 +2233,7 @@ namespace
   void launch_wave(const WaveCall &c, bool gen, cudaStream_t st)
   {
     const LevelArgs &a = c.lv[0];
-    const int grid = a.n_blk_y;
+    const int grid = a.n_blk_y; // fewer CTAs (40-70% of the rows) were measured slower, section 24
 #ifdef MVC_DEV_FASTONLY
     // development builds (-DMVC_DEV_FASTONLY): no general kernels, the host refuses such levels before launching
     if (gen)
@@ -2113,7 +2379,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
       return -4;
 #ifdef MVC_DEV_FASTONLY
     for (int l = 0; l < nl; l++)
-      if (ring_radius_of(lvl_type[l], l == 0 ? ap->pel_search : ap->search_param) == 0)
+      if (wave_plan(lvl_type[l], l == 0 ? ap->pel_search : ap->search_param) == WP_GEN)
         return -4;
 #endif
   }
@@ -2242,6 +2508,20 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
         a.vpad[p] = dr.d.vpad;
       }
       a.async_src = (async_geo && a.ew[0] % SPW == 0 && a.ew[1] % SPW == 0 && a.ew[2] % SPW == 0) ? 1 : 0;
+      {
+        // packed SADs: 8-bit, the block fills the lane group (bs_x == GW), chroma absent or paired with cw == GW / 2,
+        // rows in groups of 4, every reference row 4-byte aligned (word reads around each row)
+        static const bool pack_allowed = [] { const char *e = getenv("MVCUDA_WAVE_PACK"); return !(e && e[0] == '0'); }();
+        bool pk = pack_allowed && sizeof(pix) == 1 && wave && wave_gw >= 16 && ap->blk_x == wave_gw && a.bs_y % 4 == 0
+          && (!a.has_chroma || (2 * a.cw == wave_gw && a.ch % 4 == 0));
+        for (int p = 0; p < (a.has_chroma ? 3 : 1) && pk; p++)
+        {
+          pk = a.ew[p] % 4 == 0;
+          for (int i = 0; i < 4; i++)
+            pk = pk && ((size_t)a.ref[p][i] & 3) == 0;
+        }
+        a.packed = pk ? 1 : 0;
+      }
       a.ext_w = s_ref->pl[l * 3].d.ew;
       a.ext_h = s_ref->pl[l * 3].d.eh;
       // _lambda_level = lambda / (pel * pel) * nScale (plevel 1) or * nScale^2 (plevel 2)
@@ -2274,7 +2554,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
         a.prog = d_wave + row_off[l];
         a.rowbad = d_wave + w_rowbad + row_off[l];
         a.bad_range = ap->bad_range;
-        wave_gen = wave_gen || ring_radius_of(a.search_type, a.radius) == 0;
+        wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN;
         wc.lv[l] = a;
         continue; // launched once for all levels below
       }

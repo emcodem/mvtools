@@ -727,3 +727,163 @@ back blend about 30 us per frame). Very Slow / Placebo also spend about 30 CPU-s
 use 6 analyses per frame. Ultra Fast's interpolation (Yadifmod2 + Repair) is on the CPU. Next candidates: k_wave latency for pel 2
 / chroma (shared-memory reference tiles for the sub-pel planes, more blocks in flight per wave), analysing bVec / fVec pairs per
 launch; an FFT3D port only with an accepted non-bit-exact result (decision for the user).
+## 23. To do: VRAM use (measured 2026-10-29 evening, release 2026-10-29b)
+
+Peak dedicated VRAM per process (Windows counter `\GPU Process Memory(pid_*)\Dedicated Usage`; nvidia-smi shows N/A per process
+under WDDM), Prefetch 12, md5 identical in every cell; times are single runs with startup, only to show the regeneration cliff:
+
+| | default (min(free/4, 2 GB)) | MVCUDA_CACHE_MB=512 | 256 | 128 |
+|---|---|---|---|---|
+| Fast PAL | 3362 MiB 3.6 s | 1396 3.5 s | 1066 3.5 s | 1006 3.5 s |
+| Slower PAL | 4348 6.8 s | 2280 6.8 s | 1984 6.8 s | 2357 **96 s** |
+| Placebo PAL | 4348 14.7 s | 2302 14.7 s | 2713 **206 s** | 2523 **232 s** |
+| Fast HD | 3086 3.6 s | 1904 3.6 s | 1884 6.9 s | 1710 7.0 s |
+| Slower HD | 4860 4.7 s | 4087 **32 s** | 3698 33 s | 3662 34 s |
+| Placebo HD | 5276 12.5 s | 4153 **84 s** | 3973 89 s | 3921 88 s |
+
+Fast HD, 128 MB: Prefetch 1 1030 MiB, 4 1178, 12 1710 (each thread keeps its last 8 frames outside the budget, `t_held`).
+Where it goes: (1) the registry budget is far above the working set (Fast PAL needs about 256 MB, Slower / Placebo PAL about
+512 MB, Slower / Placebo HD more than 512 MB); (2) the free pools (`pipe_pool`, `g_pool`, `g_up`) never give buffers back,
+so a smaller budget does not lower the peak in proportion; (3) a fixed part of about 1 GB per process: context, modules and
+probably the local-memory reservation for `k_wave` (cuobjdump: STACK 5248 bytes per thread for GEN=true, 2064 for GEN=false;
+reserved for every resident thread: up to about 1.3 GB on the 170-SM 5090, about 0.2 GB on a 3060; not verified); (4) pel-2
+sub-pel planes make a referenced frame 4x larger (`extra_acct`).
+
+To do, in this order:
+1. **Auto-scaled budget**: start small (about 256 MB) and grow when frames are regenerated after eviction (the registry counts
+   regenerations), up to the current cap; replaces hand-set `MVCUDA_CACHE_MB` (env var, read once per process; keep it as an
+   override). Goal: about the 512 column above with default settings, no regeneration cliff, also with 4 concurrent jobs
+   (today a later job sizes its budget from the VRAM the others left).
+2. Give free buffers back: stream-ordered allocator (`cudaMallocAsync` + memory pool with a release threshold) instead of the
+   never-shrinking pools; check that the launch stalls of section 20 (`cudaMalloc` synchronising) do not come back.
+3. Measure the `k_wave` local-memory reservation (`cudaDeviceGetLimit(cudaLimitStackSize)` / cudaMemGetInfo around the first
+   launch) and shrink the stack frame if it is a large part of the fixed 1 GB.
+4. Optional: sub-pel planes computed on the fly instead of cached (less VRAM, more GPU work on pel-2 presets).
+Checks as usual: identical md5 (run_presetcheck -Fallback), MVCUDA_CACHE_MB=16 tests, 4 concurrent jobs, peak VRAM table again.
+Status 2026-10-29 (late night): items 1 and 3 done, item 2 not done, item 4 open; see section 24.
+## 24. k_wave latency and VRAM (2026-10-29 late night; library API 14)
+
+**Where the time went (nsys, build of section 22/23, Prefetch 12, PAL 1500 / HD 250 source frames).** `k_wave` share of all
+kernel time: Fast 82% (PAL) / 81% (HD), Slower 90% / 90%, Placebo 93% / 94%. Mean call 1.15 / 2.75 / 3.30 ms PAL, 3.0 / 7.0 /
+8.3 ms HD. Section 22's 91% for Slower is confirmed. Correction: the whole-chain kernel time is not the wall limit by itself;
+see "what limits" below.
+
+**What was slow (clock64 phase counters, `-DMVC_PHASE_PROF`):** every preset with pel-search 2 (Slow .. Placebo) ran the
+general kernel (`GEN`, mvc_refine with runtime-size SAD loops) on *every* level, because one level (0) needed Hex2Search(2) or
+UMH(2): a refine batch cost about 6,000 cycles there against 2,400 on the ring path; level-0 block of Slower about 34,000
+cycles (Fast 12,600), Placebo 56,000.
+
+**Changes (all in `Sources\cuda\mvcuda_analyse.cu`, output byte-identical at every step):**
+- *Fixed plans* (`wave_plan`): Hex2Search(2..3) = hexagon (CheckMVdir) + radius-1 ring around the moved centre, UMH(2..3) = cross
+  +-1 and one hex grid ring, then the hexagon: run in the fast kernel as a stage loop with one inlined SAD call site. QTGMC never
+  launches the GEN kernel now.
+- *Packed 8-bit SADs* (`pk_load` / `pk_sum`): a lane takes 4 columns of every 4th row, two aligned word loads per row, funnel
+  shift, `__vsadu4`; half the loads and registers of the byte form (integer sums, order-independent). `MVCUDA_WAVE_PACK=0`
+  switches back for A/B tests.
+- *Fused fold*: the group leaders add (cost << 8 | index) to a shared 64-bit atomicMin (and flag negative / overflowing cost
+  parts, falling back to the sequential fold exactly like `wave_fold_par`): 1 barrier per batch instead of 3.
+- Barrier after the phase-A fold removed, post-fold barrier skipped after the last stage; the block's vector is published by
+  warp 1 after the end-of-block barrier (its release fence overlaps warp 0's wait / predictor fetch for the next block; 5%).
+- R = 1 round for batches that fit one round (phase A, hexagon, radius-1 rings), R rounds only for larger batches (coarse
+  radius-2 rings, UMH); register cap `MVC_WAVE_REGS` 96 with `MVC_WAVE_RSAMP` 24 (GEN kernels keep 255).
+- Bad-vector search builds its candidate lists in shared memory (stack frame 2.3-2.6 KB -> 1.0-1.3 KB per thread for the QTGMC
+  kernels; the device reserves stack x max resident threads x SMs of local memory: about 0.4-0.6 GB less on the 5090).
+
+**Isolated latency per analysis call (Prefetch 1 under nsys, median k_wave, `profile\run_wavelat.ps1`):**
+| preset | PAL before | PAL now | HD before | HD now |
+|---|---|---|---|---|
+| Fast | 1021 us | 1037 (+2%) | 2534 | 2524 |
+| Slower | 2101 | **1669 (-21%)** | 5374 | **3933 (-27%)** |
+| Placebo | 2890 | **2035 (-30%)** | 7059 | **4740 (-33%)** |
+
+Fast's single call is not faster (its batches were already on the fast path; the 96-register cap costs it a little); Fast
+gains end to end from the higher residency (more concurrent calls per SM).
+
+**Tried and measured without gain (kept out or reverted):** compile-time sizes for the GEN kernels behind a noinline batch call
+(255 registers, 2 CTAs/SM: slower); register caps 64 / 80 / 128 / 168 (96 is best end to end; 255 is worst); fewer CTAs per call
+(40-70% of the rows: slower); L1 prefetch of the reference window around the block's predictor (slower); relaxed polling +
+`fence.acq_rel` instead of `ld.acquire` (the fence on the critical path cost 5%); `__nanosleep` backoff in the row wait (no
+change); `CUDA_DEVICE_MAX_CONNECTIONS=32` (the default 8 hardware queues do cap concurrency at 8 kernels, measured with a
+micro-benchmark, but at Prefetch 12 only 6-7 analyses are in flight; with Prefetch 24 + 32 queues it got slower).
+
+**What limits now (correction of the section-22 idea "more blocks in flight per wave"):** the GPU is not short of CTA slots.
+About 6-7 analyses are in flight at Prefetch 12 (the 12 frame threads spend about 60% of their time waiting for analysis
+results); per call about 75% of the duration is the wavefront's own critical path (isolated 1.04 ms Fast, 1.67 ms Slower vs
+1.4 / 2.5 ms in the full run), and more concurrency (higher Prefetch) makes each call slower than it adds. Per-call latency
+is the lever: per level about 2.5-5 us per wavefront step, and the coarse levels are about half of a call (they wait for each
+other through the global-motion estimate). Ideas left: interleaving two wavefronts (bVec/fVec) in one CTA, shared-memory
+reference windows (only saves round trips after phase A; the L1 prefetch result suggests little), sm_90 clusters for the row
+hand-over (not on RTX 30xx).
+
+**Very Slow / Placebo: the CPU noise branch.** Placebo PAL with NoiseProcess=0 takes 8.2 s instead of 12.3 s; with Prefetch 24
+the normal Placebo takes 8.1 s (identical md5): the frame threads block on FFT3DFilter. Users of Very Slow / Placebo should use
+a higher Prefetch (not changed in any script; reported numbers stay at Prefetch 12).
+
+**Finding: FFT3DFilter is not deterministic under load.** About 1 in 50 Placebo runs gave a second, always the same, md5 class
+(122 of 3000 frames, ~60 small clusters). FFT3DFilter alone: 2 of 10 runs differ when the CPU is busy, 10 of 10 identical with
+`measure=false` (FFTW_MEASURE plans depend on timing). This is the stock CPU plugin (also a pure CPU QTGMC), not the GPU path;
+`run_ab_avs.ps1` keeps mismatching framemd5 files. `measure=false` in QTGMC's noise call would fix it (decision for the user).
+
+**VRAM (section 23):**
+- *Item 1, auto-scaled budget* (`mvcuda_frames.cu`): `MVCUDA_CACHE_MB` still fixes it. Otherwise it starts at max(256 MB, 128
+  frames of the first frame's size) and grows: (a) a consumer finding its frame near the LRU end (reuse distance > 80% of the
+  budget) grows it to 1.5x that distance before evictions cost anything; (b) per 64 frames made, >= 8 lookups of evicted tokens
+  (counted only outside regenerations) grow it to 1.25x their median reuse distance (evicted tokens are remembered as "ghosts"
+  with the bytes put up to their last use), at least by half. Cap min(free / 3, 4 GB) (was min(free / 4, 2 GB)).
+  What did not work, measured: growing per regeneration, by regeneration rate, or on single misses (late requests of frames
+  evicted early through AviSynth's own caches have distances that grow with the run time and ran the budget to the cap).
+- *Bug found and fixed (also in the released build): regeneration storms.* When a consumer finds token X evicted it regenerates
+  frame (producer, n) as a new token Y, but AviSynth's frame cache keeps handing out the frame with X, so every later consumer
+  made it again: storms that went on after the budget had grown. The fixed 2 GB default was at the edge for Placebo HD (one
+  baseline run 51.8 s instead of 12 s); fixed 768 MB: Slower HD 160,000 regenerations, 8x the time. Now the registry keeps the
+  newest live token per (producer, frame) and a lookup of an evicted token is served by it (`MvCudaFrameStats::redirects`,
+  library API 14: all three DLLs together). Exact: a producer makes frame n bit-identically every time (the md5 checks below).
+- *Item 3, local-memory reservation*: see the stack change above; QTGMC no longer launches the 5.2 KB-stack GEN kernel.
+- *Item 2 not done*: with the budget sized to the chain the free pools only reach the size the chain needs, so releasing them
+  would lower only transient overshoot, not the peak; left open (would need `cudaMallocAsync` and a check for launch stalls).
+
+Peak per-process VRAM (run_vram.ps1, default settings, Prefetch 12; md5 identical in every cell; wall times single runs incl.
+start-up):
+
+| | before (fixed 2 GB, section 23) | now | budget reached |
+|---|---|---|---|
+| Fast PAL | 3334 MiB | 882-936 | 313-363 MB |
+| Slower PAL | 4370 | 1130-1218 | 384-481 MB |
+| Placebo PAL | 4362 | 1224-1440 | 466-612 MB |
+| Fast HD | 3106 | 1650-1966 | 0.9-1.2 GB |
+| Slower HD | 4802 | 3174-3586 | 1.4-1.9 GB |
+| Placebo HD | 5276-6204 (storm-prone) | 3692-5954, no storms in 5 runs | 1.9-4.0 GB |
+
+4 concurrent PAL jobs, total VRAM over idle (nvidia-smi): Fast 13.5 GB -> 3.7 GB, Slower 17.6 GB -> 4.4 GB.
+
+**Exactness (all on build_e = API 14):** run_cf_regression 59/59 PASS; run_qtgmc_vec -NoMeander 50/50 IDENTICAL; golden 85/85;
+run_presetcheck -Fallback ALL PASS for every preset on PAL (Ultra Fast with EdiMode="Bob") and HD; the same with
+MVCUDA_CACHE_MB=16 (PAL Super Fast, Fast, Medium, Slow, Slower, Very Slow, Placebo; HD Fast, Medium, Placebo), same md5s;
+full-length outputs (1500 PAL / 250 HD source frames) identical to the section-23 build for Fast / Slower / Placebo PAL and HD;
+4 concurrent jobs 4/4 identical.
+
+**Results (Prefetch 12, best of 3, High priority; 'before' = the section-22/23 build timed the same night):**
+
+| preset | PAL CPU | PAL GPU before | **PAL GPU now** | HD CPU | HD GPU before | **HD GPU now** |
+|---|---|---|---|---|---|---|
+| Ultra Fast | 2.56 s / 33.3 CPU-s | 1.32 | **1.21 s / 9.2** | 3.37 / 38.6 | 0.74 | **0.74 / 7.8** |
+| Super Fast | 3.15 / 57.4 | 1.33 | **1.24 / 7.3** | 3.25 / 42.9 | 0.60 | **0.62 / 3.8** |
+| Very Fast | 4.99 / 82.5 | 1.53 | **1.37 / 8.3** | 5.16 / 70.5 | 0.63 | **0.64 / 3.7** |
+| Faster | 5.31 / 93.0 | 1.51 | **1.42 / 8.5** | 5.22 / 73.8 | 0.69 | **0.63 / 3.4** |
+| Fast | 7.11 / 128.4 | 2.21 | **1.79 / 8.2** | 7.42 / 117.5 | 1.22 | **0.93 / 4.4** |
+| Medium | 8.00 / 146.8 | 2.69 | **2.29 / 8.2** | 8.42 / 119.6 | 1.29 | **1.01 / 5.4** |
+| Slow | 9.99 / 183.2 | 3.13 | **2.80 / 9.8** | 10.15 / 147.5 | 1.49 | **1.18 / 5.4** |
+| Slower | 14.38 / 283.1 | 5.21 | **4.33 / 12.2** | 14.42 / 243.2 | 3.14 | **2.12 / 6.5** |
+| Very Slow | 22.52 / 343.1 | 9.62 | **9.07 / 41.4** | 28.07 / 297.8 | 7.32 | **7.04 / 34.4** |
+| Placebo | 27.98 / 462.8 | 13.20 | **11.72 / 40.6** | 36.57 / 410.2 | 9.72 | **8.97 / 33.6** |
+
+4 concurrent PAL jobs (1500 frames each): Fast CPU 30.4 s / GPU before 10.9 / **now 9.0 s**; Medium 34.3 / 13.1 / **11.4**; Slower
+56.1 / 24.7 / **21.0** (all jobs identical to their single runs).
+
+**Tools (profile\):** `run_nsys.ps1` (nsys kernel summary; hidden window), `nsys_timeline.py` (kernel union / k_wave
+concurrency histogram / per-thread API time / launch-to-start delay from an nsys sqlite export), `run_wavelat.ps1` (isolated
+per-call latency), `run_ab_avs.ps1` (A/B of DLL folders, keeps md5 mismatches against stored references), `make_qtgmc_avs.ps1`,
+`run_repeat.ps1` (N runs, differing frames), `run_presettiming.ps1 -Dir`, `run_vram.ps1` (prints budget / regenerations with
+`-Env2 CUDAFILTERS_STATS=1`), `run_concurrent.ps1` now passes `-nostdin` (four ffmpeg processes started from a PowerShell job
+hung in PeekNamedPipe on their shared stdin; a harness artifact, not a GPU hang).
+Test DLL set: `profile\build_e` (API 14; sm_120 dev build). The release DLL (build.bat, all architectures) was not rebuilt.

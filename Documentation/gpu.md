@@ -382,7 +382,7 @@ Read once per process.
 | Variable | Effect |
 |---|---|
 | `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 8.0 or newer) |
-| `MVCUDA_CACHE_MB=n` | Byte budget of the device frame registry (token frames), in MB. Default: a quarter of the free device memory, at most 2048 |
+| `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
 | `MVCUDA_CACHE_FRAMES=n` | Capacity of the device super frame cache used by MAnalyse / MRecalculate / MFlowFps, in frames (default 24, minimum 2) |
 | `MVCUDA_WAVE=0` | MAnalyse with `meander=false` uses the slice kernel instead of the wavefront kernel (for comparisons) |
 | `MVCUDA_SPIN` | Waits for the GPU spin a CPU core instead of sleeping |
