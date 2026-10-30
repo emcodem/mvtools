@@ -2,6 +2,10 @@
 // evalFunc_2) for 8-bit data as it runs on AVX2 + FMA3 CPUs without AVX-512 (opt 6): new prescreener with int16 weights
 // (computeNetwork0new_AVX2, processLine0_AVX2_ASM) and the int16 predictor (extract_m8_i16_AVX2,
 // dotProd_m32/48_m16_i16_AVX2, e0_m16_FMA3, weightedAvgElliottMul5_m16_FMA3, castScale_AVX).
+// 9 / 10-bit data (16-bit containers) take the plugin's _16 functions (evalFunc_1_16 / evalFunc_2_16): uc2s64_C_16,
+// processLine0_AVX2_ASM_16, extract_m8_i16_AVX2_16, castScale_AVX_16. Their float steps are those of the 8-bit path; the
+// prescreener and predictor read the samples as int16 (pmaddwd), the cubic kernel as uint16; the prescreener weights are
+// scaled by the bit depth on the host.
 //
 // Every floating point step follows the order of the asm (explicit __f*_rn intrinsics: no contraction into FMA unless the
 // asm uses one). The asm uses the CPU's approximate rcpps / rsqrtps, whose results are implementation specific: the host
@@ -32,11 +36,12 @@ namespace
     float r_asize;         // rcpss((float)asize) as the CPU computes it
   };
 
+  template <typename T>
   struct NnPlanes
   {
-    const uint8_t *src[3];
-    uint8_t *dst[3];
-    size_t pitch_s[3], pitch_d[3];
+    const T *src[3];
+    T *dst[3];
+    size_t pitch_s[3], pitch_d[3]; // in samples
     int width[3], height[3];
     int interp[3];          // 1: made by NNEDI3, 0: copied
     int vmin[3], vmax[3];
@@ -73,7 +78,8 @@ namespace
   }
 
   // sample of field line L (the kept lines: frame row 2 * L + off), column c, both reflected as the plugin's padding
-  __device__ __forceinline__ int fld(const NnPlanes &pl, int p, int off, int L, int c)
+  template <typename T>
+  __device__ __forceinline__ int fld(const NnPlanes<T> &pl, int p, int off, int L, int c)
   {
     const int nl = pl.height[p] >> 1;
     L = reflect(L, nl);
@@ -81,16 +87,24 @@ namespace
     return pl.src[p][(size_t)(2 * L + off) * pl.pitch_s[p] + c];
   }
 
+  // the sample as the network's int16 dot products (pmaddwd) see it: 8-bit samples zero-extended, 16-bit ones as int16
+  template <typename T>
+  __device__ __forceinline__ int net_in(int v)
+  {
+    return sizeof(T) == 1 ? v : (int)(int16_t)v;
+  }
+
   // one thread per output sample: kept lines copied, missing lines made by the cubic kernel; prescreened pixels queued.
   // count_next (the queue counter of the next call, used by the previous one) is cleared here.
-  __global__ void k_nn_pre(NnNet net, NnPlanes pl, int off, unsigned *queue, unsigned *count, unsigned *count_next)
+  template <typename T>
+  __global__ void k_nn_pre(NnNet net, NnPlanes<T> pl, int off, unsigned *queue, unsigned *count, unsigned *count_next)
   {
     const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y, p = blockIdx.z;
     if ((c | r | p) == 0)
       *count_next = 0;
     if (c >= pl.width[p] || r >= pl.height[p])
       return;
-    uint8_t *drow = pl.dst[p] + (size_t)r * pl.pitch_d[p];
+    T *drow = pl.dst[p] + (size_t)r * pl.pitch_d[p];
     if (!pl.interp[p] || (r & 1) == off)
     {
       drow[c] = pl.src[p][(size_t)r * pl.pitch_s[p] + c];
@@ -98,15 +112,19 @@ namespace
     }
     const int L0 = (r - off - 3) >> 1; // field line of row r - 3 (r - off is odd)
 
-    // processLine0_AVX2_ASM: (19 * (b + c) -us 3 * (a + d) +us 16) >> 5, clamped, written for every missing pixel
+    // processLine0_AVX2_ASM: (19 * (b + c) -us 3 * (a + d) +us 16) >> 5, clamped, written for every missing pixel;
+    // processLine0_AVX2_ASM_16: (19 * (b + c) - 3 * (a + d) + 16) >>a 5 in int32, packusdw, min max, max min: the same
+    // result for every input (a negative sum stays below 0 after the shift and saturates to 0)
     {
       const int a = fld(pl, p, off, L0, c), b = fld(pl, p, off, L0 + 1, c), cc = fld(pl, p, off, L0 + 2, c), d = fld(pl, p, off, L0 + 3, c);
       int t = 19 * (b + cc) - 3 * (a + d);
       t = t < 0 ? 0 : t;
       t = (t + 16) >> 5;
+      const int smax = sizeof(T) == 1 ? 255 : 65535;
+      t = t > smax ? smax : t;
       t = t > pl.vmax[p] ? pl.vmax[p] : t;
       t = t < pl.vmin[p] ? pl.vmin[p] : t;
-      drow[c] = (uint8_t)(t < 0 ? 0 : t > 255 ? 255 : t);
+      drow[c] = (T)(t < 0 ? 0 : t > smax ? smax : t);
     }
 
     // computeNetwork0new_AVX2 for the group of 4 pixels this one belongs to: 4 field lines x 16 columns from gx - 6
@@ -115,7 +133,7 @@ namespace
     for (int y = 0; y < 4; y++)
       for (int x = 0; x < 16; x++)
       {
-        const int v = fld(pl, p, off, L0 + y, gx - 6 + x);
+        const int v = net_in<T>(fld(pl, p, off, L0 + y, gx - 6 + x));
         const int k = y * 16 + x;
         for (int j = 0; j < 4; j++)
           s[j] += v * (int)__ldg(net.pre_w + j * 64 + k);
@@ -137,9 +155,11 @@ namespace
   }
 
   // one thread per queued pixel: extract_m8_i16 + qual x (dotProd_i16, e0 exp, weightedAvgElliottMul5) + castScale
-  __global__ void k_nn_pred(NnNet net, NnPlanes pl, int off, const unsigned *queue, const unsigned *count)
+  template <typename T>
+  __global__ void k_nn_pred(NnNet net, NnPlanes<T> pl, int off, const unsigned *queue, const unsigned *count)
   {
-    extern __shared__ uint8_t sh[]; // window, [k][thread]
+    extern __shared__ __align__(16) uint8_t sh_raw[];
+    T *sh = reinterpret_cast<T *>(sh_raw); // window, [k][thread]
     const unsigned n = *count;
     const int tid = threadIdx.x, nt = blockDim.x;
     for (unsigned qi = blockIdx.x * nt + tid; qi - tid < n; qi += gridDim.x * nt) // whole blocks loop together
@@ -160,8 +180,9 @@ namespace
         for (int y = 0; y < net.ydia; y++)
           for (int x = 0; x < net.xdia; x++)
           {
-            const int v = fld(pl, p, off, L0 + y, x0 + x);
-            sh[(y * net.xdia + x) * nt + tid] = (uint8_t)v;
+            // extract_m8_i16_AVX2(_16): sum and sum of squares by pmaddwd / psadbw, int32
+            const int v = net_in<T>(fld(pl, p, off, L0 + y, x0 + x));
+            sh[(y * net.xdia + x) * nt + tid] = (T)v;
             sum += v;
             sumsq += v * v;
           }
@@ -197,7 +218,7 @@ namespace
             const int16_t *w0 = w + (size_t)j * asize, *w1 = w + (size_t)(nns + j) * asize;
             for (int k = 0; k < asize; k++)
             {
-              const int v = sh[k * nt + tid];
+              const int v = net_in<T>(sh[k * nt + tid]);
               s0 += v * (int)__ldg(w0 + k);
               s1 += v * (int)__ldg(w1 + k);
             }
@@ -224,7 +245,7 @@ namespace
             vsum = 0.0f;
           acc = __fadd_rn(__fadd_rn(__fmul_rn(vsum, sd), mean), acc);
         }
-        // castScale_AVX: truncate(val * (1 / qual) + 0.5), clamp; cvttss2si gives INT_MIN for NaN / out of range
+        // castScale_AVX(_16): truncate(val * (1 / qual) + 0.5), clamp; cvttss2si gives INT_MIN for NaN / out of range
         const float scale = net.qual == 2 ? 0.5f : 1.0f;
         const float tv = __fadd_rn(__fmul_rn(acc, scale), 0.5f);
         int iv = (tv > -2147483648.0f && tv < 2147483648.0f) ? __float2int_rz(tv) : (int)0x80000000;
@@ -232,7 +253,7 @@ namespace
           iv = pl.vmax[p];
         if (iv <= pl.vmin[p])
           iv = pl.vmin[p];
-        pl.dst[p][(size_t)r * pl.pitch_d[p] + c] = (uint8_t)iv;
+        pl.dst[p][(size_t)r * pl.pitch_d[p] + c] = (T)iv;
       }
       __syncthreads(); // the next round reuses the shared window
     }
@@ -250,6 +271,53 @@ namespace
       return nullptr;
     }
     return d;
+  }
+
+  unsigned nn_seq = 0; // pipeline order of the calls (all sample types: they share the queue counters)
+
+  template <typename T>
+  int run(const NnNet &n, const mvc::DevFrame &fs, const mvc::DevFrame &dst, int field_n, int plane_mask,
+    const int val_min[3], const int val_max[3])
+  {
+    const MvCudaFrameFormat &f = fs.f;
+    NnPlanes<T> pl = {};
+    int max_w = 0, max_h = 0;
+    size_t queue_max = 0;
+    for (int p = 0; p < f.planes; p++)
+    {
+      pl.src[p] = (const T *)fs.plane[p];
+      pl.dst[p] = (T *)dst.plane[p];
+      pl.pitch_s[p] = fs.pitch[p] / sizeof(T);
+      pl.pitch_d[p] = dst.pitch[p] / sizeof(T);
+      pl.width[p] = fs.w[p];
+      pl.height[p] = fs.h[p];
+      pl.interp[p] = (plane_mask >> p) & 1;
+      pl.vmin[p] = val_min[p];
+      pl.vmax[p] = val_max[p];
+      if (pl.interp[p] && (fs.h[p] < 8 || (fs.h[p] & 1) || fs.w[p] < 32 || fs.w[p] > 65535 || fs.h[p] > 16383))
+        return -4;
+      max_w = fs.w[p] > max_w ? fs.w[p] : max_w;
+      max_h = fs.h[p] > max_h ? fs.h[p] : max_h;
+      queue_max += (size_t)fs.w[p] * (fs.h[p] / 2);
+    }
+    const size_t qbytes = (queue_max ? queue_max : 1) * sizeof(unsigned);
+    unsigned *counts = (unsigned *)mvc::pipe_scratch(mvc::SCRATCH_NNEDI3, 2 * sizeof(unsigned));
+    unsigned *qbuf = counts ? (unsigned *)mvc::pipe_alloc(qbytes) : nullptr;
+    if (!qbuf)
+      return -2;
+    const int off = 1 - field_n;
+    const NnNet nv = n; // device pointers only; the net is freed after pipe_flush
+    const dim3 grid((max_w + 127) / 128, max_h, f.planes);
+    mvc::pipe_submit([=](cudaStream_t st) { // issued by the pipeline submitter (mvcuda_internal.h)
+      // the calls alternate between two queue counters (pipeline order): each clears the other one for the next call
+      const unsigned seq = nn_seq++;
+      unsigned *count = counts + (seq & 1), *count_next = counts + ((seq + 1) & 1);
+      k_nn_pre<T><<<grid, 128, 0, st>>>(nv, pl, off, qbuf, count, count_next);
+      const int nt = 64;
+      k_nn_pred<T><<<1024, nt, (size_t)nv.asize * nt * sizeof(T), st>>>(nv, pl, off, qbuf, count);
+    });
+    mvc::pipe_free(qbuf, qbytes); // stream-ordered reuse: later pipeline work only
+    return 0;
   }
 }
 
@@ -317,49 +385,15 @@ extern "C" int mvcuda_nnedi3(void *net, unsigned long long src, int field_n, int
   if (!fs)
     return MVCUDA_TOKEN_GONE;
   const MvCudaFrameFormat &f = fs->f;
-  if (f.bytes_per_sample != 1)
+  if (f.bytes_per_sample != 1 && f.bytes_per_sample != 2)
     return -4;
-  NnPlanes pl = {};
-  int max_w = 0, max_h = 0;
-  size_t queue_max = 0;
   auto dst = mvc::frame_alloc(f);
   if (!dst)
     return -2;
-  for (int p = 0; p < f.planes; p++)
-  {
-    pl.src[p] = (const uint8_t *)fs->plane[p];
-    pl.dst[p] = (uint8_t *)dst->plane[p];
-    pl.pitch_s[p] = fs->pitch[p];
-    pl.pitch_d[p] = dst->pitch[p];
-    pl.width[p] = fs->w[p];
-    pl.height[p] = fs->h[p];
-    pl.interp[p] = (plane_mask >> p) & 1;
-    pl.vmin[p] = val_min[p];
-    pl.vmax[p] = val_max[p];
-    if (pl.interp[p] && (fs->h[p] < 8 || (fs->h[p] & 1) || fs->w[p] < 32 || fs->w[p] > 65535 || fs->h[p] > 16383))
-      return -4;
-    max_w = fs->w[p] > max_w ? fs->w[p] : max_w;
-    max_h = fs->h[p] > max_h ? fs->h[p] : max_h;
-    queue_max += (size_t)fs->w[p] * (fs->h[p] / 2);
-  }
-  const size_t qbytes = (queue_max ? queue_max : 1) * sizeof(unsigned);
-  unsigned *counts = (unsigned *)mvc::pipe_scratch(mvc::SCRATCH_NNEDI3, 2 * sizeof(unsigned));
-  unsigned *qbuf = counts ? (unsigned *)mvc::pipe_alloc(qbytes) : nullptr;
-  if (!qbuf)
-    return -2;
-  const int off = 1 - field_n;
-  const NnNet nv = *n; // device pointers only; the net is freed after pipe_flush
-  const dim3 grid((max_w + 127) / 128, max_h, f.planes);
-  mvc::pipe_submit([=](cudaStream_t st) { // issued by the pipeline submitter (mvcuda_internal.h)
-    // the calls alternate between two queue counters (pipeline order): each clears the other one for the next call
-    static unsigned seq = 0;
-    unsigned *count = counts + (seq & 1), *count_next = counts + ((seq + 1) & 1);
-    seq++;
-    k_nn_pre<<<grid, 128, 0, st>>>(nv, pl, off, qbuf, count, count_next);
-    const int nt = 64;
-    k_nn_pred<<<1024, nt, (size_t)nv.asize * nt, st>>>(nv, pl, off, qbuf, count);
-  });
-  mvc::pipe_free(qbuf, qbytes); // stream-ordered reuse: later pipeline work only
+  const int rc = f.bytes_per_sample == 1 ? run<uint8_t>(*n, *fs, *dst, field_n, plane_mask, val_min, val_max)
+                                         : run<uint16_t>(*n, *fs, *dst, field_n, plane_mask, val_min, val_max);
+  if (rc != 0)
+    return rc;
   mvc::frame_put(dst, producer, frame, *out);
   return 0;
 }

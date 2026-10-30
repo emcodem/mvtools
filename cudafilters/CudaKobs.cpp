@@ -1,30 +1,36 @@
-// CudaKeepOnlyBobShimmerFixes(input, ref, rep, chroma): QTGMC_KeepOnlyBobShimmerFixes of QTGMC.avsi on the GPU (8 bit;
-// GPU_PIPELINE_PLAN.md section 15, stages 4 and 16), and CudaRemoveGrain(clip, mode, modeU, modeV) for the modes the GPU
-// has (12, 20 at 8 bit). Bit for bit with masktools2 / RgTools; the arithmetic is in mvcuda_kobs.cu.
+// CudaKeepOnlyBobShimmerFixes(input, ref, rep, chroma): QTGMC_KeepOnlyBobShimmerFixes of QTGMC.avsi on the GPU (8 to 10
+// bit; GPU_PIPELINE_PLAN.md section 15, stages 4 and 16, section 25 B2), and CudaRemoveGrain(clip, mode, modeU, modeV) for
+// the modes the GPU has (12, 20; 8 to 16 bit). Bit for bit with masktools2 / RgTools; the arithmetic is in mvcuda_kobs.cu.
 //
-// The function's two mt_lutxy expressions are not re-implemented: the plugin runs the installed mt_lutxy once on a
-// 256 x 256 pattern of all (x, y) pairs and uses its output as the table, so the GPU applies exactly what the CPU filter
-// computes. The CPU function / filter is built too (VideoInfo, exact fallback for unsupported settings and formats).
+// The function's two mt_lutxy expressions are not re-implemented: the plugin runs the installed mt_lutxy once on an
+// n x n pattern of all (x, y) pairs (n = 256 at 8 bit, 1024 at 10 bit; 4:4:4, the pattern in every plane) and uses its
+// output as the tables (luma and chroma: with use_expr masktools hands the expression to Expr, whose chroma results can
+// differ from luma), so the GPU applies exactly what the CPU filter computes. The CPU function / filter is built too (VideoInfo, exact fallback for unsupported settings and formats).
 
 #include "CudaCommon.h"
+
+#include <cstdint>
+#include <vector>
 
 using namespace cf;
 
 namespace
 {
-  // one 256 x 256 Y8 frame whose samples are their column (by_row = false) or their row (by_row = true)
+  // one n x n 4:4:4 frame (n = 1 << bits) whose samples in every plane are their column (by_row = false) or their row
+  // (by_row = true)
   class PatternClip : public IClip
   {
     VideoInfo _vi;
     bool _by_row;
+    int _n;
 
   public:
-    explicit PatternClip(bool by_row) : _by_row(by_row)
+    PatternClip(bool by_row, int bits) : _by_row(by_row), _n(1 << bits)
     {
       std::memset(&_vi, 0, sizeof(_vi));
-      _vi.width = 256;
-      _vi.height = 256;
-      _vi.pixel_type = VideoInfo::CS_Y8;
+      _vi.width = _n;
+      _vi.height = _n;
+      _vi.pixel_type = bits == 8 ? VideoInfo::CS_YV24 : VideoInfo::CS_YUV444P10;
       _vi.fps_numerator = 25;
       _vi.fps_denominator = 1;
       _vi.num_frames = 1;
@@ -32,11 +38,17 @@ namespace
     PVideoFrame __stdcall GetFrame(int, IScriptEnvironment *env) override
     {
       PVideoFrame f = env->NewVideoFrame(_vi);
-      BYTE *p = f->GetWritePtr(PLANAR_Y);
-      const int pitch = f->GetPitch(PLANAR_Y);
-      for (int y = 0; y < 256; y++)
-        for (int x = 0; x < 256; x++)
-          p[(size_t)y * pitch + x] = (BYTE)(_by_row ? y : x);
+      for (int plane : g_planes)
+      {
+        BYTE *p = f->GetWritePtr(plane);
+        const int pitch = f->GetPitch(plane);
+        for (int y = 0; y < _n; y++)
+          for (int x = 0; x < _n; x++)
+            if (_n == 256)
+              p[(size_t)y * pitch + x] = (BYTE)(_by_row ? y : x);
+            else
+              reinterpret_cast<uint16_t *>(p + (size_t)y * pitch)[x] = (uint16_t)(_by_row ? y : x);
+      }
       return f;
     }
     bool __stdcall GetParity(int) override { return false; }
@@ -46,30 +58,57 @@ namespace
   };
 }
 
-PClip cf::pattern_clip(bool by_row)
+PClip cf::pattern_clip(bool by_row, int bits)
 {
-  return new PatternClip(by_row);
+  return new PatternClip(by_row, bits);
 }
 
-unsigned long long cf::lut_from_frame(const PVideoFrame &f)
+namespace
 {
-  const BYTE *p = f->GetReadPtr(PLANAR_Y);
-  const int pitch = f->GetPitch(PLANAR_Y);
-  unsigned char table[65536];
-  for (int y = 0; y < 256; y++)
-    for (int x = 0; x < 256; x++)
-      table[x * 256 + y] = p[(size_t)y * pitch + x];
-  return CudaLib::get().lut2_create(table);
+  // table[x * n + y] = plane sample at column x, row y
+  template <typename T>
+  std::vector<T> read_table(const PVideoFrame &f, int plane, int n)
+  {
+    const BYTE *p = f->GetReadPtr(plane);
+    const int pitch = f->GetPitch(plane);
+    std::vector<T> table((size_t)n * n);
+    for (int y = 0; y < n; y++)
+      for (int x = 0; x < n; x++)
+        table[(size_t)x * n + y] = reinterpret_cast<const T *>(p + (size_t)y * pitch)[x];
+    return table;
+  }
+
+  template <typename T>
+  unsigned long long upload_tables(const PVideoFrame &f, int bits)
+  {
+    const int n = 1 << bits;
+    const std::vector<T> luma = read_table<T>(f, PLANAR_Y, n);
+    if (f->GetPitch(PLANAR_U) == 0)
+      return CudaLib::get().lut2_create_bits(luma.data(), nullptr, bits);
+    const std::vector<T> chroma = read_table<T>(f, PLANAR_U, n);
+    return CudaLib::get().lut2_create_bits(luma.data(), chroma.data(), bits);
+  }
 }
 
-// the table of mt_lutxy(x, y, expr, use_expr=...) as the installed masktools computes it: table[x * 256 + y]
-unsigned long long cf::lut_from_cpu(const char *expr, int use_expr, IScriptEnvironment *env)
+unsigned long long cf::lut_from_frame(const PVideoFrame &f, int bits)
 {
-  PClip px = new PatternClip(false), py = new PatternClip(true);
-  AVSValue args[4] = { px, py, expr, use_expr };
-  const char *names[4] = { nullptr, nullptr, "expr", "use_expr" };
-  PClip lut = env->Invoke("mt_lutxy", AVSValue(args, 4), names).AsClip();
-  return lut_from_frame(lut->GetFrame(0, env));
+  if (bits == 8)
+    return upload_tables<uint8_t>(f, bits);
+  if (bits == 10)
+    return upload_tables<uint16_t>(f, bits);
+  return 0;
+}
+
+// the table of mt_lutxy(x, y, expr, use_expr=...) as the installed masktools computes it: table[x * n + y]
+unsigned long long cf::lut_from_cpu(const char *expr, int use_expr, IScriptEnvironment *env, int bits)
+{
+  if (bits != 8 && bits != 10)
+    return 0;
+  PClip px = new PatternClip(false, bits), py = new PatternClip(true, bits);
+  AVSValue args[6] = { px, py, expr, use_expr, 3, 3 };
+  const char *names[6] = { nullptr, nullptr, "expr", "use_expr", "U", "V" };
+  PClip lut = env->Invoke("mt_lutxy", AVSValue(args, 6), names).AsClip();
+  return lut_from_frame(lut->GetFrame(0, env), bits);
 }
 
 namespace
@@ -105,14 +144,14 @@ namespace
       const int ed = rep < 10 ? rep : rep / 10, od = rep < 10 ? 0 : rep % 10;
       MvCudaFrameFormat f2;
       CudaLib &lib = CudaLib::get();
-      _ok = lib.ok && make_format(vi, _fmt) && make_format(ref->GetVideoInfo(), f2) && same_format(_fmt, f2) && _fmt.bits_per_sample == 8
+      _ok = lib.ok && make_format(vi, _fmt) && make_format(ref->GetVideoInfo(), f2) && same_format(_fmt, f2) && _fmt.bits_per_sample <= 10
         && !(ed == 2 || ed == 5 || od >= 3);
       _mask = 1 | ((chroma && _fmt.planes == 3) ? 6 : 0);
       if (_ok)
       {
         // the restore expressions of QTGMC_KeepOnlyBobShimmerFixes (QTGMC.avsi), with the use_expr values it passes
-        _lut1 = lut_from_cpu("x 129 scalef < x y range_half < range_half y ? ?", 2, env);
-        _lut2 = lut_from_cpu("x 127 scalef > x y range_half > range_half y ? ?", 1, env);
+        _lut1 = lut_from_cpu("x 129 scalef < x y range_half < range_half y ? ?", 2, env, _fmt.bits_per_sample);
+        _lut2 = lut_from_cpu("x 127 scalef > x y range_half > range_half y ? ?", 1, env, _fmt.bits_per_sample);
         _ok = _lut1 && _lut2;
       }
       if (_ok)
@@ -184,7 +223,7 @@ namespace
       _mode[1] = modeU;
       _mode[2] = modeV;
       CudaLib &lib = CudaLib::get();
-      _ok = lib.ok && make_format(vi, _fmt) && _fmt.bits_per_sample == 8;
+      _ok = lib.ok && make_format(vi, _fmt);
       for (int p = 0; p < _fmt.planes; p++)
         _ok = _ok && (_mode[p] == -1 || _mode[p] == 0 || _mode[p] == 12 || _mode[p] == 20
           || (_mode[p] == 11 && (env->GetCPUFlags() & CPUF_SSE4_1))); // RgTools' SSE4.1 mode 11 is mode 12

@@ -220,6 +220,7 @@ namespace
 {
   const int BB_REFS = 5;
 
+  // sample pointers are bytes, read as pixel_t; pitches in samples
   struct BbParams
   {
     const uint8_t *thin[3], *lossed;  // lossed: luma only
@@ -230,17 +231,21 @@ namespace
     const int *off1, *off2;           // first / second pass programs (luma)
     const short *c1, *c2;
     int taps1, taps2, h_first, nref, sovs;
+    int bits, maxv, half;
   };
 
+  template <typename pixel_t>
   __device__ __forceinline__ int bb_d(const BbParams &b, int x, int y)
   {
-    const int v = (int)b.thin[0][(size_t)y * b.pitch[0] + x] - (int)b.lossed[(size_t)y * b.pitch[0] + x] + 128;
-    return v < 0 ? 0 : v > 255 ? 255 : v;
+    const size_t o = (size_t)y * b.pitch[0] + x;
+    const int v = (int)((const pixel_t *)b.thin[0])[o] - (int)((const pixel_t *)b.lossed)[o] + b.half;
+    return v < 0 ? 0 : v > b.maxv ? b.maxv : v;
   }
 
   __device__ __forceinline__ int bb_avg(int a, int c) { return (a + c + 1) >> 1; }
 
-  // mt_makediff(thin, lossed) (luma), then RemoveGrain 12 (borders copied)
+  // mt_makediff(thin, lossed) (luma), then RemoveGrain 12 (borders copied; rg_mode12_sse_16 is the same cascade)
+  template <typename pixel_t>
   __global__ void k_bb_diff(BbParams b)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, w = b.w[0], h = b.h[0];
@@ -248,60 +253,64 @@ namespace
       return;
     int r;
     if (x == 0 || y == 0 || x == w - 1 || y == h - 1)
-      r = bb_d(b, x, y);
+      r = bb_d<pixel_t>(b, x, y);
     else
     {
-      const int a123 = bb_avg(bb_d(b, x, y - 1), bb_avg(bb_d(b, x - 1, y - 1), bb_d(b, x + 1, y - 1)));
-      const int a678 = bb_avg(bb_d(b, x, y + 1), bb_avg(bb_d(b, x - 1, y + 1), bb_d(b, x + 1, y + 1)));
-      const int a4c5 = bb_avg(bb_d(b, x, y), bb_avg(bb_d(b, x - 1, y), bb_d(b, x + 1, y)));
+      const int a123 = bb_avg(bb_d<pixel_t>(b, x, y - 1), bb_avg(bb_d<pixel_t>(b, x - 1, y - 1), bb_d<pixel_t>(b, x + 1, y - 1)));
+      const int a678 = bb_avg(bb_d<pixel_t>(b, x, y + 1), bb_avg(bb_d<pixel_t>(b, x - 1, y + 1), bb_d<pixel_t>(b, x + 1, y + 1)));
+      const int a4c5 = bb_avg(bb_d<pixel_t>(b, x, y), bb_avg(bb_d<pixel_t>(b, x - 1, y), bb_d<pixel_t>(b, x + 1, y)));
       int a123678 = bb_avg(a123, a678);
       a123678 = a123678 > 0 ? a123678 - 1 : 0;
       r = bb_avg(a4c5, a123678);
     }
-    b.diff[(size_t)y * w + x] = (uint8_t)r;
+    ((pixel_t *)b.diff)[(size_t)y * w + x] = (pixel_t)r;
   }
 
   // first resize pass, diff -> mid
+  template <typename pixel_t>
   __global__ void k_bb_pass1(BbParams b)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, w = b.w[0], h = b.h[0];
     if (x >= w || y >= h)
       return;
-    const uint8_t *s = b.h_first ? b.diff + (size_t)y * w + b.off1[x] : b.diff + (size_t)b.off1[y] * w + x;
-    b.mid[(size_t)y * w + x] = rs_sum<uint8_t>(s, b.h_first ? 1 : (size_t)w, b.c1 + (size_t)(b.h_first ? x : y) * b.taps1, b.taps1, 8);
+    const pixel_t *diff = (const pixel_t *)b.diff;
+    const pixel_t *s = b.h_first ? diff + (size_t)y * w + b.off1[x] : diff + (size_t)b.off1[y] * w + x;
+    ((pixel_t *)b.mid)[(size_t)y * w + x] = rs_sum<pixel_t>(s, b.h_first ? 1 : (size_t)w, b.c1 + (size_t)(b.h_first ? x : y) * b.taps1, b.taps1, b.bits);
   }
 
   // second pass (luma) and mt_makediff(thin, G); chroma is thin's; then the optional clamp; blockIdx.z = plane
+  template <typename pixel_t>
   __global__ void k_bb_final(BbParams b)
   {
     const int p = blockIdx.z, x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
     if (x >= b.w[p] || y >= b.h[p])
       return;
     const size_t o = (size_t)y * b.pitch[p] + x;
-    int v = b.thin[p][o];
+    int v = ((const pixel_t *)b.thin[p])[o];
     if (p == 0)
     {
       const int w = b.w[0];
-      const uint8_t *s = b.h_first ? b.mid + (size_t)b.off2[y] * w + x : b.mid + (size_t)y * w + b.off2[x];
-      const int g = rs_sum<uint8_t>(s, b.h_first ? (size_t)w : 1, b.c2 + (size_t)(b.h_first ? y : x) * b.taps2, b.taps2, 8);
-      v = v - g + 128;
-      v = v < 0 ? 0 : v > 255 ? 255 : v;
+      const pixel_t *mid = (const pixel_t *)b.mid;
+      const pixel_t *s = b.h_first ? mid + (size_t)b.off2[y] * w + x : mid + (size_t)y * w + b.off2[x];
+      const int g = rs_sum<pixel_t>(s, b.h_first ? (size_t)w : 1, b.c2 + (size_t)(b.h_first ? y : x) * b.taps2, b.taps2, b.bits);
+      v = v - g + b.half;
+      v = v < 0 ? 0 : v > b.maxv ? b.maxv : v;
     }
     if (b.nref)
     {
-      int up = 0, lo = 255;
+      int up = 0, lo = b.maxv;
       for (int j = 0; j < b.nref; j++)
       {
-        const int r = b.ref[j][p][o];
+        const int r = ((const pixel_t *)b.ref[j][p])[o];
         up = r > up ? r : up;
         lo = r < lo ? r : lo;
       }
-      up = up + b.sovs > 255 ? 255 : up + b.sovs;
+      up = up + b.sovs > b.maxv ? b.maxv : up + b.sovs;
       lo = lo - b.sovs < 0 ? 0 : lo - b.sovs;
       v = v < up ? v : up;
       v = v > lo ? v : lo;
     }
-    b.dst[p][o] = (uint8_t)v;
+    ((pixel_t *)b.dst[p])[o] = (pixel_t)v;
   }
 }
 
@@ -309,7 +318,7 @@ extern "C" int mvcuda_qtgmc_backblend(unsigned long long thin, unsigned long lon
   unsigned long long prog_v, int h_first, const unsigned long long *refs, int nref, int sovs, unsigned long long producer, int frame,
   MvCudaTokenHeader *out)
 {
-  if (!out || nref < 0 || nref > BB_REFS || (nref && !refs) || sovs < 0 || sovs > 255)
+  if (!out || nref < 0 || nref > BB_REFS || (nref && !refs) || sovs < 0 || sovs > 65535)
     return -4;
   if (!mvc::use_device())
     return -1;
@@ -321,10 +330,12 @@ extern "C" int mvcuda_qtgmc_backblend(unsigned long long thin, unsigned long lon
     if (!(fr[j] = mvc::frame_get(refs[j])))
       return MVCUDA_TOKEN_GONE;
   auto same = [&](const mvc::DevFrame &a) {
-    return a.f.width == ft->f.width && a.f.height == ft->f.height && a.f.planes == ft->f.planes && a.f.bytes_per_sample == 1
-      && a.f.bits_per_sample == 8 && a.f.x_ratio_uv == ft->f.x_ratio_uv && a.f.y_ratio_uv == ft->f.y_ratio_uv;
+    return a.f.width == ft->f.width && a.f.height == ft->f.height && a.f.planes == ft->f.planes
+      && a.f.bytes_per_sample == ft->f.bytes_per_sample && a.f.bits_per_sample == ft->f.bits_per_sample
+      && a.f.x_ratio_uv == ft->f.x_ratio_uv && a.f.y_ratio_uv == ft->f.y_ratio_uv;
   };
-  if (!same(*ft) || !same(*fl))
+  const int bps = ft->f.bytes_per_sample, bits = ft->f.bits_per_sample;
+  if (!((bps == 1 && bits == 8) || (bps == 2 && bits > 8 && bits <= 16)) || !same(*fl))
     return -4;
   for (int j = 0; j < nref; j++)
     if (!same(*fr[j]))
@@ -333,7 +344,7 @@ extern "C" int mvcuda_qtgmc_backblend(unsigned long long thin, unsigned long lon
   if (!ph || !pv || ph->target_size != ft->w[0] || pv->target_size != ft->h[0])
     return -4;
   const int w = ft->w[0], h = ft->h[0];
-  const size_t tmp = (size_t)w * h;
+  const size_t tmp = (size_t)w * h * bps;
   auto dst = mvc::frame_alloc(ft->f);
   uint8_t *diff = (uint8_t *)mvc::pipe_alloc(tmp), *mid = (uint8_t *)mvc::pipe_alloc(tmp);
   if (!dst || !diff || !mid)
@@ -350,7 +361,7 @@ extern "C" int mvcuda_qtgmc_backblend(unsigned long long thin, unsigned long lon
     for (int j = 0; j < nref; j++)
       b.ref[j][p] = (const uint8_t *)fr[j]->plane[p];
     b.dst[p] = (uint8_t *)dst->plane[p];
-    b.pitch[p] = ft->pitch[p];
+    b.pitch[p] = ft->pitch[p] / bps;
     b.w[p] = ft->w[p];
     b.h[p] = ft->h[p];
     max_w = b.w[p] > max_w ? b.w[p] : max_w;
@@ -369,12 +380,24 @@ extern "C" int mvcuda_qtgmc_backblend(unsigned long long thin, unsigned long lon
   b.h_first = h_first ? 1 : 0;
   b.nref = nref;
   b.sovs = sovs;
+  b.bits = bits;
+  b.maxv = (1 << bits) - 1;
+  b.half = 1 << (bits - 1);
   const int np = ft->f.planes;
   mvc::pipe_submit([=](cudaStream_t st) {
-    const dim3 gl((w + 127) / 128, h);
-    k_bb_diff<<<gl, 128, 0, st>>>(b);
-    k_bb_pass1<<<gl, 128, 0, st>>>(b);
-    k_bb_final<<<dim3((max_w + 127) / 128, max_h, np), 128, 0, st>>>(b);
+    const dim3 gl((w + 127) / 128, h), gf((max_w + 127) / 128, max_h, np);
+    if (bps == 2)
+    {
+      k_bb_diff<uint16_t><<<gl, 128, 0, st>>>(b);
+      k_bb_pass1<uint16_t><<<gl, 128, 0, st>>>(b);
+      k_bb_final<uint16_t><<<gf, 128, 0, st>>>(b);
+    }
+    else
+    {
+      k_bb_diff<uint8_t><<<gl, 128, 0, st>>>(b);
+      k_bb_pass1<uint8_t><<<gl, 128, 0, st>>>(b);
+      k_bb_final<uint8_t><<<gf, 128, 0, st>>>(b);
+    }
   });
   mvc::pipe_free(diff, tmp); // stream-ordered reuse
   mvc::pipe_free(mid, tmp);

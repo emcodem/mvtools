@@ -542,13 +542,13 @@ MVDegrainX::MVDegrainX(
     vi.height <<= 1;
   }
 
-  // GPU path: MDegrain1..6, 8 bit planar, pel 1 or 2, no limit / lsb / out16 / out32, super from a token clip
+  // GPU path: MDegrain1..6, 8 to 16 bit planar, pel 1 or 2, no limit / lsb / out16 / out32, super from a token clip
   if (_gpu_flag)
   {
     GpuBackend &gpu = GpuBackend::instance();
     _gpu_hpad = nSuperHPad;
     _gpu_vpad = nSuperVPad;
-    _gpu_ok = gpu.usable() && level >= 1 && level <= MVCUDA_MAX_DEGRAIN && _super_lite && pixelsize_super == 1 && (nPel == 1 || nPel == 2)
+    _gpu_ok = gpu.usable() && level >= 1 && level <= MVCUDA_MAX_DEGRAIN && _super_lite && (pixelsize_super == 1 || pixelsize_super == 2) && (nPel == 1 || nPel == 2)
       && !lsb_flag && !out16_flag && !out32_flag
       && nLimit >= 255 && nLimitC >= 255 && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || vi.NumComponents() >= 3)
       && vi.width >= (int)sizeof(MvCudaTokenHeader);

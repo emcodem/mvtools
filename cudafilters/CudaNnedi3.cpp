@@ -1,5 +1,5 @@
 // CudaNNEDI3: plugins_JPSDR 4.1.0 nnedi3 on the GPU (mvtools_cuda.dll mvcuda_nnedi3), bit for bit for what the plugin runs
-// on this machine when that is its opt 6 path (AVX2 + FMA3, no AVX-512): 8-bit planar input, dh = false, new prescreener
+// on this machine when that is its opt 6 path (AVX2 + FMA3, no AVX-512): 8 or 10-bit planar input, dh = false, new prescreener
 // (pscrn 2..4), int16 predictor with the fastest exp (fapprox with bits 2 and 8 set; default 15), qual 1 / 2, any nsize /
 // nns / etype. Anything else, or a CPU whose rcpps / rsqrtps tables do not have the expected structure, uses the plugin.
 //
@@ -122,7 +122,7 @@ namespace
     }
 
     // the plugin's weight preparation for the new prescreener and the int16 predictor, plain order
-    bool prepare(int nsize, int nns, int qual, int etype, int pscrn, IScriptEnvironment *env)
+    bool prepare(int nsize, int nns, int qual, int etype, int pscrn, int bits, IScriptEnvironment *env)
     {
       HMODULE hmod = GetModuleHandleW(L"plugins_JPSDR.dll");
       if (!hmod)
@@ -167,7 +167,7 @@ namespace
             cmean += bdw[offt[j * 64 + k]];
           mean[j] = cmean / 64.0;
         }
-        const int prescreener_bits = 8;
+        const int prescreener_bits = std::min(bits, 15);
         const double half = (((int)1 << prescreener_bits) - 1) / 2.0;
         for (int j = 0; j < 4; j++)
         {
@@ -307,8 +307,8 @@ namespace
       CudaLib &lib = CudaLib::get();
       if (!lib.ok)
         _why = "GPU library not usable";
-      else if (!make_format(svi, _fmt) || _fmt.bits_per_sample != 8 || !svi.IsPlanar() || svi.IsRGB())
-        _why = "only 8-bit planar YUV / Y";
+      else if (!make_format(svi, _fmt) || (_fmt.bits_per_sample != 8 && _fmt.bits_per_sample != 10) || !svi.IsPlanar() || svi.IsRGB())
+        _why = "only 8 or 10-bit planar YUV / Y (above 10 bit the plugin takes its C extract; 9 bit untested)";
       else if (dh || field < 0 || field > 3)
         _why = "dh not supported";
       else if (eff_opt != 6 && eff_opt != 7)
@@ -318,8 +318,11 @@ namespace
         _why = "parameters not supported (pscrn 2..4, fapprox int16 predictor + fastest exp, qual 1 / 2)";
       else if (!hw_tables().ok)
         _why = "this CPU's rcpps / rsqrtps tables do not have the expected structure";
-      else if (prepare(nsize, nns, qual, etype, pscrn, env))
+      else if (prepare(nsize, nns, qual, etype, pscrn, _fmt.bits_per_sample, env))
       {
+        // range 1 (the plugin's default; this filter has no range argument): 0 .. 2^bits - 1
+        for (int i = 0; i < 3; i++)
+          _vmax[i] = (1 << _fmt.bits_per_sample) - 1;
         _mask = (Y ? 1 : 0) | (_fmt.planes == 3 && U ? 2 : 0) | (_fmt.planes == 3 && V ? 4 : 0);
         _ok = true;
         _producer = lib.producer_register(&CudaNnedi3::regen, this);

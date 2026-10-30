@@ -50,6 +50,7 @@ namespace cf
     CF_LOAD(temporal_soften, "mvcuda_temporal_soften");
     CF_LOAD(merge, "mvcuda_merge");
     CF_LOAD(lut2_create, "mvcuda_lut2_create");
+    CF_LOAD(lut2_create_bits, "mvcuda_lut2_create_bits");
     CF_LOAD(lut2_free, "mvcuda_lut2_free");
     CF_LOAD(kobs, "mvcuda_kobs");
     CF_LOAD(removegrain, "mvcuda_removegrain");
@@ -64,7 +65,7 @@ namespace cf
     CF_LOAD(temporal_binomial, "mvcuda_temporal_binomial");
 #undef CF_LOAD
     ok = version && count && upload && download && producer_register && producer_unregister && regenerate && stats
-      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && version() == MVCUDA_API_VERSION && count() > 0;
+      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_create_bits && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && version() == MVCUDA_API_VERSION && count() > 0;
   }
 
   bool make_format(const VideoInfo &vi, MvCudaFrameFormat &f)

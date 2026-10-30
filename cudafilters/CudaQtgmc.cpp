@@ -1,6 +1,7 @@
 // QTGMC's output side (QTGMC.avsi "Create basic output" .. "Add back any extracted noise") as fused GPU steps; each filter's
 // CPU fallback is exactly the chain of CPU filters it replaces (inputs through CudaDownload), which also runs for what the
-// kernels do not cover (formats other than 8-bit YUV / Y, other modes).
+// kernels do not cover (other modes; formats: SharpLimit with tables and AddNoise up to 10 bit, SharpLimit smode 0 up to
+// 15 bit, BackBlend up to 16 bit, YUV / Y).
 //
 // CudaQtgmcSharpLimit(edi, degrain1, fComp1, bComp1, resharpExpr, rgBlur, Sovs, degrain2, fComp3, bComp3, tr1 = 1,
 // smode = 2, precise = false, nref = 3): binomial1 .. sharpLimit1 in one step (mvcuda_qtgmc_sharp, mvcuda_kobs.cu):
@@ -52,7 +53,7 @@ namespace
     return invoke(env, "mt_clamp", { c, tmax, tmin, sovs, sovs, p3, p3, p3 }, { nullptr, nullptr, nullptr, "overshoot", "undershoot", "Y", "U", "V" });
   }
 
-  // RemoveGrain modes the GPU computes (8 bit): 12, and 11 where RgTools runs its SSE4.1 code (identical to 12 there)
+  // RemoveGrain modes the GPU computes: 12, and 11 where RgTools runs its SSE4.1 code (identical to 12 there)
   bool rg_blur_ok(int rg_blur, IScriptEnvironment *env)
   {
     return rg_blur == 12 || (rg_blur == 11 && (env->GetCPUFlags() & CPUF_SSE4_1));
@@ -153,7 +154,7 @@ namespace
         _cpu = resharp;
       vi = _cpu->GetVideoInfo();
 
-      // Merge weights: the weighted mode of CudaMerge (8 bit: no scalar-tail difference)
+      // Merge weights: the weighted mode of CudaMerge (below 16 bit: no scalar-tail difference)
       auto weight = [](float w, int &wi, int &inv) {
         wi = (int)(w * 32767.0f + 0.5f);
         inv = 32767 - wi;
@@ -163,16 +164,18 @@ namespace
       weight(tr1 == 2 ? 0.0625f : 0.25f, _q.w2, _q.inv2);
       _q.smode = smode;
       _q.nref = nref;
-      _q.sovs = sovs;
       CudaLib &lib = CudaLib::get();
       MvCudaFrameFormat f2;
-      _ok = lib.ok && (smode == 0 || rg_blur_ok(rg_blur, env)) && sovs >= 0 && sovs <= 255 && make_format(vi, _fmt) && _fmt.bits_per_sample == 8;
+      _ok = lib.ok && (smode == 0 || rg_blur_ok(rg_blur, env)) && sovs >= 0 && sovs <= 255 && make_format(vi, _fmt);
+      const int bits = _fmt.bits_per_sample;
+      _ok = _ok && (smode ? bits <= 10 : bits < 16); // tables up to 10 bit; 16-bit Merge rounds differently
+      _q.sovs = _ok ? scale_i8(sovs, bits) : 0;   // mt_clamp's overshoot in sample units
       for (PClip c : { d1, d2, fc1, bc1, fc3, bc3 })
         _ok = _ok && make_format(c->GetVideoInfo(), f2) && same_format(_fmt, f2);
       if (_ok && smode)
-        _ok = (_q.lut = lut_from_cpu(expr, 1, env)) != 0;
+        _ok = (_q.lut = lut_from_cpu(expr, 1, env, bits)) != 0;
       if (_ok && smode == 2 && precise)
-        _ok = (_q.lut_precise = lut_from_cpu(precise_expr, 2, env)) != 0;
+        _ok = (_q.lut_precise = lut_from_cpu(precise_expr, 2, env, bits)) != 0;
       if (_ok)
         _producer = lib.producer_register(&CudaSharpLimit::regen, this);
       if (log_enabled())
@@ -264,8 +267,9 @@ namespace
 
       CudaLib &lib = CudaLib::get();
       MvCudaFrameFormat f2;
-      _ok = lib.ok && make_format(vi, _fmt) && _fmt.bits_per_sample == 8 && sovs >= 0 && sovs <= 255
-        && make_format(lossed->GetVideoInfo(), f2) && same_format(_fmt, f2);
+      _ok = lib.ok && make_format(vi, _fmt) && sovs >= 0 && sovs <= 255 && make_format(lossed->GetVideoInfo(), f2) && same_format(_fmt, f2);
+      const int bits = _fmt.bits_per_sample;
+      _sovs = _ok ? scale_i8(sovs, bits) : 0; // mt_clamp's overshoot in sample units
       for (int j = 0; j < nref && _ok; j++)
         _ok = make_format(refs[j]->GetVideoInfo(), f2) && same_format(_fmt, f2);
       // the luma programs of GaussResize(w, h, 0, 0, src_w, src_h, p=5) (FilteredResize::CreateResize, see CudaResize.cpp):
@@ -275,8 +279,8 @@ namespace
       {
         const GaussianKernel kernel(5.0, 2.0, 4.0);
         _h_first = !(src_h * w < src_w * h);
-        const ResampleProgram ph = make_program(kernel, w, 0.0, src_w, w, 8, 0.5, 0.5);
-        const ResampleProgram pv = make_program(kernel, h, 0.0, src_h, h, 8, 0.5, 0.5);
+        const ResampleProgram ph = make_program(kernel, w, 0.0, src_w, w, bits, 0.5, 0.5);
+        const ResampleProgram pv = make_program(kernel, h, 0.0, src_h, h, bits, 0.5, 0.5);
         _ph = lib.resample_program_create(ph.target_size, ph.taps, ph.offset.data(), ph.coeff.data());
         _pv = lib.resample_program_create(pv.target_size, pv.taps, pv.offset.data(), pv.coeff.data());
         _ok = _ph && _pv;
@@ -311,8 +315,8 @@ namespace
 
   // CudaQtgmcAddNoise(c, noise, expr, use_expr = 0, clamp_float = false, lutUV = 1, addUV = 2): QTGMC's grain / noise restore
   //   c.mt_adddiff(noise.mt_lut(expr, use_expr=use_expr, clamp_float=clamp_float, U=lutUV,V=lutUV), U=addUV,V=addUV)
-  // as one table lookup per sample: the plugin runs exactly that chain on the 256 x 256 pattern (x = c, y = noise) and uses
-  // the result as the table (mvcuda_mt, MVCUDA_MT_LUT). Chroma on the GPU for addUV 2 (copy c) or lutUV = addUV = 3.
+  // as one table lookup per sample: the plugin runs exactly that chain on the n x n pattern (x = c, y = noise; n = 256 at 8
+  // bit, 1024 at 10 bit) and uses the result as the table (mvcuda_mt, MVCUDA_MT_LUT). Chroma on the GPU for addUV 2 (copy c) or lutUV = addUV = 3.
   class CudaAddNoise : public GenericVideoFilter
   {
   public:
@@ -347,12 +351,13 @@ namespace
       vi = _cpu->GetVideoInfo();
       CudaLib &lib = CudaLib::get();
       MvCudaFrameFormat f2;
-      _ok = lib.ok && make_format(vi, _fmt) && _fmt.bits_per_sample == 8 && make_format(noise->GetVideoInfo(), f2) && same_format(_fmt, f2)
+      _ok = lib.ok && make_format(vi, _fmt) && _fmt.bits_per_sample <= 10 && make_format(noise->GetVideoInfo(), f2) && same_format(_fmt, f2)
         && (add_uv == 2 || (add_uv == 3 && lut_uv == 3));
       if (add_uv == 3)
         _op[1] = _op[2] = MVCUDA_MT_LUT;
       if (_ok)
-        _ok = (_lut = lut_from_frame(chain(pattern_clip(false), pattern_clip(true))->GetFrame(0, env))) != 0;
+        _ok = (_lut = lut_from_frame(chain(pattern_clip(false, _fmt.bits_per_sample), pattern_clip(true, _fmt.bits_per_sample))->GetFrame(0, env),
+          _fmt.bits_per_sample)) != 0;
       if (_ok)
         _producer = lib.producer_register(&CudaAddNoise::regen, this);
       if (log_enabled())

@@ -564,8 +564,12 @@ namespace
     }
   };
 
-  // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial
-  __global__ void __launch_bounds__(768, 1) k_search(LevelArgs a)
+  // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial.
+  // Threads per block: with 768 the kernel was capped at 80 registers and the SAD code spilled 2.7 KB per thread, which
+  // made the candidate rounds limited by local-memory traffic; 256 compiles without spills (GPU_PIPELINE_PLAN.md
+  // section 25, S1: FRC chain -9%).
+  constexpr int SEARCH_THREADS = 256;
+  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search(LevelArgs a)
   {
     extern __shared__ __align__(16) pix s_dyn[];
     __shared__ BlockShared b;
@@ -2570,7 +2574,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
         AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
       {
         const size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
-        k_search<<<a.n_slices, 768, shm, st>>>(a);
+        k_search<<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
       }
       AN_CHECK(cudaGetLastError());
     }

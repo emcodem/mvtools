@@ -887,3 +887,148 @@ per-call latency), `run_ab_avs.ps1` (A/B of DLL folders, keeps md5 mismatches ag
 `-Env2 CUDAFILTERS_STATS=1`), `run_concurrent.ps1` now passes `-nostdin` (four ffmpeg processes started from a PowerShell job
 hung in PeekNamedPipe on their shared stdin; a harness artifact, not a GPU hang).
 Test DLL set: `profile\build_e` (API 14; sm_120 dev build). The release DLL (build.bat, all architectures) was not rebuilt.
+Released 2026-10-30: commit 01b702a, pre-release gpu-qtgmc-2026-10-30 (release set `profile\build_rel14`).
+
+## 25. To do (agreed 2026-10-30): mvtools on the cudafilters model, then 10 bit everywhere
+
+User's request: port the older mvtools GPU filters to the model the cudafilters use (both inside and in how scripts use them),
+and support 10 bit wherever the CPU filter supports it. Rules unchanged: bit-exact with the CPU filter, silent fallback,
+`gpu=true` stays opt-in.
+
+**Where the mvtools filters stand (code read 2026-10-30).** MCompensate / MDegrain1..6 already follow the model (registry,
+token output, regeneration, submitter). The older paths do not:
+- MAnalyse host path (and the slice kernel, `meander=true`), MRecalculate and MFlowFps launch from the worker threads on leased
+  streams, with a host wait per call (`cudaStreamSynchronize`, `mvcuda_analyse.cu:2677`, `mvcuda_recalc.cu:377`,
+  `mvcuda_flow.cu:587`); only token + wave MAnalyse uses `pipe_call`.
+- They keep their own super cache (`mvcuda_core.cu:192-331`): counted in frames (`MVCUDA_CACHE_FRAMES`), outside the registry
+  budget, never shrinks. The key holds `levels` and `rfilter`, so the FRC chain uploads each source picture twice (levels=N for
+  MAnalyse, levels=1 for MRecalculate / MFlowFps; MFlowFps hard-codes rfilter 4, `MVFlowFps.cpp:599-602`).
+- `super_build` syncs once per plane only to give back the pinned staging buffer (`mvcuda_super.cu:329-339`).
+- MRecalculate refuses token pictures and falls to the CPU (`MVRecalculate.cpp:719-722`); MFlowFps downloads tokens
+  (`ResolveToken`, `MVFlowFps.cpp:571`) and uploads them again; MFlowFps output is always a host frame (pageable D2H + wait).
+- Vector payloads go up with pageable copies (MRecalculate old vectors, 4 MFlowFps vector fields).
+- MCompensate / MDegrain do not upload host input (`GpuBackend::with_tokens` has no upload branch, unlike `cf::with_inputs`).
+- mvtools `write_token` writes no black stripes (`GpuBackend.cpp:162-165` vs `CudaFilters.cpp:101-108`).
+- gpu.md errors in the 2026-10-30 release: line 11 says API 13 (14); line 50 claims MRecalculate / MFlowFps use token frames.
+FRC chain today per source frame: about 2 full uploads, 4 small downloads, 1 output download per output frame, ~11 host waits.
+
+**Usage rule (same as cudafilters):** token frames in -> token frames out; normal frames in -> normal frames out (computed on the
+GPU, uploaded inside the filter). Existing scripts (uc_FRC, QTGMC_gpu.avsi) keep working unchanged.
+
+**Part M: mvtools port (in this order; each step bit-exact, md5 = CPU fallback):**
+- M1 One upload per source picture: host input is uploaded once, async on the upload stream, into a registry frame keyed by
+  (super clip, n) with a producer that re-reads its child (as `CudaUpload::regen`); MAnalyse / MRecalculate / MFlowFps then all
+  take the device path. No per-plane syncs (`pin_release_after`).
+- M2 Super pyramids into the registry budget (accounted on the source frame like the pel-2 sub-pel planes, `frame_account_extra`);
+  level 0 shared regardless of `levels` / `rfilter`; retire `MVCUDA_CACHE_FRAMES` (keep it read, ignored or as a cap).
+- M3 MRecalculate and MFlowFps read token frames (`super_build_dev` ordered by marks), drop the refusal / ResolveToken.
+- M4 Submitter for every call (slice-kernel MAnalyse, MRecalculate, MFlowFps); vector uploads through pinned `pipe_upload`;
+  vector downloads wait on a blocking-sync event instead of a leased-stream sync.
+- M5 MFlowFps token output when its input is token frames, producer + regeneration; host output otherwise.
+- M6 MCompensate / MDegrain upload host input (upload + re-upload-after-regen branch in `with_tokens`), host out for host in.
+- M7 Cleanup: MAnalyse uses `with_tokens` instead of its inline copy; black stripes in mvtools tokens; `_gpu_mutex` not held over
+  the CPU path; gpu.md (API, readers list, usage rule).
+Measure: uc_FRC chain (time, CPU-s, 4 concurrent jobs, VRAM), QTGMC presets unchanged or faster.
+
+**Part B: 10 bit (stored in 16-bit containers; every CPU filter involved supports it):**
+- B1 MCompensate / MDegrain 16-bit (`mvcuda_comp.cu`): template on pixel type; 16-bit overlap arithmetic differs from 8 bit
+  (int accumulate of val*win, then `min((acc + 1024) >> 11, maxv)`, `overlap.cpp:449-463`); Wiener sub-pel clamped to maxv;
+  thSAD scaling is host-side already. Gates: `MVCompensate.cpp:243`, `MVDegrain3.cpp:551`, `mvcuda_comp.cu:236/341`.
+- B2 RgTools / MaskTools / QTGMC stages 16-bit (`mvcuda_kobs.cu`, backblend in `mvcuda_resample.cu`, CudaKobs / CudaMt /
+  CudaQtgmc gates): template kernels, half / max scaling; check RgTools 16-bit rounding (RemoveGrain 12 / 20); lutxy tables
+  1024x1024 at 10 bit (from the CPU filter as now), expressions evaluated on the GPU above 10 bit or CPU there.
+- B3 CudaNNEDI3 above 8 bit: new port of plugins_JPSDR's high-bit-depth prescreener / predictor (largest uncertainty).
+- B4 QTGMC script: drop `BitsPerComponent(Input) == 8` (`make_qtgmc_gpu.py:66`), check the `!Is420` search-clip exclusion
+  (`:49`, reason not written down), FastMA's 8-bit search-clip download.
+- B5 Optional speed: packed 16-bit SAD (`__vsadu2`) in k_wave / k_search (10-bit analysis currently uses the unpacked form).
+Tests: 10-bit 4:2:0 and 4:2:2 real material (e.g. XDCAM / ProRes 10-bit), framemd5 GPU = CPU per stage (run_cf_regression cases
++ negative controls), run_presetcheck -Fallback for every preset at 10 bit, FRC chain at 10 bit.
+Estimates (code reading): M 1.5-2 weeks, B1 2-4 days, B2 1-2 weeks, B3 1-2 weeks, B4 1 day, B5 2-4 days.
+
+**FRC baseline before Part M (2026-10-30, build_rel14, `profile\run_frc.ps1`, template `avs\m\frc.avs.tpl` = uc_FRC with
+uc_frc_gpu, seg1_wires_pole.mp4 = UHD 4:2:2 10 bit, 112 output frames, Prefetch 3):** 8.71 s / 21.5 CPU-s (best of 3), CPU
+fallback 20.2 s / 168 CPU-s, md5 BFE44775F811 everywhere. Decode alone 1.57 s. nsys (out\nsys\frc_base): GPU kernel time 6.1 s,
+of it **k_search 5.84 s (95.5%, 3.66 ms x 1596, the meander=true slice kernel, 16-bit samples, unpacked SAD)**, k_recalc 0.19 s,
+k_flow 0.02 s; copies 0.49 s H2D + 0.38 s D2H (pageable); host API time cudaMemcpyAsync 7.3 s and cudaStreamSynchronize 2.7 s
+(summed over threads). Note: uc_FRC's two supers are different clips (RemoveGrain(22) full pyramid for MAnalyse, the source
+levels=1 for MRecalculate / MFlowFps), so the "same picture uploaded twice" item mostly does not apply to it.
+Consequence: Part M can at best close the gap between 6.1 s of kernels and 8.7 s wall (about -25%); the FRC lever is k_search
+on 16-bit data (B5 packed `__vsadu2`, and the k_wave lessons of section 24 applied to the slice kernel).
+
+**Order agreed 2026-10-30 (after a doom9 reply: trymany, large exhaustive radius, coarse searchparam > 3 and pel 4 all run on
+the CPU today; same quality, no acceleration):** S1 faster k_search on 10/16 bit (packed SAD) -> S2 exhaustive radius > 3 and
+coarse searchparam > 3 (MAnalyse, MRecalculate) -> S3 trymany -> S4 pel 4 with sub-pel samples computed on the fly -> Part M
+-> rest of Part B. All bit-exact. neo-mv's new algorithms (predictors, chroma-wiener) are out of scope (other fork, no stable
+CPU reference).
+
+**S1 result (2026-10-30, uncommitted, test set `profile\build_s1` = build_rel14 + new mvtools_cuda.dll):**
+- Phase counters (`-DMVC_PHASE_PROF`) of the slice kernel on the FRC chain, per block at 768 threads: wait+pred 4,200 cycles,
+  phase A 4,650, fold A 2,950, ring (24 candidates) 13,300, fold B 1,800. The ring cost the same with 12 warps as with 24.
+- Cause: `__launch_bounds__(768, 1)` capped k_search at 80 registers; ptxas: 2.7 KB spill stores / 4.0 KB spill loads per
+  thread (the compile-time row arrays of eval_candidate and the refine path). 384 threads still spill (0.8 / 3.2 KB), **256
+  threads: no spills** (8 and 16 bit). Change: `SEARCH_THREADS = 256`.
+- FRC chain: 8.71 -> **7.87 s** (-10%), md5 unchanged (BFE44775F811, = CPU fallback). meander=true QTGMC-type analyses
+  (run_qtgmc_vec GPU run, wall incl. start-up): HD Placebo 13.8 -> 8.7 s, HD Slower 9.1 -> 5.5, HD Medium 6.0 -> 3.4, UMH ps16
+  3.0 -> 2.4. Exactness: golden 85/85, run_qtgmc_vec 50/50 IDENTICAL, FRC = fallback.
+- Tried and dropped (patch kept in `profile\out\frc\s1_window_experiment.patch`): a shared-memory window of the ring's
+  reference area (cp.async 4 / 16 bytes, candidates of a warp evaluated together). Exact, but no gain: the window load cost
+  6-7k cycles at level 0 (4 sub-pel planes) and the SADs from shared memory still ~10k cycles with 8 warps (2 warps per
+  scheduler cannot hide the shared-load latency). Wall 8.14 s with it vs 7.90 without.
+- What limits the slice kernel now: per block ~3 dependent round trips (predictors, phase A, ring), ~1,340 blocks per slice
+  in series at UHD level 0, only 24 CTAs (= CPU thread count, fixed by exactness).
+- **meander=false (wavefront kernel k_wave) on the same FRC chain: 5.51 s / 21 CPU-s (-37% vs 8.71)**, identical to the CPU
+  fallback with meander=false (8DB9CD4E). Different vectors than uc_FRC's meander=true: a picture-quality decision for the
+  user (uconvert.avsi), not done.
+
+**B1 + B2 done (2026-10-30, uncommitted, library API 15, test set `profile\build_b2`):**
+- B1 `mvcuda_comp.cu`: k_blocks / k_subpel templated on the sample type; 16-bit overlap = 32-bit sum of sample * window,
+  min((sum + 1024) >> 11, max) (Short2Bytes_Int32toWord16), degrain (sum + 128) >> 8 as at 8 bit, Wiener sub-pel clamped
+  to max. Gates in MVCompensate.cpp / MVDegrain3.cpp accept pixelsize 2.
+- B2 `mvcuda_kobs.cu` (RemoveGrain, mt ops, KeepOnlyBobShimmerFixes, SharpLimit) and the back blend (`mvcuda_resample.cu`)
+  templated; RemoveGrain 20 on 16-bit containers is rg_mode20_sse_16: (sum + 4) * 3641 >> 15, saturated to 65535.
+  Lookup tables up to 10 bit (`mvcuda_lut2_create_bits(luma, chroma, bits)`, API 15): 1024 x 1024 uint16 tables made by
+  running the installed CPU filter on a 4:4:4 pattern clip. **Two tables, luma and chroma**: with use_expr (1 above 8 bit,
+  3 always) masktools hands the expression to Expr, and Expr gives chroma other results than luma for expressions with
+  scalef / range_half (found through QTGMC Fast at 10 bit: KeepOnlyBobShimmerFixes' second lut, use_expr=1). Table indices
+  are clamped to max (AviSynth+ Sharpen leaves samples above 1023 in 10-bit clips; the CPU's Expr computes with them, a
+  table cannot). masktools' i8 parameter scaling for mt_clamp / Sovs: 255 = max, else << (bits - 8) (`cf::scale_i8`).
+  Not on the GPU: tables above 10 bit (and 9 bit: no Y9 / 4:4:4 9-bit pattern clip), SharpLimit at 16 bit (Merge rounds
+  differently there).
+- Tests: run_cf_regression 61 / 61 (MCompensate / MDegrain / KeepOnly / RemoveGrain / mt ops / SharpLimit / BackBlend /
+  AddNoise now in 422p10, 420p10, 444p16 too; new cases 'mt_lutxy expr chroma', 'KeepOnly 4 chroma blur'); GPU use at
+  10 bit confirmed per case (CUDAFILTERS_LOG / MVTOOLS_GPU_LOG / CUDAFILTERS_STATS).
+
+**B4 done (2026-10-30):** `make_qtgmc_gpu.py` no longer requires 8-bit input for the GPU output side; the 4:2:0 search-clip
+exclusion is narrowed to 4:2:0 **with ChromaMotion** (Slower / Very Slow / Placebo). Its reason, found by removing it: with
+4:2:0 + ChromaMotion the GPU search clip differs from the CPU chain (Slower 8 and 10 bit; Fast and Medium at 4:2:0 are
+identical) - **open: find the stage** (candidates: CudaBob / GaussResize chroma placement or a chroma lut on 4:2:0).
+run_presetcheck -Fallback, 60 frames, all variants identical: 10-bit 4:2:2 Fast / Medium / Slower, 4:2:0 8 and 10 bit Fast
+/ Slower. NNEDI3 stays on the CPU above 8 bit (B3 open, exact fallback).
+
+**To do: QTGMC GPU default meander=true (user 2026-10-30: "match whatever stock QTGMC does").** Doom9's only measurement
+(zorr, Zopti on MFlowFps, GMSD) found meander=false clearly worse. Measured 2026-10-30 with build_s1, PAL 1500 frames,
+'gpu all', `QTGMC_gpu_meander = true`: output identical to stock CPU QTGMC (Fast EB74AA6E7731, Slower 61DA3321F664) but
+**Fast 19.44 s / Slower 62.79 s vs CPU 6.83 / 13.96 and meander=false GPU 1.80 / 4.36**. The slice kernel is serial by
+nature (a meander row starts where the row above ended; 24 slices = CPU threads) and still uses the host-synchronised
+call path. Plan: M4 for the slice kernel (submitter, no host waits, many calls in flight), then the remaining per-block
+latency of section 24 / S1; switch the default in `make_qtgmc_gpu.py` (and QTGMC_gpu.avsi) once 'gpu all' with meander=true
+is clearly faster than the CPU. Until then the default stays false, QTGMC_gpu_meander=true gives the stock result.
+
+**B3 done (2026-10-30, test set `profile\build_b3`, library API unchanged 15):** CudaNNEDI3 at 10 bit. Much smaller than the
+estimate: at <= 10 bit plugins_JPSDR (opt 6) runs the same prescreener network (computeNetwork0new_AVX2), dotProd,
+e0_m16_FMA3 and weightedAvgElliottMul5 as at 8 bit; its `_16` functions differ only in integer work (asm diffed):
+uc2s64_C_16 copies the samples as int16, extract_m8_i16_AVX2_16 sums with pmaddwd (float tail identical), castScale_AVX_16
+stores a word, processLine0_AVX2_ASM_16 computes the cubic in int32 + packusdw (same result as the 8-bit saturating form).
+Changes: `mvcuda_nnedi3.cu` kernels templated on the sample type (network inputs read as int16 like pmaddwd, cubic as
+uint16), one queue-counter sequence for both types; `CudaNnedi3.cpp` prescreener weights scaled with half = (2^bits - 1) / 2,
+clamp 0 .. 2^bits - 1 (the plugin's default range 1), gate 8 or 10 bit. Above 10 bit the plugin takes extract_m8_i16_C_16_4
+(other float order) -> CPU; 9 bit stays on the CPU (AviSynth+ ConvertBits cannot make 9-bit clips, untested).
+Tests: run_cf_regression 65 / 65 (new: NNEDI3 Fast in 422p10 / 420p10 / 444p10 / y10 / 422p12 (fallback), big qual2 10 bit,
+pscrn4 etype1 10 bit, samples above 1023 after Sharpen); negative control (nns 1 vs 0) differs on every frame; GPU use
+confirmed (CUDAFILTERS_LOG). run_presetcheck -Fallback -Check Fast / Medium / Slower / Placebo at 10-bit 4:2:2, 10-bit 4:2:0
+and 8-bit: ALL PASS, CudaNNEDI3 on the GPU in all, md5 unchanged from build_b2.
+Speed (PAL 1500 frames, 'gpu all', Prefetch 12, best of 3): Fast 10 bit 3.34 s / 45.8 CPU-s -> **1.94 s / 12.0 CPU-s** (8 bit
+1.76 / 8.5; CPU 15.07 s / 232 CPU-s); Slower 10 bit 5.58 s / 69.2 -> **5.61 s / 12.3** (8 bit 4.24; CPU 27.48 s): Slower at
+10 bit is bound by the GPU analysis (unpacked 16-bit SAD in k_wave, B5), not by NNEDI3.
+Left of Part B: lookup tables above 10 bit (B2), NNEDI3 above 10 bit, B5 packed 16-bit SAD, the 4:2:0 + ChromaMotion
+search-clip difference (B4).

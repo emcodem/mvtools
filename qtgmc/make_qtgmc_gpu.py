@@ -29,7 +29,7 @@ def main():
     sub('msuper', r'(srchClip\.MSuper\( pel=SubPel, sharp=SubPelInterp, hpad=hpad, vpad=vpad, chroma=ChromaMotion)(, mt=bomt)? \)',
         lambda m: m.group(1) + (m.group(2) or '') + ', gpu=QTGMC_gpu )')
     # MAnalyse: "DCT=DCT, chroma=ChromaMotion, mt=bomt )" and "DCT=DCT, chroma=ChromaMotion ) : NOP()"
-    # (meander=false with the GPU: wavefront search, GPU_PIPELINE_PLAN.md W; QTGMC_gpu_meander=true keeps the slice kernel)
+    # (meander=false with the GPU: wavefront search, GPU_PIPELINE_PLAN.md W; QTGMC_gpu_meander=true keeps the slice kernel = stock result)
     sub('manalyse_mt', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion, mt=bomt) \)',
         r'\1, gpu=QTGMC_gpu, meander=!QTGMC_gpu || QTGMC_gpu_meander )')
     sub('manalyse', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion) \) : NOP\(\)',
@@ -43,10 +43,13 @@ def main():
     # GPU search clip (cudafilters.dll, GPU_PIPELINE_PLAN.md sections 17 and 22): bob, temporal soften, merges,
     # KeepOnlyBobShimmerFixes, RemoveGrain 12, Gauss / Bilinear resize, the SrchClipPP 3 mt_lutxy pair as Cuda* filters,
     # bit-exact; for every preset's pre-filter (TR0 0..2, SrchClipPP 0..3, with or without chroma motion), 4:2:2 / 4:4:4 /
-    # Y input (8-bit for the masktools / RemoveGrain stages; other depths fall back to the CPU filters inside)
+    # Y input, 4:2:0 without chroma motion (with it, Slower / Very Slow / Placebo differ from the CPU chain: open, see
+    # GPU_PIPELINE_PLAN.md section 25 B4), 8 to 16 bit (stages without a GPU path at a bit depth fall back to their CPU
+    # filters inside)
     sub('srchclip_gpu', r'(\n\tsrchClip    = srchcheck         \? srchClip : \\\n(?:[^\n]*\\\n)*[^\n]*\n)',
         lambda m: m.group(1) + '\tsrchClip    = (QTGMC_gpu && QTGMC_gpu_search && !srchcheck && InputType == 0 && UseEdiExt == 0 && TR0 >= 0 && TR0 <= 2 \\\n'
-        '\t               && SrchClipPP >= 0 && SrchClipPP <= 3 && !yuy2 && !Border && !tv_range && !Is420(planarClip)) \\\n'
+        '\t               && SrchClipPP >= 0 && SrchClipPP <= 3 && !yuy2 && !Border && !tv_range \\\n'
+        '\t               && !(Is420(planarClip) && ChromaMotion)) \\\n'
         '\t               ? QTGMC_gpu_srchclip( planarClip, TR0, Rep0, SrchClipPP, ChromaMotion, RepChroma, w, h, epsilon, \\\n'
         '\t               !QTGMC_gpu_tokens || ProgSADMask > 0.0 || (ShutterBlur > 0 && SBlurLimit > 0) || (sbpc > 8 && FastMA) ) : srchClip\n')
     # NNEDI3 interpolation (both calls) through QTGMC_gpu_nnedi3: CudaNNEDI3 (bit-exact port of plugins_JPSDR nnedi3, falls
@@ -62,8 +65,7 @@ def main():
     sub('gpu_out_flag', r'(\n\tedi1 = defined\(EdiExt\))',
         lambda m: '\n\tQTGMC_gpuOut = QTGMC_gpu && QTGMC_gpu_out && !yuy2 && InputType == 0 && !defined(EdiExt) && ChromaEdi == "" \\\n'
         '\t               && TR1 <= 2 && TR2 <= 3 && Rep1 == 0 && SourceMatch == 0 && Lossless == 0 && SMode <= 2 && SVThin <= 0.0 && Sbb <= 3 \\\n'
-        '\t               && (SLMode == 0 || SLMode == 2) && !lsb && !n16 && SubPel <= 2 && SubPelInterp == 2 && ProgSADMask <= 0.0 \\\n'
-        '\t               && BitsPerComponent(Input) == 8\n'
+        '\t               && (SLMode == 0 || SLMode == 2) && !lsb && !n16 && SubPel <= 2 && SubPelInterp == 2 && ProgSADMask <= 0.0\n'
         '\tglobal QTGMC_gpu_edi_token = QTGMC_gpuOut && QTGMC_gpu_edi && EdiMode == "NNEDI3"' + m.group(1))
     sub('gpu_out_addnoise2', r'(\n\taddNoise2 = \(NoiseRestore <= 0\.0\) \? lossed2 : \\\n[^\n]*\n)',
         lambda m: m.group(1) + '\tglobal QTGMC_gpu_edi_token = false\n'
@@ -74,7 +76,7 @@ def main():
         '\t                                              "x " + noiseCentre + " scalef - " + string(NoiseRestore) + " * range_half +", \\\n'
         '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ).CudaDownload() : addNoise2\n')
     text = ('global QTGMC_gpu = false # set to true after Import to run the mvtools motion analysis on the GPU (profile\\qtgmc\\make_qtgmc_gpu.py)\n'
-            'global QTGMC_gpu_meander = false # with QTGMC_gpu: false = wavefront search (meander=false, single slice), true = exact CPU-mt result\n'
+            'global QTGMC_gpu_meander = false # with QTGMC_gpu: false = wavefront search (meander=false, single slice), true = as stock QTGMC (slice search, exact CPU-mt result, slow on the GPU today)\n'
             'global QTGMC_gpu_search = false # with QTGMC_gpu: true = the search clip is made by cudafilters.dll (needs LoadPlugin of it)\n'
             'global QTGMC_gpu_tokens = true # with QTGMC_gpu_search: the search clip stays on the device, MSuper / MAnalyse read it there\n'
             'global QTGMC_gpu_edi = false # with QTGMC_gpu: NNEDI3 by cudafilters.dll CudaNNEDI3 (needs LoadPlugin of it)\n'
