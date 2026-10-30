@@ -134,7 +134,7 @@ private:
   int _gpu_hpad = 0, _gpu_vpad = 0; // padding of the super clip (pel-2 sub-pel planes)
   unsigned long long _producer = 0;
   std::mutex _gpu_mutex;
-  int gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src);
+  int gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host);
   static int gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
 };
 

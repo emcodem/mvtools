@@ -1,4 +1,4 @@
-// GPU version of MSuper (GPU_PLAN.md M2): pyramid reduction (rfilter=4), edge padding and the pel=2 Wiener
+// GPU version of MSuper (GPU_PLAN.md M2): pyramid reduction (rfilter 4 / 2), edge padding and the pel=2 Wiener
 // sub-pel planes, all in integer arithmetic so the result can be bit-exact against the CPU code
 // (MVPlane.cpp, Interpolation.cpp RB2Cubic* / *Wiener, Padding.cpp). 16-bit container samples only.
 //
@@ -197,15 +197,15 @@ namespace MVC_NS
   }
   const dim3 BLOCK(32, 8);
 
-  // src_device: src[] are device pointers (planes of a device frame, pitch in bytes), already ordered before st by the
-  // caller; otherwise host planes that are uploaded through pinned staging
-  static int super_build_impl(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], bool src_device,
-    DevSuper &out, cudaStream_t st)
+  // src[] are the device planes of a device frame (pitch in bytes), already ordered before st by the caller. Only queues
+  // kernels (no host wait); readers on other streams wait for out.ready.
+  int super_build_dev(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
+    cudaStream_t st)
   {
     int rc = 0;
     out.p = p;
     out.esize = (int)sizeof(pix);
-    // supported: pel 1 or 2, Wiener sharp, cubic reduction (rfilter 4); bit depth matches the sample type
+    // supported: pel 1 or 2, Wiener sharp, cubic / bilinear reduction (rfilter 4 / 2); bit depth matches the sample type
     if ((sizeof(pix) == 1 ? (p.bits_per_pixel != 8) : (p.bits_per_pixel < 9 || p.bits_per_pixel > 16))
       || (p.pel != 1 && p.pel != 2) || p.levels < 1 || p.levels > MVCUDA_MAX_LEVELS || (p.rfilter != 4 && p.rfilter != 2) || p.sharp != 2)
       return -4;
@@ -214,51 +214,19 @@ namespace MVC_NS
 
     const int maxv = (1 << p.bits_per_pixel) - 1;
     const int nplanes = p.chroma ? 3 : 1;
-    pix *d_src = nullptr, *d_tmp = nullptr;
-    void *pin = nullptr;
-    const bool timing = std::getenv("MVCUDA_TIMING") != nullptr;
-    double t_alloc = 0, t_copy = 0, t_sync = 0;
-    auto now = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
-    const double t_start = now();
-    size_t src_bytes = 0, tmp_bytes = 0;
-
     for (int plane = 0; plane < nplanes; plane++)
     {
       MvCudaPlaneDims d0;
-      size_t tmp_elems = 0;
       plane_dims(p, 0, plane, d0);
-      for (int l = 0; l < p.levels; l++)
+      for (int l = 1; l < p.levels; l++)
       {
-        MvCudaPlaneDims d;
+        MvCudaPlaneDims d, s;
         plane_dims(p, l, plane, d);
-        if (d.w < 1 || d.h < 1)
+        plane_dims(p, l - 1, plane, s);
+        // the CPU reads one row/column beyond an unpadded level-0 plane for odd sizes: not reproducible, refuse
+        if (d.w < 1 || d.h < 1 || (l == 1 && (2 * d.w > s.w || 2 * d.h > s.h)))
         {
           rc = -4;
-          goto cleanup;
-        }
-        if (l > 0)
-        {
-          MvCudaPlaneDims s;
-          plane_dims(p, l - 1, plane, s);
-          // the CPU reads one row/column beyond an unpadded level-0 plane for odd sizes: not reproducible, refuse
-          if (l == 1 && (2 * d.w > s.w || 2 * d.h > s.h))
-          {
-            rc = -4;
-            goto cleanup;
-          }
-          tmp_elems = std::max(tmp_elems, (size_t)2 * d.w * d.h);
-        }
-      }
-
-      src_bytes = (size_t)d0.w * d0.h * sizeof(pix);
-      tmp_bytes = tmp_elems * sizeof(pix);
-      double t0 = now();
-      if (!src_device)
-      {
-        d_src = (pix *)dev_alloc(src_bytes);
-        if (!d_src)
-        {
-          rc = -2;
           goto cleanup;
         }
       }
@@ -280,32 +248,11 @@ namespace MVC_NS
         }
       }
 
-      // level 0 with its padding, then each pyramid level with its padding (one kernel per level, k_level0 / k_level:
-      // the reduction reads only the inner area of the level above, so padding it first changes nothing)
-      t_alloc += now() - t0;
-      t0 = now();
-      if (src_device)
-      {
-        // a device frame (token): straight into the padded level-0 plane
-        k_level0<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, (const pix *)src[plane],
-          src_pitch_bytes[plane] / (int)sizeof(pix));
-      }
-      else
-      {
-        pin = pin_alloc(src_bytes);
-        if (pin)
-        {
-          // rows into the pinned buffer (plain memcpy), then one DMA; the buffer goes back once this plane has synchronised
-          for (int y = 0; y < d0.h; y++)
-            std::memcpy((char *)pin + (size_t)y * d0.w * sizeof(pix), (const char *)src[plane] + (size_t)y * src_pitch_bytes[plane], d0.w * sizeof(pix));
-          CUDA_CHECK(cudaMemcpyAsync(d_src, pin, src_bytes, cudaMemcpyHostToDevice, st));
-        }
-        else
-          CUDA_CHECK(cudaMemcpy2DAsync(d_src, d0.w * sizeof(pix), src[plane], src_pitch_bytes[plane], d0.w * sizeof(pix), d0.h,
-            cudaMemcpyHostToDevice, st));
-        k_level0<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, d_src, d0.w);
-      }
-      t_copy += now() - t0;
+      // level 0 with its padding straight from the device frame, then each pyramid level with its padding (one kernel
+      // per level, k_level0 / k_level: the reduction reads only the inner area of the level above, so padding it first
+      // changes nothing)
+      k_level0<<<grid_for(d0.ew, d0.eh), BLOCK, 0, st>>>((pix *)out.pl[plane].sub[0], d0, (const pix *)src[plane],
+        src_pitch_bytes[plane] / (int)sizeof(pix));
       for (int l = 0; l + 1 < p.levels; l++)
       {
         const MvCudaPlaneDims &s = out.pl[l * 3 + plane].d, &d = out.pl[(l + 1) * 3 + plane].d;
@@ -326,40 +273,18 @@ namespace MVC_NS
         k_wiener_h<<<g, BLOCK, 0, st>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
       }
       CUDA_CHECK(cudaGetLastError());
-      if (!src_device)
-      {
-        // the pinned staging buffer and d_src go back to their pools (other threads' streams): wait for this plane
-        t0 = now();
-        CUDA_CHECK(cudaStreamSynchronize(st));
-        t_sync += now() - t0;
-        pin_free(pin, src_bytes);
-        pin = nullptr;
-        dev_free(d_src, src_bytes);
-        d_src = nullptr;
-      }
     }
-    // from a device frame nothing was waited for: readers on other streams wait for this event (super_get)
-    if (src_device)
+    // nothing was waited for: readers on other streams wait for this event (frame_super)
+    out.ready = event_get();
+    if (!out.ready || cudaEventRecord(out.ready, st) != cudaSuccess)
     {
-      out.ready = event_get();
-      if (!out.ready || cudaEventRecord(out.ready, st) != cudaSuccess)
-      {
-        rc = -2;
-        goto cleanup;
-      }
+      rc = -2;
+      goto cleanup;
     }
-    if (timing)
-      std::fprintf(stderr, "mvcuda super_build: total %.2f ms (alloc %.2f, host copy+pin %.2f, sync %.2f)\n", now() - t_start, t_alloc, t_copy, t_sync);
     return 0;
 
   cleanup:
     cudaStreamSynchronize(st);
-    if (pin)
-      pin_free(pin, src_bytes);
-    if (d_src)
-      dev_free(d_src, src_bytes);
-    if (d_tmp)
-      dev_free(d_tmp, tmp_bytes);
     // release what was allocated so far
     for (DevPlane &dp : out.pl)
       for (void *&b : dp.sub)
@@ -370,18 +295,6 @@ namespace MVC_NS
         }
     return rc;
   }
-
-  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
-    cudaStream_t st)
-  {
-    return super_build_impl(p, src, src_pitch_bytes, false, out, st);
-  }
-
-  int super_build_dev(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], DevSuper &out,
-    cudaStream_t st)
-  {
-    return super_build_impl(p, src, src_pitch_bytes, true, out, st);
-  }
 }
 
 // host-memory test interface of the super builder: copies every plane back
@@ -390,9 +303,23 @@ extern "C" int MVC_API(mvcuda_super_host)(const MvCudaSuperParams *p, const void
 {
   if (!p || !src || !src_pitch_bytes || !out)
     return -4;
-  mvc::StreamLease lease;
+  if (!mvc::use_device())
+    return -1;
+  auto fr = mvc::upload_picture(*p, (int)sizeof(mvc_pix), src, src_pitch_bytes);
+  if (!fr)
+    return -4;
   mvc::DevSuper s;
-  int rc = MVC_NS::super_build(*p, src, src_pitch_bytes, s, lease.s);
+  const mvc::DevFrame *in[1] = { fr.get() };
+  int rc = mvc::leased_call(in, 1, [&](cudaStream_t st) {
+    const void *dsrc[3] = {};
+    int dpitch[3] = {};
+    for (int k = 0; k < fr->f.planes; k++)
+    {
+      dsrc[k] = fr->plane[k];
+      dpitch[k] = (int)fr->pitch[k];
+    }
+    return MVC_NS::super_build_dev(*p, dsrc, dpitch, s, st);
+  });
   if (rc)
     return rc;
   for (int l = 0; l < p->levels && !rc; l++)

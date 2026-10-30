@@ -1061,3 +1061,50 @@ packed SADs for 16-bit samples, in both search kernels. A/B first: 8-bit QTGMC S
 Smaller Part B leftovers: 10-bit k_wave registers (16-bit packed rows hold an 8-byte window per 4 samples; try neighbour-lane
 shuffles instead of the second word; 10-bit Slower 5.08 s vs 8-bit 4.25 s); lookup tables and NNEDI3 above 10 bit; the 4:2:0
 + ChromaMotion search-clip difference (B4). After all of it: milestone F (FFT3DFilter on the GPU).
+
+**Part M done (2026-10-30, uncommitted, library API 16, test set `profile\build_m1`):** MAnalyse, MRecalculate and MFlowFps
+on the cudafilters model; MCompensate / MDegrain take normal frames too.
+- M1 `mvcuda_frame_upload_keyed(fmt, planes, key)`: a host picture is uploaded once under a content key
+  (`GpuBackend::frame_key(clip, n)`); while that frame is in the registry, later requests get its token (stat
+  `upload_hits`). No producer: a consumer that finds it evicted uploads again. The keys name clip addresses, so
+  `mvcuda_cache_clear` (last GPU filter gone; MCompensate / MDegrain now count as users too) forgets them.
+- M2 super pyramids (`DevSuper`) hang off the `DevFrame` (`frame_super`), counted in the registry budget
+  (`frame_account_extra`); a stored one serves a request with the same pad / pel / sharp and at least its levels and
+  chroma (rfilter only matters above 1 level). The separate 24-frame super cache, its host build path and
+  `MVCUDA_CACHE_FRAMES` are gone; `mvcuda_*_host` are test wrappers (upload, device path, download).
+  Lesson: an evicted frame stays reachable through the per-thread holds / pins / readers, and with it its pyramids (about
+  5x the picture) outside the budget: peak VRAM went *up* with smaller budgets. Eviction now drops the pyramids and
+  sub-pel planes of the evicted frame (made again by a later reader). And the start budget (128 frames of the first
+  frame) is capped at 1 GB: 4.2 GB for UHD frames, while uc_FRC runs as fast at 1 GB.
+- M3 `mvcuda_recalc_token`, `mvcuda_flow_token` (token out), `mvcuda_flow_token_host` (host out); MRecalculate's token
+  refusal and MFlowFps's ResolveToken + re-upload are gone. `GpuBackend::Input` / `super_input` / `frame_input` /
+  `with_inputs` replace `with_tokens` and MAnalyse's inline copy: tokens are regenerated, host pictures re-uploaded.
+- M4 `leased_call(frames, issue)`: analysis (both kernels), recalc and flow are issued by the submitter on a leased stream,
+  ordered after their inputs (an uploaded frame: its own copy event `DevFrame::up_done` on the upload stream; else a
+  pipeline mark), one blocking-sync event wait; vectors up and results back through pinned staging (the slice kernel's
+  payload header too). MFlowFps first ran on the pipeline stream; moved to a leased stream, because there it queued
+  behind the wait-ops of every upload issued before it (output buffer from the upload pool, idle for any stream).
+- M5 MFlowFps: token frames out when the source clip's frame is a token (producer + `gpu_regen`, `_gpu_mutex` over
+  GetFrame because regeneration shares the vector clip state), else normal frames.
+- M6 MCompensate / MDegrain with a lite super of a normal clip: pictures uploaded (keyed; reference numbers from
+  `use_ref_frame`), result downloaded: normal frames in, normal frames out.
+- M7 MAnalyse uses `with_inputs`; mvtools `write_token` writes the black rows like cudafilters; gpu.md updated (API 16,
+  usage rule, readers, outputs, env vars). **Not done:** "`_gpu_mutex` not held over the CPU path" of MCompensate /
+  MDegrain: the CPU path and a regeneration share the MVClip objects (Update), so releasing the lock would race; it is
+  uncontended except during regenerations.
+- Tests (all on build_m1): golden 85/85; `profile\run_partm.ps1` (new) 36/36: uc_FRC-type chain (thSCD1 raised so the
+  GPU flow runs) as host / host with MVCUDA_CACHE_MB=1 / token (CudaUpload ... CudaDownload) / token with MVCUDA_CACHE_MB=1
+  (187 regenerations) / fallback, token frames without CudaDownload differ (negative control), MDegrain2 + MCompensate
+  host / tiny / fallback, in 8-bit 4:2:2, 10-bit 4:2:2, 4:2:0, 4:4:4, every one md5 = gpu=false; run_cf_regression 65/65
+  (tokens 42/42); run_qtgmc_vec 50/50 with and without meander; run_presetcheck -Fallback Fast / Slower ALL PASS;
+  uc_FRC md5 BFE44775F811 = CPU fallback.
+- uc_FRC (UHD 4:2:2 10 bit, run_frc.ps1, Prefetch 3, best of 3): B5 6.78 s / 21.4 CPU-s -> **6.57 s / 21.1**; one upload per
+  picture and super clip (296 uploads, 788 shared lookups; normal PAL test: exactly 2 x frames); copy time on the GPU
+  0.77 -> 0.36 s (nsys), kernels unchanged (k_search 2.24 ms x 1603 = 95% of GPU time). Peak VRAM 5.20 -> **4.48 GB**.
+  **4 concurrent jobs: 17.4 -> 18.5 s (+6%), open.** Ruled out by measurement: the submitter (direct issue from the worker
+  threads: same), the budget (fixed 1 / 4 GB: same or worse), GPU work and copies (nsys: equal kernels, half the copy
+  time), pinned-pool misses (12 per run), the pipeline-stream ordering of uploads (up_done events) and of MFlowFps (leased
+  stream). Next idea: nsys of the 4-job run (per-process timelines), the single upload stream per process.
+- QTGMC PAL 1500 frames 8 bit 'gpu all' (run_presettiming): Fast 1.80 -> 1.81 s, Slower 4.36 -> 4.36 s (unchanged, as
+  expected: its search clip was on the device already). Final-build tests repeated: run_partm 36/36, cf_regression 65/65,
+  qtgmc_vec 50/50 x2, run_presetcheck -Fallback Fast / Slower / Placebo ALL PASS, golden 85/85.

@@ -1,4 +1,4 @@
-// Pooled device memory, stream pool and the super-frame cache of mvtools_cuda.dll.
+// Pooled device memory, stream pool and the super frames kept with device frames, of mvtools_cuda.dll.
 
 #include "mvcuda_internal.h"
 
@@ -189,143 +189,104 @@ namespace mvc
         }
   }
 
-  // ---- frame cache ------------------------------------------------------------------------------------------------
+  // ---- super frames kept with their device frames (section 25, M2) ---------------------------------------------------
+  // They replace the earlier frame cache of their own (24 super frames by content key, outside the registry budget, also
+  // built from host memory): the pictures are device frames now (uploaded once, mvcuda_frame_upload_keyed), and a super
+  // frame lives as long as its picture, counted in the registry budget. MVCUDA_CACHE_FRAMES is no longer read.
+
+  size_t super_bytes(const MvCudaSuperParams &p, int esize)
+  {
+    size_t total = 0;
+    for (int plane = 0; plane < (p.chroma ? 3 : 1); plane++)
+      for (int l = 0; l < p.levels; l++)
+      {
+        MvCudaPlaneDims d;
+        plane_dims(p, l, plane, d);
+        total += (size_t)d.ew * d.eh * esize * (l == 0 ? p.pel * p.pel : 1);
+      }
+    return total;
+  }
+
+  MvCudaFrameFormat super_format(const MvCudaSuperParams &p, int esize)
+  {
+    MvCudaFrameFormat f = {};
+    f.width = p.width;
+    f.height = p.height;
+    f.planes = p.chroma ? 3 : 1;
+    f.bytes_per_sample = esize;
+    f.bits_per_sample = p.bits_per_pixel;
+    f.x_ratio_uv = p.x_ratio_uv;
+    f.y_ratio_uv = p.y_ratio_uv;
+    return f;
+  }
+
+  bool super_fits(const DevFrame &f, const MvCudaSuperParams &p, int esize)
+  {
+    return f.f.width == p.width && f.f.height == p.height && f.f.bits_per_sample == p.bits_per_pixel && f.f.bytes_per_sample == esize
+      && (!p.chroma || (f.f.planes == 3 && f.f.x_ratio_uv == p.x_ratio_uv && f.f.y_ratio_uv == p.y_ratio_uv));
+  }
+
   namespace
   {
-    struct CacheKey
+    // a stored super frame with parameters e serves a request for p (see frame_super); the luma level sizes depend on the
+    // chroma ratios too (level_size), so they must match also without chroma
+    bool covers(const MvCudaSuperParams &e, const MvCudaSuperParams &p)
     {
-      unsigned long long key;
-      int width, height, xr, yr, hpad, vpad, pel, levels, bits, chroma, esize, rfilter;
-      bool operator==(const CacheKey &o) const
-      {
-        return key == o.key && width == o.width && height == o.height && xr == o.xr && yr == o.yr && hpad == o.hpad
-          && vpad == o.vpad && pel == o.pel && levels == o.levels && bits == o.bits && chroma == o.chroma
-          && esize == o.esize && rfilter == o.rfilter;
-      }
-    };
-    struct CacheKeyHash
-    {
-      size_t operator()(const CacheKey &k) const
-      {
-        size_t h = (size_t)k.key * 0x9E3779B97F4A7C15ull;
-        h ^= (size_t)(k.width * 31 + k.height) + (h << 6) + (h >> 2);
-        h ^= (size_t)(k.pel * 7 + k.levels * 13 + k.bits) + (h << 6) + (h >> 2);
-        return h;
-      }
-    };
-    struct Entry
-    {
-      std::shared_ptr<DevSuper> super; // null while being built
-      bool failed = false;
-      std::list<CacheKey>::iterator lru;
-    };
-
-    std::mutex g_cache_mutex;
-    std::condition_variable g_cache_cv;
-    std::unordered_map<CacheKey, Entry, CacheKeyHash> g_cache;
-    std::list<CacheKey> g_lru; // front = most recently used
-
-    size_t cache_capacity()
-    {
-      static const size_t cap = [] {
-        const char *e = std::getenv("MVCUDA_CACHE_FRAMES");
-        const int n = e ? std::atoi(e) : 24;
-        return (size_t)(n < 2 ? 2 : n);
-      }();
-      return cap;
+      return e.width == p.width && e.height == p.height && e.x_ratio_uv == p.x_ratio_uv && e.y_ratio_uv == p.y_ratio_uv
+        && e.hpad == p.hpad && e.vpad == p.vpad && e.pel == p.pel && e.sharp == p.sharp && e.bits_per_pixel == p.bits_per_pixel
+        && e.chroma >= p.chroma && e.levels >= p.levels && (p.levels == 1 || e.rfilter == p.rfilter);
     }
   }
 
-  int super_get(SuperBuildFn build, const MvCudaSuperParams &p, unsigned long long key, const void *const src[3],
-    const int src_pitch_bytes[3], cudaStream_t s, std::shared_ptr<DevSuper> &out)
+  int frame_super(SuperBuildFn build, const std::shared_ptr<DevFrame> &fr, const MvCudaSuperParams &p, cudaStream_t s,
+    std::shared_ptr<DevSuper> &out)
   {
-    if (key == 0)
+    if (!fr || !super_fits(*fr, p, fr->f.bytes_per_sample))
+      return -4;
+    std::shared_ptr<DevSuper> found;
+    size_t made = 0;
     {
-      auto sp = std::make_shared<DevSuper>();
-      const int rc = build(p, src, src_pitch_bytes, *sp, s);
-      if (rc == 0)
+      // concurrent requests for one frame: the first builds (only queues kernels, no host wait), the others then find it
+      std::lock_guard<std::mutex> lk(fr->extra_m);
+      for (const auto &e : fr->supers)
+        if (covers(e->p, p))
+        {
+          found = e;
+          break;
+        }
+      if (!found)
+      {
+        const void *src[3] = {};
+        int pitch[3] = {};
+        for (int k = 0; k < fr->f.planes; k++)
+        {
+          src[k] = fr->plane[k];
+          pitch[k] = (int)fr->pitch[k];
+        }
+        auto sp = std::make_shared<DevSuper>();
+        const int rc = build(p, src, pitch, *sp, s);
+        if (rc)
+          return rc;
+        fr->supers.push_back(sp);
         out = sp;
-      return rc;
-    }
-    const CacheKey ck = { key, p.width, p.height, p.x_ratio_uv, p.y_ratio_uv, p.hpad, p.vpad, p.pel, p.levels,
-      p.bits_per_pixel, p.chroma, p.bits_per_pixel <= 8 ? 1 : 2, p.rfilter };
-    std::unique_lock<std::mutex> lk(g_cache_mutex);
-    for (;;)
-    {
-      auto it = g_cache.find(ck);
-      if (it == g_cache.end())
-        break;
-      if (it->second.super)
-      {
-        g_lru.splice(g_lru.begin(), g_lru, it->second.lru);
-        out = it->second.super;
-        lk.unlock();
-        // built by another thread without a host wait: this stream starts after the build
-        if (out->ready && cudaStreamWaitEvent(s, out->ready, 0) != cudaSuccess)
-          return -2;
-        return 0;
+        made = super_bytes(p, fr->f.bytes_per_sample);
       }
-      if (it->second.failed)
-        break;
-      g_cache_cv.wait(lk); // another thread is building it
     }
-    // we build it: publish a pending entry first
-    g_lru.push_front(ck);
-    Entry &e = g_cache[ck];
-    e.super.reset();
-    e.failed = false;
-    e.lru = g_lru.begin();
-    lk.unlock();
-
-    auto sp = std::make_shared<DevSuper>();
-    const int rc = build(p, src, src_pitch_bytes, *sp, s);
-
-    lk.lock();
-    auto it = g_cache.find(ck);
-    if (rc != 0)
+    if (made)
     {
-      if (it != g_cache.end())
-      {
-        g_lru.erase(it->second.lru);
-        g_cache.erase(it);
-      }
-      g_cache_cv.notify_all();
-      return rc;
+      frame_account_extra(*fr, made);
+      return 0;
     }
-    if (it != g_cache.end())
-      it->second.super = sp;
-    out = sp;
-    // evict the least recently used finished entries
-    while (g_cache.size() > cache_capacity() && !g_lru.empty())
-    {
-      auto victim = g_cache.find(g_lru.back());
-      if (victim != g_cache.end() && !victim->second.super)
-        break; // pending: leave it
-      g_cache.erase(g_lru.back());
-      g_lru.pop_back();
-    }
-    g_cache_cv.notify_all();
+    out = found;
+    // built on another stream without a host wait: s starts after the build
+    if (found->ready && cudaStreamWaitEvent(s, found->ready, 0) != cudaSuccess)
+      return -2;
     return 0;
-  }
-
-  void cache_clear()
-  {
-    std::lock_guard<std::mutex> lk(g_cache_mutex);
-    for (auto it = g_cache.begin(); it != g_cache.end();)
-    {
-      if (it->second.super)
-      {
-        g_lru.erase(it->second.lru);
-        it = g_cache.erase(it);
-      }
-      else
-        ++it;
-    }
   }
 }
 
 extern "C" void mvcuda_cache_clear()
 {
-  mvc::cache_clear();
+  mvc::keyed_clear();
   mvc::pool_trim();
 }

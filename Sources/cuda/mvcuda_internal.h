@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #ifdef MVC_PIX8
   typedef uint8_t mvc_pix;
@@ -96,30 +97,24 @@ namespace mvc
     d.eh = d.h + 2 * d.vpad;
   }
 
-  // builds the super frame from the raw planes (host memory) on stream s and waits for it; 0 on success
+  // builds the super frame from a device frame on stream s without a host wait (records DevSuper::ready); 0 on success
   typedef int (*SuperBuildFn)(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3],
     DevSuper &out, cudaStream_t s);
+
+  // device bytes of a super frame with parameters p (all levels, sub-pel planes; esize bytes per sample)
+  size_t super_bytes(const MvCudaSuperParams &p, int esize);
 
 }
 
 namespace MVC_NS
 {
-  // the per-type builder (mvcuda_super.cu), what mvc::super_get calls on a cache miss
-  int super_build(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], mvc::DevSuper &out,
-    cudaStream_t s);
-  // the same from a device frame: src[] are device plane pointers (pitch in bytes), ordered before s by the caller
+  // the per-type builder (mvcuda_super.cu): src[] are device plane pointers (pitch in bytes), ordered before s by the caller
   int super_build_dev(const MvCudaSuperParams &p, const void *const src[3], const int src_pitch_bytes[3], mvc::DevSuper &out,
     cudaStream_t s);
 }
 
 namespace mvc
 {
-  // Builds through the frame cache: key != 0 identifies the frame content (caller guarantees: same key and same
-  // parameters = same pixels); a hit costs nothing, concurrent requests for one key build it once.
-  int super_get(SuperBuildFn build, const MvCudaSuperParams &p, unsigned long long key, const void *const src[3],
-    const int src_pitch_bytes[3], cudaStream_t s, std::shared_ptr<DevSuper> &out);
-  void cache_clear();
-
   // ---- the pipeline stream (mvcuda_frames.cu) -----------------------------------------------------------------------
   // Every operation on device frames (the cudafilters stages, MCompensate / MDegrain, the waits for uploads) runs on this
   // one stream, issued by one submitter thread in submission order, without a host wait: the submission order of the
@@ -159,6 +154,15 @@ namespace mvc
   void *up_alloc(size_t bytes);                // upload buffer (no queued pipeline work uses it); nullptr on failure
   void up_free(void *p, size_t bytes);         // back to the upload pool once the pipeline stream has passed this point
   void pipe_free(void *p, size_t bytes);
+  // Inside a pipeline op: holds obj until the pipeline stream has passed the work queued so far (for objects whose memory
+  // is not stream-ordered, e.g. a DevSuper the op reads: its buffers come from dev_alloc and may go to any stream at once)
+  void pipe_keep(std::shared_ptr<void> obj);
+  struct DevFrame;
+  // Runs issue(st) on a leased stream, issued by the submitter thread (no launches from the worker threads), with st
+  // ordered after the work that made the input frames (an uploaded frame: its copy on the upload stream; else the
+  // pipeline op that wrote it); then waits for st. issue must not wait for the submitter. Returns issue's code, or -2 when
+  // the wait fails; st has finished in every case on return.
+  int leased_call(const DevFrame *const *frames, int count, const std::function<int(cudaStream_t)> &issue);
   // Device scratch shared by all pipeline ops of one kind (id), zeroed once at creation and never freed; nullptr on
   // failure. Its users run one after the other on the pipeline stream and leave it zeroed for the next one, which saves
   // a memset per op (a memset between kernels costs an engine switch on the stream).
@@ -192,11 +196,13 @@ namespace mvc
     size_t pitch[3] = {};       // bytes per row
     size_t bytes = 0;           // total device bytes
     bool upload = false;        // buffer from up_alloc (frame_alloc(f, true)), else from pipe_alloc
+    cudaEvent_t up_done = nullptr; // filled from the host: recorded on the upload stream after the copy (null: see seq)
     unsigned long long seq = 0; // the pipeline op that writes it (set by frame_put)
     unsigned long long token = 0; // registry key (set by frame_put)
-    std::mutex extra_m;        // guards subpel
+    std::mutex extra_m;        // guards subpel and supers
     std::shared_ptr<DevSubpel> subpel;
-    size_t extra_acct = 0;      // bytes of subpel counted in the registry budget (while the frame is registered)
+    std::vector<std::shared_ptr<DevSuper>> supers; // super frames (pyramids) made from this picture (frame_super)
+    size_t extra_acct = 0;      // bytes of subpel / supers counted in the registry budget (while the frame is registered)
     DevFrame() = default;
     DevFrame(const DevFrame &) = delete;
     DevFrame &operator=(const DevFrame &) = delete;
@@ -211,6 +217,22 @@ namespace mvc
   // the pel-2 sub-pel planes of fr for a super clip with luma padding hpad / vpad (8 bit), made on first use (queued on
   // the pipeline stream before anything the caller queues later); nullptr on failure
   std::shared_ptr<DevSubpel> frame_subpel(const std::shared_ptr<DevFrame> &fr, int hpad, int vpad);
+  // The super frame (MSuper pyramid with sub-pel planes) of fr for the parameters p, kept with the frame and counted in the
+  // registry budget (GPU_PIPELINE_PLAN.md section 25, M2). A stored one serves when it covers p: same padding, pel and
+  // sharp, at least p's levels and chroma, and the same rfilter when p has more than one level (only the first reduction
+  // uses it; level 0 does not depend on it). Otherwise build makes it on s, which the caller has ordered after the work
+  // that made fr; a stored one built on another stream is waited for on s. The caller keeps out until s has passed its
+  // reads (host wait, or pipe_keep on the pipeline stream). 0, -2 or build's code (-4: parameters not supported).
+  int frame_super(SuperBuildFn build, const std::shared_ptr<DevFrame> &fr, const MvCudaSuperParams &p, cudaStream_t s,
+    std::shared_ptr<DevSuper> &out);
+  // the format of the pictures a super with parameters p is made from (chroma: 3 planes)
+  MvCudaFrameFormat super_format(const MvCudaSuperParams &p, int esize);
+  // whether device frame f can be the picture of a super with parameters p (sizes, depth, chroma layout)
+  bool super_fits(const DevFrame &f, const MvCudaSuperParams &p, int esize);
+  // a host picture (planes of p's format) as a transient device frame (for the host-memory test entry points); nullptr on failure
+  // forgets the upload keys (mvcuda_frame_upload_keyed): the clips they name may be gone, and a new clip may get the address
+  void keyed_clear();
+  std::shared_ptr<DevFrame> upload_picture(const MvCudaSuperParams &p, int esize, const void *const src[3], const int pitch[3]);
 }
 
 #endif

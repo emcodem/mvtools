@@ -144,7 +144,8 @@ public :
 
 private:
 
-  bool gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload);
+  bool gpu_recalc(SrcRefData &srd, const PVideoFrame &src, const PVideoFrame &ref, int nsrc, int nref, int *payload,
+    IScriptEnvironment *env);
   void				load_src_frame (MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data);
 
 };

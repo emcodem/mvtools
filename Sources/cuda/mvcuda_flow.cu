@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace
@@ -341,121 +342,106 @@ namespace
   int align16(int v) { return (v + 15) & ~15; }
 }
 
-extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, const void *const src_raw[3],
-  const int src_pitch_bytes[3], const void *const ref_raw[3], const int ref_pitch_bytes[3], const int *vec_b,
-  const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3], const int dst_pitch_bytes[3],
-  void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS])
+// One interpolated frame from two device frames (left / right picture): a new device frame (out), or with host_dst the
+// picture in host memory. Issued by the submitter on a leased stream ordered after the work that made the pictures
+// (leased_call), not on the pipeline stream: there it would wait for every upload queued before it. The super frames are
+// kept with the pictures (frame_super); the vector fields go up and the picture comes back through pinned memory.
+static int flow_dev(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, const std::shared_ptr<mvc::DevFrame> &fl,
+  const std::shared_ptr<mvc::DevFrame> &fr, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff,
+  void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS], unsigned long long producer, int frame, MvCudaTokenHeader *out,
+  void *const host_dst[3] = nullptr, const int host_pitch[3] = nullptr)
 {
-  if (!sp || !fp || !src_raw || !ref_raw || !vec_b || !vec_f || !vec_bb || !vec_ff || !dst || !dst_pitch_bytes)
+  if (!sp || !fp || !fl || !fr || !vec_b || !vec_f || !vec_bb || !vec_ff || (!out && !host_dst))
     return -4;
   if (fp->mode != 2 || sp->levels != 1 || !sp->chroma || fp->time256 < 1 || fp->time256 > 255 || fp->width != sp->width
     || fp->height != sp->height || (sp->pel != 1 && sp->pel != 2))
     return -4;
+  if (!mvc::super_fits(*fl, *sp, (int)sizeof(pix)) || !mvc::super_fits(*fr, *sp, (int)sizeof(pix)))
+    return -4;
   if (!mvc::use_device())
     return -1;
-
-  int rc = 0;
-  const bool timing = std::getenv("MVCUDA_TIMING") != nullptr;
-  auto t0 = std::chrono::steady_clock::now();
-  auto lap = [&](const char *what) {
-    if (!timing)
-      return;
-    auto t1 = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "mvcuda flow: %-22s %7.2f ms\n", what, std::chrono::duration<double, std::milli>(t1 - t0).count());
-    t0 = t1;
-  };
-  mvc::StreamLease lease;
-  cudaStream_t st = lease.s;
-  std::shared_ptr<mvc::DevSuper> s_left, s_right;
-  rc = mvc::super_get(&MVC_NS::super_build, *sp, fp->src_key, src_raw, src_pitch_bytes, st, s_left);
-  if (!rc)
-    rc = mvc::super_get(&MVC_NS::super_build, *sp, fp->ref_key, ref_raw, ref_pitch_bytes, st, s_right);
-  lap("2 x super (cached)");
-  if (rc)
-    return rc;
 
   const int nb = fp->n_blk_xp * fp->n_blk_yp;
   const size_t small_bytes = (size_t)nb * sizeof(short), mask_bytes = (size_t)nb;
   const size_t vec_bytes = (size_t)fp->n_blk_x * fp->n_blk_y * 3 * sizeof(int), acc_bytes = (size_t)nb * sizeof(int);
   const int distinct = fp->chroma_distinct ? 1 : 0;
-
-  // device buffers: 4 vector fields (3 ints per block), small x / y arrays for luma and chroma, 2 masks
-  int *d_vec[4] = {};
-  short *d_svx[2][4] = {}, *d_svy[2][4] = {};
-  unsigned char *d_smask[2] = {};
-  int *d_acc = nullptr;
-  pix *d_dst[3] = {};
-  size_t dst_bytes[3] = {};
-  const int *hv[4] = { vec_b, vec_f, vec_bb, vec_ff };
   UpGeo geo[2];
   geo[0] = { fp->width_p, fp->height_p, fp->n_blk_xp, fp->n_blk_yp };
   geo[1] = { fp->width_p_uv, fp->height_p_uv, fp->n_blk_xp, fp->n_blk_yp };
   const int uw[2] = { fp->width, fp->width / fp->x_ratio_uv }, uh[2] = { fp->height, fp->height / fp->y_ratio_uv };
   const int lp = ilog2(sp->pel);
 
-#define FL_CHECK(call) \
-  do { \
-    cudaError_t e_ = (call); \
-    if (e_ != cudaSuccess) { \
-      fprintf(stderr, "mvcuda: %s failed: %s\n", #call, cudaGetErrorString(e_)); \
-      rc = -2; \
-      goto done; \
-    } \
-  } while (0)
-
-  for (int k = 0; k < 4; k++)
+  // the output frame from the upload pool (no queued pipeline work uses its buffer: another stream may write it); one
+  // scratch buffer, released after the host wait: the 4 vector fields, small x / y arrays [kind][field], 2 masks, the
+  // occlusion accumulator (each part 256-byte aligned)
+  auto dst = mvc::frame_alloc(fl->f, true);
+  if (!dst)
+    return -2;
+  auto al = [](size_t b) { return (b + 255) & ~(size_t)255; };
+  const size_t vecs_bytes = 4 * vec_bytes;
+  const size_t tmp_bytes = al(vecs_bytes) + 16 * al(small_bytes) + 2 * al(mask_bytes) + al(acc_bytes);
+  unsigned char *d_tmp = (unsigned char *)mvc::dev_alloc(tmp_bytes);
+  if (!d_tmp)
+    return -2;
+  int *d_vecs = (int *)d_tmp;
+  short *d_svx[2][4] = {}, *d_svy[2][4] = {};
+  unsigned char *d_smask[2] = {};
+  int *d_acc = nullptr;
   {
-    d_vec[k] = (int *)mvc::dev_alloc(vec_bytes);
-    for (int kind = 0; kind <= distinct; kind++)
-    {
-      d_svx[kind][k] = (short *)mvc::dev_alloc(small_bytes);
-      d_svy[kind][k] = (short *)mvc::dev_alloc(small_bytes);
-      if (!d_svx[kind][k] || !d_svy[kind][k])
+    size_t o = al(vecs_bytes);
+    for (int kind = 0; kind < 2; kind++)
+      for (int k = 0; k < 4; k++)
       {
-        rc = -2;
-        goto done;
+        d_svx[kind][k] = (short *)(d_tmp + o);
+        o += al(small_bytes);
+        d_svy[kind][k] = (short *)(d_tmp + o);
+        o += al(small_bytes);
       }
-    }
-    if (!d_vec[k])
+    for (int m = 0; m < 2; m++)
     {
-      rc = -2;
-      goto done;
+      d_smask[m] = d_tmp + o;
+      o += al(mask_bytes);
     }
+    d_acc = (int *)(d_tmp + o);
   }
-  for (int k = 0; k < 2; k++)
-    d_smask[k] = (unsigned char *)mvc::dev_alloc(mask_bytes);
-  d_acc = (int *)mvc::dev_alloc(acc_bytes);
-  if (!d_smask[0] || !d_smask[1] || !d_acc)
+  // pinned staging: the 4 vector fields on the way up, the picture (host output) on the way back
+  const size_t stage_bytes = host_dst && dst->bytes > vecs_bytes ? dst->bytes : vecs_bytes;
+  unsigned char *pin = (unsigned char *)mvc::pin_alloc(stage_bytes);
+  std::vector<unsigned char> pageable;
+  unsigned char *stage = pin;
+  if (!stage)
   {
-    rc = -2;
-    goto done;
+    pageable.resize(stage_bytes);
+    stage = pageable.data();
   }
-  for (int p = 0; p < 3; p++)
-  {
-    const int pw = p == 0 ? fp->width : uw[1], ph = p == 0 ? fp->height : uh[1];
-    dst_bytes[p] = (size_t)pw * ph * sizeof(pix);
-    d_dst[p] = (pix *)mvc::dev_alloc(dst_bytes[p]);
-    if (!d_dst[p])
-    {
-      rc = -2;
-      goto done;
-    }
-  }
+  const int *fields[4] = { vec_b, vec_f, vec_bb, vec_ff };
+  for (int k = 0; k < 4; k++)
+    std::memcpy(stage + k * vec_bytes, fields[k], vec_bytes);
 
-  {
-    SmallArgs sa;
-    sa.blk_x = fp->n_blk_x;
-    sa.blk_y = fp->n_blk_y;
-    sa.blk_xp = fp->n_blk_xp;
-    sa.blk_yp = fp->n_blk_yp;
-    sa.lx = fp->x_ratio_uv == 2 ? 1 : 0;
-    sa.ly = fp->y_ratio_uv == 2 ? 1 : 0;
-    sa.distinct = distinct;
-    const int tb = 256, gridn = (nb + tb - 1) / tb, gridb = (fp->n_blk_x * fp->n_blk_y + tb - 1) / tb;
+  SmallArgs sa;
+  sa.blk_x = fp->n_blk_x;
+  sa.blk_y = fp->n_blk_y;
+  sa.blk_xp = fp->n_blk_xp;
+  sa.blk_yp = fp->n_blk_yp;
+  sa.lx = fp->x_ratio_uv == 2 ? 1 : 0;
+  sa.ly = fp->y_ratio_uv == 2 ? 1 : 0;
+  sa.distinct = distinct;
+  const int tb = 256, gridn = (nb + tb - 1) / tb, gridb = (fp->n_blk_x * fp->n_blk_y + tb - 1) / tb;
 
+  std::shared_ptr<mvc::DevSuper> s_left, s_right; // held until the host wait
+  const mvc::DevFrame *in[2] = { fl.get(), fr.get() };
+  int rc = mvc::leased_call(in, 2, [&](cudaStream_t st) -> int {
+    int r = mvc::frame_super(&MVC_NS::super_build_dev, fl, *sp, st, s_left);
+    if (!r)
+      r = mvc::frame_super(&MVC_NS::super_build_dev, fr, *sp, st, s_right);
+    if (r)
+      return r;
+    if (cudaMemcpyAsync(d_vecs, stage, vecs_bytes, cudaMemcpyHostToDevice, st) != cudaSuccess)
+      return -2;
+    const int *d_vec[4];
     for (int k = 0; k < 4; k++)
     {
-      FL_CHECK(cudaMemcpyAsync(d_vec[k], hv[k], vec_bytes, cudaMemcpyHostToDevice, st));
+      d_vec[k] = d_vecs + k * (vec_bytes / sizeof(int));
       k_small<<<gridn, tb, 0, st>>>(d_vec[k], sa, d_svx[0][k], d_svy[0][k], d_svx[1][k], d_svy[1][k]);
     }
     // occlusion masks: B (vectors of the left frame) with time 256 - t, F (right frame) with t
@@ -487,7 +473,7 @@ extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCu
         fa.right[p][i] = (const pix *)dr.sub[i];
       }
       fa.kind[p] = uvp ? 1 : 0;
-      fa.dst[p] = d_dst[p];
+      fa.dst[p] = (pix *)dst->plane[p]; // packed rows of fa.w[p] samples, as k_flow writes them
     }
     // 4:4:4: chroma planes have the luma size (and use the luma arrays)
     for (int kind = 0; kind <= distinct; kind++)
@@ -509,21 +495,22 @@ extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCu
       fa.plane = p;
       k_flow<<<grd, blk, 0, st>>>(fa);
     }
-    FL_CHECK(cudaGetLastError());
+    if (cudaGetLastError() != cudaSuccess)
+      return -2;
 
-    // optional debug arrays
+    // optional debug arrays (tests only: pageable copies, waited for here)
     if (dbg)
     {
       for (int k = 0; k < 4; k++)
       {
         if (dbg[k])
-          FL_CHECK(cudaMemcpyAsync(dbg[k], d_svx[0][k], small_bytes, cudaMemcpyDeviceToHost, st));
+          cudaMemcpyAsync(dbg[k], d_svx[0][k], small_bytes, cudaMemcpyDeviceToHost, st);
         if (dbg[4 + k])
-          FL_CHECK(cudaMemcpyAsync(dbg[4 + k], d_svy[0][k], small_bytes, cudaMemcpyDeviceToHost, st));
+          cudaMemcpyAsync(dbg[4 + k], d_svy[0][k], small_bytes, cudaMemcpyDeviceToHost, st);
       }
       for (int m = 0; m < 2; m++)
         if (dbg[8 + m])
-          FL_CHECK(cudaMemcpyAsync(dbg[8 + m], d_smask[m], mask_bytes, cudaMemcpyDeviceToHost, st));
+          cudaMemcpyAsync(dbg[8 + m], d_smask[m], mask_bytes, cudaMemcpyDeviceToHost, st);
       for (int kind = 0; kind <= distinct; kind++)
       {
         const int base = 10 + 10 * kind;
@@ -534,22 +521,18 @@ extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCu
         ma.lp = lp;
         ma.pitch = align16(geo[kind].new_w);
         const size_t full_el = (size_t)ma.pitch * geo[kind].new_h;
-        short *d_full = (short *)mvc::dev_alloc(full_el * sizeof(short));
-        unsigned char *d_fullm = (unsigned char *)mvc::dev_alloc(full_el);
-        if (!d_full || !d_fullm)
+        short *d_full = nullptr;
+        unsigned char *d_fullm = nullptr;
+        if (cudaMalloc(&d_full, full_el * sizeof(short)) != cudaSuccess || cudaMalloc(&d_fullm, full_el) != cudaSuccess)
         {
-          rc = -2;
-          mvc::dev_free(d_full, full_el * sizeof(short));
-          mvc::dev_free(d_fullm, full_el);
-          goto done;
+          cudaFree(d_full);
+          return -2;
         }
         const dim3 blk(32, 8), grd((geo[kind].new_w + 31) / 32, (geo[kind].new_h + 7) / 8);
         // slot order within a kind: vxB vyB vxF vyF maskB maskF vxBB vyBB vxFF vyFF
-        const int order[4] = { 0, 1, 2, 3 };
         const int slot_vx[4] = { 0, 2, 6, 8 }, slot_vy[4] = { 1, 3, 7, 9 };
-        for (int oi = 0; oi < 4; oi++)
+        for (int k = 0; k < 4; k++)
         {
-          const int k = order[oi];
           if (dbg[base + slot_vx[k]])
           {
             cudaMemsetAsync(d_full, 0, full_el * sizeof(short), st);
@@ -573,37 +556,78 @@ extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCu
             cudaMemcpyAsync(dbg[base + 4 + m], d_fullm, full_el, cudaMemcpyDeviceToHost, st);
             cudaStreamSynchronize(st);
           }
-        mvc::dev_free(d_full, full_el * sizeof(short));
-        mvc::dev_free(d_fullm, full_el);
+        cudaStreamSynchronize(st);
+        cudaFree(d_full);
+        cudaFree(d_fullm);
       }
+      if (cudaStreamSynchronize(st) != cudaSuccess)
+        return -2;
     }
-
-    for (int p = 0; p < 3; p++)
+    // host output: the whole frame buffer back in one copy
+    if (host_dst && cudaMemcpyAsync(stage, dst->plane[0], dst->bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess)
+      return -2;
+    return 0;
+  });
+  // leased_call has waited for the stream in every case
+  mvc::dev_free(d_tmp, tmp_bytes);
+  if (!rc && host_dst)
+    for (int p = 0; p < dst->f.planes; p++)
     {
-      const int pw = fa.w[p], ph = fa.h[p];
-      FL_CHECK(cudaMemcpy2DAsync(dst[p], dst_pitch_bytes[p], d_dst[p], pw * sizeof(pix), pw * sizeof(pix), ph,
-        cudaMemcpyDeviceToHost, st));
+      const unsigned char *s = stage + ((unsigned char *)dst->plane[p] - (unsigned char *)dst->plane[0]);
+      for (int y = 0; y < dst->h[p]; y++)
+        std::memcpy((unsigned char *)host_dst[p] + (size_t)y * host_pitch[p], s + y * dst->pitch[p], dst->pitch[p]);
     }
-    FL_CHECK(cudaStreamSynchronize(st));
-    lap("masks + render + copy");
-  }
+  mvc::pin_free(pin, stage_bytes);
+  if (rc || host_dst)
+    return rc;
+  mvc::frame_put(dst, producer, frame, *out);
+  return 0;
+}
 
-done:
-  if (rc)
-    cudaStreamSynchronize(st);
-  for (int k = 0; k < 4; k++)
-  {
-    mvc::dev_free(d_vec[k], vec_bytes);
-    for (int kind = 0; kind < 2; kind++)
-    {
-      mvc::dev_free(d_svx[kind][k], small_bytes);
-      mvc::dev_free(d_svy[kind][k], small_bytes);
-    }
-  }
-  mvc::dev_free(d_smask[0], mask_bytes);
-  mvc::dev_free(d_smask[1], mask_bytes);
-  mvc::dev_free(d_acc, acc_bytes);
-  for (int p = 0; p < 3; p++)
-    mvc::dev_free(d_dst[p], dst_bytes[p]);
-  return rc;
+extern "C" int MVC_API(mvcuda_flow_host)(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, const void *const src_raw[3],
+  const int src_pitch_bytes[3], const void *const ref_raw[3], const int ref_pitch_bytes[3], const int *vec_b,
+  const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3], const int dst_pitch_bytes[3],
+  void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS])
+{
+  if (!sp || !fp || !src_raw || !ref_raw || !src_pitch_bytes || !ref_pitch_bytes || !dst || !dst_pitch_bytes)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  // test entry point: both pictures uploaded, the result downloaded
+  auto fl = mvc::upload_picture(*sp, (int)sizeof(pix), src_raw, src_pitch_bytes);
+  auto fr = mvc::upload_picture(*sp, (int)sizeof(pix), ref_raw, ref_pitch_bytes);
+  if (!fl || !fr)
+    return -4;
+  return flow_dev(sp, fp, fl, fr, vec_b, vec_f, vec_bb, vec_ff, dbg, 0, 0, nullptr, dst, dst_pitch_bytes);
+}
+
+extern "C" int MVC_API(mvcuda_flow_token)(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, unsigned long long producer,
+  int frame, MvCudaTokenHeader *out)
+{
+  if (!sp || !fp || !out)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fl = mvc::frame_get(left), fr = mvc::frame_get(right);
+  if (!fl || !fr)
+    return MVCUDA_TOKEN_GONE;
+  return flow_dev(sp, fp, fl, fr, vec_b, vec_f, vec_bb, vec_ff, nullptr, producer, frame, out);
+}
+
+extern "C" int MVC_API(mvcuda_flow_token_host)(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3],
+  const int dst_pitch_bytes[3])
+{
+  if (!sp || !fp || !dst || !dst_pitch_bytes)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fl = mvc::frame_get(left), fr = mvc::frame_get(right);
+  if (!fl || !fr)
+    return MVCUDA_TOKEN_GONE;
+  for (int p = 0; p < fl->f.planes; p++)
+    if (!dst[p] || dst_pitch_bytes[p] < (int)fl->pitch[p])
+      return -4;
+  return flow_dev(sp, fp, fl, fr, vec_b, vec_f, vec_bb, vec_ff, nullptr, 0, 0, nullptr, dst, dst_pitch_bytes);
 }

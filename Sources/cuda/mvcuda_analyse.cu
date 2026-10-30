@@ -49,7 +49,7 @@ namespace
     int search_type;  // mvc_refine::S_*: the refine step of this level (exhaustive levels use the ring fold below)
     int has_chroma;   // 0: luma-only search, cw = ch = 0
     int async_src;  // 1: the source block can be copied with 4-byte cp.async (all plane rows 4-byte aligned)
-    int packed;     // 1: SADs in the packed form of k_wave (pk_load / pk_sum), see analyse_impl
+    int packed;     // 1: SADs in the packed form of k_wave (pk_load / pk_sum), see analyse_dev
     int packed_s;   // 1: eval_dispatch may use eval_candidate_pk (reference rows aligned for the packed reads)
     const int *glob;   // device: doubled global MV estimate of this level (x, y), already in units of this level's pel
     int *vec;          // device: (vx, vy, sad) triples of this level
@@ -2462,13 +2462,12 @@ namespace
   }
 }
 
-// src_device: src / ref are the device planes of two device frames (tokens, see mvcuda_analyse_token); otherwise host
-// planes that the super builder uploads
-static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
-  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words, bool src_device,
-  unsigned long long dev_seq = 0)
+// The search on two device frames (source and reference picture); their super frames are kept with them (frame_super).
+// Issued by the pipeline submitter on a leased stream ordered after the ops that made the frames (leased_call).
+static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const std::shared_ptr<mvc::DevFrame> &fs,
+  const std::shared_ptr<mvc::DevFrame> &fr, int *payload, int payload_words)
 {
-  if (!sp || !ap || !src || !ref || !payload)
+  if (!sp || !ap || !fs || !fr || !payload)
     return -4;
   // supported: luma only or luma + chroma, pel 1 or 2, field shift 0, every search type of mvcuda_refine.cuh
   // (the coarse levels are exhaustive, as on the CPU, except for the horizontal / vertical types)
@@ -2556,8 +2555,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
   };
 
   int rc = 0;
-  mvc::StreamLease lease;
-  cudaStream_t st = lease.s;
+  cudaStream_t st = nullptr; // the leased stream of the call (leased_call)
   std::shared_ptr<mvc::DevSuper> s_src, s_ref;
   int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr, *d_wave = nullptr;
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
@@ -2565,10 +2563,11 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
   // level][global estimate ready per level][global estimate (x, y) per level][bad flag]
   const size_t w_rowbad = rows_total, w_ticket = 2 * (size_t)rows_total, w_done = w_ticket + 1, w_ready = w_done + MVCUDA_MAX_LEVELS;
   const size_t w_glob = w_ready + MVCUDA_MAX_LEVELS, w_bad = w_glob + 2 * MVCUDA_MAX_LEVELS, w_fin = w_bad + 1, wave_words = w_fin + 1;
-  const size_t wave_bytes = wave ? wave_words * sizeof(int) : 0;
-  // wavefront: the wave state follows the payload in one buffer, so one copy brings back the vectors and the bad flag
+  const size_t wave_bytes = wave ? wave_words * sizeof(int) : sizeof(int);
+  // the wave state (slice kernel: the bad flag) follows the payload in one buffer, so one copy brings back the vectors and
+  // the bad flag
   const size_t pay_alloc = pay_bytes + wave_bytes;
-  int *h_stage = nullptr; // pinned copy of that buffer (a copy to pageable memory blocks inside the driver)
+  int *h_stage = (int *)mvc::pin_alloc(pay_alloc); // pinned copy of that buffer (pageable copies block inside the driver)
   std::vector<int> host;
   WaveCall wc = {};
 
@@ -2586,21 +2585,19 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
     } \
   } while (0)
   {
-    const mvc::SuperBuildFn build = src_device ? &MVC_NS::super_build_dev : &MVC_NS::super_build;
-    int r = mvc::super_get(build, *sp, ap->src_key, src, src_pitch_bytes, st, s_src);
+    int r = mvc::frame_super(&MVC_NS::super_build_dev, fs, *sp, st, s_src);
     if (!r)
-      r = mvc::super_get(build, *sp, ap->ref_key, ref, ref_pitch_bytes, st, s_ref);
+      r = mvc::frame_super(&MVC_NS::super_build_dev, fr, *sp, st, s_ref);
     if (r)
       return r;
   }
-  lap("2 x super (cached)");
+  lap("2 x super (kept with the frames)");
 
   d_freq = (int *)mvc::dev_alloc(freq_bytes);
   if (wave)
   {
     // one launch for the whole call (WaveCall): the kernel writes the payload header and every vector, and with the
     // pinned buffer also hands them over and clears its state (self_finish)
-    h_stage = (int *)mvc::pin_alloc(pay_alloc);
     self_finish = h_stage != nullptr;
     d_pay = self_finish ? wave_buf_get(pay_alloc, fresh) : (int *)mvc::dev_alloc(pay_alloc);
     d_wave = d_pay ? d_pay + words : nullptr;
@@ -2614,7 +2611,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
   {
     d_pay = (int *)mvc::dev_alloc(pay_alloc);
     d_glob = (int *)mvc::dev_alloc(2 * sizeof(int));
-    d_bad = (int *)mvc::dev_alloc(sizeof(int));
+    d_bad = d_pay ? d_pay + words : nullptr;
   }
   if (!d_pay || !d_freq || !d_glob || !d_bad || (wave && !d_wave))
     return -2;
@@ -2626,13 +2623,19 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
     }
     else
     {
-      host.assign(words, 0);
-      host[0] = words;
-      host[1] = 1;
+      // the payload header and a cleared bad flag, through the pinned buffer (also the result's way back: same stream)
+      int *h = h_stage;
+      if (!h)
+      {
+        host.assign(words + 1, 0);
+        h = host.data();
+      }
+      std::memset(h, 0, pay_alloc);
+      h[0] = words;
+      h[1] = 1;
       for (int l = nl - 1; l >= 0; l--)
-        host[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
-      AN_CHECK(cudaMemcpyAsync(d_pay, host.data(), pay_bytes, cudaMemcpyHostToDevice, st));
-      AN_CHECK(cudaMemsetAsync(d_bad, 0, sizeof(int), st));
+        h[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
+      AN_CHECK(cudaMemcpyAsync(d_pay, h, pay_alloc, cudaMemcpyHostToDevice, st));
       AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
     }
     bool wave_gen = false;
@@ -2827,34 +2830,20 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
 #undef AN_CHECK
   };
 
-  if (src_device && wave)
-  {
-    // The device frames are results of pipeline ops (up to dev_seq). The calls are issued by the pipeline submitter (one
-    // thread for all launches, mvcuda_internal.h), this stream ordered after the op that made the frames.
-    mvc::mark_request(dev_seq);
-    mvc::pipe_call([&](cudaStream_t ps) {
-      cudaEvent_t e = mvc::mark_in_op(dev_seq, ps);
-      rc = (e && cudaStreamWaitEvent(st, e, 0) != cudaSuccess) ? -2 : issue();
-    });
-  }
-  else
-  {
-    if (src_device && !mvc::pipeline_order(st, dev_seq))
-      return -2;
-    rc = issue();
-  }
+  // The device frames are results of pipeline ops (or uploads) up to their seq. Issued by the pipeline submitter (one
+  // thread for all launches, mvcuda_internal.h) on a leased stream ordered after the ops that made the frames; the host
+  // waits for that stream only.
+  const mvc::DevFrame *in[2] = { fs.get(), fr.get() };
+  rc = mvc::leased_call(in, 2, [&](cudaStream_t s) {
+    st = s;
+    return issue();
+  });
   if (rc)
     goto done;
-  if (cudaStreamSynchronize(st) != cudaSuccess)
-  {
-    fprintf(stderr, "mvcuda: analysis failed: %s\n", cudaGetErrorString(cudaGetLastError()));
-    rc = -2;
-    goto done;
-  }
   if (h_stage)
   {
     memcpy(payload, h_stage, pay_bytes);
-    bad = h_stage[words + w_bad];
+    bad = h_stage[words + (wave ? w_bad : 0)];
   }
   lap("analysis kernels");
   {
@@ -2882,8 +2871,7 @@ static int analyse_impl(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *
   }
 
 done:
-  if (rc)
-    cudaStreamSynchronize(st); // queued work may still use the buffers (and the super frames) released below
+  // leased_call has waited for the stream in every case: the buffers can go back
   // a buffer of a completed self-finishing call has its state cleared: back to the wave pool (else the general pool)
   if (self_finish && d_pay && (rc == 0 || rc == MVCUDA_NEEDS_CPU))
     wave_buf_put(d_pay, pay_alloc);
@@ -2892,21 +2880,26 @@ done:
   mvc::dev_free(d_freq, freq_bytes);
   mvc::pin_free(h_stage, pay_alloc);
   if (!wave)
-  {
     mvc::dev_free(d_glob, 2 * sizeof(int));
-    mvc::dev_free(d_bad, sizeof(int));
-  }
   return rc;
 }
 
 extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words)
 {
-  return analyse_impl(sp, ap, src, src_pitch_bytes, ref, ref_pitch_bytes, payload, payload_words, false);
+  if (!sp || !ap || !src || !ref || !src_pitch_bytes || !ref_pitch_bytes || !payload)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fs = mvc::upload_picture(*sp, (int)sizeof(mvc_pix), src, src_pitch_bytes);
+  auto fr = mvc::upload_picture(*sp, (int)sizeof(mvc_pix), ref, ref_pitch_bytes);
+  if (!fs || !fr)
+    return -4;
+  return analyse_dev(sp, ap, fs, fr, payload, payload_words);
 }
 
-// The same search with the source and reference pictures given as device frames (tokens of the cudafilters pipeline):
-// the super frames are built from device memory, no upload. MVCUDA_TOKEN_GONE when a token was evicted.
+// The same search with the source and reference pictures given as device frames (tokens: cudafilters pipeline frames or
+// pictures uploaded by the plugin, mvcuda_frame_upload_keyed). MVCUDA_TOKEN_GONE when a token was evicted.
 extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, unsigned long long src_token,
   unsigned long long ref_token, int *payload, int payload_words)
 {
@@ -2918,21 +2911,7 @@ extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const 
   if (!fs || !fr)
     return MVCUDA_TOKEN_GONE;
   // the frames must be the pictures the super parameters describe
-  auto fits = [&](const mvc::DevFrame &f) {
-    return f.f.width == sp->width && f.f.height == sp->height && f.f.bits_per_sample == sp->bits_per_pixel
-      && f.f.bytes_per_sample == (int)sizeof(mvc_pix)
-      && (!sp->chroma || (f.f.planes == 3 && f.f.x_ratio_uv == sp->x_ratio_uv && f.f.y_ratio_uv == sp->y_ratio_uv));
-  };
-  if (!fits(*fs) || !fits(*fr))
+  if (!mvc::super_fits(*fs, *sp, (int)sizeof(mvc_pix)) || !mvc::super_fits(*fr, *sp, (int)sizeof(mvc_pix)))
     return -4;
-  const void *src[3] = {}, *ref[3] = {};
-  int src_pitch[3] = {}, ref_pitch[3] = {};
-  for (int p = 0; p < fs->f.planes; p++)
-  {
-    src[p] = fs->plane[p];
-    src_pitch[p] = (int)fs->pitch[p];
-    ref[p] = fr->plane[p];
-    ref_pitch[p] = (int)fr->pitch[p];
-  }
-  return analyse_impl(sp, ap, src, src_pitch, ref, ref_pitch, payload, payload_words, true, fs->seq > fr->seq ? fs->seq : fr->seq);
+  return analyse_dev(sp, ap, fs, fr, payload, payload_words);
 }

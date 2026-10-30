@@ -542,7 +542,8 @@ MVDegrainX::MVDegrainX(
     vi.height <<= 1;
   }
 
-  // GPU path: MDegrain1..6, 8 to 16 bit planar, pel 1 or 2, no limit / lsb / out16 / out32, super from a token clip
+  // GPU path: MDegrain1..6, 8 to 16 bit planar, pel 1 or 2, no limit / lsb / out16 / out32, lite super (MSuper(gpu=true));
+  // token frames out for a token source clip, normal frames out for a normal one (pictures uploaded)
   if (_gpu_flag)
   {
     GpuBackend &gpu = GpuBackend::instance();
@@ -553,7 +554,10 @@ MVDegrainX::MVDegrainX(
       && nLimit >= 255 && nLimitC >= 255 && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || vi.NumComponents() >= 3)
       && vi.width >= (int)sizeof(MvCudaTokenHeader);
     if (_gpu_ok)
+    {
       _producer = gpu.producer_register(&MVDegrainX::gpu_regen, this);
+      gpu.add_user(); // the upload keys name clips: forgotten when the last GPU filter goes
+    }
     if (GpuBackend::log_enabled())
       std::fprintf(stderr, "MDegrain%d gpu requested: %s\n", level, _gpu_ok ? "using the GPU" : "not supported here, CPU");
   }
@@ -574,7 +578,10 @@ MVDegrainX::MVDegrainX(
 MVDegrainX::~MVDegrainX()
 {
   if (_producer)
+  {
     GpuBackend::instance().producer_unregister(_producer);
+    GpuBackend::instance().remove_user();
+  }
   if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
   {
     delete DstPlanes;
@@ -613,12 +620,13 @@ int MVDegrainX::gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *o
 {
   MVDegrainX *self = static_cast<MVDegrainX *>(user);
   std::lock_guard<std::mutex> lk(self->_gpu_mutex);
-  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr);
+  bool host;
+  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr, host);
 }
 
 // MDegrain<level> of frame n as a device frame: 0 and the token in h, else the CPU path. props_src: the source frame (the
-// CPU path makes its output frame from it).
-int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src)
+// CPU path makes its output frame from it). host: the source frame is a normal frame (uploaded), the result goes back as one.
+int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host)
 {
   const int L = level;
   bool usableF[MAX_DEGRAIN] = {}, usableB[MAX_DEGRAIN] = {};
@@ -638,26 +646,38 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
   PVideoFrame src = child->GetFrame(n, env);
   if (props_src)
     *props_src = src;
-  MvCudaTokenHeader ts;
-  if (!GpuBackend::frame_token(src, child->GetVideoInfo(), ts))
-    return -1;
-  PVideoFrame refF[MAX_DEGRAIN], refB[MAX_DEGRAIN];
-  for (int j = L - 1; j >= 0; j--)
-    mvClipF[j]->use_ref_frame(refF[j], usableF[j], super, n, env);
-  for (int j = 0; j < L; j++)
-    mvClipB[j]->use_ref_frame(refB[j], usableB[j], super, n, env);
-  const VideoInfo &svi = super->GetVideoInfo();
-  // hs: source, then backward and forward reference of each radius; an unusable direction has weight 0 (the CPU reads
+  // in: source, then backward and forward reference of each radius; an unusable direction has weight 0 (the CPU reads
   // the source there too)
-  MvCudaTokenHeader hs[1 + 2 * MAX_DEGRAIN];
-  hs[0] = ts;
+  GpuBackend::Input in[1 + 2 * MAX_DEGRAIN];
+  if (!GpuBackend::frame_input(src, child->GetVideoInfo(), (const void *)child.operator->(), n, in[0]))
+    return -1;
+  host = in[0].host;
+  // the reference frames as the CPU path takes them; their numbers are part of the upload key of a normal super frame
+  PVideoFrame refF[MAX_DEGRAIN], refB[MAX_DEGRAIN];
+  int nf_ref[MAX_DEGRAIN] = {}, nb_ref[MAX_DEGRAIN] = {};
+  for (int j = L - 1; j >= 0; j--)
+  {
+    mvClipF[j]->use_ref_frame(nf_ref[j], usableF[j], super, n, env);
+    if (usableF[j])
+      refF[j] = super->GetFrame(nf_ref[j], env);
+  }
   for (int j = 0; j < L; j++)
   {
-    hs[1 + j] = ts;
-    hs[1 + L + j] = ts;
-    if (usableB[j] && !GpuBackend::lite_token(refB[j], svi, hs[1 + j]))
+    mvClipB[j]->use_ref_frame(nb_ref[j], usableB[j], super, n, env);
+    if (usableB[j])
+      refB[j] = super->GetFrame(nb_ref[j], env);
+  }
+  const VideoInfo &svi = super->GetVideoInfo();
+  const void *sclip = (const void *)super.operator->();
+  for (int j = 0; j < L; j++)
+  {
+    in[1 + j] = in[0];
+    in[1 + L + j] = in[0];
+    if (usableB[j] && (!GpuBackend::super_input(refB[j], svi, sclip, nb_ref[j], in[1 + j])
+      || (in[1 + j].host && in[1 + j].fmt.planes != in[0].fmt.planes)))
       return -1;
-    if (usableF[j] && !GpuBackend::lite_token(refF[j], svi, hs[1 + L + j]))
+    if (usableF[j] && (!GpuBackend::super_input(refF[j], svi, sclip, nf_ref[j], in[1 + L + j])
+      || (in[1 + L + j].host && in[1 + L + j].fmt.planes != in[0].fmt.planes)))
       return -1;
   }
 
@@ -725,7 +745,7 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
     g.win_chroma = OverWinsUV->GetWindow(0);
   }
   GpuBackend &gpu = GpuBackend::instance();
-  return gpu.with_tokens(hs, 1 + 2 * L, env, [&](const unsigned long long *tk) {
+  return gpu.with_inputs(in, 1 + 2 * L, env, [&](const unsigned long long *tk) {
     return gpu.degrain(&g, L, tk[0], tk + 1, tk + 1 + L, blocks.data(), mask, _producer, n, &h);
   });
 }
@@ -737,12 +757,20 @@ PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
   {
     MvCudaTokenHeader h;
     PVideoFrame props;
-    const int rc = gpu_make(n, env, h, &props);
+    bool host = false;
+    int rc = gpu_make(n, env, h, &props, host);
     if (rc == 0)
     {
       PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &props) : env->NewVideoFrame(vi);
-      GpuBackend::write_token(dst, h);
-      return dst;
+      if (!host)
+      {
+        GpuBackend::write_token(dst, h);
+        return dst;
+      }
+      // normal frames in, normal frames out (the device frame was made by this thread a moment ago)
+      if (GpuBackend::instance().download_frame(h, dst, vi))
+        return dst;
+      rc = -2;
     }
     if (GpuBackend::log_enabled())
       std::fprintf(stderr, "MDegrain%d gpu frame %d rc=%d -> CPU\n", level, n, rc);

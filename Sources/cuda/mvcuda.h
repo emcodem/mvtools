@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 15
+#define MVCUDA_API_VERSION 16
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -83,17 +83,22 @@ typedef struct
   int search_radius;                      // exhaustive search radius (searchparam)
   int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left)
   int slice_threads;                      // 1: CPU single-thread result; N: CPU result with N threads (nLambda is 0 on the first row of every slice)
-  unsigned long long src_key, ref_key;    // 0, or an identifier of the frame content (see mvcuda_analyse_host)
+  unsigned long long src_key, ref_key;    // ignored since API 16 (pictures are device frames, see mvcuda_frame_upload_keyed)
   int search_type;                        // SearchType.h value (1, 2, 4, 8, 16, 32, 64, 128); 0 = exhaustive. search_radius is its parameter
 } MvCudaRecalcParams;
 
 // Recalculates the vectors of one frame on the GPU. The super frames (level 0, chroma, pel 1 or 2) are built from the
 // raw planes of the source and the reference frame (host memory, as for mvcuda_super_host). old_vectors and
 // out_vectors are the (vx, vy, sad) int triples of the old and the new vector plane, block by block.
-// Returns like mvcuda_super_host.
+// Returns like mvcuda_super_host. Test entry point (uploads both pictures); filters use mvcuda_recalc_token.
 MVCUDA_API int mvcuda_recalc_host(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], const int *old_vectors,
   int *out_vectors);
+
+// The same with the pictures as device frames (tokens): the super frames are kept with them (made on first use).
+// MVCUDA_TOKEN_GONE when a token was evicted (API 16).
+MVCUDA_API int mvcuda_recalc_token(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, unsigned long long src_token,
+  unsigned long long ref_token, const int *old_vectors, int *out_vectors);
 
 // ---- GPU MAnalyse search (M3), see mvcuda_analyse.cu --------------------------------------------------------
 
@@ -114,8 +119,7 @@ typedef struct
   int pel_search;                         // exhaustive search radius at level 0 (pelsearch), 1..3
   int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left)
   int slice_threads;                      // 1: single-slice CPU result; N: CPU result with N threads (see file)
-  unsigned long long src_key, ref_key;    // 0, or an identifier of the frame content: the library keeps built super frames
-                                          // by (key, geometry) and reuses them; same key must always mean the same pixels
+  unsigned long long src_key, ref_key;    // ignored since API 16 (pictures are device frames, see mvcuda_frame_upload_keyed)
   int search_type;                        // SearchType.h value used at level 0 (and at every level for 64 / 128); 0 = exhaustive.
                                           // Coarse levels are exhaustive (radius search_param) for every other type, as on the CPU
   int bad_range;                          // MAnalyse badrange (wide search for blocks above badSAD; used by the meander=false search)
@@ -124,12 +128,13 @@ typedef struct
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are
 // built from the raw planes as for mvcuda_super_host. payload receives the vector frame payload exactly as MAnalyse
 // writes it: int32 [total words, 1], then per level, coarse to fine, [size, (vx, vy, sad) * blocks]; payload_words is
-// its capacity. Returns like mvcuda_super_host, or MVCUDA_NEEDS_CPU.
+// its capacity. Returns like mvcuda_super_host, or MVCUDA_NEEDS_CPU. Test entry point (uploads both pictures).
 MVCUDA_API int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const void *const src[3],
   const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], int *payload, int payload_words);
 
 // The same with the source / reference pictures as device frames (tokens, see "device frames and tokens" below): no
-// upload, the super frames are built on the device. MVCUDA_TOKEN_GONE when a token was evicted (make it again and retry).
+// upload; the super frames are kept with the device frames (made on first use, counted in the registry budget).
+// MVCUDA_TOKEN_GONE when a token was evicted (make it again and retry).
 MVCUDA_API int mvcuda_analyse_token(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, unsigned long long src_token,
   unsigned long long ref_token, int *payload, int payload_words);
 
@@ -150,7 +155,7 @@ typedef struct
   int time256;                             // interpolation position, 1..255
   double occ_norm;                         // 10 / ml / pel as MFlowFps computes it
   int mode;                                // 2 (extra frames), the only one implemented
-  unsigned long long src_key, ref_key;     // frame cache keys of the left / right frame (0 = uncached)
+  unsigned long long src_key, ref_key;     // ignored since API 16
 } MvCudaFlowParams;
 
 // Renders one interpolated frame (MFlowFps mask=2 path) on the GPU. The super frames (level 0, chroma, pel 1 or 2) of the
@@ -164,7 +169,8 @@ MVCUDA_API int mvcuda_flow_host(const MvCudaSuperParams *sp, const MvCudaFlowPar
   const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3], const int dst_pitch_bytes[3],
   void *const dbg[MVCUDA_FLOW_DEBUG_SLOTS]);
 
-// drops all cached super frames and pooled device memory (call when the last user of the library goes away)
+// gives the pooled device memory back to the driver and forgets the upload keys (call when the last user of the library
+// goes away)
 MVCUDA_API void mvcuda_cache_clear();
 
 // ---- device frames and tokens (GPU_PIPELINE_PLAN.md section 4, milestone D), see mvcuda_frames.cu ---------------------
@@ -206,6 +212,7 @@ typedef struct
   unsigned long long frames;                 // frames in the registry
   unsigned long long uploads, downloads, evictions, regenerations, lookups_gone;
   unsigned long long redirects;               // lookups of evicted tokens served by a newer token of the same frame (API 14)
+  unsigned long long upload_hits;             // mvcuda_frame_upload_keyed calls served by a frame already on the device (API 16)
 } MvCudaFrameStats;
 
 // Copies a host frame (src[plane], pitch in bytes) to the device and registers it. out receives the header to write into
@@ -213,6 +220,12 @@ typedef struct
 // -4 bad arguments.
 MVCUDA_API int mvcuda_frame_upload(const MvCudaFrameFormat *f, const void *const src[3], const int src_pitch_bytes[3],
   unsigned long long producer, int frame, MvCudaTokenHeader *out);
+
+// The same for a picture identified by a content key (key != 0; same key = same pixels, e.g. a clip and a frame number):
+// while a frame uploaded under that key (and format) is in the registry, out receives its token and nothing is copied.
+// Uploaded frames have no producer: a consumer that finds the token evicted uploads again (API 16).
+MVCUDA_API int mvcuda_frame_upload_keyed(const MvCudaFrameFormat *f, const void *const src[3], const int src_pitch_bytes[3],
+  unsigned long long key, MvCudaTokenHeader *out);
 
 // Copies the device frame of a token to host memory (dst[plane], pitch in bytes). MVCUDA_TOKEN_GONE when evicted.
 MVCUDA_API int mvcuda_frame_download(unsigned long long token, void *const dst[3], const int dst_pitch_bytes[3]);
@@ -234,6 +247,17 @@ MVCUDA_API int mvcuda_token_pin(unsigned long long token);
 MVCUDA_API void mvcuda_token_unpin(unsigned long long token);
 
 MVCUDA_API void mvcuda_frame_stats(MvCudaFrameStats *s);
+
+// ---- MFlowFps on device frames (see mvcuda_flow.cu and mvcuda_flow_host above) -----------------------------------------
+// The same with the left / right pictures as device frames (tokens); the result is a new device frame (the pictures'
+// format), out its token (producer / frame for regeneration). MVCUDA_TOKEN_GONE when a token was evicted (API 16).
+MVCUDA_API int mvcuda_flow_token(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, unsigned long long producer,
+  int frame, MvCudaTokenHeader *out);
+// The same with the result copied into host planes (dst[plane], pitch in bytes) instead of a device frame (API 16).
+MVCUDA_API int mvcuda_flow_token_host(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3],
+  const int dst_pitch_bytes[3]);
 
 // ---- resampling (AviSynth+ FilteredResizeV / H semantics), see mvcuda_resample.cu ------------------------------------
 // A program is the AviSynth integer resampling program of one plane after resize_prepare_coeffs: for each of target_size
