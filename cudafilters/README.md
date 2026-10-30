@@ -7,8 +7,9 @@ CPU filter chain too: it is the exact fallback when the GPU cannot make a frame.
 `mvtools_cuda.dll` must sit in one folder and come from one build (library API version check).
 
 GPU filters return *token frames*: ordinary AviSynth frames whose first luma row holds a `MvCudaTokenHeader` while the picture
-stays in device memory. `CudaDownload` turns them back into pixels; `MSuper(gpu=true)`, `MAnalyse`, `MCompensate` and
-`MDegrain` of mvtools2 read them directly. See `GPU_PIPELINE_PLAN.md` (sections 16 onwards) for the design and the test
+stays in device memory. `CudaDownload` turns them back into pixels; `MSuper(gpu=true)`, `MAnalyse`, `MRecalculate`,
+`MFlowFps`, `MCompensate` and `MDegrain` of mvtools2 read them directly (token frames in, token frames out; normal frames
+in, normal frames out: see `..\Documentation\gpu.md`). See `GPU_PIPELINE_PLAN.md` (sections 16 onwards) for the design and the test
 results.
 
 Filters: `CudaUpload`, `CudaDownload`, `CudaBob`, `CudaTemporalSoften`, `CudaMerge`, `CudaMergeLuma`, `CudaMergeChroma`,
