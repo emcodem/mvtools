@@ -8,7 +8,7 @@ This page covers the CUDA part of this mvtools build:
 - the environment variables
 
 The design notes and measurements are in `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md` and `GPU_PIPELINE_PLAN.md`. They describe how
-the work got here; this page describes what the functions do now (library API version 15).
+the work got here; this page describes what the functions do now (library API version 16).
 
 ## Principles
 
@@ -48,12 +48,16 @@ filter and frame number that produced it, the format). Every 8th luma row of a t
 does not understand tokens shows obvious stripes, not a plausible picture.
 
 - **Readers.** Every `Cuda*` filter, `MSuper`, `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept
-  token frames as input. The `Cuda*` filters, `MSuper`, `MCompensate`, `MDegrain1..6` and `MAnalyse` use the device frame
-  directly; `MRecalculate` and `MFlowFps` download it (MRecalculate then computes on the CPU, MFlowFps uploads the pictures
-  again), as does any of them when it runs on the CPU. Any other filter needs `CudaDownload` in front of it.
-- **Mixed input.** Every `Cuda*` filter also accepts normal frames and uploads them.
+  token frames as input and use the device frame directly; when one of them runs on the CPU, it downloads the picture.
+  Any other filter needs `CudaDownload` in front of it.
+- **Usage rule.** Token frames in, token frames out; normal frames in, normal frames out. A GPU filter given normal frames
+  uploads the pictures itself, computes on the GPU and returns normal frames. The mvtools2 filters upload each picture
+  of a super clip once, shared by every GPU filter that reads that super clip (both MAnalyse directions, MRecalculate,
+  MFlowFps, MCompensate, MDegrain).
 - **Eviction.** The device frames live in a registry with a memory budget (`MVCUDA_CACHE_MB`). When a frame is evicted
-  before it is read, the filter that produced it makes it again, so evictions cost time but never change the result.
+  before it is read, the filter that produced it makes it again (an uploaded picture is uploaded again), so evictions cost
+  time but never change the result. The super pyramids that MAnalyse, MRecalculate and MFlowFps make on the device are
+  kept with the device frame of their picture and counted in the same budget.
 - **Supported formats.** Device frames are planar Y or YUV (no RGB, no alpha), 8 to 16 bit integer, chroma subsampling 1
   or 2 in each direction (4:2:0, 4:2:2, 4:4:4, Y only), and at least 72 bytes per luma row (the header must fit). Filters
   that work through a lookup table (CudaLutxy, CudaKeepOnlyBobShimmerFixes, CudaQtgmcSharpLimit with `smode` 1 / 2,
@@ -63,7 +67,7 @@ does not understand tokens shows obvious stripes, not a plausible picture.
 A typical chain:
 
 ```
-CudaUpload()                         # or start with a Cuda* filter
+CudaUpload()                         # or start with a Cuda* filter (without it: normal frames in and out, GPU inside)
 ...Cuda* filters...
 sup = MSuper(pel=2, gpu=true)        # "lite" super of the token clip
 ...MAnalyse / MDegrain / MCompensate with gpu=true...
@@ -79,9 +83,9 @@ CudaDownload()                       # pixels again for the rest of the script
 | `MSuper(gpu=true)` | Nothing: it makes a "lite" super clip that holds only the picture, so the GPU filters build the pyramid themselves | lite super clip |
 | `MAnalyse(gpu=true)` | Hierarchical search, all levels, with its own super pyramid | normal vector clip |
 | `MRecalculate(gpu=true)` | Refinement search | normal vector clip |
-| `MCompensate(gpu=true)` | Block compensation | token frames |
-| `MDegrain1..6(gpu=true)` | Degraining | token frames |
-| `MFlowFps(gpu=true)` | Flow interpolation (`mask=2`) | normal frames |
+| `MCompensate(gpu=true)` | Block compensation | token frames for a token clip, else normal frames |
+| `MDegrain1..6(gpu=true)` | Degraining | token frames for a token clip, else normal frames |
+| `MFlowFps(gpu=true)` | Flow interpolation (`mask=2`) | token frames for a token clip, else normal frames |
 
 `MDegrainN`, `MFlow`, `MFlowInter`, `MFlowBlur`, `MBlockFps`, `MMask`, `MSCDetection`, `MShow`, `MDepan`, `MScaleVect`,
 `MStoreVect` and `MRestoreVect` have no GPU path.
@@ -166,13 +170,14 @@ a normal vector clip.
 
 The GPU path is used when all of these hold:
 
-- `super` is a lite super (`MSuper(gpu=true)`) **of a token clip**, so the pictures are on the device
+- `super` is a lite super (`MSuper(gpu=true)`)
 - 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `recursion=0`, `fields=false`, `tr=0`
 
-The output is token frames. Frames without a usable vector field (scene change) come out as the source or reference
-picture, as on the CPU. When a frame cannot be made on the GPU, it is made on the CPU and returned as a normal frame.
+The output is token frames when the super clip is a lite super of a token clip, otherwise normal frames (the pictures are
+uploaded). Frames without a usable vector field (scene change) come out as the source or reference picture, as on the
+CPU. When a frame cannot be made on the GPU, it is made on the CPU and returned as a normal frame.
 
 ### MDegrain1 .. MDegrain6
 
@@ -180,13 +185,14 @@ picture, as on the CPU. When a frame cannot be made on the GPU, it is made on th
 
 The GPU path is used when all of these hold:
 
-- the source clip is a token clip, and `super` is a lite super of a token clip
+- `super` is a lite super (`MSuper(gpu=true)`)
 - 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `limit` and `limitC` 255 (the default)
 - `lsb`, `out16`, `out32` false
 
-The output is token frames, or normal frames for frames made on the CPU. MDegrainN has no `gpu` parameter.
+The output is token frames when the source clip is a token clip, otherwise normal frames (the pictures are uploaded), and
+normal frames for frames made on the CPU. MDegrainN has no `gpu` parameter.
 
 ### MFlowFps
 
@@ -198,7 +204,9 @@ The GPU path is used when all of these hold:
 - super from this build's `MSuper` with `sharp=2`, no `pelclip`, `pel` 1 or 2
 - planar YUV with three planes (not Y only, not RGB), 8-bit or 16-bit container, chroma subsampling 1 or 2
 
-The output is normal frames. Single frames go to the CPU whenever the GPU cannot make them.
+The output is token frames when the source clip is a token clip (they are made again after eviction), otherwise normal
+frames. Single frames go to the CPU whenever the GPU cannot make them, for example frames whose vectors are not usable
+(scene change; see `thSCD1` / `thSCD2`); those come out as normal frames.
 
 ---
 
@@ -219,9 +227,10 @@ All filters return token frames when they run on the GPU, and are `MT_NICE_FILTE
 Uploads every frame to the device and returns token frames. Token frames pass through unchanged. If the GPU or the format
 is not usable, the frames pass through as normal frames; every consumer accepts those.
 
-Upload is not needed in front of a `Cuda*` filter, because they all upload normal frames themselves. It is useful in
-front of `MSuper(gpu=true)` when `MCompensate` / `MDegrain` should run on the GPU. Frames uploaded by `CudaUpload` can be
-made again after eviction (it reads its input again); frames uploaded inside other filters cannot.
+Upload is not needed in front of a GPU filter, because they all upload normal frames themselves. Put it where the rest of
+the chain should stay on the device: after it, the GPU filters return token frames. Frames uploaded by `CudaUpload` can be
+made again after eviction (it reads its input again); a filter that uploads normal frames itself uploads them again when
+needed.
 
 #### CudaDownload(clip)
 
@@ -374,7 +383,7 @@ Read once per process.
 | Variable | Effect |
 |---|---|
 | `MVTOOLS_GPU_DISABLE` | Do not load `mvtools_cuda.dll`; everything runs on the CPU. cudafilters honours it too |
-| `MVTOOLS_GPU_LOG` | Print every GPU decision and per-frame fallback to stderr |
+| `MVTOOLS_GPU_LOG` | Print every GPU decision and per-frame fallback to stderr, and the device frame registry statistics when the last GPU filter is destroyed |
 | `MVTOOLS_GPU_FORCE_FALLBACK` | Every GPU call reports "use the CPU" (for testing the fallback paths) |
 | `MVTOOLS_GPU_SLICES=n` | Slice count of MAnalyse (`meander=true`) and MRecalculate on the GPU; changes the vector field compared with the CPU |
 | `MVTOOLS_GPU_PROFILE` | Wall time per named phase, printed to stderr when the process ends |
@@ -391,8 +400,7 @@ Read once per process.
 | Variable | Effect |
 |---|---|
 | `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 8.0 or newer) |
-| `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
-| `MVCUDA_CACHE_FRAMES=n` | Capacity of the device super frame cache used by MAnalyse / MRecalculate / MFlowFps, in frames (default 24, minimum 2) |
+| `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames, uploaded pictures and the super pyramids kept with them), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
 | `MVCUDA_WAVE=0` | MAnalyse with `meander=false` uses the slice kernel instead of the wavefront kernel (for comparisons) |
 | `MVCUDA_SPIN` | Waits for the GPU spin a CPU core instead of sleeping |
 | `MVCUDA_TIMING` | Kernel timings to stderr |

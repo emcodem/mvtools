@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace
@@ -259,11 +260,13 @@ namespace
   }
 }
 
-extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
-  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], const int *old_vectors,
-  int *out_vectors)
+// The recalculation on two device frames (source and reference picture); their super frames are kept with them
+// (frame_super). Issued by the pipeline submitter on a leased stream ordered after the ops that made the frames; the
+// vectors go up and come back through one pinned buffer.
+static int recalc_dev(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const std::shared_ptr<mvc::DevFrame> &fs,
+  const std::shared_ptr<mvc::DevFrame> &fr, const int *old_vectors, int *out_vectors)
 {
-  if (!sp || !rp || !src || !ref || !old_vectors || !out_vectors)
+  if (!sp || !rp || !fs || !fr || !old_vectors || !out_vectors)
     return -4;
   // supported: level-0-only super, luma only or luma + chroma, pel 1 or 2, every search type of mvcuda_refine.cuh
   // (0 = exhaustive), smooth 0/1
@@ -271,6 +274,8 @@ extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const Mv
   if (sp->levels != 1 || rp->smooth < 0 || rp->smooth > 1 || rp->search_radius < 1 || rp->old_pel < 1
     || rp->n_blk_x < 1 || rp->n_blk_y < 1 || rp->old_blk_x < 1 || rp->old_blk_y < 1 || rp->lambda_level < 0
     || !mvc_refine::supported_type(search_type) || rp->search_radius > mvc_refine::max_param(search_type))
+    return -4;
+  if (!mvc::super_fits(*fs, *sp, (int)sizeof(pix)) || !mvc::super_fits(*fr, *sp, (int)sizeof(pix)))
     return -4;
   if (!mvc::use_device())
     return -1;
@@ -285,33 +290,15 @@ extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const Mv
     t0 = t1;
   };
 
-  int rc = 0;
-  mvc::StreamLease lease;
-  cudaStream_t st = lease.s;
-  std::shared_ptr<mvc::DevSuper> s_src, s_ref;
-  int *d_old = nullptr, *d_out = nullptr;
+  int *d_buf = nullptr;
   const size_t n_old = (size_t)rp->old_blk_x * rp->old_blk_y, n_new = (size_t)rp->n_blk_x * rp->n_blk_y;
-  const size_t old_bytes = n_old * 3 * sizeof(int), new_bytes = n_new * 3 * sizeof(int);
-
-  rc = mvc::super_get(&MVC_NS::super_build, *sp, rp->src_key, src, src_pitch_bytes, st, s_src);
-  if (!rc)
-    rc = mvc::super_get(&MVC_NS::super_build, *sp, rp->ref_key, ref, ref_pitch_bytes, st, s_ref);
-  lap("2 x super (cached)");
-  if (rc)
-    return rc;
+  const size_t old_bytes = n_old * 3 * sizeof(int), new_bytes = n_new * 3 * sizeof(int), buf_bytes = old_bytes + new_bytes;
+  // [old vectors][new vectors], on the device and pinned on the host (else the caller's arrays, pageable)
+  unsigned char *pin = (unsigned char *)mvc::pin_alloc(buf_bytes);
+  if (pin)
+    std::memcpy(pin, old_vectors, old_bytes);
 
   KArgs a = {};
-  for (int p = 0; p < 3; p++)
-  {
-    a.src[p] = (const pix *)s_src->pl[p].sub[0];
-    for (int i = 0; i < 4; i++)
-      a.ref[p][i] = (const pix *)s_ref->pl[p].sub[i];
-    a.ew[p] = s_ref->pl[p].d.ew;
-    a.hpad[p] = s_ref->pl[p].d.hpad;
-    a.vpad[p] = s_ref->pl[p].d.vpad;
-  }
-  a.ext_w0 = s_ref->pl[0].d.ew;
-  a.ext_h0 = s_ref->pl[0].d.eh;
   a.pel = sp->pel;
   a.log_pel = ilog2(sp->pel);
   a.bits = sp->bits_per_pixel;
@@ -347,40 +334,84 @@ extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const Mv
     a.n_slices = slices < 1 ? 1 : slices;
   }
 
+  int rc = 0;
+  d_buf = (int *)mvc::dev_alloc(buf_bytes);
+  if (!d_buf)
+    rc = -2;
+  std::shared_ptr<mvc::DevSuper> s_src, s_ref;
+  const mvc::DevFrame *in[2] = { fs.get(), fr.get() };
+  if (!rc)
+    rc = mvc::leased_call(in, 2, [&](cudaStream_t st) -> int {
 #define RC_CHECK(call) \
   do { \
     cudaError_t e_ = (call); \
     if (e_ != cudaSuccess) { \
       fprintf(stderr, "mvcuda: %s failed: %s\n", #call, cudaGetErrorString(e_)); \
-      rc = -2; \
-      goto done; \
+      return -2; \
     } \
   } while (0)
-
-  d_old = (int *)mvc::dev_alloc(old_bytes);
-  d_out = (int *)mvc::dev_alloc(new_bytes);
-  if (!d_old || !d_out)
-  {
-    rc = -2;
-    goto done;
-  }
-  RC_CHECK(cudaMemcpyAsync(d_old, old_vectors, old_bytes, cudaMemcpyHostToDevice, st));
-  a.old_vec = d_old;
-  a.out = d_out;
-  {
-    const int warps_per_block = 4;
-    const int blocks = (int)((n_new + warps_per_block - 1) / warps_per_block);
-    k_recalc<<<blocks, 32 * warps_per_block, 0, st>>>(a);
-  }
-  RC_CHECK(cudaGetLastError());
-  RC_CHECK(cudaMemcpyAsync(out_vectors, d_out, new_bytes, cudaMemcpyDeviceToHost, st));
-  RC_CHECK(cudaStreamSynchronize(st));
-  lap("vectors + recalc kernel");
-
-done:
-  if (rc)
-    cudaStreamSynchronize(st);
-  mvc::dev_free(d_old, old_bytes);
-  mvc::dev_free(d_out, new_bytes);
+      int r = mvc::frame_super(&MVC_NS::super_build_dev, fs, *sp, st, s_src);
+      if (!r)
+        r = mvc::frame_super(&MVC_NS::super_build_dev, fr, *sp, st, s_ref);
+      if (r)
+        return r;
+      for (int p = 0; p < 3; p++)
+      {
+        a.src[p] = (const pix *)s_src->pl[p].sub[0];
+        for (int i = 0; i < 4; i++)
+          a.ref[p][i] = (const pix *)s_ref->pl[p].sub[i];
+        a.ew[p] = s_ref->pl[p].d.ew;
+        a.hpad[p] = s_ref->pl[p].d.hpad;
+        a.vpad[p] = s_ref->pl[p].d.vpad;
+      }
+      a.ext_w0 = s_ref->pl[0].d.ew;
+      a.ext_h0 = s_ref->pl[0].d.eh;
+      a.old_vec = d_buf;
+      a.out = d_buf + n_old * 3;
+      RC_CHECK(cudaMemcpyAsync(d_buf, pin ? (const void *)pin : (const void *)old_vectors, old_bytes, cudaMemcpyHostToDevice, st));
+      {
+        const int warps_per_block = 4;
+        const int blocks = (int)((n_new + warps_per_block - 1) / warps_per_block);
+        k_recalc<<<blocks, 32 * warps_per_block, 0, st>>>(a);
+      }
+      RC_CHECK(cudaGetLastError());
+      RC_CHECK(cudaMemcpyAsync(pin ? (void *)(pin + old_bytes) : (void *)out_vectors, a.out, new_bytes, cudaMemcpyDeviceToHost, st));
+      return 0;
+#undef RC_CHECK
+    });
+  if (!rc && pin)
+    std::memcpy(out_vectors, pin + old_bytes, new_bytes);
+  lap("supers + vectors + recalc kernel");
+  // leased_call has waited for the stream in every case
+  mvc::dev_free(d_buf, buf_bytes);
+  mvc::pin_free(pin, buf_bytes);
   return rc;
+}
+
+extern "C" int MVC_API(mvcuda_recalc_host)(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, const void *const src[3],
+  const int src_pitch_bytes[3], const void *const ref[3], const int ref_pitch_bytes[3], const int *old_vectors,
+  int *out_vectors)
+{
+  if (!sp || !rp || !src || !ref || !src_pitch_bytes || !ref_pitch_bytes || !old_vectors || !out_vectors)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fs = mvc::upload_picture(*sp, (int)sizeof(pix), src, src_pitch_bytes);
+  auto fr = mvc::upload_picture(*sp, (int)sizeof(pix), ref, ref_pitch_bytes);
+  if (!fs || !fr)
+    return -4;
+  return recalc_dev(sp, rp, fs, fr, old_vectors, out_vectors);
+}
+
+extern "C" int MVC_API(mvcuda_recalc_token)(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, unsigned long long src_token,
+  unsigned long long ref_token, const int *old_vectors, int *out_vectors)
+{
+  if (!sp || !rp || !old_vectors || !out_vectors)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fs = mvc::frame_get(src_token), fr = mvc::frame_get(ref_token);
+  if (!fs || !fr)
+    return MVCUDA_TOKEN_GONE;
+  return recalc_dev(sp, rp, fs, fr, old_vectors, out_vectors);
 }

@@ -638,7 +638,7 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
     bool gpu_done = false;
     if (_gpu_ok && fieldShift == 0 && outfile == NULL)
     {
-      gpu_done = gpu_recalc(srd, nsrc, nref, reinterpret_cast <int *> (pDst));
+      gpu_done = gpu_recalc(srd, src, ref, nsrc, nref, reinterpret_cast <int *> (pDst), env);
     }
     if (!gpu_done)
     {
@@ -695,8 +695,10 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
 
 
 
-// GPU version of GroupOfPlanes::RecalculateMVs for the frames loaded into pSrcGOF / pRefGOF.
-bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload)
+// GPU version of GroupOfPlanes::RecalculateMVs for the super frames src / ref (their level-0 pictures: device frames, or
+// host pictures uploaded once per super frame).
+bool MVRecalculate::gpu_recalc(SrcRefData &srd, const PVideoFrame &src, const PVideoFrame &ref, int nsrc, int nref, int *payload,
+  IScriptEnvironment *env)
 {
   if (GpuBackend::force_fallback())
     return false;
@@ -704,21 +706,10 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = srd._analysis_data;
 
-  const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
-  const void *src_p[3] = { 0, 0, 0 }, *ref_p[3] = { 0, 0, 0 };
-  int src_pitch[3] = { 0, 0, 0 }, ref_pitch[3] = { 0, 0, 0 };
-  for (int p = 0; p < (nModeYUV == YUVPLANES ? 3 : 1); p++) // luma-only recalculation: the chroma planes are not touched
-  {
-    MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
-    MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
-    src_p[p] = ps->GetAbsolutePelPointer(ps->GetHPadding(), ps->GetVPadding());
-    ref_p[p] = pr->GetAbsolutePelPointer(pr->GetHPadding(), pr->GetVPadding());
-    src_pitch[p] = ps->GetPitch();
-    ref_pitch[p] = pr->GetPitch();
-  }
-  // a GPU search clip (token frames) as super source: this path takes host pictures, the CPU path downloads them
-  MvCudaTokenHeader tok;
-  if (_super_lite && (GpuBackend::read_token(src_p[0], a.nWidth * a.pixelsize, tok) || GpuBackend::read_token(ref_p[0], a.nWidth * a.pixelsize, tok)))
+  GpuBackend::Input in[2];
+  const VideoInfo &svi = child->GetVideoInfo();
+  if (!GpuBackend::super_input(src, svi, (const void *)child.operator->(), nsrc, in[0])
+    || !GpuBackend::super_input(ref, svi, (const void *)child.operator->(), nref, in[1]))
     return false;
 
   // the old vectors: finest plane of the vector clip, (vx, vy, sad) per block
@@ -769,16 +760,16 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, int nsrc, int nref, int *payload
   rp.search_radius = nSearchParam;
   rp.chroma_sad_scale = _gpu_effective_chroma_scale;
   rp.slice_threads = _gpu_slices;
-  rp.src_key = GpuBackend::frame_key((const void *)child.operator->(), nsrc);
-  rp.ref_key = GpuBackend::frame_key((const void *)child.operator->(), nref);
 
   const int n_new = a.nBlkX * a.nBlkY;
   std::vector<int> out_vec(size_t(n_new) * 3);
   int rc = -1;
   try
   {
-    GpuScope sc_call("recalc: recalc_host call");
-    rc = gpu.recalc_host(&sp, &rp, src_p, src_pitch, ref_p, ref_pitch, old_vec.data(), out_vec.data());
+    GpuScope sc_call("recalc: recalc_token call");
+    rc = gpu.with_inputs(in, 2, env, [&](const unsigned long long *tk) {
+      return gpu.recalc_token(&sp, &rp, tk[0], tk[1], old_vec.data(), out_vec.data());
+    });
   }
   catch (...)
   {

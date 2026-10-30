@@ -27,6 +27,7 @@ namespace mvc
       std::list<unsigned long long>::iterator lru;
       unsigned long long used_at; // g_put_bytes at the last put / lookup (reuse distance, budget_on_miss)
       unsigned long long key;     // frame_key (g_latest)
+      unsigned long long ukey;    // upload key (g_keyed), 0 = none
     };
 
     std::mutex g_mutex;
@@ -107,8 +108,11 @@ namespace mvc
     // lookups of evicted tokens raise the budget to 1.25 times their median distance, at least by half (the cap if that
     // is beyond it). Lookups made inside a regeneration (of its inputs) do not count: one late request of an old frame
     // cascades into many (QTGMC Placebo PAL: 2 regenerations at a fixed 384 MB, 1,200 and the cap when they counted).
-    // The first frame sets the start: at least BUDGET_START_FRAMES frames of its size.
+    // The first frame sets the start: at least BUDGET_START_FRAMES frames of its size, but not above BUDGET_START_MAX (UHD
+    // frames: 128 of them are 4 GB, while the uc_FRC chain, its super pyramids counted, runs as fast with 1 GB; larger
+    // needs grow the budget as above).
     const unsigned BUDGET_WINDOW = 64, BUDGET_MISSES = 8, BUDGET_START_FRAMES = 128;
+    const size_t BUDGET_START_MAX = (size_t)1024 << 20;
     unsigned long long g_put_bytes = 0;                       // bytes of all frames put so far
     unsigned g_window_puts = 0;
     std::vector<unsigned long long> *g_window_dist = new std::vector<unsigned long long>; // miss distances of the window
@@ -127,6 +131,9 @@ namespace mvc
     {
       return producer ? (producer << 32) ^ (unsigned)frame : 0;
     }
+    // Pictures uploaded under a content key (mvcuda_frame_upload_keyed): key -> token of the live frame. The GPU filters of
+    // mvtools that read the same host picture (both MAnalyse directions, MRecalculate, MFlowFps, ...) share one upload.
+    std::unordered_map<unsigned long long, unsigned long long> *g_keyed = new std::unordered_map<unsigned long long, unsigned long long>;
     std::list<unsigned long long> *g_ghost_order = new std::list<unsigned long long>; // eviction order, oldest first
     const size_t GHOSTS = 65536;
     thread_local int t_regen_depth = 0; // regenerations this thread is inside (mvcuda_token_regenerate)
@@ -173,7 +180,10 @@ namespace mvc
         return;
       if (g_put_bytes == frame_bytes) // the first frame
       {
-        const size_t start = (size_t)BUDGET_START_FRAMES * frame_bytes, cap = budget_cap();
+        size_t start = (size_t)BUDGET_START_FRAMES * frame_bytes;
+        const size_t cap = budget_cap();
+        if (start > BUDGET_START_MAX)
+          start = BUDGET_START_MAX;
         if (start > budget())
           g_budget.store(start < cap ? start : cap);
       }
@@ -296,6 +306,7 @@ namespace mvc
       void *p;
       size_t bytes;
       bool up;    // upload buffer, else pinned staging buffer
+      std::shared_ptr<void> keep = nullptr; // pipe_keep: an object held until then (p is null)
     };
     struct PinBatch
     {
@@ -311,6 +322,8 @@ namespace mvc
 
     void release_now(const Release &r)
     {
+      if (!r.p)
+        return; // pipe_keep: the object goes with the list entry
       if (r.up)
       {
         std::lock_guard<std::mutex> lk(g_up_mutex);
@@ -420,20 +433,30 @@ namespace mvc
   }
 
   // copies pinned host memory to an upload buffer on the upload stream now and orders the pipeline stream after it;
-  // the pinned buffer returns to its pool afterwards. False when the copy could not be queued (nothing queued then).
-  bool up_copy(void *d, void *pin, size_t bytes)
+  // the pinned buffer returns to its pool afterwards. done: null, or receives an event of its own recorded after the copy
+  // (readers outside the pipeline wait for that, not for the pipeline). False when the copy could not be queued (nothing
+  // queued then).
+  bool up_copy(void *d, void *pin, size_t bytes, cudaEvent_t *done = nullptr)
   {
     const cudaStream_t us = upload_stream();
     cudaEvent_t e = us ? event_get() : nullptr;
-    if (!e)
+    cudaEvent_t own = (e && done) ? event_get() : nullptr;
+    if (!e || (done && !own))
+    {
+      event_put(e);
       return false;
-    if (cudaMemcpyAsync(d, pin, bytes, cudaMemcpyHostToDevice, us) != cudaSuccess || cudaEventRecord(e, us) != cudaSuccess)
+    }
+    if (cudaMemcpyAsync(d, pin, bytes, cudaMemcpyHostToDevice, us) != cudaSuccess || cudaEventRecord(e, us) != cudaSuccess
+      || (own && cudaEventRecord(own, us) != cudaSuccess))
     {
       cudaGetLastError();
       cudaStreamSynchronize(us);
       event_put(e);
+      event_put(own);
       return false;
     }
+    if (done)
+      *done = own;
     pipe_submit([e, pin, bytes](cudaStream_t s) {
       cudaStreamWaitEvent(s, e, 0);
       event_put(e); // a later re-recording does not affect this wait
@@ -720,8 +743,51 @@ namespace mvc
     pp.free.emplace(bytes, p);
   }
 
+  void pipe_keep(std::shared_ptr<void> obj)
+  {
+    if (obj)
+      g_unsealed->push_back(Release{ nullptr, 0, false, std::move(obj) });
+  }
+
+  int leased_call(const DevFrame *const *frames, int count, const std::function<int(cudaStream_t)> &issue)
+  {
+    StreamLease lease;
+    const cudaStream_t st = lease.s;
+    int rc = 0;
+    // uploaded frames: their own copy event; frames made by pipeline ops: a mark after the latest of those ops
+    unsigned long long seq = 0;
+    for (int i = 0; i < count; i++)
+      if (!frames[i]->up_done && frames[i]->seq > seq)
+        seq = frames[i]->seq;
+    if (seq)
+      mark_request(seq);
+    pipe_call([&](cudaStream_t ps) {
+      for (int i = 0; i < count && rc == 0; i++)
+        if (frames[i]->up_done && cudaStreamWaitEvent(st, frames[i]->up_done, 0) != cudaSuccess)
+          rc = -2;
+      cudaEvent_t e = rc == 0 ? mark_in_op(seq, ps) : nullptr;
+      if (rc == 0)
+        rc = (e && cudaStreamWaitEvent(st, e, 0) != cudaSuccess) ? -2 : issue(st);
+    });
+    // the host waits for this stream only (blocking-sync event: the thread sleeps)
+    cudaEvent_t done = rc == 0 ? event_get() : nullptr;
+    const bool ok = done && cudaEventRecord(done, st) == cudaSuccess && cudaEventSynchronize(done) == cudaSuccess;
+    if (!ok)
+    {
+      if (rc == 0)
+        std::fprintf(stderr, "mvcuda: leased call failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+      cudaStreamSynchronize(st); // the caller releases the buffers st used
+      cudaGetLastError();
+      if (rc == 0)
+        rc = -2;
+    }
+    event_put(done);
+    return rc;
+  }
+
   DevFrame::~DevFrame()
   {
+    event_put(up_done);
     if (upload)
       up_free(plane[0], bytes);
     else
@@ -762,12 +828,13 @@ namespace mvc
     Held &hold = t_held[t_held_pos++ % HOLDS];
     hold.token = token;
     hold.fr = fr;
+    std::vector<std::shared_ptr<DevFrame>> evicted;
     {
       std::lock_guard<std::mutex> lk(g_mutex);
       g_lru.push_front(token);
       g_put_bytes += fr->bytes;
       const unsigned long long key = frame_key(producer, frame);
-      g_frames[token] = Slot{ fr, g_lru.begin(), g_put_bytes, key };
+      g_frames[token] = Slot{ fr, g_lru.begin(), g_put_bytes, key, 0 };
       if (key)
         (*g_latest)[key] = token;
       g_bytes += fr->bytes;
@@ -786,11 +853,27 @@ namespace mvc
           auto lt = g_latest->find(it->second.key);
           if (lt != g_latest->end() && lt->second == victim)
             g_latest->erase(lt);
+          if (it->second.ukey)
+          {
+            auto kt = g_keyed->find(it->second.ukey);
+            if (kt != g_keyed->end() && kt->second == victim)
+              g_keyed->erase(kt);
+          }
+          evicted.push_back(it->second.fr);
           g_frames.erase(it); // the memory goes back to the pool when the last holder lets go
         }
         g_lru.pop_back();
         g_stats.evictions++;
       }
+    }
+    // An evicted frame can stay reachable (the holds of the thread that made it, pins, readers in flight), but the data
+    // kept with it (super pyramids, sub-pel planes: several times the picture) leaves the budget with it: drop it now,
+    // a later reader makes it again. Readers in flight hold their own references (and pipeline ops pipe_keep them).
+    for (const auto &e : evicted)
+    {
+      std::lock_guard<std::mutex> lk(e->extra_m);
+      e->supers.clear();
+      e->subpel.reset();
     }
     std::memset(&out, 0, sizeof(out));
     out.magic = MVCUDA_TOKEN_MAGIC;
@@ -901,7 +984,7 @@ namespace
         for (size_t y = 0; y < pl.h[p]; y++)
           std::memcpy(pin + pl.off[p] + y * pl.pitch[p], s + y * pitch_bytes[p], pl.pitch[p]);
       }
-      if (fr.upload && mvc::up_copy(base, pin, total)) // the whole frame buffer, alignment gaps included
+      if (fr.upload && mvc::up_copy(base, pin, total, &fr.up_done)) // the whole frame buffer, alignment gaps included
         return 0;
       mvc::pipe_submit([base, pin, total](cudaStream_t s) {
         cudaMemcpyAsync(base, pin, total, cudaMemcpyHostToDevice, s);
@@ -989,6 +1072,77 @@ extern "C" int mvcuda_frame_upload(const MvCudaFrameFormat *f, const void *const
   std::lock_guard<std::mutex> lk(mvc::g_mutex);
   mvc::g_stats.uploads++;
   return 0;
+}
+
+extern "C" int mvcuda_frame_upload_keyed(const MvCudaFrameFormat *f, const void *const src[3], const int src_pitch_bytes[3],
+  unsigned long long key, MvCudaTokenHeader *out)
+{
+  if (!f || !src || !src_pitch_bytes || !out)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  if (key)
+  {
+    std::lock_guard<std::mutex> lk(mvc::g_mutex);
+    auto kt = mvc::g_keyed->find(key);
+    auto it = kt != mvc::g_keyed->end() ? mvc::g_frames.find(kt->second) : mvc::g_frames.end();
+    if (it != mvc::g_frames.end())
+    {
+      const MvCudaFrameFormat &g = it->second.fr->f;
+      if (g.width == f->width && g.height == f->height && g.planes == f->planes && g.bytes_per_sample == f->bytes_per_sample
+        && g.bits_per_sample == f->bits_per_sample && (g.planes == 1 || (g.x_ratio_uv == f->x_ratio_uv && g.y_ratio_uv == f->y_ratio_uv)))
+      {
+        // a hit counts as a use of the frame (LRU order, budget growth) and stays reachable for this thread
+        mvc::g_lru.splice(mvc::g_lru.begin(), mvc::g_lru, it->second.lru);
+        if (mvc::t_regen_depth == 0)
+          mvc::budget_on_hit(mvc::g_put_bytes - it->second.used_at);
+        it->second.used_at = mvc::g_put_bytes;
+        mvc::Held &hold = mvc::t_held[mvc::t_held_pos++ % mvc::HOLDS];
+        hold.token = kt->second;
+        hold.fr = it->second.fr;
+        std::memset(out, 0, sizeof(*out));
+        out->magic = MVCUDA_TOKEN_MAGIC;
+        out->layout = MVCUDA_TOKEN_LAYOUT;
+        out->device = mvc::current_device();
+        out->token = kt->second;
+        out->format = g;
+        mvc::g_stats.upload_hits++;
+        return 0;
+      }
+    }
+  }
+  const int rc = mvcuda_frame_upload(f, src, src_pitch_bytes, 0, 0, out);
+  if (rc == 0 && key)
+  {
+    std::lock_guard<std::mutex> lk(mvc::g_mutex);
+    auto it = mvc::g_frames.find(out->token);
+    if (it != mvc::g_frames.end())
+    {
+      it->second.ukey = key;
+      (*mvc::g_keyed)[key] = out->token;
+    }
+  }
+  return rc;
+}
+
+namespace mvc
+{
+  void keyed_clear()
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_keyed->clear();
+    for (auto &f : g_frames)
+      f.second.ukey = 0;
+  }
+
+  std::shared_ptr<DevFrame> upload_picture(const MvCudaSuperParams &p, int esize, const void *const src[3], const int pitch[3])
+  {
+    const MvCudaFrameFormat f = super_format(p, esize);
+    MvCudaTokenHeader h;
+    if (mvcuda_frame_upload(&f, src, pitch, 0, 0, &h) != 0)
+      return nullptr;
+    return frame_get(h.token); // reachable for this thread even when already evicted (t_held)
+  }
 }
 
 extern "C" int mvcuda_frame_download(unsigned long long token, void *const dst[3], const int dst_pitch_bytes[3])

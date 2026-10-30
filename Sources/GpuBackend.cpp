@@ -5,6 +5,8 @@
 
 #include "AvstpWrapper.h"
 #include "GpuBackend.h"
+#include "MVPlaneSet.h"
+#include "SuperParams64Bits.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -161,22 +163,108 @@ PVideoFrame GpuBackend::resolve_frame(const PVideoFrame &f, const VideoInfo &vi,
 
 void GpuBackend::write_token(PVideoFrame &dst, const MvCudaTokenHeader &h)
 {
-  std::memcpy(dst->GetWritePtr(PLANAR_Y), &h, sizeof(h));
+  BYTE *y = dst->GetWritePtr(PLANAR_Y);
+  const int pitch = dst->GetPitch(PLANAR_Y), row = dst->GetRowSize(PLANAR_Y), height = dst->GetHeight(PLANAR_Y);
+  std::memcpy(y, &h, sizeof(h));
+  for (int r = 8; r < height; r += 8)
+    std::memset(y + (size_t)r * pitch, 0, row);
+}
+
+namespace
+{
+  bool make_format(const VideoInfo &vi, int width, int height, bool chroma, MvCudaFrameFormat &f)
+  {
+    if (!vi.IsPlanar() || vi.IsRGB() || vi.IsYUY2() || (vi.ComponentSize() != 1 && vi.ComponentSize() != 2))
+      return false;
+    f = MvCudaFrameFormat();
+    f.width = width;
+    f.height = height;
+    f.planes = chroma && !vi.IsY() ? 3 : 1;
+    f.bytes_per_sample = vi.ComponentSize();
+    f.bits_per_sample = vi.BitsPerComponent();
+    f.x_ratio_uv = f.planes == 3 ? 1 << vi.GetPlaneWidthSubsampling(PLANAR_U) : 1;
+    f.y_ratio_uv = f.planes == 3 ? 1 << vi.GetPlaneHeightSubsampling(PLANAR_U) : 1;
+    return f.x_ratio_uv <= 2 && f.y_ratio_uv <= 2 && width > 0 && height > 0;
+  }
+}
+
+bool GpuBackend::super_input(const PVideoFrame &f, const VideoInfo &super_vi, const void *clip, int n, Input &in)
+{
+  SuperParams64Bits params;
+  std::memcpy(&params, &super_vi.num_audio_samples, 8);
+  in = Input();
+  // the picture's chroma planes exist in the super frame only when MSuper processed them
+  if (!make_format(super_vi, super_vi.width - 2 * params.nHPad, params.nHeight, (params.nModeYUV & UPLANE) != 0, in.fmt))
+    return false;
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  for (int p = 0; p < in.fmt.planes; p++)
+  {
+    const int xr = p ? in.fmt.x_ratio_uv : 1, yr = p ? in.fmt.y_ratio_uv : 1;
+    in.pitch[p] = f->GetPitch(planes_l[p]);
+    in.planes[p] = f->GetReadPtr(planes_l[p]) + (size_t)(params.nVPad / yr) * in.pitch[p] + (size_t)(params.nHPad / xr) * in.fmt.bytes_per_sample;
+  }
+  if (read_token(in.planes[0], in.fmt.width * in.fmt.bytes_per_sample, in.h))
+    return true; // a device frame already (lite super of a token clip)
+  in.host = true;
+  in.key = frame_key(clip, n);
+  return true;
+}
+
+bool GpuBackend::frame_input(const PVideoFrame &f, const VideoInfo &vi, const void *clip, int n, Input &in)
+{
+  in = Input();
+  if (!make_format(vi, vi.width, vi.height, true, in.fmt))
+    return false;
+  if (frame_token(f, vi, in.h))
+    return true;
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  for (int p = 0; p < in.fmt.planes; p++)
+  {
+    in.pitch[p] = f->GetPitch(planes_l[p]);
+    in.planes[p] = f->GetReadPtr(planes_l[p]);
+  }
+  in.host = true;
+  in.key = frame_key(clip, n);
+  return true;
+}
+
+bool GpuBackend::download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, const VideoInfo &vi)
+{
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  void *d[3] = { 0, 0, 0 };
+  int dp[3] = { 0, 0, 0 };
+  for (int p = 0; p < (vi.IsY() ? 1 : 3); p++)
+  {
+    d[p] = dst->GetWritePtr(planes_l[p]);
+    dp[p] = dst->GetPitch(planes_l[p]);
+  }
+  return frame_download(h.token, d, dp) == 0;
 }
 
 void GpuBackend::remove_user()
 {
-  if (InterlockedDecrement(&_users) == 0 && cache_clear != nullptr)
+  if (InterlockedDecrement(&_users) != 0)
+    return;
+  if (log_enabled() && frame_stats != nullptr)
+  {
+    MvCudaFrameStats s;
+    frame_stats(&s);
+    std::fprintf(stderr, "mvtools gpu: device frames %llu (%.1f of %.1f MB), uploads %llu (shared %llu), downloads %llu, evictions %llu, regenerations %llu, lookups of evicted tokens %llu\n",
+      s.frames, s.bytes / 1048576.0, s.budget / 1048576.0, s.uploads, s.upload_hits, s.downloads, s.evictions, s.regenerations, s.lookups_gone);
+  }
+  if (cache_clear != nullptr)
     cache_clear();
 }
 
 GpuBackend::GpuBackend()
-  : analyse_host(nullptr)
-  , recalc_host(nullptr)
-  , flow_host(nullptr)
-  , cache_clear(nullptr)
+  : cache_clear(nullptr)
   , analyse_token(nullptr)
+  , recalc_token(nullptr)
+  , flow_token(nullptr)
+  , flow_token_host(nullptr)
+  , frame_upload_keyed(nullptr)
   , frame_download(nullptr)
+  , frame_stats(nullptr)
   , token_regenerate(nullptr)
   , token_pin(nullptr)
   , token_unpin(nullptr)
@@ -220,12 +308,14 @@ GpuBackend::GpuBackend()
   }
   auto version = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_api_version"));
   auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
-  analyse_host = reinterpret_cast<decltype(analyse_host)>(GetProcAddress(lib, "mvcuda_analyse_host"));
-  recalc_host = reinterpret_cast<decltype(recalc_host)>(GetProcAddress(lib, "mvcuda_recalc_host"));
-  flow_host = reinterpret_cast<decltype(flow_host)>(GetProcAddress(lib, "mvcuda_flow_host"));
   cache_clear = reinterpret_cast<decltype(cache_clear)>(GetProcAddress(lib, "mvcuda_cache_clear"));
   analyse_token = reinterpret_cast<decltype(analyse_token)>(GetProcAddress(lib, "mvcuda_analyse_token"));
+  recalc_token = reinterpret_cast<decltype(recalc_token)>(GetProcAddress(lib, "mvcuda_recalc_token"));
+  flow_token = reinterpret_cast<decltype(flow_token)>(GetProcAddress(lib, "mvcuda_flow_token"));
+  flow_token_host = reinterpret_cast<decltype(flow_token_host)>(GetProcAddress(lib, "mvcuda_flow_token_host"));
+  frame_upload_keyed = reinterpret_cast<decltype(frame_upload_keyed)>(GetProcAddress(lib, "mvcuda_frame_upload_keyed"));
   frame_download = reinterpret_cast<decltype(frame_download)>(GetProcAddress(lib, "mvcuda_frame_download"));
+  frame_stats = reinterpret_cast<decltype(frame_stats)>(GetProcAddress(lib, "mvcuda_frame_stats"));
   token_regenerate = reinterpret_cast<decltype(token_regenerate)>(GetProcAddress(lib, "mvcuda_token_regenerate"));
   token_pin = reinterpret_cast<decltype(token_pin)>(GetProcAddress(lib, "mvcuda_token_pin"));
   token_unpin = reinterpret_cast<decltype(token_unpin)>(GetProcAddress(lib, "mvcuda_token_unpin"));
@@ -233,14 +323,12 @@ GpuBackend::GpuBackend()
   producer_unregister = reinterpret_cast<decltype(producer_unregister)>(GetProcAddress(lib, "mvcuda_producer_unregister"));
   compensate = reinterpret_cast<decltype(compensate)>(GetProcAddress(lib, "mvcuda_compensate"));
   degrain = reinterpret_cast<decltype(degrain)>(GetProcAddress(lib, "mvcuda_degrain"));
-  if (version == nullptr || count == nullptr || analyse_host == nullptr || recalc_host == nullptr || flow_host == nullptr || cache_clear == nullptr
-    || analyse_token == nullptr || frame_download == nullptr || token_regenerate == nullptr || token_pin == nullptr || token_unpin == nullptr || producer_register == nullptr || producer_unregister == nullptr || compensate == nullptr || degrain == nullptr
+  if (version == nullptr || count == nullptr || cache_clear == nullptr || recalc_token == nullptr || flow_token == nullptr
+    || frame_upload_keyed == nullptr || flow_token_host == nullptr || analyse_token == nullptr || frame_download == nullptr || token_regenerate == nullptr || token_pin == nullptr || token_unpin == nullptr || producer_register == nullptr || producer_unregister == nullptr || compensate == nullptr || degrain == nullptr
     || version() != MVCUDA_API_VERSION || count() <= 0)
   {
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: library unusable (missing exports, API version or no device), using the CPU\n");
-    analyse_host = nullptr;
-    recalc_host = nullptr;
     return;
   }
   _usable = true;

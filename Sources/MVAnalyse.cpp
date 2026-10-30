@@ -696,7 +696,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
     bool gpu_done = false;
     if (_gpu_ok && fieldShift == 0 && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
     {
-      gpu_done = gpu_search(nsrc, nref, reinterpret_cast<int*>(pDst), env);
+      gpu_done = gpu_search(src, ref, nsrc, nref, reinterpret_cast<int*>(pDst), env);
     }
     if (!gpu_done)
     {
@@ -768,9 +768,9 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
 
 
-// Runs the whole search on the GPU for the frames already loaded into pSrcGOF / pRefGOF (raw level-0 planes of the
-// super frames). Returns false (nothing written that matters) when the CPU has to do it.
-bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload, IScriptEnvironment *env)
+// Runs the whole search on the GPU for the super frames src / ref (their level-0 pictures: device frames, or host
+// pictures uploaded once per super frame). Returns false (nothing written that matters) when the CPU has to do it.
+bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int nsrc, int nref, int *payload, IScriptEnvironment *env)
 {
   if (GpuBackend::force_fallback())
     return false;
@@ -778,18 +778,11 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload, IScriptEnvironment 
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
-  const MVPlaneSet sets[3] = { YPLANE, UPLANE, VPLANE };
-  const void *src_p[3] = { 0, 0, 0 }, *ref_p[3] = { 0, 0, 0 };
-  int src_pitch[3] = { 0, 0, 0 }, ref_pitch[3] = { 0, 0, 0 };
-  for (int p = 0; p < (nModeYUV == YUVPLANES ? 3 : 1); p++) // luma-only analysis: the chroma planes are not touched
-  {
-    MVPlane *ps = pSrcGOF->GetFrame(0)->GetPlane(sets[p]);
-    MVPlane *pr = pRefGOF->GetFrame(0)->GetPlane(sets[p]);
-    src_p[p] = ps->GetAbsolutePelPointer(ps->GetHPadding(), ps->GetVPadding());
-    ref_p[p] = pr->GetAbsolutePelPointer(pr->GetHPadding(), pr->GetVPadding());
-    src_pitch[p] = ps->GetPitch();
-    ref_pitch[p] = pr->GetPitch();
-  }
+  GpuBackend::Input in[2];
+  const VideoInfo &svi = child->GetVideoInfo();
+  if (!GpuBackend::super_input(src, svi, (const void *)child.operator->(), nsrc, in[0])
+    || !GpuBackend::super_input(ref, svi, (const void *)child.operator->(), nref, in[1]))
+    return false;
 
   MvCudaSuperParams sp = {};
   sp.width = a.nWidth;
@@ -828,61 +821,15 @@ bool MVAnalyse::gpu_search(int nsrc, int nref, int *payload, IScriptEnvironment 
   ap.pel_search = nPelSearch;
   ap.chroma_sad_scale = _gpu_effective_chroma_scale;
   ap.slice_threads = _gpu_slices;
-  ap.src_key = GpuBackend::frame_key((const void *)child.operator->(), nsrc);
-  ap.ref_key = GpuBackend::frame_key((const void *)child.operator->(), nref);
 
   const int words = _vectorfields_aptr->GetArraySize();
-  // pictures that are token frames (GPU search clip): the search reads the device frames; one token and one ordinary
-  // picture cannot be mixed here, the CPU path downloads the token
-  MvCudaTokenHeader src_tok, ref_tok;
-  const int pic_row = a.nWidth * a.pixelsize;
-  const bool src_is_tok = _super_lite && GpuBackend::read_token(src_p[0], pic_row, src_tok);
-  const bool ref_is_tok = _super_lite && GpuBackend::read_token(ref_p[0], pic_row, ref_tok);
-  if (src_is_tok != ref_is_tok)
-    return false;
   int rc = -1;
   try
   {
-    if (src_is_tok)
-    {
-      GpuScope sc_call("analyse: analyse_token call");
-      rc = gpu.analyse_token(&sp, &ap, src_tok.token, ref_tok.token, payload, words);
-      if (rc == MVCUDA_TOKEN_GONE)
-      {
-        // evicted: pin the frame still there, let the producer make the other one again (pinned right away, so making
-        // one cannot evict the other under a small budget), then once more
-        MvCudaTokenHeader *const hs[2] = { &src_tok, &ref_tok };
-        unsigned long long tk[2] = { src_tok.token, ref_tok.token };
-        bool pinned[2] = { false, false };
-        bool ok = true;
-        for (int i = 0; i < 2 && ok; i++)
-        {
-          if (gpu.token_pin(tk[i]) == 0)
-          {
-            pinned[i] = true;
-            continue;
-          }
-          MvCudaTokenHeader again;
-          ok = hs[i]->producer != 0 && gpu.token_regenerate(hs[i]->producer, hs[i]->frame, env, &again) == 0
-            && gpu.token_pin(again.token) == 0;
-          if (ok)
-          {
-            tk[i] = again.token;
-            pinned[i] = true;
-          }
-        }
-        if (ok)
-          rc = gpu.analyse_token(&sp, &ap, tk[0], tk[1], payload, words);
-        for (int i = 0; i < 2; i++)
-          if (pinned[i])
-            gpu.token_unpin(tk[i]);
-      }
-    }
-    else
-    {
-      GpuScope sc_call("analyse: analyse_host call");
-      rc = gpu.analyse_host(&sp, &ap, src_p, src_pitch, ref_p, ref_pitch, payload, words);
-    }
+    GpuScope sc_call("analyse: analyse_token call");
+    rc = gpu.with_inputs(in, 2, env, [&](const unsigned long long *tk) {
+      return gpu.analyse_token(&sp, &ap, tk[0], tk[1], payload, words);
+    });
   }
   catch (...)
   {

@@ -42,16 +42,16 @@ public:
 
   bool usable() const { return _usable; }
 
-  int (*analyse_host)(const MvCudaSuperParams *, const MvCudaAnalyseParams *, const void *const[3], const int[3],
-    const void *const[3], const int[3], int *, int);
-  int (*recalc_host)(const MvCudaSuperParams *, const MvCudaRecalcParams *, const void *const[3], const int[3],
-    const void *const[3], const int[3], const int *, int *);
-  int (*flow_host)(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
-    const void *const[3], const int[3], const int *, const int *, const int *, const int *, void *const[3], const int[3],
-    void *const[]);
   void (*cache_clear)();
   int (*analyse_token)(const MvCudaSuperParams *, const MvCudaAnalyseParams *, unsigned long long, unsigned long long, int *, int);
+  int (*recalc_token)(const MvCudaSuperParams *, const MvCudaRecalcParams *, unsigned long long, unsigned long long, const int *, int *);
+  int (*flow_token)(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long, const int *,
+    const int *, const int *, const int *, unsigned long long, int, MvCudaTokenHeader *);
+  int (*flow_token_host)(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long, const int *,
+    const int *, const int *, const int *, void *const[3], const int[3]);
+  int (*frame_upload_keyed)(const MvCudaFrameFormat *, const void *const[3], const int[3], unsigned long long, MvCudaTokenHeader *);
   int (*frame_download)(unsigned long long, void *const[3], const int[3]);
+  void (*frame_stats)(MvCudaFrameStats *);
   int (*token_regenerate)(unsigned long long, int, void *, MvCudaTokenHeader *);
   int (*token_pin)(unsigned long long);
   void (*token_unpin)(unsigned long long);
@@ -77,47 +77,78 @@ public:
   // f itself, or when it is a token frame its picture downloaded into a new frame (for CPU code); throws when the device
   // frame cannot be made again
   PVideoFrame resolve_frame(const PVideoFrame &f, const VideoInfo &vi, IScriptEnvironment *env);
-  // writes a token header into the start of the luma plane of a new frame
+  // writes a token header into the start of the luma plane of a new frame, and black rows every 8 rows below it (as
+  // cudafilters does: a filter that does not understand tokens shows obvious stripes, not a plausible picture)
   static void write_token(PVideoFrame &dst, const MvCudaTokenHeader &h);
 
-  // Runs op(tokens) on the device frames of the given token headers; when op reports MVCUDA_TOKEN_GONE, the tokens still
-  // there are pinned, the others made again by their producers (pinned right away), and op runs once more.
+  // One input picture of a GPU call (GPU_PIPELINE_PLAN.md section 25, usage rule: token frames in -> token frames out,
+  // normal frames in -> normal frames out): a device frame already (token), or a host picture that with_inputs uploads
+  // once under a content key (the clip and the frame number), shared by every GPU filter reading that picture.
+  struct Input
+  {
+    MvCudaTokenHeader h = {};    // the token (set by with_inputs for host pictures)
+    bool host = false;           // a host picture: planes / pitch / fmt / key below
+    const void *planes[3] = {};
+    int pitch[3] = {};
+    MvCudaFrameFormat fmt = {};
+    unsigned long long key = 0;
+  };
+  // The picture of frame f of the super clip `clip` (MSuper with or without gpu=true: level 0 inside the padding; a token
+  // frame's header at the picture position) as the input of frame n. False for formats the device cannot take.
+  static bool super_input(const PVideoFrame &f, const VideoInfo &super_vi, const void *clip, int n, Input &in);
+  // the same for frame n of an ordinary clip (a token frame's header at the start of the luma plane)
+  static bool frame_input(const PVideoFrame &f, const VideoInfo &vi, const void *clip, int n, Input &in);
+
+  // Runs op(tokens) on the device frames of the inputs (host pictures uploaded first, or found on the device under their
+  // key). When op reports MVCUDA_TOKEN_GONE, the inputs still there are pinned, the evicted ones made again (token inputs
+  // by their producers, host pictures uploaded again; pinned right away, so that making one cannot evict another under a
+  // small budget), and op runs once more.
   template <class Op>
-  int with_tokens(const MvCudaTokenHeader *hs, int count, IScriptEnvironment *env, Op op)
+  int with_inputs(Input *in, int count, IScriptEnvironment *env, Op op)
   {
     unsigned long long tk[16];
     bool pinned[16] = {};
     if (count > 16)
       return -4;
     for (int i = 0; i < count; i++)
-      tk[i] = hs[i].token;
+    {
+      if (in[i].host)
+      {
+        const int rc = frame_upload_keyed(&in[i].fmt, in[i].planes, in[i].pitch, in[i].key, &in[i].h);
+        if (rc)
+          return rc;
+      }
+      tk[i] = in[i].h.token;
+    }
     int rc = op(tk);
     if (rc != MVCUDA_TOKEN_GONE)
       return rc;
     rc = 0;
-    for (int i = 0; i < count && rc == 0; i++)
-    {
-      bool dup = false; // the same token twice: pinned once is enough
-      for (int k = 0; k < i; k++)
-        dup = dup || (pinned[k] && tk[k] == hs[i].token);
-      if (dup)
-        continue;
-      if (token_pin(tk[i]) == 0)
+    // token inputs first: their regeneration may evict uploaded pictures, which are cheap to send again
+    for (int pass = 0; pass < 2 && rc == 0; pass++)
+      for (int i = 0; i < count && rc == 0; i++)
       {
-        pinned[i] = true;
-        continue;
-      }
-      MvCudaTokenHeader again;
-      if (!hs[i].producer || token_regenerate(hs[i].producer, hs[i].frame, env, &again) != 0 || token_pin(again.token) != 0)
-        rc = MVCUDA_TOKEN_GONE;
-      else
-      {
+        if (in[i].host != (pass == 1))
+          continue;
+        if (token_pin(tk[i]) == 0) // counted: an input given twice is pinned twice
+        {
+          pinned[i] = true;
+          continue;
+        }
+        MvCudaTokenHeader again;
+        const bool ok = in[i].host ? frame_upload_keyed(&in[i].fmt, in[i].planes, in[i].pitch, in[i].key, &again) == 0
+                                   : in[i].h.producer && token_regenerate(in[i].h.producer, in[i].h.frame, env, &again) == 0;
+        if (!ok || token_pin(again.token) != 0)
+        {
+          rc = MVCUDA_TOKEN_GONE;
+          break;
+        }
+        const unsigned long long old = tk[i];
         for (int k = i; k < count; k++) // later entries with the same frame use the new token too
-          if (hs[k].token == hs[i].token)
+          if (tk[k] == old)
             tk[k] = again.token;
         pinned[i] = true;
       }
-    }
     if (rc == 0)
       rc = op(tk);
     for (int i = 0; i < count; i++)
@@ -125,6 +156,9 @@ public:
         token_unpin(tk[i]);
     return rc;
   }
+
+  // copies the device frame h (made by this thread a moment ago, so still reachable) into the planes of dst; false on failure
+  bool download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, const VideoInfo &vi);
 
   // number of block-row slices to use: the CPU thread count when mt is on (so the result equals the CPU result with
   // that many threads), 1 without mt; 24 when mt is on but no thread pool is available (the GPU needs slices)

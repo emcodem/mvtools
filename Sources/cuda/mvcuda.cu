@@ -215,3 +215,47 @@ extern "C" int mvcuda_flow_host(const MvCudaSuperParams *sp, const MvCudaFlowPar
     ? mvcuda_flow_host_8(sp, fp, src_raw, src_pitch_bytes, ref_raw, ref_pitch_bytes, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes, dbg)
     : mvcuda_flow_host_16(sp, fp, src_raw, src_pitch_bytes, ref_raw, ref_pitch_bytes, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes, dbg);
 }
+
+extern "C" int mvcuda_recalc_token_8(const MvCudaSuperParams *, const MvCudaRecalcParams *, unsigned long long, unsigned long long,
+  const int *, int *);
+extern "C" int mvcuda_recalc_token_16(const MvCudaSuperParams *, const MvCudaRecalcParams *, unsigned long long, unsigned long long,
+  const int *, int *);
+
+extern "C" int mvcuda_recalc_token(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp, unsigned long long src_token,
+  unsigned long long ref_token, const int *old_vectors, int *out_vectors)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8 ? mvcuda_recalc_token_8(sp, rp, src_token, ref_token, old_vectors, out_vectors)
+                                 : mvcuda_recalc_token_16(sp, rp, src_token, ref_token, old_vectors, out_vectors);
+}
+
+extern "C" int mvcuda_flow_token_8(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long,
+  const int *, const int *, const int *, const int *, unsigned long long, int, MvCudaTokenHeader *);
+extern "C" int mvcuda_flow_token_16(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long,
+  const int *, const int *, const int *, const int *, unsigned long long, int, MvCudaTokenHeader *);
+
+extern "C" int mvcuda_flow_token_host_8(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long,
+  const int *, const int *, const int *, const int *, void *const[3], const int[3]);
+extern "C" int mvcuda_flow_token_host_16(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long,
+  const int *, const int *, const int *, const int *, void *const[3], const int[3]);
+
+extern "C" int mvcuda_flow_token_host(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, void *const dst[3],
+  const int dst_pitch_bytes[3])
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8 ? mvcuda_flow_token_host_8(sp, fp, left, right, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes)
+                                 : mvcuda_flow_token_host_16(sp, fp, left, right, vec_b, vec_f, vec_bb, vec_ff, dst, dst_pitch_bytes);
+}
+
+extern "C" int mvcuda_flow_token(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, unsigned long long left,
+  unsigned long long right, const int *vec_b, const int *vec_f, const int *vec_bb, const int *vec_ff, unsigned long long producer,
+  int frame, MvCudaTokenHeader *out)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8 ? mvcuda_flow_token_8(sp, fp, left, right, vec_b, vec_f, vec_bb, vec_ff, producer, frame, out)
+                                 : mvcuda_flow_token_16(sp, fp, left, right, vec_b, vec_f, vec_bb, vec_ff, producer, frame, out);
+}

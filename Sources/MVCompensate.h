@@ -149,7 +149,7 @@ private:
   bool           _gpu_ok;
   unsigned long long _producer;
   std::mutex     _gpu_mutex;
-  int            gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src);
+  int            gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host);
   static int     gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
 };
 
