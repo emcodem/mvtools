@@ -1,6 +1,6 @@
 # MRecalculate smooth=2 (DTL2020 post_2.7.47_822) vs pinterf smooth=1
 
-Full page with A/B viewer: [index.html](https://raw.githack.com/emcodem/mvtools/gpu_work/compare/dtl_smooth2/index.html)
+Full page with A/B viewer: [index.html](https://emcodem.github.io/mvtools/compare/dtl_smooth2/)
 
 Clip: UHD 10-bit 4:2:2, pole and wires against sky (`seg1_wires_pole.mp4`). Chain as in our frame-rate converter:
 MAnalyse 32/16 → MRecalculate 16/8, `thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true`, pel 2 →
