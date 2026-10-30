@@ -119,7 +119,8 @@ a { color: var(--accent); }
         </tbody>
       </table>
     </div>
-    <p class="note"><b>Control.</b> A comparison that can only say "equal" proves nothing, so the same vector script was run with <code>smooth=2</code> in MRecalculate. Both DLLs accept it, and the vectors then differ in 32k to 91k of the 386,553 words per frame. So the two runs really used two different DLLs.</p>
+    <p class="note src-ref"><b>Scripts.</b> A: <a href="#s-pinterf_sm1_vec"><code>pinterf_sm1_vec.avs</code></a>, <a href="#s-pinterf_sm1_flow"><code>pinterf_sm1_flow.avs</code></a>, <a href="#s-pinterf_degrain"><code>pinterf_degrain.avs</code></a>. B: <a href="#s-dtl_sm1_vec"><code>dtl_sm1_vec.avs</code></a>, <a href="#s-dtl_sm1_flow"><code>dtl_sm1_flow.avs</code></a>, <a href="#s-dtl_degrain"><code>dtl_degrain.avs</code></a>. They are equal except for the <code>LoadPlugin</code> path. The table's other formats come from the same scripts with a conversion appended to the source line (see <a href="#scripts">Scripts</a>).</p>
+    <p class="note"><b>Control.</b> A comparison that can only say "equal" proves nothing, so the same vector script was run with <code>smooth=2</code> in MRecalculate. Both DLLs accept it, and the vectors then differ in 32k to 91k of the 386,553 words per frame. So the two runs really used two different DLLs. Scripts: <a href="#s-pinterf_sm2_vec"><code>pinterf_sm2_vec.avs</code></a> against <a href="#s-dtl_sm2_vec"><code>dtl_sm2_vec.avs</code></a>.</p>
     <p class="note"><b>AreaMode is not on this branch.</b> DTL's newest branch is pinterf 2.7.47 plus <code>smooth=2</code> (about 45 changed lines in <code>PlaneOfBlocks.cpp</code>). AreaMode and his other search experiments are on his older default branch (2.7.46-a, last changed June 2024).</p>
   </section>
 
@@ -138,6 +139,7 @@ a { color: var(--accent); }
       <span><i class="sw" style="background:#8c6b0e"></i>small change</span>
       <span><i class="sw" style="background:#ff1a1a"></i>large change</span>
     </div>
+    <p class="note src-ref"><b>Scripts.</b> A: <a href="#s-pinterf_sm1_vec"><code>pinterf_sm1_vec.avs</code></a>, B: <a href="#s-dtl_sm2_vec"><code>dtl_sm2_vec.avs</code></a>. Each outputs 4 vector frames (Interleave): the MRecalculate backward and forward vectors of source frames 10 and 50, in that order. The maps and the tables below are drawn from these frames by <code>scripts/viz.py</code>.</p>
     <p>The changed blocks follow the pole and the wires on the right and the leaves on the left: thin or fine structures that move differently from what surrounds them. That is where the four interpolated input vectors disagree, so that is where the radius grows.</p>
     <div class="scroll">
       <table>
@@ -156,7 +158,7 @@ a { color: var(--accent); }
       <p>The new code writes the widened radius into <code>nSearchParam</code>, a member of <code>PlaneOfBlocks</code> that is set from <code>searchparam</code> once per frame and is not restored after the block:</p>
       <pre class="mono">nSearchParam = std::clamp(adaptiveSearchParam, nSearchParam, RECALCULATE_ADAPTIVE_RADIUS_LIMIT); // limit 100</pre>
       <p>The lower bound of the clamp is the current value, so the radius can only grow. After the first bad block whose four input vectors disagree, every later bad block in the frame is searched with that radius, up to 100 half-pel (50 px), even where its own input vectors agree. With <code>mt=true</code> all slices share the member, so it is also a data race.</p>
-      <p>Test build with the radius restored after each block (two added lines, otherwise DTL's code):</p>
+      <p>Test build with the radius restored after each block (two added lines, otherwise DTL's code, <a href="https://github.com/emcodem/mvtools/blob/gpu_work/compare/dtl_smooth2/smooth2_radius_fix.patch">patch</a>). Script: <a href="#s-fix_sm2_vec"><code>fix_sm2_vec.avs</code></a>, compared with <a href="#s-pinterf_sm1_vec"><code>pinterf_sm1_vec.avs</code></a>.</p>
       <div class="scroll">
         <table>
           <thead><tr><th>Vector frame</th><th class="num">Changed, as released</th><th class="num">Changed, fixed</th><th class="num">SAD sum, released</th><th class="num">SAD sum, fixed</th></tr></thead>
@@ -184,12 +186,12 @@ a { color: var(--accent); }
     <div class="eyebrow">3 · In the picture · MFlowFps output</div>
     <h2>The interpolated frame, pinterf against DTL smooth=2</h2>
     <div class="two">
-      <figure><img src="img/frame_overview.jpg" alt="Interpolated output frame 5 with the compared area marked" width="960" height="540"><figcaption>Output frame 5 of 8 (24000/1001). The amber box is the crop below, at full resolution (960×540 of 3840×2160).</figcaption></figure>
+      <figure><img src="img/frame_overview.jpg" alt="Interpolated output frame 5 with the compared area marked" width="960" height="540"><figcaption>MFlowFps output frame 22 (24000/1001), the 5th of the 8 frames the scripts return (<code>Trim(18, 25)</code>), between source frames 27 and 28. A from <a href="#s-pinterf_sm1_flow"><code>pinterf_sm1_flow.avs</code></a>. The amber box is the crop below, at full resolution (960×540 at x=2880, y=240 of 3840×2160).</figcaption></figure>
       <div style="display:grid; gap:10px">
         <h3>Difference to pinterf per output frame (PSNR, RGB average)</h3>
         <div class="psnr" id="psnr" role="img" aria-label="PSNR per frame against pinterf, DTL as released and DTL fixed"></div>
         <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>DTL as released</span><span><i class="sw" style="background:var(--fixed)"></i>DTL, radius fixed</span><span>higher = closer to pinterf</span></div>
-        <p class="note">Frames 3 and 7 land on source frames, so no vectors are used and all three are identical. Elsewhere the release differs by 57–59 dB, the fixed build by 60–63 dB.</p>
+        <p class="note">1–8 = output frames 18–25. A: <a href="#s-pinterf_sm1_flow"><code>pinterf_sm1_flow.avs</code></a>, released: <a href="#s-dtl_sm2_flow"><code>dtl_sm2_flow.avs</code></a>, fixed: <a href="#s-fix_sm2_flow"><code>fix_sm2_flow.avs</code></a>. Frames 3 and 7 land on source frames, so no vectors are used and all three are identical. Elsewhere the release differs by 57–59 dB, the fixed build by 60–63 dB.</p>
       </div>
     </div>
     <div class="controls">
@@ -210,31 +212,18 @@ a { color: var(--accent); }
       <div class="bar" id="bar"></div>
       <span class="tag tl" id="tl">A · pinterf</span><span class="tag tr" id="tr">B · DTL smooth=2</span>
     </div>
+    <p class="note src-ref" id="abref"></p>
   </section>
 
   <section>
     <div class="eyebrow">How it was run</div>
     <p class="note">Same AviSynth+ scripts for both DLLs, only the <code>LoadPlugin</code> path changed; <code>mt=false</code> for MSuper / MAnalyse / MRecalculate (one slice). Vector frames compared word by word after the 64-word header, pictures by <code>framemd5</code>. Parameters our fork adds (<code>gpu</code>, MFlowFps <code>mt</code>) were left out because DTL's fork does not have them.</p>
   </section>
-  <section>
+  <section id="scripts">
     <div class="eyebrow">Scripts, as run</div>
     <h2>The AviSynth+ scripts</h2>
-    <p class="note">Copied unchanged from the runs, including the local paths. They differ only in the <code>LoadPlugin</code> path of mvtools2.dll, <code>smooth=2,</code> in MRecalculate and the last line. The missing line break before <code>out =</code> / <code>return</code> comes from the script generator; AviSynth+ parses it as two statements. The identity check ran the vec, flow and degrain scripts in five formats by appending to the source line: nothing (10-bit 4:2:2), <code>.ConvertBits(8, dither=-1)</code>, <code>.ConvertToYUV420()</code>, <code>.ConvertBits(8, dither=-1).ConvertToYUV420()</code>, <code>.ConvertToYUV444()</code>. Output: <code>ffmpeg -i x_vec.avs -f rawvideo</code> for vectors, <code>-f framemd5</code> or <code>-pix_fmt rgb24 x_%d.png</code> for pictures. All scripts, the ffmpeg commands and the patch: <a href="https://github.com/emcodem/mvtools/tree/gpu_work/compare/dtl_smooth2">github.com/emcodem/mvtools/…/compare/dtl_smooth2</a>.</p>
-    <details open><summary><code>pinterf_sm1_flow.avs</code> · A · pinterf, smooth=1 (default): MFlowFps frames 18–25</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
-m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
-pre = m.RemoveGrain(22)
-supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
-sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
-bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
-return out.Trim(18, 25)</pre></details>
-    <details><summary><code>pinterf_sm1_vec.avs</code> · A · pinterf, smooth=1: vector frames bv/fv 10, bv/fv 50</summary>
+    <p class="note">Copied unchanged from the runs, including the local paths. They differ only in the <code>LoadPlugin</code> path of mvtools2.dll, <code>smooth=2,</code> in MRecalculate and the last line. Each section above names the scripts it was made from. The missing line break before <code>out =</code> / <code>return</code> comes from the script generator; AviSynth+ parses it as two statements. The identity check ran the vec, flow and degrain scripts in five formats by appending to the source line: nothing (10-bit 4:2:2), <code>.ConvertBits(8, dither=-1)</code>, <code>.ConvertToYUV420()</code>, <code>.ConvertBits(8, dither=-1).ConvertToYUV420()</code>, <code>.ConvertToYUV444()</code>. Output: <code>ffmpeg -i x_vec.avs -f rawvideo</code> for vectors, <code>-f framemd5</code> or <code>-pix_fmt rgb24 x_%d.png</code> for pictures. All scripts, the ffmpeg commands and the patch: <a href="https://github.com/emcodem/mvtools/tree/gpu_work/compare/dtl_smooth2">github.com/emcodem/mvtools/…/compare/dtl_smooth2</a>.</p>
+    <details id="s-pinterf_sm1_vec"><summary><code>pinterf_sm1_vec.avs</code> · A · our build, smooth=1 (default) · vector frames</summary>
 <pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
 LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
 LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
@@ -247,10 +236,10 @@ bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, t
 fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
-    <details><summary><code>dtl_sm1_flow.avs</code> · B · DTL, smooth=1: MFlowFps</summary>
+    <details id="s-pinterf_sm1_flow"><summary><code>pinterf_sm1_flow.avs</code> · A · our build, smooth=1 · MFlowFps output frames 18–25</summary>
 <pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
 LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
 SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
@@ -261,61 +250,7 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
 return out.Trim(18, 25)</pre></details>
-    <details><summary><code>dtl_sm2_flow.avs</code> · B · DTL, smooth=2 as released: MFlowFps</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
-m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
-pre = m.RemoveGrain(22)
-supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
-sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
-bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
-return out.Trim(18, 25)</pre></details>
-    <details><summary><code>dtl_sm2_vec.avs</code> · B · DTL, smooth=2 as released: vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
-m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
-pre = m.RemoveGrain(22)
-supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
-sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
-bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
-    <details><summary><code>fix_sm2_flow.avs</code> · B + radius patch, smooth=2: MFlowFps</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
-m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
-pre = m.RemoveGrain(22)
-supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
-sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
-bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
-return out.Trim(18, 25)</pre></details>
-    <details><summary><code>fix_sm2_vec.avs</code> · B + radius patch, smooth=2: vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
-m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
-pre = m.RemoveGrain(22)
-supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
-sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
-bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
-fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
-    <details><summary><code>pinterf_degrain.avs</code> · identity check: MDegrain2 + MCompensate (same script for B)</summary>
+    <details id="s-pinterf_degrain"><summary><code>pinterf_degrain.avs</code> · A · our build · MDegrain2 + MCompensate</summary>
 <pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
 LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
 LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
@@ -330,6 +265,115 @@ fv2 = MAnalyse(sup, isb=false, delta=2, blksize=16, overlap=8, chroma=true, mt=f
 d = MDegrain2(src, sup, bv1, fv1, bv2, fv2, thSAD=400, thSCD1=50000)
 c = MCompensate(src, sup, bv1, thSCD1=50000)
 return StackHorizontal(d, c)</pre></details>
+    <details id="s-dtl_sm1_vec"><summary><code>dtl_sm1_vec.avs</code> · B · DTL c688008, smooth=1 · vector frames</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
+    <details id="s-dtl_sm1_flow"><summary><code>dtl_sm1_flow.avs</code> · B · DTL c688008, smooth=1 · MFlowFps</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
+return out.Trim(18, 25)</pre></details>
+    <details id="s-dtl_degrain"><summary><code>dtl_degrain.avs</code> · B · DTL c688008 · MDegrain2 + MCompensate</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+src = m.Trim(0, 29)
+sup = MSuper(src, pel=2, mt=false)
+bv1 = MAnalyse(sup, isb=true, delta=1, blksize=16, overlap=8, chroma=true, mt=false)
+fv1 = MAnalyse(sup, isb=false, delta=1, blksize=16, overlap=8, chroma=true, mt=false)
+bv2 = MAnalyse(sup, isb=true, delta=2, blksize=16, overlap=8, chroma=true, mt=false)
+fv2 = MAnalyse(sup, isb=false, delta=2, blksize=16, overlap=8, chroma=true, mt=false)
+d = MDegrain2(src, sup, bv1, fv1, bv2, fv2, thSAD=400, thSCD1=50000)
+c = MCompensate(src, sup, bv1, thSCD1=50000)
+return StackHorizontal(d, c)</pre></details>
+    <details id="s-pinterf_sm2_vec"><summary><code>pinterf_sm2_vec.avs</code> · control · our build, smooth=2 · vector frames</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
+    <details id="s-dtl_sm2_vec"><summary><code>dtl_sm2_vec.avs</code> · B · DTL c688008, smooth=2 as released · vector frames</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
+    <details id="s-dtl_sm2_flow"><summary><code>dtl_sm2_flow.avs</code> · B · DTL c688008, smooth=2 as released · MFlowFps</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
+return out.Trim(18, 25)</pre></details>
+    <details id="s-fix_sm2_vec"><summary><code>fix_sm2_vec.avs</code> · B · DTL c688008 + radius patch, smooth=2 · vector frames</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
+    <details id="s-fix_sm2_flow"><summary><code>fix_sm2_flow.avs</code> · B · DTL c688008 + radius patch, smooth=2 · MFlowFps</summary>
+<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
+pre = m.RemoveGrain(22)
+supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
+sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, mt=false)
+bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
+fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
+return out.Trim(18, 25)</pre></details>
   </section>
 </main>
 
@@ -354,12 +398,16 @@ return StackHorizontal(d, c)</pre></details>
     diff.hidden = !isDiff; bar.hidden = isDiff; split.disabled = isDiff; tr.hidden = isDiff;
     tl.textContent = isDiff ? '|pinterf − ' + bName + '| × 12' : 'A · pinterf';
     tr.textContent = 'B · ' + bName;
+    const bScript = isFix ? 'fix_sm2_flow' : 'dtl_sm2_flow';
+    document.getElementById('abref').innerHTML = '<b>Shown.</b> Output frame 22 (5th of <code>Trim(18, 25)</code>), crop 960×540 at x=2880, y=240. A: <a href="#s-pinterf_sm1_flow"><code>pinterf_sm1_flow.avs</code></a> · B: <a href="#s-' + bScript + '"><code>' + bScript + '.avs</code></a>' + (isDiff ? ' · |A − B| × 12, grey.' : '.');
   }
   bAB.addEventListener('click', () => { isDiff = false; render(); });
   bD.addEventListener('click', () => { isDiff = true; render(); });
   bRel.addEventListener('click', () => { isFix = false; render(); });
   bFix.addEventListener('click', () => { isFix = true; render(); });
   render();
+  const openHash = () => { const d = location.hash && document.getElementById(location.hash.slice(1)); if (d && d.tagName === 'DETAILS') d.open = true; };
+  window.addEventListener('hashchange', openHash); openHash();
 
   const rel = [57.52, 59.00, null, 58.27, 57.31, 57.60, null, 57.34];
   const fix = [60.23, 63.01, null, 61.65, 61.43, 61.93, null, 61.23];

@@ -37,7 +37,9 @@ The other scripts in [scripts/avs/](scripts/avs) differ from this one only in:
 | `dtl_sm1_flow` | DTL c688008 | default (smooth=1) | MFlowFps |
 | `dtl_sm2_flow` | DTL c688008 | `smooth=2,` after `thSAD=100,` | MFlowFps |
 | `fix_sm2_flow` | DTL c688008 + patch | `smooth=2,` | MFlowFps |
-| `*_vec` | as above | as above | `return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))` |
+| `pinterf_sm2_vec` | ours | `smooth=2,` | vectors (control run) |
+| `pinterf_degrain`, `dtl_degrain` | ours / DTL | none | MDegrain2 + MCompensate |
+| `*_vec` (`pinterf_sm1`, `dtl_sm1`, `dtl_sm2`, `fix_sm2`) | as above | as above | `return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))` |
 
 Frames, crops, PSNR and maps: [scripts/render.ps1](scripts/render.ps1) (the ffmpeg commands as run; output file names
 unified). The 5-format × 3-chain identity check: [scripts/cmp.ps1](scripts/cmp.ps1) + [scripts/cmp.py](scripts/cmp.py);
