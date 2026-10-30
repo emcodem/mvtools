@@ -8,7 +8,7 @@ This page covers the CUDA part of this mvtools build:
 - the environment variables
 
 The design notes and measurements are in `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md` and `GPU_PIPELINE_PLAN.md`. They describe how
-the work got here; this page describes what the functions do now (library API version 13).
+the work got here; this page describes what the functions do now (library API version 15).
 
 ## Principles
 
@@ -48,14 +48,17 @@ filter and frame number that produced it, the format). Every 8th luma row of a t
 does not understand tokens shows obvious stripes, not a plausible picture.
 
 - **Readers.** Every `Cuda*` filter, `MSuper`, `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept
-  token frames as input. They use the device frame directly, or download it when they run on the CPU. Any other filter
-  needs `CudaDownload` in front of it.
+  token frames as input. The `Cuda*` filters, `MSuper`, `MCompensate`, `MDegrain1..6` and `MAnalyse` use the device frame
+  directly; `MRecalculate` and `MFlowFps` download it (MRecalculate then computes on the CPU, MFlowFps uploads the pictures
+  again), as does any of them when it runs on the CPU. Any other filter needs `CudaDownload` in front of it.
 - **Mixed input.** Every `Cuda*` filter also accepts normal frames and uploads them.
 - **Eviction.** The device frames live in a registry with a memory budget (`MVCUDA_CACHE_MB`). When a frame is evicted
   before it is read, the filter that produced it makes it again, so evictions cost time but never change the result.
 - **Supported formats.** Device frames are planar Y or YUV (no RGB, no alpha), 8 to 16 bit integer, chroma subsampling 1
-  or 2 in each direction (4:2:0, 4:2:2, 4:4:4, Y only), and at least 72 bytes per luma row (the header must fit). Many
-  filters cover only 8 bit on the GPU; see each filter below. In any other format a filter runs on the CPU.
+  or 2 in each direction (4:2:0, 4:2:2, 4:4:4, Y only), and at least 72 bytes per luma row (the header must fit). Filters
+  that work through a lookup table (CudaLutxy, CudaKeepOnlyBobShimmerFixes, CudaQtgmcSharpLimit with `smode` 1 / 2,
+  CudaQtgmcAddNoise) and CudaNNEDI3 cover 8 and 10 bit; see each filter below. In any other format a filter runs
+  on the CPU.
 
 A typical chain:
 
@@ -164,7 +167,7 @@ a normal vector clip.
 The GPU path is used when all of these hold:
 
 - `super` is a lite super (`MSuper(gpu=true)`) **of a token clip**, so the pictures are on the device
-- 8 bit, planar Y or YUV
+- 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `recursion=0`, `fields=false`, `tr=0`
 
@@ -178,7 +181,7 @@ picture, as on the CPU. When a frame cannot be made on the GPU, it is made on th
 The GPU path is used when all of these hold:
 
 - the source clip is a token clip, and `super` is a lite super of a token clip
-- 8 bit, planar Y or YUV
+- 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `limit` and `limitC` 255 (the default)
 - `lsb`, `out16`, `out32` false
@@ -242,7 +245,7 @@ filters follow the AviSynth+ 3.7.5 arithmetic of its SSE2 / AVX2 code (including
 source frame unchanged where the CPU filter does (weight near 0, or near 1 for Merge). The resizers follow the
 AviSynth+ 3.7.5 `FilteredResize` and read `_ChromaLocation` from frame 0 when `placement` is "auto".
 
-### RgTools, MaskTools2 (8 bit on the GPU)
+### RgTools, MaskTools2 (8 to 16 bit on the GPU, CudaLutxy 8 and 10 bit)
 
 | Function | Replaces | Parameters (defaults) | On the GPU |
 |---|---|---|---|
@@ -255,8 +258,12 @@ AviSynth+ 3.7.5 `FilteredResize` and read `_ChromaLocation` from frame 0 when `p
 
 For the MaskTools2 filters, the GPU covers the plane modes 3 (process) and 2 (copy the first clip); any other plane mode
 (such as the default `U=1, V=1`) means the CPU filter. In practice, pass `U=3, V=3` or `U=2, V=2` to stay on the GPU.
-CudaLutxy does not parse the expression: at creation it runs the installed `mt_lutxy` once over all 256 x 256 (x, y)
-pairs and uses the result as the table, so it computes exactly what the CPU filter computes.
+CudaLutxy does not parse the expression: at creation it runs the installed `mt_lutxy` once over all (x, y) pairs (256 x
+256 at 8 bit, 1024 x 1024 at 10 bit, in a 4:4:4 clip) and uses the result as two tables, one for luma and one for chroma
+(with `use_expr` masktools hands the expression to `Expr`, whose chroma results can differ from luma), so it computes
+exactly what the CPU filter computes. Samples above the bit depth's maximum (AviSynth+ `Sharpen` leaves such values in
+10-bit clips) are read as the maximum. `CudaClamp`'s `overshoot` / `undershoot` are scaled as masktools scales them
+(given in 8-bit units: 255 means the maximum, other values are shifted up).
 
 ### NNEDI3
 
@@ -268,7 +275,7 @@ nnedi3's: `field` -1, `dh` false, `Y`/`U`/`V` true, `nsize` 6, `nns` 1, `qual` 1
 
 The GPU reproduces the plugin's AVX2 + FMA code path (its `opt` 6 / 7). It runs on the GPU when all of these hold:
 
-- 8-bit planar YUV or Y
+- 8 or 10-bit planar YUV or Y (above 10 bit the plugin takes a different code path; 9 bit is not tested)
 - `dh=false`, `field` -2..3
 - the plugin would take its AVX2 + FMA path on this CPU: `opt=0` on a CPU with AVX2 + FMA3 (or FMA4) and without
   AVX-512, or `opt` 6 / 7 set explicitly
@@ -284,7 +291,7 @@ The GPU reproduces the plugin's AVX2 + FMA code path (its `opt` 6 / 7). It runs 
 #### CudaKeepOnlyBobShimmerFixes(clip input, clip ref, int rep, bool chroma)
 
 Replaces `QTGMC_KeepOnlyBobShimmerFixes` of `QTGMC.avsi` (which must be loaded). Defaults: `rep` 1, `chroma` true. On the
-GPU: 8 bit, both clips of the same format, and `rep` with an edge mode other than 2 or 5 (the edge mode is `rep` itself
+GPU: 8 or 10 bit, both clips of the same format, and `rep` with an edge mode other than 2 or 5 (the edge mode is `rep` itself
 below 10, else its tens digit; for `rep` >= 10 the units digit must be 0..2).
 
 #### CudaQtgmcBinomial0(clip b, int luma_threshold, int chroma_threshold, int scenechange, bool chroma)
@@ -319,8 +326,9 @@ nref 0:   result = resharp
 ```
 
 With `smode=0, nref=0` it returns binomial1 itself (QTGMC's `lossed1`, the input of the back blend). It stops with an error
-for `tr1` outside 0..2, `smode` outside 0..2, or `nref` other than 0 / 3 / 5. On the GPU: 8 bit, all clips of one format,
-`Sovs` 0..255, and with `smode` 1 or 2 `rgBlur` 12 (or 11 on SSE4.1 CPUs).
+for `tr1` outside 0..2, `smode` outside 0..2, or `nref` other than 0 / 3 / 5. On the GPU: 8 or 10 bit (with `smode` 0: 8 to
+15 bit), all clips of one format, `Sovs` 0..255 (in 8-bit units, scaled like `mt_clamp` does), and with `smode` 1 or 2
+`rgBlur` 12 (or 11 on SSE4.1 CPUs).
 
 #### CudaQtgmcBackBlend(clip thin, clip lossed, float src_width, float src_height, clip edi, clip fComp1, clip bComp1, clip fComp3, clip bComp3, int nref, int sovs)
 
@@ -333,8 +341,8 @@ thin.mt_makediff(mt_makediff(thin, lossed, U=1, V=1).RemoveGrain(12, -1)
 
 QTGMC passes `src_width` / `src_height` = width / height plus a small epsilon. Defaults: `nref` 0, `sovs` 0. `nref` must
 be 0, 3 or 5, and the reference clips it needs (`edi`, `fComp1`, `bComp1`, and for 5 `fComp3`, `bComp3`) must be given;
-otherwise it stops with an error. On the GPU: 8 bit, all clips of one format, `sovs` 0..255, `src_width` != width and
-`src_height` != height, both > 0.
+otherwise it stops with an error. On the GPU: 8 to 16 bit, all clips of one format, `sovs` 0..255 (8-bit units),
+`src_width` != width and `src_height` != height, both > 0.
 
 #### CudaQtgmcAddNoise(clip c, clip noise, string expr, int use_expr, bool clamp_float, int lutUV, int addUV)
 
@@ -344,8 +352,9 @@ QTGMC's grain / noise restore as one table lookup per sample:
 c.mt_adddiff(noise.mt_lut(expr, use_expr=use_expr, clamp_float=clamp_float, U=lutUV, V=lutUV), U=addUV, V=addUV)
 ```
 
-The table is made by running that chain once on a 256 x 256 pattern. Defaults: `use_expr` 0, `clamp_float` false, `lutUV` 1,
-`addUV` 2. On the GPU: 8 bit, both clips of one format, and `addUV=2`, or `lutUV=3` with `addUV=3`.
+The tables are made by running that chain once on a 256 x 256 (10 bit: 1024 x 1024) pattern. Defaults: `use_expr` 0,
+`clamp_float` false, `lutUV` 1, `addUV` 2. On the GPU: 8 or 10 bit, both clips of one format, and `addUV=2`, or
+`lutUV=3` with `addUV=3`.
 
 ### Using cudafilters with QTGMC
 

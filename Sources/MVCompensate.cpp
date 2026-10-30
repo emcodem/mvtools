@@ -236,11 +236,11 @@ MVCompensate::MVCompensate(
     _boundary_cnt_arr.resize(nBlkY);
   }
 
-  // GPU path: 8 bit planar, pel 1 or 2, single compensation, no recursion / fields, super from a token clip
+  // GPU path: 8 to 16 bit planar, pel 1 or 2, single compensation, no recursion / fields, super from a token clip
   if (gpu_flag)
   {
     GpuBackend &gpu = GpuBackend::instance();
-    _gpu_ok = gpu.usable() && _super_lite && pixelsize_super == 1 && (nPel == 1 || nPel == 2) && recursion == 0 && !fields && !_multi_flag
+    _gpu_ok = gpu.usable() && _super_lite && (pixelsize_super == 1 || pixelsize_super == 2) && (nPel == 1 || nPel == 2) && recursion == 0 && !fields && !_multi_flag
       && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || planecount == 3) && vi.width >= (int)sizeof(MvCudaTokenHeader);
     if (_gpu_ok)
       _producer = gpu.producer_register(&MVCompensate::gpu_regen, this);

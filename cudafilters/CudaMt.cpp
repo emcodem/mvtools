@@ -1,5 +1,5 @@
-// Single masktools2 operations on the GPU (8 bit), bit for bit with masktools2 2.2.30 as it runs on SSE2+ CPUs; the
-// arithmetic is mvcuda_mt (mvcuda_kobs.cu):
+// Single masktools2 operations on the GPU (8 to 16 bit, CudaLutxy up to 10 bit), bit for bit with masktools2 2.2.30 as
+// it runs on SSE2+ CPUs; the arithmetic is mvcuda_mt (mvcuda_kobs.cu):
 //   CudaLogic(a, b, mode, Y, U, V)                       mt_logic "min" / "max"
 //   CudaClamp(c, bright, dark, overshoot, undershoot, Y, U, V)   mt_clamp
 //   CudaExpand(c, mode, Y, U, V) / CudaInpand(...)       mt_expand / mt_inpand, mode "vertical"
@@ -42,7 +42,7 @@ namespace
     {
       vi = _cpu->GetVideoInfo();
       CudaLib &lib = CudaLib::get();
-      _ok = lib.ok && make_format(vi, _fmt) && _fmt.bits_per_sample == 8 && (op != MVCUDA_MT_LUT || lut != 0);
+      _ok = lib.ok && make_format(vi, _fmt) && (op != MVCUDA_MT_LUT || lut != 0);
       for (int p = 0; p < _fmt.planes && _ok; p++)
       {
         if (modes[p] == 3)
@@ -140,7 +140,10 @@ AVSValue __cdecl Create_CudaClamp(AVSValue args, void *, IScriptEnvironment *env
   const int over = args[3].AsInt(0), under = args[4].AsInt(0);
   if (over < 0 || under < 0 || over > 255 || under > 255)
     m[0] = m[1] = m[2] = 0;
-  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[2].AsClip(), MVCUDA_MT_CLAMP, m, cpu, 0, over, under, "CudaClamp");
+  // overshoot / undershoot in sample units, as masktools scales them (paramscale "i8")
+  const int bits = cpu->GetVideoInfo().BitsPerComponent();
+  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[2].AsClip(), MVCUDA_MT_CLAMP, m, cpu, 0, scale_i8(over, bits),
+    scale_i8(under, bits), "CudaClamp");
 }
 
 static AVSValue create_morph(AVSValue args, IScriptEnvironment *env, bool expand)
@@ -173,6 +176,7 @@ AVSValue __cdecl Create_CudaLutxy(AVSValue args, void *, IScriptEnvironment *env
   PClip cpu = cpu_filter("mt_lutxy", 2, args, names, 7, env);
   int m[3];
   plane_modes(args[4], args[5], args[6], m);
-  const unsigned long long lut = CudaLib::get().ok ? lut_from_cpu(args[2].AsString("x"), args[3].AsInt(0), env) : 0;
+  const int bits = cpu->GetVideoInfo().BitsPerComponent();
+  const unsigned long long lut = CudaLib::get().ok && bits <= 10 ? lut_from_cpu(args[2].AsString("x"), args[3].AsInt(0), env, bits) : 0;
   return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[1].AsClip(), MVCUDA_MT_LUT, m, cpu, lut, 0, 0, "CudaLutxy");
 }

@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 14
+#define MVCUDA_API_VERSION 15
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -274,27 +274,33 @@ MVCUDA_API int mvcuda_temporal_binomial(const unsigned long long tokens[5], int 
 MVCUDA_API int mvcuda_merge(unsigned long long a, unsigned long long b, const int mode[3], int weight_i, int invweight_i,
   const int tail_start[3], unsigned long long producer, int frame, MvCudaTokenHeader *out);
 
-// ---- 8-bit MaskTools / RgTools building blocks and QTGMC_KeepOnlyBobShimmerFixes, see mvcuda_kobs.cu ------------------
+// ---- MaskTools / RgTools building blocks and QTGMC_KeepOnlyBobShimmerFixes, see mvcuda_kobs.cu ------------------------
+// 8 bit, and 9..16 bit in 16-bit containers; functions that take a lookup table work up to 10 bit (the table's bit depth
+// must be the frames').
 // 256 x 256 lookup table of a two-clip function (index x * 256 + y, as mt_lutxy(x, y)); kept on the device, 0 on failure
 MVCUDA_API unsigned long long mvcuda_lut2_create(const unsigned char *table);
+// the same for bits 8..10 with one table for luma and one for chroma (nullptr: the luma table): (1 << bits) x (1 << bits)
+// entries each, index x << bits | y, uint8_t entries for 8 bit, uint16_t above (API 15)
+MVCUDA_API unsigned long long mvcuda_lut2_create_bits(const void *luma, const void *chroma, int bits);
 MVCUDA_API void mvcuda_lut2_free(unsigned long long lut);
 
-// QTGMC_KeepOnlyBobShimmerFixes(Input, Ref, Rep, Chroma) of QTGMC.avsi on 8-bit device frames. lut1 / lut2: the function's
+// QTGMC_KeepOnlyBobShimmerFixes(Input, Ref, Rep, Chroma) of QTGMC.avsi on device frames (up to 10 bit). lut1 / lut2: the function's
 // two restore expressions as tables. planes_mask: bit p set = plane p is processed (Y always, U / V with Chroma); other
 // planes are Input's. Supported Rep: those that need neither RemoveGrain 4 (erosion 2 or 5) nor the square mt_expand
 // (over-dilation 3 or more); -4 otherwise.
 MVCUDA_API int mvcuda_kobs(unsigned long long input, unsigned long long ref, int rep, int planes_mask, unsigned long long lut1,
   unsigned long long lut2, unsigned long long producer, int frame, MvCudaTokenHeader *out);
 
-// RgTools RemoveGrain on 8-bit device frames, per plane: mode -1 or 0 copy (RgTools leaves the plane undefined for -1),
+// RgTools RemoveGrain on device frames (8..16 bit), per plane: mode -1 or 0 copy (RgTools leaves the plane undefined for -1),
 // 12 or 20 as RgTools' SSE4.1 code computes them; -4 for other modes
 MVCUDA_API int mvcuda_removegrain(unsigned long long src, const int mode[3], unsigned long long producer, int frame, MvCudaTokenHeader *out);
 
-// One 8-bit masktools-style operation per plane on device frames a, b, c (same format): op[p] is one of
+// One masktools-style operation per plane on device frames a, b, c (same format, 8..16 bit; MVCUDA_MT_LUT up to 10 bit):
+// op[p] is one of
 #define MVCUDA_MT_COPY_A 0  // a (masktools U / V = 2: copy the first clip)
 #define MVCUDA_MT_MIN 1     // mt_logic "min"
 #define MVCUDA_MT_MAX 2     // mt_logic "max"
-#define MVCUDA_MT_CLAMP 3   // mt_clamp(a, bright b, dark c, overshoot p1, undershoot p2)
+#define MVCUDA_MT_CLAMP 3   // mt_clamp(a, bright b, dark c, overshoot p1, undershoot p2) (p1 / p2 in sample units)
 #define MVCUDA_MT_VEXPAND 4 // mt_expand(mode="vertical") of a
 #define MVCUDA_MT_VINPAND 5 // mt_inpand(mode="vertical") of a
 #define MVCUDA_MT_LUT 6     // mt_lutxy(a, b) through the table lut (mvcuda_lut2_create)
@@ -303,7 +309,8 @@ MVCUDA_API int mvcuda_mt(const int op[3], unsigned long long a, unsigned long lo
   int p1, int p2, unsigned long long producer, int frame, MvCudaTokenHeader *out);
 
 // QTGMC's binomial smooth, resharp and temporal sharpness limit (QTGMC.avsi "Create basic output" .. sharpLimit1, for
-// Rep1 0, no source match / lossless / SVThin) in one step, 8 bit, all planes (masktools U = V = 3):
+// Rep1 0, no source match / lossless / SVThin) in one step, up to 10 bit (8..15 bit with smode 0), all planes (masktools
+// U = V = 3); sovs in sample units (masktools scales mt_clamp's overshoot: 255 = max, else << (bits - 8)):
 //   binomial = tr1 0: edi;  1: Merge(deg1, edi, w2);  2: Merge(Merge(deg1, deg2, w1), edi, w2)
 //   smode 0: resharp = binomial
 //   smode 1: resharp = mt_lutxy(binomial, RemoveGrain(binomial, 12), lut)
@@ -323,8 +330,8 @@ typedef struct
 MVCUDA_API int mvcuda_qtgmc_sharp(const MvCudaQtgmcSharp *p, unsigned long long edi, unsigned long long deg1, unsigned long long deg2,
   const unsigned long long *refs, unsigned long long producer, int frame, MvCudaTokenHeader *out);
 
-// QTGMC's back blend (Sbb), 8 bit: thin.mt_makediff(mt_makediff(thin, lossed, U=1,V=1).RemoveGrain(12, -1).GaussResize(...),
-// U=2,V=2): the luma of the result is thin - G + 128 (clamped), G the resize of RemoveGrain 12 of thin - lossed + 128,
+// QTGMC's back blend (Sbb), 8..16 bit: thin.mt_makediff(mt_makediff(thin, lossed, U=1,V=1).RemoveGrain(12, -1).GaussResize(...),
+// U=2,V=2): the luma of the result is thin - G + half (clamped), G the resize of RemoveGrain 12 of thin - lossed + half,
 // through the luma resampling programs prog_h / prog_v (mvcuda_resample_program_create, both passes, horizontal first
 // when h_first, as CudaGaussResize); chroma is thin's. With nref > 0 the result is then clamped like mvcuda_qtgmc_sharp
 // (all planes).

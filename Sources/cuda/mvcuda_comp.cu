@@ -1,16 +1,19 @@
-// MCompensate and MDegrain1..6 on device frames (8 bit, pel 1 or 2, one-level super), bit for bit with MVTools'
-// MVCompensate::compensate_slice_overlap / _normal and MVDegrainX::GetFrame (Degrain1to6_C, Overlaps_C, Short2Bytes):
+// MCompensate and MDegrain1..6 on device frames (8 to 16 bit, pel 1 or 2, one-level super), bit for bit with MVTools'
+// MVCompensate::compensate_slice_overlap / _normal and MVDegrainX::GetFrame (Degrain1to6_C, Overlaps_C, Short2Bytes,
+// Short2Bytes_Int32toWord16):
 // - a block's samples: compensation takes the reference block at the vector (or the source block when the block is
 //   bad), degrain forms (src * WSrc + sum(refF * WF + refB * WB) + 128) >> 8 with the host's normalised weights (they sum
 //   to 256, so the 8-bit SIMD code's 16-bit sums cannot overflow and equal the C code);
 // - with overlap every block adds (sample * window + 32) >> 6 to a 16-bit sum, which becomes min(255, (sum + 16) >> 5)
-//   (Short2Bytes_sse2: arithmetic shift and unsigned saturation); without overlap the block sample is the output;
+//   (Short2Bytes_sse2: arithmetic shift and unsigned saturation); above 8 bit the sum of sample * window is a 32-bit int
+//   and becomes min((sum + 1024) >> 11, max pixel value); without overlap the block sample is the output;
 // - the area right of / below the block grid is copied from the fill frame.
 // The super frame of a pel-1 one-level MSuper is the picture with replicated edges (PadReferenceFrame), so a reference
 // sample at a vector reaching into the padding is the clamped picture sample. With pel 2 a block starts at
 // MVPlane::GetPointer(blx, bly): sub-pel plane (blx & 1) | (bly & 1) << 1 at (blx >> 1, bly >> 1); plane 0 is the padded
 // picture, planes 1..3 the Wiener planes of the padded picture (Padding + Refine with sharp = 2: horizontal, vertical,
-// horizontal of the vertical one, MVPlane.cpp / Interpolation.cpp), made once per device frame (frame_subpel).
+// horizontal of the vertical one, MVPlane.cpp / Interpolation.cpp, clamped to the max pixel value), made once per device
+// frame (frame_subpel).
 // One thread per output sample sums the (at most 2 x 2) blocks covering it; the sum is integer, so the order does not matter.
 
 #include "mvcuda_internal.h"
@@ -23,13 +26,15 @@ namespace
 {
   const int MAXR = 2 * MVCUDA_MAX_DEGRAIN; // reference frames of one call
 
+  // sample pointers are bytes; the kernels read them as T (uint8_t or uint16_t)
   struct CompPlanes
   {
     const uint8_t *src[3], *fill[3];
     const uint8_t *ref[MAXR][3];      // compensate: ref[0]; degrain: ref[2k] backward, ref[2k + 1] forward of radius k + 1
     const uint8_t *sub[MAXR][3][3];   // pel 2: the Wiener planes of each reference (DevSubpel::sub)
     uint8_t *dst[3];
-    size_t pitch[3];                  // all frames of a call have one format (packed rows)
+    size_t pitch[3];                  // in samples; all frames of a call have one format (packed rows)
+    int maxv;                         // max pixel value (255 for 8 bit)
     int width[3], height[3];
     int bw[3], bh[3], step_x[3], step_y[3], log_x[3], log_y[3];
     int lstep_x, lstep_y;             // luma block step: block origins are (luma origin * pel + vector) >> chroma shift
@@ -39,28 +44,35 @@ namespace
     int active[3];
   };
 
+  template <class T>
+  __device__ __forceinline__ int at(const uint8_t *p, size_t pitch, int x, int y)
+  {
+    return ((const T *)p)[(size_t)y * pitch + x];
+  }
+
+  template <class T>
   __device__ __forceinline__ int px(const uint8_t *p, size_t pitch, int w, int h, int x, int y)
   {
     x = x < 0 ? 0 : x >= w ? w - 1 : x;
     y = y < 0 ? 0 : y >= h ? h - 1 : y;
-    return p[(size_t)y * pitch + x];
+    return at<T>(p, pitch, x, y);
   }
 
   // sample (i, j) of the reference block that starts at (X, Y) (plane coordinates in 1 / PEL units) of reference r
-  template <int PEL>
+  template <class T, int PEL>
   __device__ __forceinline__ int ref_at(const CompPlanes &pl, int r, int p, int X, int Y, int i, int j)
   {
     if (PEL == 1)
-      return px(pl.ref[r][p], pl.pitch[p], pl.width[p], pl.height[p], X + i, Y + j);
+      return px<T>(pl.ref[r][p], pl.pitch[p], pl.width[p], pl.height[p], X + i, Y + j);
     const int idx = (X & 1) | ((Y & 1) << 1);
     const int x = (X >> 1) + i, y = (Y >> 1) + j;
     if (idx == 0)
-      return px(pl.ref[r][p], pl.pitch[p], pl.width[p], pl.height[p], x, y);
+      return px<T>(pl.ref[r][p], pl.pitch[p], pl.width[p], pl.height[p], x, y);
     const int ew = pl.ew[p], eh = pl.eh[p];
     int ex = x + pl.hp[p], ey = y + pl.vp[p];
     ex = ex < 0 ? 0 : ex >= ew ? ew - 1 : ex; // vectors stay inside the padding; clamped only for safety
     ey = ey < 0 ? 0 : ey >= eh ? eh - 1 : ey;
-    return pl.sub[r][p][idx - 1][(size_t)ey * ew + ex];
+    return at<T>(pl.sub[r][p][idx - 1], ew, ex, ey);
   }
 
   // the blocks along one axis covering coordinate v: [*b0, *b1]
@@ -84,16 +96,16 @@ namespace
   }
 
   // MODE 0: compensate (blocks: mvx, mvy, use_ref), MODE 1: degrain of radius L (blocks: see mvcuda_degrain)
-  template <int MODE, int PEL>
+  template <class T, int MODE, int PEL>
   __global__ void k_blocks(CompPlanes pl, const int *blocks, int nbx, int nby, int ov, int L)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, p = blockIdx.z;
     if (x >= pl.width[p] || y >= pl.height[p])
       return;
-    uint8_t *d = pl.dst[p] + (size_t)y * pl.pitch[p] + x;
+    T *d = (T *)pl.dst[p] + (size_t)y * pl.pitch[p] + x;
     if (!pl.active[p] || x >= pl.wb[p] || y >= pl.hb[p])
     {
-      *d = pl.fill[p][(size_t)y * pl.pitch[p] + x];
+      *d = (T)at<T>(pl.fill[p], pl.pitch[p], x, y);
       return;
     }
     const int bw = pl.bw[p], bh = pl.bh[p], sx = pl.step_x[p], sy = pl.step_y[p];
@@ -116,19 +128,19 @@ namespace
         if (MODE == 0)
         {
           if (b[2])
-            v = ref_at<PEL>(pl, 0, p, (lx + b[0]) >> pl.log_x[p], (ly + b[1]) >> pl.log_y[p], i, j);
+            v = ref_at<T, PEL>(pl, 0, p, (lx + b[0]) >> pl.log_x[p], (ly + b[1]) >> pl.log_y[p], i, j);
           else
-            v = pl.src[p][(size_t)y * pl.pitch[p] + x];
+            v = at<T>(pl.src[p], pl.pitch[p], x, y);
         }
         else
         {
           const int *w = b + 4 * L + (p == 0 ? 0 : 1 + 2 * L); // WSrc, WRefB[L], WRefF[L]
-          int s = (int)pl.src[p][(size_t)y * pl.pitch[p] + x] * w[0];
+          int s = at<T>(pl.src[p], pl.pitch[p], x, y) * w[0];
           for (int k = 0; k < L; k++)
           {
             const int *mv = b + 4 * k;
-            const int rb = ref_at<PEL>(pl, 2 * k, p, (lx + mv[0]) >> pl.log_x[p], (ly + mv[1]) >> pl.log_y[p], i, j);
-            const int rf = ref_at<PEL>(pl, 2 * k + 1, p, (lx + mv[2]) >> pl.log_x[p], (ly + mv[3]) >> pl.log_y[p], i, j);
+            const int rb = ref_at<T, PEL>(pl, 2 * k, p, (lx + mv[0]) >> pl.log_x[p], (ly + mv[1]) >> pl.log_y[p], i, j);
+            const int rf = ref_at<T, PEL>(pl, 2 * k + 1, p, (lx + mv[2]) >> pl.log_x[p], (ly + mv[3]) >> pl.log_y[p], i, j);
             s += rf * w[1 + L + k] + rb * w[1 + k];
           }
           v = (s + 128) >> 8;
@@ -136,48 +148,61 @@ namespace
         if (ov)
         {
           const int wv = pl.win[p][window_index(bx, by, nbx, nby) * bw * bh + j * bw + i];
-          acc = (int)(short)(acc + ((v * wv + 32) >> 6)); // 16-bit sum, as the CPU's short buffer
+          if (sizeof(T) == 1)
+            acc = (int)(short)(acc + ((v * wv + 32) >> 6)); // 16-bit sum, as the CPU's short buffer
+          else
+            acc += v * wv; // 32-bit sum (Overlaps_C<uint16_t>)
         }
         else
           single = v;
       }
     if (ov)
     {
-      int r = (short)(acc + 16) >> 5; // _mm_srai_epi16 on the signed 16-bit sum, then packus
-      *d = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+      if (sizeof(T) == 1)
+      {
+        int r = (short)(acc + 16) >> 5; // _mm_srai_epi16 on the signed 16-bit sum, then packus
+        *d = (T)(r < 0 ? 0 : r > 255 ? 255 : r);
+      }
+      else
+      {
+        int r = (acc + 1024) >> 11; // Short2Bytes_Int32toWord16(_sse4): srai, packus, min with the max pixel value
+        *d = (T)(r < 0 ? 0 : r > pl.maxv ? pl.maxv : r);
+      }
     }
     else
-      *d = (uint8_t)single;
+      *d = (T)single;
   }
 
   // ---- pel-2 sub-pel planes (MSuper sharp = 2: HorizontalWiener / VerticalWiener over the padded plane) ----------------
   struct SubBuild
   {
     const uint8_t *src[3];
-    size_t ps[3];
+    size_t ps[3];                     // in samples
     int w[3], h[3], hp[3], vp[3], ew[3], eh[3];
     uint8_t *dst[3][3];
+    int maxv;
   };
 
-  __device__ __forceinline__ int wiener6(int a, int b, int c, int d, int e, int f)
+  __device__ __forceinline__ int wiener6(int a, int b, int c, int d, int e, int f, int maxv)
   {
     const int v = (a + (-b + (c << 2) + (d << 2) - e) * 5 + f + 16) >> 5;
-    return min(255, max(0, v));
+    return min(maxv, max(0, v));
   }
 
   // one sample of a Wiener pass at position t of a line of n samples, s(k) = sample k of the line (Interpolation.cpp: two
   // samples averaged at the first two and the last four positions, the last one copied)
   template <class S>
-  __device__ __forceinline__ int wiener_at(int t, int n, S s)
+  __device__ __forceinline__ int wiener_at(int t, int n, int maxv, S s)
   {
     if (t < 2 || (t >= n - 4 && t < n - 1))
       return (s(t) + s(t + 1) + 1) >> 1;
     if (t >= n - 1)
       return s(t);
-    return wiener6(s(t - 2), s(t - 1), s(t), s(t + 1), s(t + 2), s(t + 3));
+    return wiener6(s(t - 2), s(t - 1), s(t), s(t + 1), s(t + 2), s(t + 3), maxv);
   }
 
   // blockIdx.z = plane * 3 + sub (0 horizontal, 1 vertical, 2 horizontal of vertical); padded-plane coordinates
+  template <class T>
   __global__ void k_subpel(SubBuild b)
   {
     const int p = blockIdx.z / 3, s = blockIdx.z % 3;
@@ -185,21 +210,21 @@ namespace
     const int ew = b.ew[p], eh = b.eh[p];
     if (x >= ew || y >= eh)
       return;
-    const uint8_t *src = b.src[p];
+    const T *src = (const T *)b.src[p];
     const size_t ps = b.ps[p];
-    const int w = b.w[p], h = b.h[p], hp = b.hp[p], vp = b.vp[p];
+    const int w = b.w[p], h = b.h[p], hp = b.hp[p], vp = b.vp[p], maxv = b.maxv;
     auto P = [&](int px_, int py_) {
       const int cx = min(max(px_ - hp, 0), w - 1), cy = min(max(py_ - vp, 0), h - 1);
       return (int)src[(size_t)cy * ps + cx];
     };
     int v;
     if (s == 0)
-      v = wiener_at(x, ew, [&](int k) { return P(k, y); });
+      v = wiener_at(x, ew, maxv, [&](int k) { return P(k, y); });
     else if (s == 1)
-      v = wiener_at(y, eh, [&](int k) { return P(x, k); });
+      v = wiener_at(y, eh, maxv, [&](int k) { return P(x, k); });
     else
-      v = wiener_at(x, ew, [&](int k) { return wiener_at(y, eh, [&](int m) { return P(k, m); }); });
-    b.dst[p][s][(size_t)y * ew + x] = (uint8_t)v;
+      v = wiener_at(x, ew, maxv, [&](int k) { return wiener_at(y, eh, maxv, [&](int m) { return P(k, m); }); });
+    ((T *)b.dst[p][s])[(size_t)y * ew + x] = (T)v;
   }
 
   bool frames_match(const mvc::DevFrame &a, const mvc::DevFrame &b)
@@ -233,7 +258,7 @@ namespace
     for (int r = 0; r < nref; r++)
       if (!(fr[r] = mvc::frame_get(t_refs[r])))
         return MVCUDA_TOKEN_GONE;
-    if (fs->f.bytes_per_sample != 1 || !frames_match(*fs, *ff))
+    if ((fs->f.bytes_per_sample != 1 && fs->f.bytes_per_sample != 2) || !frames_match(*fs, *ff))
       return -4;
     for (int r = 0; r < nref; r++)
       if (!frames_match(*fs, *fr[r]))
@@ -276,7 +301,9 @@ namespace
       return -2;
     int *d_blocks = (int *)d_up;
     short *d_win = ov ? (short *)(d_up + bbytes) : nullptr;
+    const int bps = f.bytes_per_sample;
     CompPlanes pl = {};
+    pl.maxv = bps == 1 ? 255 : (1 << f.bits_per_sample) - 1;
     pl.lstep_x = g->blk_x - g->ov_x;
     pl.lstep_y = g->blk_y - g->ov_y;
     int max_w = 0, max_h = 0;
@@ -301,7 +328,7 @@ namespace
         pl.vp[p] = sp[0]->vp[p];
       }
       pl.dst[p] = (uint8_t *)dst->plane[p];
-      pl.pitch[p] = fs->pitch[p];
+      pl.pitch[p] = fs->pitch[p] / bps;
       pl.width[p] = fs->w[p];
       pl.height[p] = fs->h[p];
       pl.bw[p] = g->blk_x >> sx;
@@ -319,10 +346,17 @@ namespace
     }
     const dim3 grid((max_w + 127) / 128, max_h, f.planes);
     const int nbx = g->n_blk_x, nby = g->n_blk_y;
-    if (g->pel == 2)
-      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<MODE, 2><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+    if (bps == 2)
+    {
+      if (g->pel == 2)
+        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 2><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+      else
+        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 1><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+    }
+    else if (g->pel == 2)
+      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 2><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
     else
-      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<MODE, 1><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 1><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
     mvc::up_free(d_up, up_bytes); // reused once the pipeline stream has passed this point
     mvc::frame_put(dst, producer, frame, *out);
     return 0;
@@ -338,8 +372,9 @@ namespace mvc
 
   std::shared_ptr<DevSubpel> frame_subpel(const std::shared_ptr<DevFrame> &fr, int hpad, int vpad)
   {
-    if (!fr || fr->f.bytes_per_sample != 1)
+    if (!fr || (fr->f.bytes_per_sample != 1 && fr->f.bytes_per_sample != 2))
       return nullptr;
+    const int bps = fr->f.bytes_per_sample;
     std::lock_guard<std::mutex> lk(fr->extra_m);
     if (fr->subpel && fr->subpel->hpad == hpad && fr->subpel->vpad == vpad)
       return fr->subpel;
@@ -359,7 +394,7 @@ namespace mvc
       for (int k = 0; k < 3; k++)
       {
         off[p][k] = total;
-        total += ((size_t)s->ew[p] * s->eh[p] + 255) & ~(size_t)255;
+        total += ((size_t)s->ew[p] * s->eh[p] * bps + 255) & ~(size_t)255;
       }
       max_ew = s->ew[p] > max_ew ? s->ew[p] : max_ew;
       max_eh = s->eh[p] > max_eh ? s->eh[p] : max_eh;
@@ -368,10 +403,11 @@ namespace mvc
     if (!s->buf)
       return nullptr;
     s->bytes = total;
+    b.maxv = bps == 1 ? 255 : (1 << fr->f.bits_per_sample) - 1;
     for (int p = 0; p < fr->f.planes; p++)
     {
       b.src[p] = (const uint8_t *)fr->plane[p];
-      b.ps[p] = fr->pitch[p];
+      b.ps[p] = fr->pitch[p] / bps;
       b.w[p] = fr->w[p];
       b.h[p] = fr->h[p];
       b.hp[p] = s->hp[p];
@@ -385,7 +421,10 @@ namespace mvc
       }
     }
     const dim3 grid((max_ew + 127) / 128, max_eh, fr->f.planes * 3);
-    pipe_submit([=](cudaStream_t st) { k_subpel<<<grid, 128, 0, st>>>(b); });
+    if (bps == 2)
+      pipe_submit([=](cudaStream_t st) { k_subpel<uint16_t><<<grid, 128, 0, st>>>(b); });
+    else
+      pipe_submit([=](cudaStream_t st) { k_subpel<uint8_t><<<grid, 128, 0, st>>>(b); });
     fr->subpel = s;
     frame_account_extra(*fr, total);
     return s;

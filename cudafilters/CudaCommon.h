@@ -32,6 +32,7 @@ namespace cf
     decltype(&mvcuda_temporal_soften) temporal_soften = nullptr;
     decltype(&mvcuda_merge) merge = nullptr;
     decltype(&mvcuda_lut2_create) lut2_create = nullptr;
+    decltype(&mvcuda_lut2_create_bits) lut2_create_bits = nullptr;
     decltype(&mvcuda_lut2_free) lut2_free = nullptr;
     decltype(&mvcuda_kobs) kobs = nullptr;
     decltype(&mvcuda_removegrain) removegrain = nullptr;
@@ -66,14 +67,20 @@ namespace cf
   // A CPU filter reading a token frame directly would compute on the header bytes.
   PClip cpu_input(PClip c, IScriptEnvironment *env);
 
-  // the table of mt_lutxy(x, y, expr, use_expr=...) as the installed masktools computes it (a 256 x 256 pattern through
-  // the CPU filter), uploaded; 0 on failure
-  unsigned long long lut_from_cpu(const char *expr, int use_expr, IScriptEnvironment *env);
+  // the table of mt_lutxy(x, y, expr, use_expr=...) as the installed masktools computes it for bits 8 or 10 (an n x n
+  // pattern through the CPU filter, n = 1 << bits), uploaded; 0 on failure or for other bit depths
+  unsigned long long lut_from_cpu(const char *expr, int use_expr, IScriptEnvironment *env, int bits = 8);
 
-  // 256 x 256 Y8 clip (one frame) whose samples are their column (by_row = false: the x of a table) or their row (true: y)
-  PClip pattern_clip(bool by_row);
-  // uploads the table read from a 256 x 256 Y8 frame made from the two pattern clips (table[x * 256 + y]); 0 on failure
-  unsigned long long lut_from_frame(const PVideoFrame &f);
+  // n x n 4:4:4 8 / 10-bit clip (one frame, n = 1 << bits) whose samples in every plane are their column (by_row = false:
+  // the x of a table) or their row (true: y)
+  PClip pattern_clip(bool by_row, int bits = 8);
+  // uploads the tables read from an n x n frame made from the two pattern clips (table[x * n + y]; luma from Y, chroma from
+  // U when the frame has it); 0 on failure
+  unsigned long long lut_from_frame(const PVideoFrame &f, int bits = 8);
+
+  // a masktools integer parameter given in 8-bit units (paramscale "i8", the default) at bits: 255 stays the max value,
+  // others are shifted up (masktools ScaleParam)
+  inline int scale_i8(int v, int bits) { return v >= 255 ? (1 << bits) - 1 : v << (bits - 8); }
 
   const int g_planes[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
 
