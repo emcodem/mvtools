@@ -40,7 +40,8 @@ The other scripts in [scripts/avs/](scripts/avs) differ from this one only in:
 | `*_vec` | as above | as above | `return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))` |
 
 Frames, crops, PSNR and maps: [scripts/render.ps1](scripts/render.ps1) (the ffmpeg commands as run; output file names
-unified). The 5-format × 3-chain identity check: [scripts/cmp.ps1](scripts/cmp.ps1) + [scripts/cmp.py](scripts/cmp.py).
+unified). The 5-format × 3-chain identity check: [scripts/cmp.ps1](scripts/cmp.ps1) + [scripts/cmp.py](scripts/cmp.py);
+its MDegrain2 + MCompensate script: [scripts/avs/pinterf_degrain.avs](scripts/avs/pinterf_degrain.avs).
 
 ## 1. Same parameters: identical
 
