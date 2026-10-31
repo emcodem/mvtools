@@ -34,6 +34,10 @@
 #include <malloc.h>
 #define MVBRIDGE_EXPORT extern "C" __declspec(dllexport)
 #else
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 #define MVBRIDGE_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
@@ -53,6 +57,47 @@ bool debug_log()
   }();
   return on;
 }
+
+#ifndef _WIN32
+// MVBRIDGE_DEBUG only: on a crash print each frame as module + offset (resolve with addr2line -f -e <module> <offset>)
+void crash_handler(int sig, siginfo_t *si, void *)
+{
+  void *frames[64];
+  const int n = backtrace(frames, 64);
+  char line[512];
+  int len = snprintf(line, sizeof(line), "mvtools_vsbridge: signal %d at address %p\n", sig, si ? si->si_addr : nullptr);
+  (void)!write(2, line, (size_t)len);
+  for (int i = 0; i < n; ++i)
+  {
+    Dl_info info{};
+    if (dladdr(frames[i], &info) && info.dli_fname)
+      len = snprintf(line, sizeof(line), "  #%d %s +0x%zx\n", i, info.dli_fname,
+                     (size_t)((const char *)frames[i] - (const char *)info.dli_fbase));
+    else
+      len = snprintf(line, sizeof(line), "  #%d %p\n", i, frames[i]);
+    (void)!write(2, line, (size_t)len);
+  }
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void install_crash_handler()
+{
+  static bool done = false;
+  if (done || !debug_log())
+    return;
+  done = true;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = crash_handler;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, nullptr);
+  sigaction(SIGBUS, &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
+}
+#else
+void install_crash_handler() {}
+#endif
 
 void *aligned_alloc64(size_t size)
 {
@@ -441,8 +486,9 @@ PVideoFrame wrap_vs_frame(const VSFrame *f, bool writable, const VideoInfo &vi)
   ptrdiff_t off[3] = {0, 0, 0};
   for (int k = 1; k < g.nplanes; ++k)
   {
+    // int offsets, with room for subframe offsets on top
     off[k] = p[k] - p[0];
-    if (off[k] < INT_MIN / 2 || off[k] > INT_MAX / 2)
+    if (off[k] < (ptrdiff_t)INT_MIN + (1 << 28) || off[k] > (ptrdiff_t)INT_MAX - (1 << 28))
       fits = false;
   }
   b->readonly = !writable; // input frames belong to VS's cache
@@ -461,12 +507,13 @@ PVideoFrame wrap_vs_frame(const VSFrame *f, bool writable, const VideoInfo &vi)
                                                      (int)off[2], pitch[1], g.row[1], g.height[1], vi.pixel_type);
     return PVideoFrame(vf);
   }
-  // contiguous copy, AviSynth layout (pitch aligned to 64)
+  // contiguous copy with the VS frame's own strides: mvtools assumes that frames of one format share one pitch (e.g.
+  // FlowInterExtra reads src with the ref frame's pitch), so the copy must not change it
   int dpitch[3];
   size_t size = 0, start[3];
   for (int k = 0; k < g.nplanes; ++k)
   {
-    dpitch[k] = (g.row[k] + 63) & ~63;
+    dpitch[k] = pitch[k];
     start[k] = size;
     size += (size_t)dpitch[k] * g.height[k];
   }
@@ -827,6 +874,10 @@ public:
       ThrowError("mvtools_vsbridge: newVideoFrame failed (%dx%d)", w, h);
     if (!psrc && pmap && pmap->get())
       g_vsapi->copyMap(pmap->get(), g_vsapi->getFramePropertiesRW(dst));
+    // vector clips: MAnalyse leaves the header gap (bytes 4 + sizeof(MVAnalysisData) .. 255) unwritten; zero it so the
+    // clip is deterministic and equal to AviSynth+'s (small frames, cheap)
+    if (is_packed(vi))
+      memset(g_vsapi->getWritePtr(dst, 0), 0, (size_t)g_vsapi->getStride(dst, 0) * h);
     return wrap_vs_frame(dst, true, vi);
   }
 
@@ -1488,6 +1539,13 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
   }
   f->out_frames = f->avs_vi.num_frames;
   f->mtmode = clip->SetCacheHints(CACHE_GET_MTMODE, 0);
+  // debugging: MVBRIDGE_SERIAL=MAnalyse,MFlowInter runs the named functions as one serialised instance
+  if (const char *serial = std::getenv("MVBRIDGE_SERIAL"))
+  {
+    const std::string list = "," + lower(serial) + ",";
+    if (list.find("," + lower(def.name) + ",") != std::string::npos || list == ",all,")
+      f->mtmode = MT_SERIALIZED;
+  }
   f->all.push_back(clip);
   if (f->mtmode == MT_MULTI_INSTANCE)
     f->idle.push_back(raw);
@@ -1732,6 +1790,7 @@ MVBRIDGE_EXPORT int mvbridge_register_functions(int abi, VSPlugin *plugin, const
   if (!plugin || !vspapi || !init3)
     return fail("mvtools_vsbridge: bad arguments");
   std::lock_guard<std::mutex> l(g_register_mutex);
+  install_crash_handler();
   g_env.reg_plugin = plugin;
   g_env.reg_api = vspapi;
   int r = 0;

@@ -9,6 +9,7 @@ import runpy
 import sys
 import time
 
+import numpy as np
 import vapoursynth as vs
 
 
@@ -30,14 +31,15 @@ def main():
         for n, f in enumerate(clip.frames()):
             m = hashlib.md5()
             size = 0
-            for p in range(f.format.num_planes):
+            # AviSynth's plane order: planar RGB is G, B, R (avsmd5 hashes PLANAR_Y/U/V = G/B/R)
+            order = [1, 2, 0] if f.format.color_family == vs.RGB else range(f.format.num_planes)
+            for p in order:
                 row = f.width * f.format.bytes_per_sample if p == 0 else \
                     (f.width >> f.format.subsampling_w) * f.format.bytes_per_sample
                 h = f.height if p == 0 else (f.height >> f.format.subsampling_h)
-                mv = memoryview(f[p]).cast('B')
-                stride = f.get_stride(p)
+                a = np.asarray(f[p]).view(np.uint8).reshape(h, -1)  # rows without the stride padding
                 for y in range(h):
-                    m.update(mv[y * stride:y * stride + row])
+                    m.update(a[y, :row].tobytes())
                 size += row * h
             out.write('0, %10d, %10d,        1, %8d, %s\n' % (n, n, size, m.hexdigest()))
     print('vsmd5: %d frames, %.2f s' % (clip.num_frames, time.time() - t0), file=sys.stderr)

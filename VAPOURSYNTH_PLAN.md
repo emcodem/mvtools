@@ -35,19 +35,19 @@ channel (`VSClip` rebuilds `VideoInfo` from `VSVideoInfo`, audio fields zeroed, 
   `div = mul = 1`, which is wrong for any rate change (output n needs source n·fb/fa), and `MDegrainN` / `tr` is
   missing. Ours is computed per filter from its arguments (below).
 
-### Decision 1: frame requests: prefetch rule per filter, computed at creation, slow path as safety net
+### Decision 1: frame requests: learned prefetch offsets, slow path as safety net
 
-`Sources/vs/vs_prefetch.cpp`: table keyed by the AviSynth function name. Each entry is a function
-`(args, input VideoInfos) -> per-input rule`, where a rule maps output frame n to a list of input frames. The rule
-is evaluated once at creation from the filter's arguments, so filter sources stay unchanged. Examples:
-- MSuper, MMask, MShow, MSCDetection, MFlow, MStoreVect, MScaleVect, most cudafilters: {n}.
-- MAnalyse: super n, n±delta (multi: all deltas up to `delta`); MRecalculate: same on the super, {n} on the vectors.
-- MCompensate / MDegrain1..6 / MDegrainN: super and source n-tr..n+tr, vectors {n} (tr from the call; MDegrainN `tr`).
-- MFlowFps / MBlockFps / MFlowInter: source floor(n·fb/fa) and +1, vectors of that frame pair (from `num` / `den`
-  and the source rate, as `MVFlowFps::GetFrame` computes it).
-- Unknown function: {n} on every input.
-A request outside the rule goes through the slow path with one warning per filter instance (name, n, input index),
-which is how gaps in the table show up in testing; the test chains must run without that warning.
+(Revised in step 2. The first plan was a hand-written rule table per function; reading the filters showed that the
+frames they fetch depend on internal state: per-delta direction in MAnalyse, a static-frame mode, MCompensate taking
+the delta from the vectors' header. A table would be fragile.)
+
+Generic rule in `vsbridge/bridge.cpp`: for input k, base(n) = floor(n · frames_k / frames_out) (covers rate changes:
+MFlowFps, MBlockFps, MAnalyse multi), plus a set of offsets learned per input, starting with {0}. `arInitial`
+requests base(n) + every offset. When the filter fetches a frame that was not requested, the bridge adds that offset to
+the set and serves the frame through the synchronous path. Only speed depends on this, never the output. Measured on
+the UHD chain over 160 output frames: misses only during the warm-up, i.e. while VS has about one frame per thread
+in flight before anything has been learned (last miss at output frame 23-28 with 24 threads), none after. `MVBRIDGE_DEBUG=1`
+prints the misses and a summary per filter.
 
 ### Decision 2: VideoInfo side channel: registry keyed by `VSNode*`
 
@@ -145,22 +145,55 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
 
 ## Remaining design problems (in order of risk)
 
-1. **`Invoke`.** `InternalCache` (MFlowBlur / MFlowFps / MFlowInter) becomes a pass-through. `MSuper` / `MAnalyse`
-   from CudaNVOFAnalyse call this plugin's own filters through the shim. The CPU fallbacks of cudafilters (`Bob`,
+1. **`Invoke`.** Done for mvtools2: `InternalCache` (MFlowBlur / MFlowFps / MFlowInter) is a pass-through; `Invoke`
+   of a function registered through the bridge calls it directly (positional and named arguments). `MSuper` /
+   `MAnalyse` from CudaNVOFAnalyse will go that way. The CPU fallbacks of cudafilters (`Bob`,
    `TemporalSoften`, `RemoveGrain`, `mt_lutxy`, `nnedi3`, `QTGMC_KeepOnlyBobShimmerFixes`) map to VS equivalents where
    one exists (`std.*`, `rgvs.RemoveGrain`, `znedi3` / `nnedi3`, `std.Expr` for the LUT) and otherwise throw a clear
    error at creation; the GPU path does not need them.
-2. **Threading / MT modes.** Default `fmParallelRequests` (see step 1). Filters with cross-frame state (MAnalyse with
-   temporal predictor, MRecalculate chains with state) → `fmUnordered` / `fmFrameState`. avstp is Windows-only and
-   AviSynth-only; under VS the CPU search runs single-sliced as on Linux AviSynth+ (GPU: `MVTOOLS_GPU_SLICES`).
+2. **Threading / MT modes.** Done: `MT_NICE_FILTER` → `fmParallel` with one instance; `MT_MULTI_INSTANCE` (almost
+   every mvtools filter) → `fmParallel` with an instance pool: an idle instance per call, a new one created on demand
+   (one at a time per filter), as AviSynth+ creates one per prefetch thread; `MT_SERIALIZED` (MAnalyse with
+   `temporal` or `outfile`) and unknown → `fmParallelRequests`, one instance. `MVBRIDGE_SERIAL=MAnalyse,...` (or
+   `all`) forces the serialised mode, for debugging. avstp is Windows-only and AviSynth-only; under VS the CPU search
+   runs single-sliced as on Linux AviSynth+ (GPU: `MVTOOLS_GPU_SLICES`).
 3. **GPU token frames.** cudafilters and the mvtools GPU path pass token frames between filters; check that they
    survive VS's frame cache and copy-on-write (frame props copied, `MakeWritable` never on a token frame). VS now has
    its own GPU frames (Vulkan, `ffGPUOutput`, `vnode:gpu`, API 4.2+); token frames stay CPU-resident VS frames for
    now, interop with Vulkan GPU frames is a later item.
 
+## Findings of step 2 / 3 (2026-10-31)
+
+- **One pitch per format.** mvtools assumes that all frames of one format share one pitch: `FlowInterExtra` reads
+  the src frame with the ref frame's pitch (`MVFlowInter.cpp:437`). The bridge first copied frames whose VS planes
+  are too far apart for int offsets (happens under memory pressure, 24 threads) into buffers with 64-aligned pitches,
+  while zero-copy frames keep VS's 32-aligned stride; MFlowInter then read past the Y plane (ASan: 1 byte after an
+  8.49 MB VS plane) and crashed or gave different output, only at high thread counts. The copy now keeps the VS
+  stride. Rule for any future frame path in the bridge: never change the pitch of a format.
+- **Unwritten bytes in vector clips.** MAnalyse writes 4 + sizeof(MVAnalysisData) = 96 bytes of its 256-byte header;
+  bytes 96..255 were whatever the frame memory held (deterministic under AviSynth+, not under VS). New frames of packed
+  (vector) formats are zero-filled now; the vector clips are byte-identical to AviSynth+'s.
+- **Argument names.** AviSynth names are case-insensitive, VS's are not, and mvtools2 is not consistent (MRecalculate
+  `thsad`, MCompensate / MDegrain `thSAD`). The bridge registers each name in the casing most frequent among the
+  plugin's functions, so the documented casing works everywhere.
+- Planar RGB: mvtools2's MAnalyse accepts YUV only, so no mvtools2 chain uses the RGB plane mapping; it gets tested
+  with cudafilters.
+- Bridge missing next to libmvtools2.so: VS loads, `core.mvpf` exists with no functions, the reason is on stderr.
+
+Test tools (`vsbridge/test/`): `vsmd5.py` (framemd5 like `avsmd5`; planar RGB hashed G, B, R as AviSynth),
+`vstest.py` (`raw_source` = avsmd5's RawSource, `load_mvtools`), `gen_inputs.py` (HD 4:2:0 8-bit and 4:4:4 10-bit raw
+from the UHD source), `compare.py` (each chain in both hosts with the same libmvtools2.so, framemd5 diff),
+`lin_cpu.vpy` (the stored Linux reference chain; `MVPF_LOOP` for longer clips).
+
+Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, CPU): 17 chains (vectors, MStoreVect / MRestoreVect, MCompensate,
+MDegrain2, MDegrainN, MFlow, MFlowInter, MFlowBlur, MFlowFps, MBlockFps, MMask, MSCDetection, MShow, MScaleVect,
+MRecalculate, the UHD lin_cpu chain) give identical framemd5 in both hosts, 3 rounds at 24 VS threads; lin_cpu also
+at 1 thread.
+
 ## Files
 
-`vsbridge/` (decision 5: `avs_interface.cpp` from AviSynth+, `bridge.cpp`, `prefetch.cpp`, `CMakeLists.txt`),
+`vsbridge/` (decision 5: `avs_interface.cpp` and `avs_cpuid.cpp` from AviSynth+, `bridge.cpp`, `bridge_core.h`,
+`exports.map`, `CMakeLists.txt`, `test/`),
 `Sources/VapourSynthEntry.cpp` (and one in cudafilters): `VapourSynthPluginInit2` next to `AvisynthPluginInit3` (one library
 per plugin, each host ignores the other entry point), `cmake/plugin_exports.map` exports both, `VapourSynth4.h`
 (+ `VSHelper4.h` if used) vendored under `Sources/include/` (no build dependency on an installed VapourSynth). Option
@@ -170,9 +203,11 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
 
 1. ~~Read VS's `avisynth_compat.cpp` and the API 4 rules for frame requests inside filters; decide the request hook
    and the VideoInfo side channel.~~ Done 2026-10-31 (above).
-2. Shim core: `AVS_Linkage` table, environment, clip / frame wrappers, arg translation, node registry; first filters
-   MSuper, MAnalyse, MCompensate. Test host on Linux (WSL): VapourSynth from pip in the uv venv + `vspipe`.
-3. MDegrain1..N, MRecalculate, MFlowFps / MFlowInter / MBlockFps (temporal requests), then the rest of `Interface.cpp`.
+2. ~~Shim core: `AVS_Linkage` table, environment, clip / frame wrappers, arg translation, node registry; first filters
+   MSuper, MAnalyse, MCompensate.~~ Done 2026-10-31 on Linux (findings above).
+3. ~~MDegrain1..N, MRecalculate, MFlowFps / MFlowInter / MBlockFps (temporal requests), then the rest of
+   `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path. Open: the GPU path of mvtools2 under VS (`gpu=true`, token
+   frames), MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
 4. cudafilters through the same shim; CudaNVOFAnalyse.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.
@@ -182,7 +217,7 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
 - The same chains in AviSynth+ and VS on the same OS give identical framemd5 (Linux: `avsmd5` vs `vspipe` → framemd5;
   Windows: AviSynth+ vs VS portable). Chains: the Linux test chain (MAnalyse + MRecalculate + MFlowFps, UHD 10-bit
   4:2:2), MDegrain2 / MDegrainN, MCompensate, planar RGB, 4:2:0 8-bit, GPU on and off, NVOFA.
-- No "not prefetched" warning in any test chain.
+- Prefetch misses only in the warm-up (decision 1).
 - Multi-threaded VS (`core.num_threads` 1 vs 24) gives the same md5; 3 runs stable; no hang at exit (the submitter
   atexit fix applies to VS too, the host process is python / vspipe).
 - Fallbacks under VS: libmvtools_cuda missing, NVOFA missing, a cudafilters CPU fallback without its VS equivalent →
