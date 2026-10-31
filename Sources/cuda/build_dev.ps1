@@ -16,10 +16,10 @@ $common = "-DMVCUDA_EXPORTS -O3 --std=c++17 $Flags -gencode arch=compute_120,cod
 $hdr = @('mvcuda.h', 'mvcuda_internal.h')
 # unit -> extra sources it includes
 $units = [ordered]@{
-  'mvcuda.cu' = @(); 'mvcuda_core.cu' = @(); 'mvcuda_frames.cu' = @(); 'mvcuda_resample.cu' = @(); 'mvcuda_temporal.cu' = @(); 'mvcuda_merge.cu' = @(); 'mvcuda_kobs.cu' = @(); 'mvcuda_nnedi3.cu' = @(); 'mvcuda_comp.cu' = @()
+  'mvcuda.cu' = @(); 'mvcuda_core.cu' = @(); 'mvcuda_frames.cu' = @(); 'mvcuda_resample.cu' = @(); 'mvcuda_temporal.cu' = @(); 'mvcuda_merge.cu' = @(); 'mvcuda_kobs.cu' = @(); 'mvcuda_nnedi3.cu' = @(); 'mvcuda_comp.cu' = @(); 'mvcuda_nvofa.cu' = @('mvcuda_nvofa.h')
   'mvcuda_super_8.cu' = @('mvcuda_super.cu'); 'mvcuda_super_16.cu' = @('mvcuda_super.cu')
   'mvcuda_recalc_8.cu' = @('mvcuda_recalc.cu', 'mvcuda_refine.cuh'); 'mvcuda_recalc_16.cu' = @('mvcuda_recalc.cu', 'mvcuda_refine.cuh')
-  'mvcuda_analyse_8.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh'); 'mvcuda_analyse_16.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh')
+  'mvcuda_analyse_8.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh', 'mvcuda_nvofa.h'); 'mvcuda_analyse_16.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh', 'mvcuda_nvofa.h')
   'mvcuda_flow_8.cu' = @('mvcuda_flow.cu'); 'mvcuda_flow_16.cu' = @('mvcuda_flow.cu')
 }
 $stampFile = Join-Path $obj 'flags.txt'
