@@ -162,7 +162,9 @@ it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOUR
 * Formats: Gray, YUV 4:2:0 / 4:2:2 / 4:4:4, 8-16 bit, 32 bit float where mvtools2 supports it. Vector
   clips appear in VapourSynth as Gray8 clips; pass them only to `mvpf` filters: a vector or super clip that went through
   another VapourSynth filter (e.g. `std.Trim`) is not recognised.
-* Output is bit-identical with AviSynth+ on the same system (17 test chains, `vsbridge/test/compare.py`). Not verified
-  yet: `gpu=true` under VapourSynth, MDepan, cudafilters (planned as namespace `cuda`).
+* Output is bit-identical with AviSynth+ on the same system (17 CPU and 7 GPU test chains, `vsbridge/test/compare.py`).
+  `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
+  it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan, cudafilters (planned as namespace
+  `cuda`).
 * Debugging: `MVBRIDGE_DEBUG=1` prints frame-request misses, instance counts and a backtrace on a crash;
   `MVBRIDGE_SERIAL=MAnalyse,MFlowFps` (or `all`) runs the named filters single-threaded.

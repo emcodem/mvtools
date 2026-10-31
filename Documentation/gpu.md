@@ -37,9 +37,9 @@ Requirements:
 
 - x64 AviSynth+. cudafilters needs AviSynth+ 3.6 or newer (interface V8) and refuses to load on older versions; 3.7.5 is the
   tested version.
-- VapourSynth: mvtools2 runs under VapourSynth through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"), but
-  only the CPU path is verified there so far; `gpu=true` and cudafilters under VapourSynth are open items of
-  `VAPOURSYNTH_PLAN.md`.
+- VapourSynth: mvtools2 runs under VapourSynth through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"),
+  `gpu=true` included (same output as AviSynth+; `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under
+  VapourSynth is an open item of `VAPOURSYNTH_PLAN.md`.
 - An NVIDIA GPU with compute capability 8.0 or newer (RTX 30xx, 40xx, 50xx, A100, H100). Older cards count as "no usable
   device". The first device with cc >= 8.0 is used; `MVCUDA_DEVICE=n` picks another.
 - `CudaNNEDI3` and `CudaKeepOnlyBobShimmerFixes` call into other plugins: they need `plugins_JPSDR.dll` (nnedi3), and

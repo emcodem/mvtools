@@ -2,11 +2,14 @@
 raw input with the same libmvtools2.so; the framemd5 of both must be identical (VAPOURSYNTH_PLAN.md, verification).
 
 usage: python compare.py [chain ...]      (inside the Linux test setup; inputs from gen_inputs.py)
-env:   MVPF_PLUGIN_DIR  folder with libmvtools2.so and libmvtools_vsbridge.so
+       python compare.py cpu | gpu        (the CPU chains / the gpu_* chains; default: all)
+env:   MVPF_PLUGIN_DIR  folder with libmvtools2.so and libmvtools_vsbridge.so (+ libmvtools_cuda.so for the GPU chains;
+                        without it the gpu_* chains run the CPU fallback in both hosts and must still match)
        AVSMD5           avsmd5 binary (default ~/opt/bin/avsmd5)
        MVPF_THREADS     VapourSynth threads (default: VS's own)
 """
 import os
+import re
 import subprocess
 import sys
 import time
@@ -92,6 +95,43 @@ CHAINS = {
 }
 
 
+def vs_body(avs):
+    """The VapourSynth form of an AviSynth chain body in the subset used below: M* calls -> mv.M*, true / false."""
+    vs = re.sub(r'\b(M[A-Z]\w*)\(', r'mv.\1(', avs)
+    return re.sub(r'\bfalse\b', 'False', re.sub(r'\btrue\b', 'True', vs))
+
+
+# GPU chains (Documentation/gpu.md): lite super (MSuper gpu=true) and the GPU paths of MAnalyse, MRecalculate,
+# MCompensate, MDegrain2 and MFlowFps; normal frames in and out (token frames need cudafilters' CudaUpload)
+GPU_ANA = ('sup = MSuper(c, pel=2, gpu=true)\n'
+           'bv = MAnalyse(sup, isb=true, blksize=16, overlap=8, gpu=true)\n'
+           'fv = MAnalyse(sup, isb=false, blksize=16, overlap=8, gpu=true)\n')
+GPU_CHAINS = {
+    'gpu_vectors': ('hd420p8', GPU_ANA + 'out = bv\n'),
+    'gpu_vectors_normalsuper': ('hd444p10', 'sup = MSuper(c, pel=2)\n'
+                                'out = MAnalyse(sup, isb=false, blksize=16, overlap=8, gpu=true)\n'),
+    'gpu_compensate': ('hd444p10', GPU_ANA + 'out = MCompensate(c, sup, fv, gpu=true)\n'),
+    'gpu_degrain2': ('hd420p8',
+                     'sup = MSuper(c, pel=2, gpu=true)\n'
+                     'bv1 = MAnalyse(sup, isb=true, delta=1, blksize=16, overlap=8, gpu=true)\n'
+                     'fv1 = MAnalyse(sup, isb=false, delta=1, blksize=16, overlap=8, gpu=true)\n'
+                     'bv2 = MAnalyse(sup, isb=true, delta=2, blksize=16, overlap=8, gpu=true)\n'
+                     'fv2 = MAnalyse(sup, isb=false, delta=2, blksize=16, overlap=8, gpu=true)\n'
+                     'out = MDegrain2(c, sup, bv1, fv1, bv2, fv2, thSAD=400, gpu=true)\n'),
+    'gpu_recalculate': ('hd420p8', GPU_ANA + 'sup1 = MSuper(c, pel=2, levels=1, gpu=true)\n'
+                        'bv = MRecalculate(sup1, bv, blksize=8, overlap=4, thSAD=100, gpu=true)\n'
+                        'out = MCompensate(c, sup, bv, gpu=true)\n'),
+    'gpu_flowfps': ('uhd422p10', 'sup = MSuper(c, pel=2, hpad=16, vpad=16, rfilter=4, gpu=true)\n'
+                    'bv = MAnalyse(sup, isb=true, blksize=32, overlap=16, search=3, truemotion=true, chroma=true, gpu=true)\n'
+                    'fv = MAnalyse(sup, isb=false, blksize=32, overlap=16, search=3, truemotion=true, chroma=true, gpu=true)\n'
+                    'out = MFlowFps(c, sup, bv, fv, num=60000, den=1001, mask=2, ml=200, gpu=true)\n'),
+    'lin_gpu': ('uhd422p10', None),  # the stored Linux GPU reference chain (lin_gpu.avs / lin_gpu.vpy)
+}
+CPU_NAMES = list(CHAINS)
+for _name, (_src, _body) in GPU_CHAINS.items():
+    CHAINS[_name] = (_src, _body, None if _body is None else vs_body(_body))
+
+
 def write(path, text):
     with open(path, 'w') as fh:
         fh.write(text)
@@ -135,7 +175,9 @@ def run_chain(name):
 
 
 def main():
-    names = sys.argv[1:] or list(CHAINS)
+    names = []
+    for a in sys.argv[1:] or ['cpu', 'gpu']:
+        names += CPU_NAMES if a == 'cpu' else list(GPU_CHAINS) if a == 'gpu' else [a]
     bad = 0
     for name in names:
         status, info, ta, tv = run_chain(name)

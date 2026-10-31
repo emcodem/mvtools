@@ -157,10 +157,10 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
    `temporal` or `outfile`) and unknown → `fmParallelRequests`, one instance. `MVBRIDGE_SERIAL=MAnalyse,...` (or
    `all`) forces the serialised mode, for debugging. avstp is Windows-only and AviSynth-only; under VS the CPU search
    runs single-sliced as on Linux AviSynth+ (GPU: `MVTOOLS_GPU_SLICES`).
-3. **GPU token frames.** cudafilters and the mvtools GPU path pass token frames between filters; check that they
-   survive VS's frame cache and copy-on-write (frame props copied, `MakeWritable` never on a token frame). VS now has
-   its own GPU frames (Vulkan, `ffGPUOutput`, `vnode:gpu`, API 4.2+); token frames stay CPU-resident VS frames for
-   now, interop with Vulkan GPU frames is a later item.
+3. **GPU token frames.** mvtools2's GPU path done (findings of the GPU step below); token frames themselves only
+   appear with cudafilters (`CudaUpload`), so their end-to-end test comes with step 4. VS now has its own GPU frames
+   (Vulkan, `ffGPUOutput`, `vnode:gpu`, API 4.2+); token frames stay CPU-resident VS frames for now, interop with
+   Vulkan GPU frames is a later item.
 
 ## Findings of step 2 / 3 (2026-10-31)
 
@@ -183,12 +183,48 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
 Test tools (`vsbridge/test/`): `vsmd5.py` (framemd5 like `avsmd5`; planar RGB hashed G, B, R as AviSynth),
 `vstest.py` (`raw_source` = avsmd5's RawSource, `load_mvtools`), `gen_inputs.py` (HD 4:2:0 8-bit and 4:4:4 10-bit raw
 from the UHD source), `compare.py` (each chain in both hosts with the same libmvtools2.so, framemd5 diff),
-`lin_cpu.vpy` (the stored Linux reference chain; `MVPF_LOOP` for longer clips).
+`lin_cpu.vpy` / `lin_gpu.vpy` (the stored Linux reference chains; `MVPF_LOOP` for longer clips). `compare.py cpu` /
+`compare.py gpu` run one group; the GPU chains need `libmvtools_cuda.so` in `MVPF_PLUGIN_DIR` (without it they test the
+fallback).
 
 Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, CPU): 17 chains (vectors, MStoreVect / MRestoreVect, MCompensate,
 MDegrain2, MDegrainN, MFlow, MFlowInter, MFlowBlur, MFlowFps, MBlockFps, MMask, MSCDetection, MShow, MScaleVect,
 MRecalculate, the UHD lin_cpu chain) give identical framemd5 in both hosts, 3 rounds at 24 VS threads; lin_cpu also
 at 1 thread.
+
+## Findings of the GPU step (mvtools2 `gpu=true`, 2026-10-31)
+
+- **Token frames through the bridge (code review; tested end to end with cudafilters in step 4).** A token frame is an
+  ordinary frame whose first luma bytes hold the `MvCudaTokenHeader`; the device frame lives in mvtools_cuda's registry
+  with its own budget and is made again by its producer after eviction. Nothing in the bridge depends on that: input
+  frames are wrapped without copying or copied byte for byte (header included), output frames are handed to VS as they
+  are or copied row by row, VS's cache only holds references to immutable frames, and the bridge marks a frame read-only
+  once VS has it. How long VS keeps a token frame changes only how often a device frame is made again, never the
+  result. Regeneration: the producer instance runs inside another filter's `GetFrame` (`mvcuda_token_regenerate` ->
+  `gpu_regen`, guarded by the instance's own mutex); its input fetches are not in that filter's request set and take the
+  synchronous path. The learned offsets are only updated for an input of the filter whose `GetFrame` is running.
+- **Shared uploads need one IClip per node.** The GPU filters upload each super picture once and share it under the key
+  `GpuBackend::frame_key(child, n)`, i.e. the consumer's input `IClip*`. In AviSynth+ every consumer of a script
+  variable holds the same clip; the bridge made one `VSClip` per consumer argument, so each consumer uploaded its own
+  copy (`gpu_degrain2`, 40 frames: 246 uploads under VS vs 80 under AviSynth+; output identical). The bridge now keeps one
+  `VSClip` per `VSNode*` (`acquire_vsclip` / `release_vsclip`: the map holds a reference of its own plus a count of the
+  filters using it, so a lookup never revives a clip whose last reference is going away); the learned prefetch moved
+  from the clip to the consuming filter (`BridgeFilter::input_of`). Now 80 uploads at 1 VS thread (= AviSynth+), 99 at
+  24 threads (more frames in flight, more evictions).
+- **Instances.** Every MT_MULTI_INSTANCE GPU filter gets up to one instance per VS thread (93 MAnalyse instances in
+  `gpu_degrain2` at 24 threads, vs 4 in single-threaded AviSynth+); they share the device frame registry, so this costs
+  host memory, not device frames.
+- **Broken `libmvtools_cuda.so`.** A truncated library made glibc's `dlopen` die of SIGBUS (it maps segments past the end
+  of the file), in AviSynth+ as well as VS. `dynlib::open` (`Sources/cuda/dyn_lib.h`, used by mvtools2, cudafilters,
+  the NVOFA loader and the VS entry point) now refuses on Linux a file that is shorter than its ELF segments, with the
+  reason in the log; the filters then run on the CPU.
+
+Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, RTX 5090, CUDA 13.4): 7 GPU chains (`compare.py gpu`: GPU vectors on
+a lite and a normal super, MCompensate, MDegrain2, MRecalculate + MCompensate, MFlowFps `mask=2` on UHD 4:2:2 10-bit,
+the stored `lin_gpu` chain) identical in both hosts, 4 rounds at 24 VS threads and 1 round at 1 thread; VS `lin_gpu` =
+the stored AviSynth+ reference `lin_gpu.md5`. Without `libmvtools_cuda.so` and with a truncated one, both hosts run the
+CPU fallback and stay identical (`lin_gpu` = `lin_cpu.md5`). python and vspipe exit cleanly (rc 0, no hang). The 17 CPU
+chains still identical, 3 rounds.
 
 ## Files
 
@@ -206,8 +242,8 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
 2. ~~Shim core: `AVS_Linkage` table, environment, clip / frame wrappers, arg translation, node registry; first filters
    MSuper, MAnalyse, MCompensate.~~ Done 2026-10-31 on Linux (findings above).
 3. ~~MDegrain1..N, MRecalculate, MFlowFps / MFlowInter / MBlockFps (temporal requests), then the rest of
-   `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path. Open: the GPU path of mvtools2 under VS (`gpu=true`, token
-   frames), MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
+   `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path; GPU path (`gpu=true`) done 2026-10-31 (findings above).
+   Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
 4. cudafilters through the same shim; CudaNVOFAnalyse.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.

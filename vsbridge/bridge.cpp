@@ -558,19 +558,25 @@ class VSClip;
 std::mutex g_clips_mutex;
 std::unordered_set<IClip *> g_clips; // live VSClips, to recognise a filter that returns one of its inputs
 
+// One VSClip per VS node, shared by every filter that takes the node as an argument: in AviSynth+ all consumers of a
+// script variable hold the same IClip, and the GPU path keys its shared uploads by that pointer
+// (GpuBackend::frame_key(child, n)), so one wrapper per consumer would upload each super picture once per consumer.
+// The map holds a reference of its own plus the number of filters using the entry (acquire_vsclip / release_vsclip), so
+// a lookup never revives a clip whose last reference is just going away.
+struct NodeClip
+{
+  PClip clip;
+  int users = 0;
+};
+std::unordered_map<VSNode *, NodeClip> g_node_clips; // under g_clips_mutex
+
 class VSClip : public IClip
 {
 public:
   VSNode *node;
   VideoInfo vi;
-  BridgeFilter *owner = nullptr; // the filter whose argument this clip is (learned prefetch), set after creation
-  int input_index = -1;
 
-  VSClip(VSNode *n, const VideoInfo &v) : node(n), vi(v)
-  {
-    std::lock_guard<std::mutex> l(g_clips_mutex);
-    g_clips.insert(this);
-  }
+  VSClip(VSNode *n, const VideoInfo &v) : node(n), vi(v) {} // only through acquire_vsclip (under g_clips_mutex)
   ~VSClip() override
   {
     {
@@ -594,6 +600,51 @@ bool is_vsclip(IClip *c)
   std::lock_guard<std::mutex> l(g_clips_mutex);
   return g_clips.count(c) != 0;
 }
+
+// The shared VSClip of node, for one more filter. Takes over the node reference.
+VSClip *acquire_vsclip(VSNode *node, const VideoInfo &vi)
+{
+  std::lock_guard<std::mutex> l(g_clips_mutex);
+  NodeClip &e = g_node_clips[node];
+  if (e.users++ == 0)
+  {
+    VSClip *c = new VSClip(node, vi);
+    g_clips.insert(c);
+    e.clip = c;
+  }
+  else
+    g_vsapi->freeNode(node); // the existing VSClip holds a reference
+  if (debug_log())
+    fprintf(stderr, "mvtools_vsbridge: node %p -> clip %p, %d users\n", (void *)node, (void *)e.clip.operator->(),
+            e.users);
+  return static_cast<VSClip *>(e.clip.operator->());
+}
+
+// One filter less uses c; the last one drops the map's reference (the clip goes when the plugin's references go).
+void release_vsclip(VSClip *c)
+{
+  PClip drop;
+  {
+    std::lock_guard<std::mutex> l(g_clips_mutex);
+    auto it = g_node_clips.find(c->node);
+    if (it == g_node_clips.end() || --it->second.users != 0)
+      return;
+    drop = it->second.clip;
+    g_node_clips.erase(it);
+  }
+  // drop released here, outside the lock: ~VSClip takes it
+}
+
+// releases the VSClips of a create call that did not become a filter
+struct ClipUses
+{
+  std::vector<VSClip *> v;
+  ~ClipUses()
+  {
+    for (VSClip *c : v)
+      release_vsclip(c);
+  }
+};
 
 } // namespace
 
@@ -643,10 +694,18 @@ struct BridgeFilter
     if (r.offsets.size() < 64 && std::find(r.offsets.begin(), r.offsets.end(), offset) == r.offsets.end())
       r.offsets.push_back(offset);
   }
+  // index of input c (the first, when the same node is given twice), -1 when c is not an input of this filter
+  int input_of(const VSClip *c) const
+  {
+    for (size_t k = 0; k < input_clips.size(); ++k)
+      if (input_clips[k] == c)
+        return (int)k;
+    return -1;
+  }
   ~BridgeFilter()
   {
     for (VSClip *c : input_clips)
-      c->owner = nullptr;
+      release_vsclip(c);
   }
 };
 
@@ -664,7 +723,10 @@ PVideoFrame VSClip::GetFrame(int n, IScriptEnvironment *env)
   {
     // not in the request set: learn the offset for the next frames, then fetch synchronously (safe in VS: the pool
     // thread is parked as reserveThread, see VAPOURSYNTH_PLAN.md step 1)
-    if (c && owner && c->filter == owner)
+    // learned only for the filter whose GetFrame this is (not e.g. a producer regenerating a GPU frame on its behalf)
+    BridgeFilter *owner = c ? c->filter : nullptr;
+    const int input_index = owner ? owner->input_of(this) : -1;
+    if (input_index >= 0)
     {
       const int off = n - owner->base(input_index, c->n);
       owner->learn(input_index, off);
@@ -1414,7 +1476,7 @@ bool vs_arg(const VSMap *in, const ArgDef &a, VSCore *core, std::vector<VSClip *
           return false;
         }
       }
-      VSClip *c = new VSClip(node, vi);
+      VSClip *c = acquire_vsclip(node, vi);
       clips.push_back(c);
       vals.emplace_back(c);
       break;
@@ -1447,7 +1509,8 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
   } restore{prev_core};
 
   std::vector<AVSValue> a(def.args.size());
-  std::vector<VSClip *> clips;
+  ClipUses uses; // until they belong to the filter
+  std::vector<VSClip *> &clips = uses.v;
   std::string err;
   for (size_t i = 0; i < def.args.size(); ++i)
     if (!vs_arg(in, def.args[i], core, clips, a[i], err))
@@ -1556,8 +1619,6 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
     std::unique_ptr<InputRule> r(new InputRule);
     r->node = c->node;
     r->frames = c->vi.num_frames;
-    c->owner = f.get();
-    c->input_index = (int)f->inputs.size();
     f->inputs.push_back(std::move(r));
     f->input_clips.push_back(c);
     deps.push_back({c->node, rpGeneral});
@@ -1571,6 +1632,7 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
       f->dur_den = f->vs_vi.fpsNum;
     }
   }
+  clips.clear(); // released by ~BridgeFilter from here on
 
   const int mode = f->mtmode == MT_NICE_FILTER || f->mtmode == MT_MULTI_INSTANCE ? fmParallel : fmParallelRequests;
   BridgeFilter *fp = f.get();
