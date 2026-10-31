@@ -208,7 +208,7 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
   {
     const bool sharp_ok = (params.param & 0x80) && ((params.param >> 3) & 3) == 2 && !(params.param & 0x20);
     _gpu_ok = GpuBackend::instance().usable() && sharp_ok && (pixelsize_super == 1 || pixelsize_super == 2)
-      && vi.IsPlanar() && !vi.IsYUY2() && !isGrey && !isRGB && planecount == 3 && maskmode == 2 && (nPel == 1 || nPel == 2)
+      && vi.IsPlanar() && !vi.IsYUY2() && !isGrey && !isRGB && planecount == 3 && maskmode == 2 && (nPel == 1 || nPel == 2 || nPel == 4)
       && (xRatioUVs[1] == 1 || xRatioUVs[1] == 2) && (yRatioUVs[1] == 1 || yRatioUVs[1] == 2);
     if (GpuBackend::log_enabled())
       std::fprintf(stderr, "MFlowFps gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");

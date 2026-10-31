@@ -191,6 +191,44 @@ namespace MVC_NS
     dst[(size_t)y * W + x] = (pix)v;
   }
 
+  // The 12 quarter-pel planes of pel 4 (MVPlane::refine_pel4, Average2: (a + b + 1) >> 1) from the half-pel planes
+  // p0 (full), p2 (horizontal Wiener), p8 (vertical Wiener), p10 (horizontal Wiener of p8). Planes 5, 7, 13 and 15 are
+  // averages of averages and are computed from the four inputs here. The CPU skips the last column of planes 3, 7, 11,
+  // 15 and the last row of 12, 13, 14, 15 (offset reads, stale memory there): those samples take clamped reads here.
+  // They are never read: a vector of the search range ends its block at row eh - 2 / column ew - 2 at most.
+  struct QuarterPtrs
+  {
+    pix *q[16];
+  };
+  __global__ void k_quarter_v(QuarterPtrs qp, const pix *p0, const pix *p2, const pix *p8, const pix *p10, int W, int H)
+  {
+    pix *const *q = qp.q;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H)
+      return;
+    const int x1 = min(x + 1, W - 1), y1 = min(y + 1, H - 1);
+    const size_t o = (size_t)y * W + x, ox = (size_t)y * W + x1, oy = (size_t)y1 * W + x, oxy = (size_t)y1 * W + x1;
+    auto avg = [](int a, int b) { return (a + b + 1) >> 1; };
+    const int a0 = p0[o], a2 = p2[o], a8 = p8[o], a10 = p10[o];
+    const int v4 = avg(a0, a8), v6 = avg(a2, a10);
+    const int v4x = avg(p0[ox], p8[ox]);                        // plane 4 at x + 1
+    const int v12 = avg(p0[oy], a8), v14 = avg(p2[oy], a10);
+    const int v12x = avg(p0[oxy], p8[ox]);                      // plane 12 at x + 1
+    q[1][o] = (pix)avg(a0, a2);
+    q[3][o] = (pix)avg(p0[ox], a2);
+    q[4][o] = (pix)v4;
+    q[5][o] = (pix)avg(v4, v6);
+    q[6][o] = (pix)v6;
+    q[7][o] = (pix)avg(v4x, v6);
+    q[9][o] = (pix)avg(a8, a10);
+    q[11][o] = (pix)avg(p8[ox], a10);
+    q[12][o] = (pix)v12;
+    q[13][o] = (pix)avg(v12, v14);
+    q[14][o] = (pix)v14;
+    q[15][o] = (pix)avg(v12x, v14);
+  }
+
   dim3 grid_for(int w, int h)
   {
     return dim3((w + 31) / 32, (h + 7) / 8);
@@ -205,9 +243,9 @@ namespace MVC_NS
     int rc = 0;
     out.p = p;
     out.esize = (int)sizeof(pix);
-    // supported: pel 1 or 2, Wiener sharp, cubic / bilinear reduction (rfilter 4 / 2); bit depth matches the sample type
+    // supported: pel 1, 2 or 4, Wiener sharp, cubic / bilinear reduction (rfilter 4 / 2); bit depth matches the sample type
     if ((sizeof(pix) == 1 ? (p.bits_per_pixel != 8) : (p.bits_per_pixel < 9 || p.bits_per_pixel > 16))
-      || (p.pel != 1 && p.pel != 2) || p.levels < 1 || p.levels > MVCUDA_MAX_LEVELS || (p.rfilter != 4 && p.rfilter != 2) || p.sharp != 2)
+      || (p.pel != 1 && p.pel != 2 && p.pel != 4) || p.levels < 1 || p.levels > MVCUDA_MAX_LEVELS || (p.rfilter != 4 && p.rfilter != 2) || p.sharp != 2)
       return -4;
     if (!use_device())
       return -1;
@@ -271,6 +309,19 @@ namespace MVC_NS
         k_wiener_h<<<g, BLOCK, 0, st>>>(sub[1], sub[0], d0.ew, d0.eh, maxv);
         k_wiener_v<<<g, BLOCK, 0, st>>>(sub[2], sub[0], d0.ew, d0.eh, maxv);
         k_wiener_h<<<g, BLOCK, 0, st>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
+      }
+      else if (p.pel == 4)
+      {
+        // refine_pel4: the half-pel planes 2, 8, 10 as pel 2's 1, 2, 3, then the quarter-pel averages (one kernel)
+        pix **sub = (pix **)out.pl[plane].sub;
+        const dim3 g = grid_for(d0.ew, d0.eh);
+        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[2], sub[0], d0.ew, d0.eh, maxv);
+        k_wiener_v<<<g, BLOCK, 0, st>>>(sub[8], sub[0], d0.ew, d0.eh, maxv);
+        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[10], sub[8], d0.ew, d0.eh, maxv);
+        QuarterPtrs qp;
+        for (int i = 0; i < 16; i++)
+          qp.q[i] = sub[i];
+        k_quarter_v<<<g, BLOCK, 0, st>>>(qp, sub[0], sub[2], sub[8], sub[10], d0.ew, d0.eh);
       }
       CUDA_CHECK(cudaGetLastError());
     }

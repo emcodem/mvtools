@@ -8,7 +8,7 @@ This page covers the CUDA part of this mvtools build:
 - the environment variables
 
 The design notes and measurements are in `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md` and `GPU_PIPELINE_PLAN.md`. They describe how
-the work got here; this page describes what the functions do now (library API version 17).
+the work got here; this page describes what the functions do now (library API version 18).
 
 ## Principles
 
@@ -103,7 +103,9 @@ With `gpu=true`, MSuper skips the CPU pyramid and the sub-pel planes. When all o
 only the picture inside its padding rows:
 
 - the GPU library is usable
-- `pel` 1 or 2, `sharp=2`, `rfilter` 2 or 4, no `pelclip`
+- `pel` 1 or 2, `sharp=2`, `rfilter` 2 or 4, no `pelclip` (with `pel=4` it makes the normal super: MCompensate and MDegrain
+  have no pel-4 GPU path yet, and a lite super would make them rebuild it on the CPU for every frame they read; MAnalyse,
+  MRecalculate and MFlowFps take the normal pel-4 super on the GPU)
 - planar YUV (not Y only, not YUY2), 8-bit or 16-bit container
 - chroma subsampling 1 or 2 in each direction
 - `hpad` divisible by the horizontal chroma ratio, `vpad` by the vertical one, height divisible by the vertical one
@@ -128,14 +130,15 @@ The GPU path is used when all of these hold:
 
 | Setting | Supported on the GPU |
 |---|---|
-| super clip | from this build's `MSuper`, `sharp=2`, `rfilter` 2 or 4, no `pelclip`, `pel` 1 or 2 |
+| super clip | from this build's `MSuper`, `sharp=2`, `rfilter` 2 or 4, no `pelclip`, `pel` 1, 2 or 4 |
 | format | planar, 8-bit or 16-bit container; with `chroma=true` chroma subsampling 1 or 2 |
 | `blksize` | up to 32 |
 | `levels` | up to 12 (counted levels) |
 | `search` | 0 to 7 |
-| `pelsearch` (finest level) | 1 to 24; 1 to 3 for `search=3` (exhaustive) |
-| `searchparam` (coarse levels, when there is more than one level) | 1 to 3; 1 to 24 for `search=6` / `7` (horizontal / vertical) |
-| `divide`, `dct`, `temporal`, `trymany`, `multi` | 0 / false only |
+| `pelsearch` (finest level) | 1 to 24; 1 to 64 for `search=3` (exhaustive) |
+| `searchparam` (coarse levels, when there is more than one level) | 1 to 64 (the coarse levels search exhaustively); 1 to 24 for `search=6` / `7` (horizontal / vertical) |
+| `trymany` | true or false |
+| `divide`, `dct`, `temporal`, `multi` | 0 / false only |
 | `outfile` | not set |
 
 Single frames run on the CPU when the clip is field-based (a field shift is needed), when `delta` is 0 or less (static
@@ -151,6 +154,17 @@ result depends on the number of slices. The GPU reproduces that:
   faster GPU mode. To keep the output independent of where a frame was searched, the CPU fallback of such a filter
   searches in one slice too, whatever `mt` says.
 
+**Speed of the wider settings.** With `meander=true`, exhaustive radii above 3 (the finest level with `search=3`, every
+coarse level with `searchparam` above 3) use a parallel exhaustive pass: the reference area of all candidates in
+shared memory, candidates pruned by their vector cost like the CPU's, one parallel minimum. Measured (RTX 5090 against
+24 CPU threads, MAnalyse only): PAL 1500 frames Prefetch 8, `pelsearch=24`: 8 bit 1.31 ms/frame (CPU 1.54), 10 bit 1.75
+(CPU 2.12); UHD 10 bit 4:2:2, 32x32 blocks: `pelsearch=8` 31 ms/frame (CPU 24), `pelsearch=24` 52 (CPU 31). At UHD the
+GPU searches of different frames do not run at the same time yet (GPU_PIPELINE_PLAN.md section 29), so there the CPU is
+still faster for large radii. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
+slower); `trymany` uses the parallel pass for its exhaustive refines.
+`trymany` with `meander=false` uses the slice kernel with one slice (the wavefront kernel does not implement it).
+`pel=4` keeps 16 sub-pel planes per plane on the device (4 times the memory of pel 2).
+
 The output is a normal vector clip; every consumer of vectors works unchanged.
 
 ### MRecalculate
@@ -159,7 +173,7 @@ The output is a normal vector clip; every consumer of vectors works unchanged.
 
 The same super, format, `blksize` and `divide` / `dct` / `outfile` conditions as MAnalyse, and:
 
-- `search` 0 to 7, with `searchparam` 1 to 24 (1 to 3 for `search=3`)
+- `search` 0 to 7, with `searchparam` 1 to 24 (1 to 64 for `search=3`)
 - `smooth` 0 or 1
 - `tr` 0 (a single vector clip)
 
@@ -203,7 +217,7 @@ normal frames for frames made on the CPU. MDegrainN has no `gpu` parameter.
 The GPU path is used when all of these hold:
 
 - `mask=2` (the default)
-- super from this build's `MSuper` with `sharp=2`, no `pelclip`, `pel` 1 or 2
+- super from this build's `MSuper` with `sharp=2`, no `pelclip`, `pel` 1, 2 or 4
 - planar YUV with three planes (not Y only, not RGB), 8-bit or 16-bit container, chroma subsampling 1 or 2
 
 The output is token frames when the source clip is a token clip (they are made again after eviction), otherwise normal

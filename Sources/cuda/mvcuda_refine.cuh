@@ -37,10 +37,35 @@ namespace mvc_refine
       || t == S_HORIZONTAL || t == S_VERTICAL;
   }
 
-  // largest search parameter accepted for a type (keeps the work per block bounded)
+  // largest search parameter accepted for a type (keeps the work per block bounded). Exhaustive radii above 3 are cut
+  // into consecutive batches of at most MAX_BATCH (see refine); 64 = 16640 candidates per block.
   inline int max_param(int t)
   {
-    return t == S_EXHAUSTIVE ? 3 : 24;
+    return t == S_EXHAUSTIVE ? 64 : 24;
+  }
+
+  // candidate k (0 .. 8r - 1) of ExpandingSearch(r, 1, 0, 0) in CPU order: the top / bottom sides without corners
+  // (interleaved), the left / right sides without corners (interleaved), then the four corners
+  __device__ __forceinline__ void expanding_point(int r, int k, int &dx, int &dy)
+  {
+    const int side = 2 * (2 * r - 1);
+    if (k < side)
+    {
+      dx = -r + 1 + (k >> 1);
+      dy = (k & 1) ? r : -r;
+    }
+    else if (k < 2 * side)
+    {
+      k -= side;
+      dx = (k & 1) ? r : -r;
+      dy = -r + 1 + (k >> 1);
+    }
+    else
+    {
+      k -= 2 * side;
+      dx = (k & 2) ? r : -r;
+      dy = (k & 1) ? r : -r;
+    }
   }
 
   // ExpandingSearch(r, s, mvx, mvy) candidates in CPU order, appended at n; returns the new count
@@ -290,12 +315,26 @@ namespace mvc_refine
       break;
     case S_EXHAUSTIVE:
     {
-      // all radii are centred on the vector at the start, so the whole search is one batch
+      // all radii are centred on the vector at the start, so the whole search is one sequence of CheckMV in a fixed
+      // order. Folding it in consecutive batches (the running minimum carried from one to the next) accepts exactly
+      // what one long fold would; radius <= 3 (48 candidates) stays one batch.
       const int mvx = c.bx, mvy = c.by;
-      int xs[48], ys[48], n = 0;
+      int xs[MAX_BATCH], ys[MAX_BATCH], n = 0;
       for (int i = 1; i <= param; i++)
-        n = add_expanding(xs, ys, n, i, 1, mvx, mvy);
-      c.run_batch(M_CHECK, n, xs, ys, nullptr, dummy);
+        for (int k = 0; k < 8 * i; k++)
+        {
+          int dx, dy;
+          expanding_point(i, k, dx, dy);
+          xs[n] = mvx + dx;
+          ys[n++] = mvy + dy;
+          if (n == MAX_BATCH)
+          {
+            c.run_batch(M_CHECK, n, xs, ys, nullptr, dummy);
+            n = 0;
+          }
+        }
+      if (n)
+        c.run_batch(M_CHECK, n, xs, ys, nullptr, dummy);
     }
     break;
     case S_HEX2:

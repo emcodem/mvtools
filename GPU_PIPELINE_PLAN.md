@@ -1068,7 +1068,8 @@ packed SADs for 16-bit samples, in both search kernels. A/B first: 8-bit QTGMC S
    Left from it: 4 concurrent uc_FRC jobs 17.4 -> 18.5 s (+6%), cause not found; next: nsys of the 4-job run
    (per-process timelines), the single upload stream per process.
 5. QTGMC default meander=true once 'gpu all' with the slice kernel is clearly faster than the CPU (M4 is done, so this
-   only waits for the measurement).
+   only waits for the measurement). Measured 2026-10-31: Fast 3.88 s vs CPU 6.97 s, stock md5 (section 28); the switch is
+   the user's decision.
 Smaller Part B leftovers: 10-bit k_wave registers (16-bit packed rows hold an 8-byte window per 4 samples; try neighbour-lane
 shuffles instead of the second word; 10-bit Slower 5.08 s vs 8-bit 4.25 s); lookup tables and NNEDI3 above 10 bit; the 4:2:0
 + ChromaMotion search-clip difference (B4). After all of it: milestone F (FFT3DFilter on the GPU).
@@ -1157,3 +1158,155 @@ Plan: NVOF_FILTER_PLAN.md; experiment and the user's visual judgement: opticalfl
 - Speed (uc_FRC chain, Prefetch 3): 4.74 s best of 3 (hook: 4.90 s; exact search 6.75 s).
 - **Open:** the 4-concurrent-jobs figure; HD (pel 4) path; deployment of cudafilters.dll + mvtools_cuda.dll to
   `C:\dev\uconvert\dlls`; the NVOFA defects of the user's judgement (AB15, AF13-16, Z13; NVOF_FILTER_PLAN.md).
+
+## 27. S2 / S3 / S4 done: large exhaustive radius, trymany, pel 4 (2026-10-31; library API 18)
+
+All bit-exact against gpu=false (vectors and SADs compared directly: `profile\run_s234.ps1` hashes the vector clip after
+its 256-byte MVAnalysisData header, whose padding words are uninitialised and differ between two CPU runs).
+- S2 `mvcuda_refine.cuh`: the exhaustive refine emits its rings point by point (`expanding_point`, CPU order) in batches
+  of MAX_BATCH (160), the running minimum carried over: one long CheckMV sequence around a fixed centre, so the cut is
+  exact. Radius <= 3 stays one batch and keeps the ring fold (k_search) / WP_RING (k_wave); larger radii take
+  mvc_refine (`ring_radius_of` returns 0). Limits: exhaustive 1..64 at the finest and the coarse levels, other types 24.
+- S3 trymany (`LevelArgs::try_many`, coarse levels only as GroupOfPlanes): k_search runs the 7 Refines of
+  PseudoEPZSearch (zero, global and predictor taken unconditionally, predictors[0..3] after nMinCost = verybigSAD + 1,
+  so an out-of-range predictor refines the previous result), then the lowest saved cost, first on ties. Phase A SADs
+  copied to registers before the fold barrier. meander=false + trymany: k_search with one slice (k_wave lacks it);
+  `slices = 1` for every meander=false k_search call now (before: MVCUDA_WAVE=0 used several, unlike the fallback).
+- S4 pel 4: `k_quarter_v` (mvcuda_super.cu) makes the 12 quarter planes of refine_pel4 (Average2 (a + b + 1) >> 1) from
+  planes 0 / 2 / 8 / 10 (2, 8, 10 by the pel-2 Wiener kernels). The CPU leaves the last column of planes 3/7/11/15 and the
+  last row of 12..15 stale; never read (a vector in range ends its block at ew - 2 / eh - 2), clamped here. ref tables
+  [3][MVCUDA_MAX_SUB] in analyse, recalc, flow. MAnalyse, MRecalculate, MFlowFps accept pel 4. **MSuper(gpu=true) stays
+  normal at pel 4**: MCompensate / MDegrain have no pel-4 path, a lite super would make them CompleteLite per frame read.
+- Tests (test set `profile\build_s4`): run_s234 105/105 on build_s2 (8-bit 4:2:2, 10-bit 4:2:2, 4:2:0 8 / 10 bit, 4:4:4;
+  negative controls s3_neg / s4_neg differ), S4 28/28 on build_s4; `profile\run_frc_pel4.ps1` (uc_FRC chain at pel 4,
+  host and token) 6/6 identical, all three filters on the GPU; golden 85/85; run_partm 27/27; cf_regression PASS (tokens
+  42/0); run_qtgmc_vec all IDENTICAL; run_presetcheck -Fallback Fast / Slower / Placebo ALL PASS. golden `test_analyse.py` /
+  `bench_analyse.py` ctypes structs got `try_many`.
+- **Open:** speed. Large radii / trymany run through mvc_refine on the slice kernel (24 CTAs): PAL 20 frames
+  pelsearch=24 4.8 s vs CPU 0.2 s, searchparam=20 6.3 s vs 0.1 s, trymany+UMH6 4.9 s vs 0.1 s (wall incl. start-up).
+  Ideas: wider candidate parallelism for big exhaustive batches (a CTA per block row segment is not possible with
+  meander; more warps per batch, shared-memory reference window), k_wave GEN for meander=false. pel 4 for MCompensate /
+  MDegrain (frame_subpel with 15 planes, ref_at<PEL 4>), then lite MSuper at pel 4. uc_FRC HD branch can now use the GPU
+  for the whole pel-4 chain (uconvert.avsi untouched).
+
+## 28. Other NVIDIA features: what is left for speed (review 2026-10-31)
+
+**Measured (build_s5, PAL MXF 1500 frames, Prefetch 12, ffmpeg -benchmark at High priority, best of 3-5):**
+
+| run | wall | CPU-s | md5 |
+|---|---|---|---|
+| ffms2 decode only | 0.84-0.93 s | 4.5 | |
+| ffms2 decode + Bob() (3000 frames out) | 0.61-0.64 s | 4.4 | |
+| QTGMC Fast 'gpu all', meander=false (default) | 1.85 s | 8.6 | 3AC93B54EB0F |
+| QTGMC Fast 'gpu all', meander=true | **3.88 s** | 9.2 | EB74AA6E7731 = stock CPU |
+| QTGMC Fast CPU | 6.97 s | 127.1 | EB74AA6E7731 |
+
+- Floor: source reading is 0.6-0.9 s of Fast's 1.85 s, so at most about 1-1.2 s is left for any GPU work. Decode alone is
+  slower than decode + Bob (repeatable); probably Prefetch contention on the serialized ffms2 source.
+- meander=true (stock result) went from 19.44 s (build_s1) to 3.88 s with Part M: 1.8x the CPU, 14x less CPU time. This
+  meets the condition of open item 5.
+- NVDEC is ruled out for the test material. MPEG-2 4:2:2 profile is not supported: ffmpeg `-hwaccel cuda
+  -hwaccel_output_format cuda` silently decodes in software (output yuv422p); LWLibavVideoSource `prefer_hw=1`
+  (`C:\dev\uconvert\dlls\LSMASHSource.dll`, has mpeg2_cuvid) fails with "failed to get the video track". The `*_cuvid`
+  decoders copy to host memory anyway (no device frames for the GPU filters).
+- SASS on sm_120 (CUDA 13.4): `__vsadu4` is native (VIMNMX.U8x4 x2, VIADD.U8x4, IDP.4A + IADD). `__vsadu2` is emulated,
+  about 10 instructions (PRMT / SHF / IABS / IADD3). `__dp2a_lo(__vmaxu2(a, b) - __vminu2(a, b), 0x0101u, acc)` is 4
+  (VIMNMX.U16x2 x2, IADD, IDP.2A.LO.U16.U8) and exact: max - min >= 0 in each half, so the 32-bit subtract does not borrow.
+
+**To do (bit-exact unless noted), in the suggested order:**
+1. T0 QTGMC default meander=true (`make_qtgmc_gpu.py`, `QTGMC_gpu.avsi`): user decision, the measurement is done.
+2. T1 16-bit SAD in `pk_row` (`mvcuda_analyse.cu:392-393`, used by k_wave and k_search) with the dp2a form above. A/B with
+   `MVCUDA_WAVE_PACK` / `MVCUDA_SEARCH_PACK`; measure 10-bit Slower (5.08 s vs 8-bit 4.25 s) and uc_FRC (run_frc.ps1).
+   8 bit: accumulate in `__dp4a(__vabsdiffu4(a, b), 0x01010101u, acc)` saves one IADD per 4 samples (marginal).
+3. T2 Slice kernel critical path (meander=true, the 3.88 -> ~2 s gap): a meander slice is serial, so shorten each block step.
+   Split each block's candidates into those that do not depend on the neighbour just finished (zero, global, coarse-level
+   and temporal predictors) and those that do; idle warps compute the first group's SADs ahead, the serial path evaluates
+   the rest and folds in CPU order. First check what k_search already overlaps (section 24: only the predictor fetch).
+4. T3 k_wave on sm_90+: thread block clusters with distributed shared memory for the row hand-over (today polled global
+   memory, 2.5-5 us per wavefront step); the current kernel stays for sm_80 / 86 / 89. Helps meander=false only.
+5. T4 CUDA Graphs for the fixed per-frame launch sequences (super build, QTGMC output side): one launch instead of ~9 us
+   per WDDM launch; per-frame parameters via `cudaGraphExecKernelNodeSetParams` or device-side parameter buffers;
+   regeneration / eviction keep the direct path. Matters where the submitter is the limit (Fast and faster presets).
+6. T5 NNEDI3 predictor on int8 tensor cores (mma.sync IMMA): int16 weights split into a signed high and an unsigned low
+   byte (two passes; four for 10-bit samples), int32 sums exact in any order. NNEDI3 is a small share of GPU time next
+   to k_wave, so only for high nns presets.
+7. T6 Decode floor: test ffms2 `threads=` and the Prefetch contention on the source (no effect on the output).
+
+**Not useful (reasoned or measured):** SAD on tensor cores (not a dot product; SSD changes the metric); texture-unit
+interpolation for on-the-fly sub-pel (8-bit fixed-point weights, not MSuper's filter); MPS / TCC (not on Windows GeForce);
+NVENC motion-estimation-only mode (non-exact, NVOFA covers it); NVDEC for MPEG-2 4:2:2 (above); batching bVec + fVec per
+launch (halves launches but not the wavefront's critical path; interleaving both in one CTA is the variant worth trying,
+section 24).
+
+## 29. Large exhaustive radius made fast (2026-10-31; library API 18 unchanged)
+
+Start (section 27 path, mvc_refine batches of 160): PAL MAnalyse pelsearch=24 247 ms/frame GPU vs CPU 4.9 (no Prefetch).
+`AnaChecker::exhaustive_fast` (mvcuda_analyse.cu, k_search only, exhaustive refine with radius > 3, `MVCUDA_EXH_FAST=0`
+switches it off): every candidate is around one centre, so the CPU's CheckMV sequence ends at the earliest candidate with
+the lowest cost below the starting minimum when every cost part is >= 0 (pnew >= 0, nlambda >= 0; a negative part or an
+overflow found during the pass returns to the sequential batches): one block-wide minimum of (cost << 15 | ring index).
+Steps and what each was worth (all exact, run_s234 105/105 after each; `-DMVC_PHASE_PROF` adds window / eval / reduce
+cycle counters and live-run counts):
+1. thread per candidate, reference window (all sub-pel planes of the candidates' area) in dynamic shared memory: 247 ->
+   25 ms/frame. Window copy and evaluation each about 60k / 200k cycles per block.
+2. runs of 8 candidates per thread with a shared sub-pel phase (step pel << log_x_uv), window row in registers; packed
+   rows (`sad_rows_pk`, funnel shift by a compile-time amount); 16 bit <= 12 bits per sample: max - min of both halves,
+   lane sums folded per row. 8 bit: `__vsadu4` stays (an explicit max/min + `__dp4a` form measured slower). SASS check:
+   sm_120 has no hardware SAD; __vsadu4 / __vsadu2 are emulated (VIMNMX / IDP / PRMT).
+3. window copy: division-free walk, 8 loads in flight: 55k -> 23k cycles per block.
+4. pruning as the CPU does: a candidate whose vector cost alone reaches the starting minimum gets no SAD; live runs are
+   compacted into a shared list (EXH_LIST 512; must stay small: static shared memory reduces the window room), rows of a
+   run split over 2 / 4 / 8 lanes when few runs are left. UHD pelsearch=24: 392 -> 154 live runs per block.
+5. tried and dropped: a 512-thread k_search variant for these levels (no gain).
+Results (best of 2, RTX 5090 vs 24 threads; benchmarks shorter than about 1 s are distorted by the GPU clock ramp,
+990 -> 2767 MHz, so long runs): PAL 1500 frames Prefetch 8: pelsearch 24 8 bit 1.31 ms/frame (CPU 1.54), 10 bit 1.75 (CPU
+2.12); pelsearch 8 0.90 / 1.00 (CPU 0.70 / 0.83; radius 2 is 0.91 / 0.86 vs CPU 0.58 / 0.67: SD is small for the GPU).
+UHD 10 bit 4:2:2 32x32 Prefetch 3: pelsearch 2 11.4 (CPU 23.6, decode-bound), 8 31.5 (25.3), 24 52.2 (30.9).
+**Found, open:** at UHD the k_search launches of different frames never overlap on the GPU (nsys: max 1 running across 8
+leased streams; cudaEventSynchronize waits 216 ms per call for 30 ms kernels), with host or token input, a cached source,
+16 or 24 slices, MVCUDA_CACHE_MB 1 GB or 8 GB, radius 2 or 8. At PAL the same calls overlap (up to 5 / 8). Pre-existing
+(radius 2 too), so likely also in uc_FRC and the "4 concurrent jobs" item; with overlap the UHD figures above should
+drop by up to the Prefetch factor. Next: find what orders the leased streams at UHD sizes (nsys trace of stream waits /
+events, kernel resource limits per launch).
+
+## 30. Optimisation potential: the 5x target and what bit-exactness costs (review 2026-10-31, not started)
+
+User's target: GPU work at least 5x faster than the CPU. Asked whether dropping bit-exactness would get there (question
+only; nothing decided, nothing built).
+
+**Where it stands (GPU vs CPU, measured):** QTGMC Fast 10 bit whole chain 1.94 vs 15.07 s (7.8x); QTGMC Slower 8 bit 4.36
+vs 13.96 s (3.2x); QTGMC Fast meander=true (stock result) 3.88 vs 6.97 s (1.8x, section 28); uc_FRC UHD exact 6.57 vs 20.2 s
+(3.1x), with NVOFA vectors 4.74 s (4.3x); MAnalyse UHD radius 2 11 vs 23 ms/frame (2x, decode-bound), radius 24 52 vs 31
+(0.6x, section 29); SD material generally below 2x (frames too small to fill the GPU). A whole chain cannot exceed the
+part the GPU does not touch (decode, CPU-only filters; section 28 T6), so 5x is a target for GPU stages, not every chain.
+
+**What exactness costs, largest first:**
+1. The meander chain and the CPU slice count: the CPU result depends on the slice count (16-24) and, inside a slice, on
+   the left neighbour's vector. The slice kernel therefore runs one CTA per slice, block after block: 16-24 of 170 SMs,
+   latency-bound. Every optimisation of sections 24 / 25 / 29 works against this limit.
+2. Per-frame CPU fallback (eviction, the bad-vector wide search, scene changes) is only safe because GPU and CPU agree
+   bit for bit; without exactness, fallback frames could differ from their neighbours (visible flicker).
+3. Exact candidate order and cost chains (batches, CheckMV folds, trymany's 7 refines): moderate.
+4. Integer SAD semantics: small (section 28 T1 has the cheap exact 16-bit form).
+
+**Exact options (first):**
+- E1 Find the UHD serialisation (section 29): leased-stream analyses never overlap at UHD, at PAL they do. Up to the
+  Prefetch factor (3-8x) for everything UHD, exact or not: probably the cheapest way to 5x for uc_FRC.
+- E2 Thread block clusters (sm_90+) for the slice kernel: one meander slice spread over several SMs (distributed shared
+  memory), candidates split between them; the per-block chain latency stays. Large refactor, gain unknown. (Section 28
+  T3 is the same idea for k_wave's row hand-over.)
+- E3 Section 28 T2: overlap the predictor-independent candidates of the next block with the serial path.
+- E4 meander=false + gpu=true (exists): exact against the CPU's single-slice result, wavefront parallel (QTGMC Fast 1.85 s
+  vs stock CPU 6.97 s); different vectors from stock meander, judged somewhat worse on doom9.
+
+**Non-exact options (each behind its own switch, default off, exact stays the reference):**
+- X1 Fully parallel block search: predictors only from the coarser level and the previous frame (no left / up
+  neighbour), every block independent, all SMs busy. Expected 10-50x for the search over today. Risk: less coherent
+  vector fields (the neighbour predictors smooth them); needs the user's visual judgement as for NVOFA.
+- X2 Approximate SADs for pruning (8-bit or row-subsampled) and the exact SAD for the best few: 2-4x for large radii;
+  occasionally another winner.
+- X3 NVOFA (CudaNVOFAnalyse, exists) / NVENC ME-only (NVENCMEAnalyse.md): the search on fixed-function hardware, nearly
+  free on the SMs; known defects (NVOF_FILTER_PLAN.md).
+- X4 Tolerance-based fallback instead of the exact one: fewer forced CPU frames; possible flicker at fallback frames.
+
+**Suggested order:** E1, then section 28 T0-T2, then decide on X1 (e.g. an `exact=false` mode) with a visual comparison.

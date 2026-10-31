@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 17
+#define MVCUDA_API_VERSION 18
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -115,14 +115,15 @@ typedef struct
   int use_global;                         // MAnalyse global=true
   int meander;                            // MAnalyse meander=true
   int bad_sad;                            // badSAD, already scaled
-  int search_param;                       // exhaustive search radius at the coarse levels (searchparam), 1..3
-  int pel_search;                         // exhaustive search radius at level 0 (pelsearch), 1..3
+  int search_param;                       // exhaustive search radius at the coarse levels (searchparam), 1..64
+  int pel_search;                         // search radius at level 0 (pelsearch): 1..64 exhaustive, 1..24 other types
   int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left)
   int slice_threads;                      // 1: single-slice CPU result; N: CPU result with N threads (see file)
   unsigned long long src_key, ref_key;    // ignored since API 16 (pictures are device frames, see mvcuda_frame_upload_keyed)
   int search_type;                        // SearchType.h value used at level 0 (and at every level for 64 / 128); 0 = exhaustive.
                                           // Coarse levels are exhaustive (radius search_param) for every other type, as on the CPU
   int bad_range;                          // MAnalyse badrange (wide search for blocks above badSAD; used by the meander=false search)
+  int try_many;                           // MAnalyse trymany: refine around every predictor at the coarse levels (API 18)
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are

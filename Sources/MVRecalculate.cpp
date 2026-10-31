@@ -424,7 +424,7 @@ MVRecalculate::MVRecalculate(
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
       && !divideExtra && !_dctmode && _nbr_srd == 1
       && GpuBackend::search_supported((int)searchType, nSearchParam, nSearchParam, 1)
-      && (nSuperPel == 1 || nSuperPel == 2) && smooth >= 0 && smooth <= 1
+      && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && smooth >= 0 && smooth <= 1
       && analysisData.nBlkSizeX <= 32 && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2))) && lstrlen(_outfilename) == 0;
     if (GpuBackend::log_enabled())
     {

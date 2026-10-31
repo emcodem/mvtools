@@ -24,7 +24,7 @@ namespace
 
   struct KArgs
   {
-    const pix *ref[3][4];
+    const pix *ref[3][MVCUDA_MAX_SUB];
     const pix *src[3];
     int ew[3];
     int hpad[3], vpad[3];
@@ -268,7 +268,7 @@ static int recalc_dev(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp,
 {
   if (!sp || !rp || !fs || !fr || !old_vectors || !out_vectors)
     return -4;
-  // supported: level-0-only super, luma only or luma + chroma, pel 1 or 2, every search type of mvcuda_refine.cuh
+  // supported: level-0-only super, luma only or luma + chroma, pel 1, 2 or 4, every search type of mvcuda_refine.cuh
   // (0 = exhaustive), smooth 0/1
   const int search_type = rp->search_type ? rp->search_type : mvc_refine::S_EXHAUSTIVE;
   if (sp->levels != 1 || rp->smooth < 0 || rp->smooth > 1 || rp->search_radius < 1 || rp->old_pel < 1
@@ -358,7 +358,7 @@ static int recalc_dev(const MvCudaSuperParams *sp, const MvCudaRecalcParams *rp,
       for (int p = 0; p < 3; p++)
       {
         a.src[p] = (const pix *)s_src->pl[p].sub[0];
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < MVCUDA_MAX_SUB; i++)
           a.ref[p][i] = (const pix *)s_ref->pl[p].sub[i];
         a.ew[p] = s_ref->pl[p].d.ew;
         a.hpad[p] = s_ref->pl[p].d.hpad;
