@@ -37,9 +37,10 @@ Requirements:
 
 - x64 AviSynth+. cudafilters needs AviSynth+ 3.6 or newer (interface V8) and refuses to load on older versions; 3.7.5 is the
   tested version.
-- VapourSynth: mvtools2 runs under VapourSynth through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"),
-  `gpu=true` included (same output as AviSynth+; `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under
-  VapourSynth is an open item of `VAPOURSYNTH_PLAN.md`.
+- VapourSynth (work in progress, Linux only so far, not in the Windows release bundles): mvtools2 runs under VapourSynth
+  through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"), `gpu=true` included (same output as AviSynth+;
+  `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under VapourSynth (namespace `cuda`) covers only
+  CudaUpload / CudaDownload and the Merge filters so far (`VAPOURSYNTH_PLAN.md`).
 - An NVIDIA GPU with compute capability 8.0 or newer (RTX 30xx, 40xx, 50xx, A100, H100). Older cards count as "no usable
   device". The first device with cc >= 8.0 is used; `MVCUDA_DEVICE=n` picks another.
 - `CudaNNEDI3` and `CudaKeepOnlyBobShimmerFixes` call into other plugins: they need `plugins_JPSDR.dll` (nnedi3), and
@@ -414,6 +415,11 @@ in a script, as uconvert's `uc_frc_nvof` does.
 mvtools2 `gpu` parameters. Run it with `python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]`. The source file is only
 read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false), and
 `global QTGMC_gpu_meander = true` keeps MAnalyse on the slice search instead of the wavefront search.
+
+The Windows release bundle wraps this: `QTGMC_gpu_load.avsi` (source: `qtgmc\bundle\`) loads every DLL and script from
+its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all the QTGMC GPU switches (`QTGMC_gpu`,
+`QTGMC_gpu_search`, `QTGMC_gpu_tokens`, `QTGMC_gpu_edi`, `QTGMC_gpu_out`) at once. `qtgmc\bundle\examples\` has example
+scripts for QTGMC, a GPU / CPU comparison and frame-rate conversion (exact search and CudaNVOFAnalyse).
 
 ---
 

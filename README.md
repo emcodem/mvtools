@@ -4,7 +4,9 @@ Supporting YUY2, 4:2:0, 4:2:2, 4:4:4 at native 8, 10, 12, 14 and 16 bit depths, 
 Still supporting Windows XP.
 x86 and x64 versions
 From December 20, 2020: Linux port
-This branch (gpu_work): VapourSynth support through `mvtools_vsbridge` (namespace `mvpf`, see "VapourSynth" below)
+This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 (`gpu=true`, the `cudafilters` plugin and QTGMC
+on the GPU, see "GPU" below); VapourSynth support through `mvtools_vsbridge` (namespace `mvpf`, work in progress, see
+"VapourSynth" below)
 
 File: mvtools2.dll
 
@@ -136,7 +138,25 @@ From the 'build' folder under project root:
         cd build
         sudo make install
 
-## VapourSynth (this branch)
+## GPU (this branch)
+
+CUDA paths for MSuper / MAnalyse / MRecalculate / MCompensate / MDegrain1..6 / MFlowFps (`gpu=true`, default false),
+bit-exact with the CPU result; settings, formats or machines the GPU does not cover run the CPU code with the same
+output. Needs an NVIDIA GPU with compute capability 8.0+ (RTX 30xx and newer) and `mvtools_cuda.dll` next to
+`mvtools2.dll`.
+
+* Reference of every GPU parameter, the `cudafilters` plugin and the environment variables: `Documentation/gpu.md`.
+* `cudafilters/`: GPU versions of the AviSynth core, MaskTools2, RgTools and NNEDI3 stages QTGMC uses, plus
+  `CudaNVOFAnalyse` (vectors from NVIDIA's optical flow accelerator).
+* `qtgmc/`: `make_qtgmc_gpu.py` makes `QTGMC_gpu.avsi` from an unmodified QTGMC.avsi; `qtgmc/bundle/` holds the loader
+  and the example scripts of the Windows release bundle.
+* Windows release bundles (AviSynth+ x64, DLLs, patched QTGMC, examples, docs): GitHub releases `gpu-qtgmc-*` of
+  github.com/emcodem/mvtools.
+* Design notes and measurements: `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`, `DECISIONS.md`.
+
+## VapourSynth (this branch, work in progress)
+
+Not part of the Windows release bundles yet.
 
 mvtools2 runs under VapourSynth (API 4.0, so R55 or newer; tested with R81) unchanged: `mvtools_vsbridge` is a small AviSynth+ host on top of
 the VapourSynth API, and `libmvtools2.so` / `mvtools2.dll` only gained a `VapourSynthPluginInit2` entry point that loads

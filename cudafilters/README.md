@@ -19,8 +19,10 @@ Filters: `CudaUpload`, `CudaDownload`, `CudaBob`, `CudaTemporalSoften`, `CudaMer
 accelerator, not bit-exact with anything: NVOF_FILTER_PLAN.md). QTGMC uses them through the patched script made by `..\qtgmc\make_qtgmc_gpu.py`. Parameters, defaults
 and what each filter covers on the GPU: `..\Documentation\gpu.md`.
 
-VapourSynth: planned under namespace `cuda` through `mvtools_vsbridge` (`..\VAPOURSYNTH_PLAN.md` step 4, `..\DECISIONS.md`
-D9); not available yet. mvtools2 itself already runs under VapourSynth (namespace `mvpf`, CPU path verified).
+VapourSynth (work in progress, Linux only so far, not in the Windows release bundles): namespace `cuda` through
+`mvtools_vsbridge` (`..\VAPOURSYNTH_PLAN.md` step 4, `..\DECISIONS.md` D9). Tested: CudaUpload / CudaDownload,
+CudaMerge / MergeLuma / MergeChroma and mvtools2 `gpu=true` chains on token frames, bit-identical with AviSynth+; the
+other filters are not available under VapourSynth yet (`..\README.md` "VapourSynth").
 
 Build (Visual Studio 2026 Build Tools, toolset v145):
 
