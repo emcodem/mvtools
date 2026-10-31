@@ -6,8 +6,10 @@
 #ifndef MVCUDA_H
 #define MVCUDA_H
 
-#ifdef MVCUDA_EXPORTS
+#if defined(MVCUDA_EXPORTS) && defined(_WIN32)
 #define MVCUDA_API __declspec(dllexport)
+#elif defined(MVCUDA_EXPORTS)
+#define MVCUDA_API __attribute__((visibility("default")))
 #else
 #define MVCUDA_API
 #endif

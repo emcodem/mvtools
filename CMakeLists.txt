@@ -203,6 +203,36 @@ add_subdirectory("Sources")
 add_subdirectory("DePan")
 add_subdirectory("DePanEstimate")
 
+# ELF platforms: export only the plugin entry points (cmake/plugin_exports.map). Otherwise plugin globals are interposed
+# by same-named symbols of the host or other plugins (AVS_linkage of libavisynth.so: crash in AvisynthPluginInit3).
+function(mv_plugin_exports target)
+  if(NOT WIN32 AND NOT APPLE)
+    target_link_options(${target} PRIVATE "-Wl,--version-script=${PROJECT_SOURCE_DIR}/cmake/plugin_exports.map")
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/cmake/plugin_exports.map")
+  endif()
+endfunction()
+if(NOT WIN32)
+  mv_plugin_exports(mvtools2)
+  mv_plugin_exports(depan)
+  mv_plugin_exports(depanestimate)
+endif()
+
+# GPU part: mvtools_cuda (needs the CUDA toolkit) and the cudafilters plugin. mvtools2 itself never links against it:
+# it opens mvtools_cuda at run time and uses the CPU when the library, the driver or a device is missing.
+option(MVTOOLS_GPU "Build mvtools_cuda and cudafilters (needs the CUDA toolkit)" ON)
+if(MVTOOLS_GPU)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    add_subdirectory("Sources/cuda")
+    add_subdirectory("cudafilters")
+    mv_plugin_exports(cudafilters)
+  else()
+    message(WARNING "MVTOOLS_GPU: no CUDA compiler found (set CMAKE_CUDA_COMPILER or -DMVTOOLS_GPU=OFF); building the CPU plugins only")
+  endif()
+endif()
+
 # uninstall target
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake_uninstall.cmake.in"

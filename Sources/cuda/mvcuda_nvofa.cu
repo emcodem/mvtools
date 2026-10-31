@@ -1,10 +1,11 @@
 // NVOFA sessions (mvcuda_nvofa.h). The SDK headers (third_party/nvof, NVIDIA, BSD-3) only
-// declare types; nvofapi64.dll is loaded at run time, so the DLL has no new link dependency and works without it.
+// declare types; nvofapi64.dll (Linux: libnvidia-opticalflow.so.1) is loaded at run time, so the library has no new link
+// dependency and works without it.
 #include "mvcuda_nvofa.h"
 
 #include "third_party/nvof/nvOpticalFlowCuda.h"
 
-#include <windows.h>
+#include "dyn_lib.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,14 +38,14 @@ namespace mvc_nvofa
       if (g_loaded)
         return g_loaded > 0;
       g_loaded = -1;
-      HMODULE m = LoadLibraryW(L"nvofapi64.dll");
+      void *m = dynlib::open(dynlib::nvofa_lib_name);
       if (!m)
       {
-        fprintf(stderr, "mvcuda nvofa: nvofapi64.dll not found\n");
+        fprintf(stderr, "mvcuda nvofa: %s not found (%s)\n", dynlib::nvofa_lib_name, dynlib::last_error().c_str());
         return false;
       }
       typedef NV_OF_STATUS(NVOFAPI * PFN_create)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *);
-      auto create = (PFN_create)GetProcAddress(m, "NvOFAPICreateInstanceCuda");
+      auto create = (PFN_create)dynlib::symbol(m, "NvOFAPICreateInstanceCuda");
       cudaDriverEntryPointQueryResult q;
       if (!create || create(NV_OF_API_VERSION, &g_f) != NV_OF_SUCCESS
         || cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", (void **)&g_ctx_get, 12000, cudaEnableDefault, &q) != cudaSuccess

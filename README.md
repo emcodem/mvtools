@@ -108,11 +108,26 @@ From the 'build' folder under project root:
 
       rm build/CMakeCache.txt
 
+* GPU part (this branch): `libmvtools_cuda.so` and the `libcudafilters.so` plugin are built when a CUDA compiler is
+  found (CUDA 12.8+ / 13.x, compute capability 8.0+). Point CMake at nvcc if it is not on the PATH, or switch it off:
+
+        cmake -B build -S . -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+        cmake -B build -S . -DMVTOOLS_GPU=OFF                      # CPU plugins only
+        cmake -B build -S . -DMVTOOLS_CUDA_ARCH=120-real           # development: local RTX 50xx only, faster
+
+  `libmvtools_cuda.so` must sit in the same folder as `libmvtools2.so` / `libcudafilters.so`; it needs only the NVIDIA
+  driver at run time (static CUDA runtime). Without the library, the driver or a usable GPU, the filters use the CPU.
+  CudaNNEDI3 reads `nnedi3_weights.bin` from the folder of `libcudafilters.so`. Without avstp (Windows only) the CPU
+  search runs single-sliced, while `gpu=true` reproduces the 24-thread CPU result (set `MVTOOLS_GPU_SLICES=1` to match
+  the single-sliced CPU result).
+
 * Find binaries at
 
-        build/mvtools/libmvtools2.so
-        build/depan/libdepan.so
-        build/depanestimate/libdepanestimate.so
+        build/Sources/libmvtools2.so
+        build/DePan/libdepan.so
+        build/DePanEstimate/libdepanestimate.so
+        build/Sources/cuda/libmvtools_cuda.so
+        build/cudafilters/libcudafilters.so
 
 * Install binaries
 

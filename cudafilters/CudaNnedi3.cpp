@@ -3,15 +3,19 @@
 // (pscrn 2..4), int16 predictor with the fastest exp (fapprox with bits 2 and 8 set; default 15), qual 1 / 2, any nsize /
 // nns / etype. Anything else, or a CPU whose rcpps / rsqrtps tables do not have the expected structure, uses the plugin.
 //
-// The network weights are read from the loaded plugins_JPSDR.dll (resource 101, as the plugin does) and prepared with
+// The network weights are read from the loaded plugins_JPSDR.dll (resource 101, as the plugin does; elsewhere from
+// nnedi3_weights.bin next to this plugin) and prepared with
 // the plugin's own code (constructor of nnedi3.cpp, same double arithmetic), in plain order instead of the asm order.
 
 #include "CudaCommon.h"
+#include "dyn_lib.h"
 
 #include <immintrin.h>
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <vector>
 
@@ -121,19 +125,50 @@ namespace
       return static_cast<CudaNnedi3 *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
     }
 
+    // The raw nnedi3 weights (the standard nnedi3_weights.bin, 13574928 bytes): resource 101 of the loaded
+    // plugins_JPSDR.dll as the plugin itself reads it (Windows), else nnedi3_weights.bin in the folder of this plugin
+    // (read once, kept for the process). nullptr when neither exists; the caller checks the size.
+    static const float *weights(size_t &size)
+    {
+#ifdef _WIN32
+      if (HMODULE hmod = GetModuleHandleW(L"plugins_JPSDR.dll"))
+      {
+        HRSRC hrsrc = FindResourceW(hmod, MAKEINTRESOURCEW(101), L"BINARY");
+        HGLOBAL hglob = hrsrc ? LoadResource(hmod, hrsrc) : nullptr;
+        const float *p = hglob ? (const float *)LockResource(hglob) : nullptr;
+        if (p)
+        {
+          size = SizeofResource(hmod, hrsrc);
+          return p;
+        }
+      }
+#endif
+      static std::once_flag once;
+      static std::vector<float> file;
+      std::call_once(once, [] {
+        const std::filesystem::path dir = dynlib::module_dir(reinterpret_cast<const void *>(&CudaLib::get));
+        if (dir.empty())
+          return;
+        std::ifstream f(dir / "nnedi3_weights.bin", std::ios::binary | std::ios::ate);
+        if (!f)
+          return;
+        const std::streamoff n = f.tellg();
+        if (n <= 0 || n % (std::streamoff)sizeof(float) != 0 || n > (64 << 20))
+          return;
+        std::vector<float> v((size_t)n / sizeof(float));
+        f.seekg(0);
+        if (f.read(reinterpret_cast<char *>(v.data()), n))
+          file.swap(v);
+      });
+      size = file.size() * sizeof(float);
+      return file.empty() ? nullptr : file.data();
+    }
+
     // the plugin's weight preparation for the new prescreener and the int16 predictor, plain order
     bool prepare(int nsize, int nns, int qual, int etype, int pscrn, int bits, IScriptEnvironment *env)
     {
-      HMODULE hmod = GetModuleHandleW(L"plugins_JPSDR.dll");
-      if (!hmod)
-      {
-        _why = "plugins_JPSDR.dll not loaded";
-        return false;
-      }
-      HRSRC hrsrc = FindResourceW(hmod, MAKEINTRESOURCEW(101), L"BINARY");
-      HGLOBAL hglob = hrsrc ? LoadResource(hmod, hrsrc) : nullptr;
-      const float *bdata = hglob ? (const float *)LockResource(hglob) : nullptr;
-      const DWORD size = hrsrc ? SizeofResource(hmod, hrsrc) : 0;
+      size_t size = 0;
+      const float *bdata = weights(size);
       const int dims0 = 49 * 4 + 5 * 4 + 9 * 4, dims0new = 4 * 65 + 4 * 5;
       const int dims1 = (xdiaTable[nsize] * ydiaTable[nsize] + 1) << (nnsTablePow2[nns] + 1);
       int dims1tsize = 0, dims1offset = 0;
@@ -144,9 +179,9 @@ namespace
             dims1offset = dims1tsize;
           dims1tsize += (xdiaTable[i] * ydiaTable[i] + 1) << (nnsTablePow2[j] + 2);
         }
-      if (!bdata || size != (DWORD)((dims0 + dims0new * 3 + dims1tsize * 2) * sizeof(float)))
+      if (!bdata || size != (size_t)(dims0 + dims0new * 3 + dims1tsize * 2) * sizeof(float))
       {
-        _why = "weights resource not found";
+        _why = "nnedi3 weights not found (plugins_JPSDR.dll not loaded and no nnedi3_weights.bin next to cudafilters)";
         return false;
       }
 

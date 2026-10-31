@@ -1,9 +1,5 @@
-// Shared parts of the cudafilters plugin: the mvtools_cuda.dll loader and the token-frame helpers (see CudaFilters.cpp).
+// Shared parts of the cudafilters plugin: the mvtools_cuda library loader and the token-frame helpers (see CudaFilters.cpp).
 #pragma once
-
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 
 #include "avisynth.h"
 #include "mvcuda.h"

@@ -8,8 +8,7 @@
 // tokens back into normal frames; a normal frame passes through both filters unchanged.
 
 #include "CudaCommon.h"
-
-extern "C" IMAGE_DOS_HEADER __ImageBase;
+#include "dyn_lib.h"
 
 namespace cf
 {
@@ -23,20 +22,20 @@ namespace cf
   {
     if (std::getenv("MVTOOLS_GPU_DISABLE"))
       return;
-    wchar_t path[MAX_PATH] = {};
-    if (GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) == 0)
+    const std::filesystem::path dir = dynlib::module_dir(reinterpret_cast<const void *>(&CudaLib::get));
+    if (dir.empty())
       return;
-    std::wstring dir(path);
-    const size_t slash = dir.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-      return;
-    dir.resize(slash + 1);
-    HMODULE lib = LoadLibraryW((dir + L"mvtools_cuda.dll").c_str());
+    // the same file mvtools2 loads: one process-wide instance, so both plugins share one frame registry
+    void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
     if (!lib)
+    {
+      if (log_enabled())
+        std::fprintf(stderr, "cudafilters: %s not loaded (%s)\n", dynlib::cuda_lib_name, dynlib::last_error().c_str());
       return;
-    auto version = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_api_version"));
-    auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
-#define CF_LOAD(member, name) member = reinterpret_cast<decltype(member)>(GetProcAddress(lib, name))
+    }
+    auto version = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_api_version"));
+    auto count = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_device_count"));
+#define CF_LOAD(member, name) member = reinterpret_cast<decltype(member)>(dynlib::symbol(lib, name))
     CF_LOAD(upload, "mvcuda_frame_upload");
     CF_LOAD(download, "mvcuda_frame_download");
     CF_LOAD(producer_register, "mvcuda_producer_register");

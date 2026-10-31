@@ -8,6 +8,7 @@
 #include "avisynth.h"
 #include "cuda/mvcuda.h"
 
+#include <atomic>
 #include <chrono>
 
 // MVTOOLS_GPU_PROFILE=1: wall time per named phase (sum, count), printed to stderr when the process ends
@@ -197,7 +198,7 @@ public:
 private:
   GpuBackend();
   bool _usable;
-  long _users;
+  std::atomic<long> _users;
 };
 
 #endif

@@ -1,12 +1,8 @@
-#define NOMINMAX
-#define NOGDI
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 #include "AvstpWrapper.h"
 #include "GpuBackend.h"
 #include "MVPlaneSet.h"
 #include "SuperParams64Bits.h"
+#include "cuda/dyn_lib.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -14,8 +10,6 @@
 #include <map>
 #include <mutex>
 #include <string>
-
-extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 namespace
 {
@@ -98,7 +92,7 @@ unsigned long long GpuBackend::frame_key(const void *clip, int n)
 
 void GpuBackend::add_user()
 {
-  InterlockedIncrement(&_users);
+  ++_users;
 }
 
 bool GpuBackend::read_token(const void *p, int row_bytes, MvCudaTokenHeader &h)
@@ -243,7 +237,7 @@ bool GpuBackend::download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, co
 
 void GpuBackend::remove_user()
 {
-  if (InterlockedDecrement(&_users) != 0)
+  if (--_users != 0)
     return;
   if (log_enabled() && frame_stats != nullptr)
   {
@@ -282,47 +276,39 @@ GpuBackend::GpuBackend()
     return;
   }
 
-  wchar_t path[MAX_PATH] = {};
-  if (GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH) == 0)
+  const std::filesystem::path dir = dynlib::module_dir(reinterpret_cast<const void *>(&GpuBackend::instance));
+  if (dir.empty())
   {
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: cannot determine the plugin folder\n");
     return;
   }
-  std::wstring dir(path);
-  const size_t slash = dir.find_last_of(L"\\/");
-  if (slash == std::wstring::npos)
-  {
-    if (log_enabled())
-      std::fprintf(stderr, "mvtools gpu: plugin path has no folder part\n");
-    return;
-  }
-  dir.resize(slash + 1);
 
-  HMODULE lib = LoadLibraryW((dir + L"mvtools_cuda.dll").c_str());
+  void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
   if (lib == nullptr)
   {
     if (log_enabled())
-      std::fprintf(stderr, "mvtools gpu: mvtools_cuda.dll not found next to mvtools2.dll, using the CPU\n");
+      std::fprintf(stderr, "mvtools gpu: %s not loaded from the plugin folder (%s), using the CPU\n", dynlib::cuda_lib_name,
+        dynlib::last_error().c_str());
     return;
   }
-  auto version = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_api_version"));
-  auto count = reinterpret_cast<int (*)()>(GetProcAddress(lib, "mvcuda_device_count"));
-  cache_clear = reinterpret_cast<decltype(cache_clear)>(GetProcAddress(lib, "mvcuda_cache_clear"));
-  analyse_token = reinterpret_cast<decltype(analyse_token)>(GetProcAddress(lib, "mvcuda_analyse_token"));
-  recalc_token = reinterpret_cast<decltype(recalc_token)>(GetProcAddress(lib, "mvcuda_recalc_token"));
-  flow_token = reinterpret_cast<decltype(flow_token)>(GetProcAddress(lib, "mvcuda_flow_token"));
-  flow_token_host = reinterpret_cast<decltype(flow_token_host)>(GetProcAddress(lib, "mvcuda_flow_token_host"));
-  frame_upload_keyed = reinterpret_cast<decltype(frame_upload_keyed)>(GetProcAddress(lib, "mvcuda_frame_upload_keyed"));
-  frame_download = reinterpret_cast<decltype(frame_download)>(GetProcAddress(lib, "mvcuda_frame_download"));
-  frame_stats = reinterpret_cast<decltype(frame_stats)>(GetProcAddress(lib, "mvcuda_frame_stats"));
-  token_regenerate = reinterpret_cast<decltype(token_regenerate)>(GetProcAddress(lib, "mvcuda_token_regenerate"));
-  token_pin = reinterpret_cast<decltype(token_pin)>(GetProcAddress(lib, "mvcuda_token_pin"));
-  token_unpin = reinterpret_cast<decltype(token_unpin)>(GetProcAddress(lib, "mvcuda_token_unpin"));
-  producer_register = reinterpret_cast<decltype(producer_register)>(GetProcAddress(lib, "mvcuda_producer_register"));
-  producer_unregister = reinterpret_cast<decltype(producer_unregister)>(GetProcAddress(lib, "mvcuda_producer_unregister"));
-  compensate = reinterpret_cast<decltype(compensate)>(GetProcAddress(lib, "mvcuda_compensate"));
-  degrain = reinterpret_cast<decltype(degrain)>(GetProcAddress(lib, "mvcuda_degrain"));
+  auto version = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_api_version"));
+  auto count = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_device_count"));
+  cache_clear = reinterpret_cast<decltype(cache_clear)>(dynlib::symbol(lib, "mvcuda_cache_clear"));
+  analyse_token = reinterpret_cast<decltype(analyse_token)>(dynlib::symbol(lib, "mvcuda_analyse_token"));
+  recalc_token = reinterpret_cast<decltype(recalc_token)>(dynlib::symbol(lib, "mvcuda_recalc_token"));
+  flow_token = reinterpret_cast<decltype(flow_token)>(dynlib::symbol(lib, "mvcuda_flow_token"));
+  flow_token_host = reinterpret_cast<decltype(flow_token_host)>(dynlib::symbol(lib, "mvcuda_flow_token_host"));
+  frame_upload_keyed = reinterpret_cast<decltype(frame_upload_keyed)>(dynlib::symbol(lib, "mvcuda_frame_upload_keyed"));
+  frame_download = reinterpret_cast<decltype(frame_download)>(dynlib::symbol(lib, "mvcuda_frame_download"));
+  frame_stats = reinterpret_cast<decltype(frame_stats)>(dynlib::symbol(lib, "mvcuda_frame_stats"));
+  token_regenerate = reinterpret_cast<decltype(token_regenerate)>(dynlib::symbol(lib, "mvcuda_token_regenerate"));
+  token_pin = reinterpret_cast<decltype(token_pin)>(dynlib::symbol(lib, "mvcuda_token_pin"));
+  token_unpin = reinterpret_cast<decltype(token_unpin)>(dynlib::symbol(lib, "mvcuda_token_unpin"));
+  producer_register = reinterpret_cast<decltype(producer_register)>(dynlib::symbol(lib, "mvcuda_producer_register"));
+  producer_unregister = reinterpret_cast<decltype(producer_unregister)>(dynlib::symbol(lib, "mvcuda_producer_unregister"));
+  compensate = reinterpret_cast<decltype(compensate)>(dynlib::symbol(lib, "mvcuda_compensate"));
+  degrain = reinterpret_cast<decltype(degrain)>(dynlib::symbol(lib, "mvcuda_degrain"));
   if (version == nullptr || count == nullptr || cache_clear == nullptr || recalc_token == nullptr || flow_token == nullptr
     || frame_upload_keyed == nullptr || flow_token_host == nullptr || analyse_token == nullptr || frame_download == nullptr || token_regenerate == nullptr || token_pin == nullptr || token_unpin == nullptr || producer_register == nullptr || producer_unregister == nullptr || compensate == nullptr || degrain == nullptr
     || version() != MVCUDA_API_VERSION || count() <= 0)

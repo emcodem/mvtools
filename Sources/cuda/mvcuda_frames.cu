@@ -4,6 +4,7 @@
 #include "mvcuda_internal.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <thread>
@@ -468,13 +469,32 @@ namespace mvc
   // With 12+ Prefetch threads each issuing ~50 small pipeline operations per frame, the threads mostly waited for the
   // driver's launch lock (cudaLaunchKernel at 80-160 us instead of 5). Now one thread issues every pipeline operation, in
   // submission order (the order that already defines correctness); the worker threads only queue closures.
+  //
+  // Process exit. On Linux exit() runs the static destructors (the CUDA runtime's included) while this detached thread
+  // still runs; ops queued by filters released at exit would then call into a runtime being torn down and crash. An
+  // atexit handler, registered after the runtime initialised and so run before its teardown, sets g_exiting and waits
+  // (bounded) for the op in progress; from then on nothing touches CUDA: queued ops are leaked, not run (their device
+  // memory goes with the process), and waiters return. On Windows ExitProcess has already ended this thread when the
+  // handler runs, so it only sets the flag.
   namespace
   {
+    std::atomic<bool> g_exiting{ false };
+
+    // keeps ops (and what they hold) alive forever: destroying them may release device memory through the runtime
+    template <typename T>
+    void leak(T &&v)
+    {
+      new T(std::move(v));
+    }
+
+    void submitter_at_exit();
+
     struct Submitter
     {
       std::mutex m;
       std::condition_variable cv;
       std::vector<std::function<void(cudaStream_t)>> q;
+      std::atomic<bool> busy{ false };             // the submitter is issuing a batch
       unsigned long long queued = 0;               // ops queued so far = sequence number of the last one (under m)
 
       // Marks: events recorded on the pipeline stream right after a given op, on demand (mark_after). A consumer outside
@@ -492,6 +512,7 @@ namespace mvc
       Submitter()
       {
         std::thread([this] { run(); }).detach(); // lives as long as the process
+        std::atexit(submitter_at_exit);
       }
 
       // a mark after the first upto ops (all issued); submitter thread only
@@ -522,15 +543,22 @@ namespace mvc
             std::unique_lock<std::mutex> lk(m);
             cv.wait(lk, [&] { return !q.empty(); });
             batch.swap(q);
+            busy = true;
           }
-          for (auto &op : batch)
+          size_t i = 0;
+          for (; i < batch.size() && !g_exiting; i++)
           {
+            auto &op = batch[i];
             op(s);
             const cudaError_t err = cudaGetLastError();
-            if (err != cudaSuccess)
+            if (err == cudaErrorCudartUnloading)
+              g_exiting = true; // exit already under way (handler not run): stop touching the runtime
+            else if (err != cudaSuccess)
               std::fprintf(stderr, "mvcuda pipeline: %s\n", cudaGetErrorString(err));
             op = nullptr; // captured frames released at once
             ++issued;
+            if (g_exiting)
+              break;
             if (issued >= want.load())
               record_mark(s, issued);
             if (g_unsealed->size() >= 16)
@@ -538,8 +566,19 @@ namespace mvc
             if ((issued & 31) == 0)
               pin_reclaim();
           }
+          if (g_exiting)
+          {
+            if (i < batch.size())
+              leak(std::vector<std::function<void(cudaStream_t)>>(std::make_move_iterator(batch.begin() + i),
+                std::make_move_iterator(batch.end())));
+            batch.clear();
+            busy = false;
+            mark_cv.notify_all();
+            continue; // parks in cv.wait; later batches are leaked the same way
+          }
           batch.clear();
           pin_seal(s); // the queue may run empty now: no staging buffer waits for a later batch
+          busy = false;
         }
       }
     };
@@ -550,12 +589,37 @@ namespace mvc
       return *s;
     }
 
+    void submitter_at_exit()
+    {
+      g_exiting = true;
+      Submitter &sb = submitter();
+      {
+        std::lock_guard<std::mutex> lk(sb.m);
+      }
+      sb.cv.notify_all();
+      {
+        std::lock_guard<std::mutex> lk(sb.mark_m);
+      }
+      sb.mark_cv.notify_all();
+#ifndef _WIN32
+      // the op in progress finishes while the runtime is still intact; bounded, so exit never hangs
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (sb.busy && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
+    }
+
     thread_local unsigned long long t_last_seq = 0; // sequence number of this thread's last queued op
   }
 
   void pipe_submit(std::function<void(cudaStream_t)> op)
   {
     Submitter &sb = submitter();
+    if (g_exiting)
+    {
+      leak(std::move(op)); // process exit: never run, never destroyed (see g_exiting)
+      return;
+    }
     bool was_empty;
     {
       std::lock_guard<std::mutex> lk(sb.m);
@@ -569,18 +633,36 @@ namespace mvc
 
   void pipe_call(std::function<void(cudaStream_t)> op)
   {
-    // the caller waits for its own op only (one signal, no wake-up of other waiters)
-    std::mutex m;
-    std::condition_variable cv;
-    bool done = false;
-    pipe_submit([&](cudaStream_t s) {
+    // the caller waits for its own op only (one signal, no wake-up of other waiters). At process exit an op that has not
+    // started is cancelled instead (state 0 -> 3), so the caller returns and the op, which refers to the caller's stack,
+    // can never run afterwards; one that has started is waited for.
+    struct State
+    {
+      std::mutex m;
+      std::condition_variable cv;
+      std::atomic<int> state{ 0 }; // 0 queued, 1 running, 2 done, 3 cancelled
+    };
+    auto st = std::make_shared<State>();
+    pipe_submit([st, &op](cudaStream_t s) {
+      int expected = 0;
+      if (!st->state.compare_exchange_strong(expected, 1))
+        return; // cancelled: the caller has returned
       op(s);
-      std::lock_guard<std::mutex> lk(m);
-      done = true;
-      cv.notify_one();
+      std::lock_guard<std::mutex> lk(st->m);
+      st->state = 2;
+      st->cv.notify_one();
     });
-    std::unique_lock<std::mutex> lk(m);
-    cv.wait(lk, [&] { return done; });
+    std::unique_lock<std::mutex> lk(st->m);
+    while (st->state != 2)
+    {
+      if (g_exiting)
+      {
+        int expected = 0;
+        if (st->state.compare_exchange_strong(expected, 3))
+          return;
+      }
+      st->cv.wait_for(lk, std::chrono::milliseconds(20));
+    }
   }
 
   void pipe_flush()
@@ -602,6 +684,8 @@ namespace mvc
     std::unique_lock<std::mutex> lk(sb.mark_m);
     while (sb.marked < seq)
     {
+      if (g_exiting)
+        return nullptr; // process exit: no more marks (see g_exiting)
       unsigned long long w = sb.want.load();
       while (seq < w && !sb.want.compare_exchange_weak(w, seq))
         ;
@@ -609,7 +693,7 @@ namespace mvc
       lk.unlock();
       pipe_submit([](cudaStream_t) {});
       lk.lock();
-      sb.mark_cv.wait(lk, [&] { return sb.marked >= seq || sb.want.load() == ~0ull; });
+      sb.mark_cv.wait(lk, [&] { return sb.marked >= seq || sb.want.load() == ~0ull || g_exiting.load(); });
     }
     // the earliest mark at or after seq (a slot recorded again later only makes the wait longer, never wrong)
     int best = -1;

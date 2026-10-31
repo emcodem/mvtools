@@ -86,6 +86,36 @@ the SAD (`:3358`). It fixes the 1/4-px rounding, the 8x8 coarseness and the SADs
 search missed beyond its radius. On Pascal it runs on the CPU, on Ampere+ with `gpu=true`.
 
 ## Phase 0: CMake as the only build system, Linux for the whole repo (before the plugin)
+
+**Status 2026-10-31: Linux build and run done (steps 1, 2, 5, 6 below); open: step 3 (Windows CMake build bit-identical)
+and step 4 (remove vcxproj / bat files); after that VapourSynth (user's decision: an AviSynth-API shim over the
+VapourSynth API, one code base).** Done:
+- `Sources/cuda/dyn_lib.h`: the one run-time loader (LoadLibraryW / dlopen RTLD_NOW, module folder via
+  GetModuleHandleExW / dladdr); used by GpuBackend, cudafilters' CudaLib and the NVOFA loader. Rule (user): a missing or
+  broken lazily loaded library never hangs or crashes, it only selects the fallback (SetThreadErrorMode, every symbol
+  and the API version checked, nothing loaded from global constructors, no link-time dependency on driver libraries).
+- CMake: `Sources/cuda/CMakeLists.txt` (unit list of build.bat, static cudart, hidden visibility, `MVTOOLS_CUDA_ARCH`,
+  `MVTOOLS_CUDA_FLAGS`), `cudafilters/CMakeLists.txt`, root option `MVTOOLS_GPU` (skipped with a warning without nvcc).
+- `cmake/plugin_exports.map`: ELF plugins export only `AvisynthPluginInit3`. Without it mvtools2 crashed in
+  AvisynthPluginInit3: its `AVS_linkage` was interposed by libavisynth.so's read-only symbol of the same name.
+- `mvcuda_frames.cu`: process exit. Linux runs static destructors (CUDA runtime included) while the detached submitter
+  thread still issues ops, which crashed after NVOFA runs ("driver shutting down", then SIGSEGV in pin_seal). An atexit
+  handler now stops the submitter first (bounded wait); later ops are leaked, waiters return.
+- CudaNNEDI3 weights: plugins_JPSDR.dll resource (Windows, unchanged) or `nnedi3_weights.bin` next to cudafilters.
+- Missing `<cstring>` in mvcuda_analyse.cu (MSVC included it indirectly).
+
+Test setup (WSL2 Ubuntu 26.04, no sudo needed): GCC 15.2, CUDA 13.4 from the NVIDIA pip wheels (`~/opt/cuda`), CMake /
+Ninja in a uv venv, AviSynth+ v3.7.5 built into `~/.local`, test host `avsmd5` (AviSynth+ C API, ffmpeg-compatible
+framemd5, `RawSource` for raw planar input; source in the session scratchpad, to be added to the repo). Input: 40 frames
+of seg1 decoded on Windows (LWLibav) to raw, identical frame md5s on both systems. Results (MAnalyse + MRecalculate +
+MFlowFps chain, UHD 10-bit 4:2:2, 32 output frames; NVOFA chain 19 frames):
+- Linux GPU == Windows GPU == Windows CPU with avstp (24 threads): bit-identical.
+- Linux GPU with `MVTOOLS_GPU_SLICES=1` == Linux CPU (single-sliced, no avstp); Linux CPU != Windows CPU (slicing only).
+- libmvtools_cuda.so missing: fallback with a log line, output == CPU. cudafilters without it: CudaNVOFAvailable()
+  false, script fallback runs.
+- CudaUpload/CudaDownload round trip == source; NVOFA (libnvidia-opticalflow.so.1 in WSL) Linux == Windows, 8/8 clean
+  exits. Windows regression with the changed sources: e2e60p6 cpu / gpu identical to the stored md5s.
+
 Starting point: mvtools2, DePan, DePanEstimate already have a cross-platform CMake build from upstream (root
 `CMakeLists.txt:200-204`, GCC / Clang / MinGW / macOS branches `:180-198`, `Sources/Files.cmake` drops `AvstpFinder` off
 Windows). Windows / MSVC-only is what this branch added:
