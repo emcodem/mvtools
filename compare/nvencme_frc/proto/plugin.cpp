@@ -8,6 +8,7 @@
 #include "avisynth.h"
 #include "MVAnalysisData.h"
 
+#include <cmath>
 #include <cstring>
 
 const AVS_Linkage *AVS_linkage = nullptr;
@@ -19,6 +20,7 @@ namespace
     MVAnalysisData _ad = {};
     bool _isb, _half, _chroma_me = nvme::env_on("NVME_CHROMA");
     int _levels = 1;
+    double _pseudo = std::getenv("NVME_PSEUDO") ? std::atof(std::getenv("NVME_PSEUDO")) : 0.0;
     int _delta, _pel, _words = 0, _big_sad = 0;
     nvme::Params _np;
     VideoInfo _src_vi;
@@ -70,11 +72,23 @@ namespace
       const uint8_t *p = f->GetReadPtr(PLANAR_Y);
       const int pitch = f->GetPitch(PLANAR_Y), w = _src_vi.width, h = _src_vi.height;
       const int bits = _src_vi.BitsPerComponent(), shift = bits - 8;
-      auto px = [&](int x, int y) -> int {
+      auto rd = [&](const uint8_t *b, int pt, int x, int y) -> int {
         if (bits == 8)
-          return p[(size_t)y * pitch + x];
-        const int v = reinterpret_cast<const uint16_t *>(p + (size_t)y * pitch)[x];
+          return b[(size_t)y * pt + x];
+        const int v = reinterpret_cast<const uint16_t *>(b + (size_t)y * pt)[x];
         return std::min((v + (1 << (shift - 1))) >> shift, 255);
+      };
+      // pseudo-luma (NVME_PSEUDO=k): Y + k (U - 128) - k (V - 128), so that colour edges reach NVENC's luma-only ME
+      const bool pseudo = _pseudo != 0.0 && !_src_vi.IsY();
+      const uint8_t *pu = pseudo ? f->GetReadPtr(PLANAR_U) : nullptr, *pv = pseudo ? f->GetReadPtr(PLANAR_V) : nullptr;
+      const int cpitch = pseudo ? f->GetPitch(PLANAR_U) : 0;
+      const int lx = pseudo ? _src_vi.GetPlaneWidthSubsampling(PLANAR_U) : 0, ly = pseudo ? _src_vi.GetPlaneHeightSubsampling(PLANAR_U) : 0;
+      auto px = [&](int x, int y) -> int {
+        const int yv = rd(p, pitch, x, y);
+        if (!pseudo)
+          return yv;
+        const int u = rd(pu, cpitch, x >> lx, y >> ly) - 128, v = rd(pv, cpitch, x >> lx, y >> ly) - 128;
+        return std::min(std::max((int)std::lround(yv + _pseudo * (u - v)), 0), 255);
       };
       g.resize((size_t)_np.w * _np.h);
       for (int y = 0; y < _np.h; y++)

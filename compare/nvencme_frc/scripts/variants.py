@@ -29,6 +29,9 @@ ALL = [
     ('p4l4', 'NVENC P4 pyramid 4', (4, False, 4), ''),
     ('p4nl3', 'NVENC P4 pyramid 3, no intra', (4, False, 3), '', {'NVME_NOINTRA': '1'}),
     ('p7l3', 'NVENC P7 pyramid 3', (7, False, 3), ''),
+    ('p4ps1', 'NVENC P4 pseudo-luma k=1', (4, False), '', {'NVME_PSEUDO': '1'}),
+    ('p4ps2', 'NVENC P4 pseudo-luma k=2', (4, False), '', {'NVME_PSEUDO': '2'}),
+    ('p4nl3ps2', 'NVENC P4 pyr 3, no intra, pseudo k=2', (4, False, 3), '', {'NVME_NOINTRA': '1', 'NVME_PSEUDO': '2'}),
 ]
 ALL = [v if len(v) == 5 else v + ({},) for v in ALL]
 BY_KEY = {v[0]: v for v in ALL}
@@ -55,7 +58,7 @@ def write_script(work, key, text=None):
 
 def env_for(key):
     env = dict(os.environ)
-    for k in ('MVCUDA_NVOFA', 'NVME_CHROMA', 'NVME_NOINTRA', 'NVME_P16'):
+    for k in ('MVCUDA_NVOFA', 'NVME_CHROMA', 'NVME_NOINTRA', 'NVME_P16', 'NVME_PSEUDO'):
         env.pop(k, None)
     env.update(BY_KEY[key][4])
     if BY_KEY[key][3]:

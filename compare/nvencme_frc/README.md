@@ -4,14 +4,15 @@
 > NVENCMEAnalyse.** Judged by eye (user): plain P4 "extremely bad", the hinted pyramid (P4, 3 levels, intra off) in
 > [img/slowmo_pyramid_1.7-2.6.mp4](img/slowmo_pyramid_1.7-2.6.mp4) "still extremely bad". Every NVENC lever was
 > tried: presets P1/P4/P7, half resolution, chroma (ignored by the ME), intra off, 16x16 only, a hinted pyramid
-> (fixes the search range, SADs near NVOFA's, fields even less coherent); AV1 has no ME-only mode, HEVC ME-only output
+> (fixes the search range, SADs near NVOFA's, fields even less coherent), colour mixed into the luma (worse); AV1 has
+> no ME-only mode, HEVC ME-only output
 > is broken. The cause is the cost function: the encoder's ME picks the cheapest match per block, not the true motion,
 > and the API has no smoothness control. What remains would be our own processing (smoothing the field, stronger
 > MRecalculate), i.e. not NVENC's quality. NVOFA covers Ampere+; NVENC would only have added Pascal / Turing, which
 > cannot be tested here. The spot crops and `spots_check.csv` below were not judged (not needed after the clips).
 >
 > Prototype switches (environment of the AviSynth process): `NVME_FRESH=0` keep sessions (faster, not deterministic),
-> `NVME_NOINTRA=1`, `NVME_CHROMA=1`, `NVME_P16=1` (16x16 partitions only), `NVME_SESSIONS=<n>` (pool size, default 2),
+> `NVME_NOINTRA=1`, `NVME_CHROMA=1`, `NVME_P16=1` (16x16 partitions only), `NVME_PSEUDO=<k>` (colour into the luma), `NVME_SESSIONS=<n>` (pool size, default 2),
 > `NVME_TUNING=<n>` (tuning used for the preset config).
 
 Early visual check for [NVENCMEAnalyse.md](../../NVENCMEAnalyse.md) step 5, done before the plugin exists: a throwaway
@@ -99,6 +100,25 @@ in the sky: 3–4× the exact search's score and 10× NVOFA's, with SADs between
   previous call) to 0 %. The missing predictors, not the block size or chroma, look like the main weakness on fast
   motion. Next lever: `meExternalHints` (H.264 only) from a half-resolution pass or from the previous frame of the same
   direction — deterministic predictors instead of whatever the session saw last.
+
+### Colour into the luma (`NVME_PSEUDO=k`), DTL: "luma only ME can greatly degrade ME quality on colour footage"
+
+NVENC ignores chroma, so the colour goes into the luma that NVENC sees: Y + k (U − 128) − k (V − 128) (8 bit, chroma at
+the luma position).
+
+| variant | score all | score tree | mean SAD | cells > 0.5 |
+|---|---:|---:|---:|---:|
+| P4 | 0.098 | 0.124 | 1219 | 3240 |
+| P4 pseudo-luma k = 1 | 0.104 | 0.129 | 1228 | 3438 |
+| P4 pseudo-luma k = 2 | 0.119 | 0.143 | 1255 | 3815 |
+| P4 pyramid 3, intra off | 0.121 | 0.192 | 875 | 2592 |
+| P4 pyramid 3, intra off, pseudo-luma k = 2 | 0.277 | 0.356 | 949 | 8491 |
+| *NVOFA medium (luma only, 8-bit grey)* | *0.009* | *0.011* | *820* | *2* |
+
+Worse with every step of k, much worse in the pyramid (the downscaled levels mix colour noise into the hints). On this
+clip luma-only input is not what holds NVENC back: NVOFA gets the same 8-bit luma (`k_of_gray`) and gives the most
+coherent fields; MRecalculate (`chroma=true`) adds chroma to every variant's final vectors. DTL's point stays valid for
+scenes where objects differ in colour only, for NVOFA as well.
 
 ### Hinted pyramid (`levels=2..4`)
 
