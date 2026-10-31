@@ -1,10 +1,12 @@
-/* Linker version script for the plugins on ELF platforms (Linux, BSD): export only the host entry points and bind every
+/* Linker version script for the plugins on ELF platforms (Linux, BSD): export only the host entry points (AviSynth+ and
+   VapourSynth; a plugin without a VapourSynth entry simply lacks that symbol) and bind every
    other symbol inside the plugin. Without it a plugin global such as AVS_linkage is interposed by the identically named
    symbol of libavisynth.so (read-only there), and the plugin crashes in AvisynthPluginInit3; plugins could also bind to
    each other's C++ symbols. */
 {
   global:
     AvisynthPluginInit3;
+    VapourSynthPluginInit2;
   local:
     *;
 };

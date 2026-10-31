@@ -74,8 +74,41 @@ Under VS, `VapourSynthPluginInit2` sets `AVS_linkage` to the shim's own table be
   `buildFrameView` does). Planar RGB: AviSynth plane order G,B,R vs VS R,G,B mapped here.
 - `IScriptEnvironment` (+ `IScriptEnvironment2` / Neo parts the filters call): a class of the shim; everything not in
   the inventory below throws "not supported under VapourSynth: <method>".
-One DLL / .so serves both hosts; a process never has both hosts driving the same plugin instance, so one global
-`AVS_linkage` is enough.
+The plugin keeps one global `AVS_linkage`; a process never has both hosts driving the same plugin instance.
+
+### Decision 5: the shim is its own library, `mvtools_vsbridge`, a small AviSynth+ host for VS
+
+The `AVS_Linkage` entries are member-function pointers of the header's own classes (`bool (VideoInfo::*)() const`,
+...). AviSynth+ implements them by compiling `avisynth.h` in core mode (`BUILDING_AVSCORE`: real member definitions in
+`interface.cpp`), while plugins compile the same header in plugin mode (inline members that call through the table).
+Both modes in one binary break the one-definition rule: the strong core definitions would replace the plugin's inline
+ones, and under AviSynth+ the plugin would then run our code on AviSynth+'s frames. So:
+- `vsbridge/` builds `mvtools_vsbridge.dll` / `libmvtools_vsbridge.so` in core mode: AviSynth+'s `interface.cpp`
+  (VideoInfo, AVSValue, PClip, PVideoFrame, VideoFrame accessors, the table), the environment, VS clip and frame
+  wrappers, node registry, prefetch rules, argument translation. Exports only `mvbridge_register`.
+- mvtools2 (later cudafilters) gets one small file, `VapourSynthEntry.cpp`: `VapourSynthPluginInit2` opens the bridge
+  from the plugin's own folder (`dyn_lib.h`) and calls `mvbridge_register(plugin, vspapi, id, namespace, name,
+  &AvisynthPluginInit3)`. The bridge runs `AvisynthPluginInit3` with its environment and table, records every
+  `AddFunction`, and registers a VS function per entry. Filter code is untouched; the AviSynth+ binary only gains one
+  export.
+- Bridge missing or broken: the plugin still configures its namespace and registers no functions (and writes the
+  reason to stderr), so VS loads without error and `core.mvpf` is empty. Never a crash (user's rule).
+- VS's plugin autoloader ignores libraries without `VapourSynthPluginInit2` (`VSNoEntryPointException` is swallowed,
+  `vscore.cpp:2332`), so the bridge can sit in the plugin folder next to mvtools2.
+- One bridge instance per process serves every plugin that registers through it, so `Invoke("MSuper")` from
+  cudafilters (step 4) is a direct call into mvtools2's registered function, as in AviSynth+.
+
+Frame memory: VS allocates each plane separately (`vscore.cpp:220-251`); AviSynth+'s `VideoFrame` addresses planes
+as `int` offsets from one buffer. The bridge wraps a VS frame without copying when the plane distances fit in `int`,
+otherwise it copies into one contiguous buffer (input) / copies back at return (output), counted and logged once.
+
+### Decision 6: function and argument names
+
+VS functions keep the AviSynth names (`core.mvpf.MAnalyse`, `core.mvpf.MDegrain2`) and the AviSynth parameter names
+(`thSAD`, `blksize`), so mvtools2's documentation applies unchanged. Positional parameters without a name in the
+AviSynth string get names from a table in the bridge (`MDegrain2`: `clip, super, mvbw, mvfw, mvbw2, mvfw2`;
+`MAnalyse`: `super`; `MDegrainN`: `clip, super, mvmulti, tr`); otherwise `c1`, `c2`, ... as VS's compat layer does.
+`c+` (MStoreVect) becomes a clip array.
 
 ### Decision 4: vector clips travel as Gray8 carriers; super clips need nothing
 
@@ -127,8 +160,8 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
 
 ## Files
 
-`Sources/vs/` (shim: `vs_linkage.cpp`, `vs_clip.cpp`, `vs_env.cpp`, `vs_frame.cpp`, `vs_args.cpp`, `vs_prefetch.cpp`,
-`vs_register.cpp`), `VapourSynthPluginInit2` in mvtools2 and cudafilters next to `AvisynthPluginInit3` (one library
+`vsbridge/` (decision 5: `avs_interface.cpp` from AviSynth+, `bridge.cpp`, `prefetch.cpp`, `CMakeLists.txt`),
+`Sources/VapourSynthEntry.cpp` (and one in cudafilters): `VapourSynthPluginInit2` next to `AvisynthPluginInit3` (one library
 per plugin, each host ignores the other entry point), `cmake/plugin_exports.map` exports both, `VapourSynth4.h`
 (+ `VSHelper4.h` if used) vendored under `Sources/include/` (no build dependency on an installed VapourSynth). Option
 `MVTOOLS_VAPOURSYNTH=ON`.

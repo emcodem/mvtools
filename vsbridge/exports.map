@@ -1,0 +1,7 @@
+/* mvtools_vsbridge on ELF platforms: export only the registration entry for the plugins' VapourSynthPluginInit2. */
+{
+  global:
+    mvbridge_register_functions;
+  local:
+    *;
+};

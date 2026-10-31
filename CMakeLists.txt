@@ -217,6 +217,14 @@ if(NOT WIN32)
   mv_plugin_exports(depanestimate)
 endif()
 
+# VapourSynth: mvtools_vsbridge, an AviSynth+ host for VapourSynth that runs the plugins unchanged (VAPOURSYNTH_PLAN.md).
+# The plugins only gain a VapourSynthPluginInit2 export that opens it at run time; no VapourSynth installation is needed to
+# build (VapourSynth4.h is vendored in Sources/include).
+option(MVTOOLS_VAPOURSYNTH "Build mvtools_vsbridge (VapourSynth support)" ON)
+if(MVTOOLS_VAPOURSYNTH)
+  add_subdirectory("vsbridge")
+endif()
+
 # GPU part: mvtools_cuda (needs the CUDA toolkit) and the cudafilters plugin. mvtools2 itself never links against it:
 # it opens mvtools_cuda at run time and uses the CPU when the library, the driver or a device is missing.
 option(MVTOOLS_GPU "Build mvtools_cuda and cudafilters (needs the CUDA toolkit)" ON)

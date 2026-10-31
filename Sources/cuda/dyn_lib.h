@@ -25,9 +25,11 @@ namespace dynlib
 #ifdef _WIN32
   constexpr const char *cuda_lib_name = "mvtools_cuda.dll";
   constexpr const char *nvofa_lib_name = "nvofapi64.dll";
+  constexpr const char *vsbridge_lib_name = "mvtools_vsbridge.dll";
 #else
   constexpr const char *cuda_lib_name = "libmvtools_cuda.so";
   constexpr const char *nvofa_lib_name = "libnvidia-opticalflow.so.1";
+  constexpr const char *vsbridge_lib_name = "libmvtools_vsbridge.so";
 #endif
 
   // nullptr when the library cannot be loaded. A bare file name searches the system's library path. Libraries are never
