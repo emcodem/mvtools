@@ -43,7 +43,7 @@ namespace
     int bs_x, bs_y, ov_x, ov_y, cw, ch, log_x_uv, log_y_uv;
     int ext_w, ext_h, ew[3], hpad[3], vpad[3];
     const pix *src[3];
-    const pix *ref[3][4];
+    const pix *ref[3][MVCUDA_MAX_SUB]; // sub-pel planes (pel * pel at level 0, MVPlane order), the rest null
     int lambda_level, lsad, pnew, pzero, pglobal, bits, chroma_scale, radius, meander, use_global;
     int bad_sad, n_slices;
     int search_type;  // mvc_refine::S_*: the refine step of this level (exhaustive levels use the ring fold below)
@@ -60,6 +60,9 @@ namespace
     int *nlam;         // device: nLambda per block (k_interp writes it, k_wave reads it); unused on the smallest level
     int *rowbad;       // device: per block row, number of blocks that took the wide "bad vector" search
     int bad_range;     // MAnalyse badrange (> 0 UMH, < 0 exhaustive rings, 0 none)
+    int try_many;      // PseudoEPZSearch with tryMany (coarse levels of MAnalyse trymany=true): k_search only
+    int exh_fast;      // k_search: exhaustive radius > 3 through AnaChecker::exhaustive_fast (MVCUDA_EXH_FAST=0: off)
+    int win_cap;       // k_search: samples of dynamic shared memory after the source buffers (reference window)
   };
 
   // One whole analysis call for the wavefront kernel (one launch for all levels): the rows of all levels, coarsest level
@@ -354,6 +357,80 @@ namespace
     return v;
   }
 
+  const int EXH_LIST = 512;            // runs of AnaChecker::exh_runs that are compacted after pruning
+  const int EXH_XL = 24, EXH_XC = 16; // spare window columns of AnaChecker::exhaustive_fast (runs of 8, luma step <= 2,
+                                      // one word read past the last sample, rows rounded up to 4 samples)
+
+  // SADs of K = 8 candidates of a run over `rows` rows (exh_runs): window rows as 32-bit words from wrow (pitch wpitch
+  // words), candidate k starts O + k * SL samples into the first word; source rows packed in srow (NCOL samples each).
+  // Each candidate's words are realigned by a funnel shift with a compile-time amount, summed with __vsadu4 (8 bit) /
+  // __vsadu2 (16 bit): the same integer sums as the scalar form.
+  // NARROW (16 bit, <= 12 bits per sample): |a - b| of both halves as max - min (no borrow between the lanes), summed
+  // lane-wise over one row (at most 16 terms of 4095 per lane) and folded once per row (measured: 10-bit radius 24
+  // 4.4 -> 2.8 ms/frame); 8 bit __vsadu4; else __vsadu2.
+  template <int NCOL, int SL, int O, bool NARROW>
+  __device__ __forceinline__ void sad_rows_pk(const unsigned *wrow, int wpitch, const unsigned *srow, int row0, int rstep, int rows, unsigned (&acc)[8])
+  {
+    constexpr int SPWD = 4 / (int)sizeof(pix), NSW = NCOL / SPWD;
+    constexpr int NWW = (O + 7 * SL + NCOL - 1) / SPWD + 2;
+    for (int row = row0; row < rows; row += rstep)
+    {
+      unsigned w[NWW], sw[NSW];
+      #pragma unroll
+      for (int i = 0; i < NWW; i++)
+        w[i] = wrow[row * wpitch + i];
+      #pragma unroll
+      for (int i = 0; i < NSW; i++)
+        sw[i] = srow[row * NSW + i];
+      #pragma unroll
+      for (int k = 0; k < 8; k++)
+      {
+        const int off = O + k * SL, q = off / SPWD, m = off % SPWD;
+        unsigned lanes = 0;
+        #pragma unroll
+        for (int g = 0; g < NSW; g++)
+        {
+          const unsigned rw = m ? __funnelshift_r(w[q + g], w[q + g + 1], 8 * (int)sizeof(pix) * m) : w[q + g];
+          if constexpr (sizeof(pix) == 1)
+            acc[k] += __vsadu4(sw[g], rw); // measured faster than max - min with __dp4a
+          else if constexpr (NARROW)
+            lanes += __vmaxu2(sw[g], rw) - __vminu2(sw[g], rw);
+          else
+            acc[k] += __vsadu2(sw[g], rw);
+        }
+        if constexpr (sizeof(pix) == 2 && NARROW)
+          acc[k] += (lanes & 0xffffu) + (lanes >> 16);
+      }
+    }
+  }
+  // dispatch on the start offset in the first word (0 .. samples per word - 1) and on NARROW (bits <= 12, 16 bit)
+  template <int NCOL, int SL>
+  __device__ __forceinline__ void sad_rows_pk_o(int o, bool narrow, const unsigned *wrow, int wpitch, const unsigned *srow, int row0, int rstep, int rows, unsigned (&acc)[8])
+  {
+    if constexpr (sizeof(pix) == 2)
+    {
+      if (narrow)
+      {
+        if (o == 0)
+          sad_rows_pk<NCOL, SL, 0, true>(wrow, wpitch, srow, row0, rstep, rows, acc);
+        else
+          sad_rows_pk<NCOL, SL, 1, true>(wrow, wpitch, srow, row0, rstep, rows, acc);
+      }
+      else if (o == 0)
+        sad_rows_pk<NCOL, SL, 0, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+      else
+        sad_rows_pk<NCOL, SL, 1, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+    }
+    else if (o == 0)
+      sad_rows_pk<NCOL, SL, 0, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+    else if (o == 1)
+      sad_rows_pk<NCOL, SL, 1, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+    else if (o == 2)
+      sad_rows_pk<NCOL, SL, 2, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+    else
+      sad_rows_pk<NCOL, SL, 3, false>(wrow, wpitch, srow, row0, rstep, rows, acc);
+  }
+
   struct BlockShared
   {
     int sl[mvc_refine::MAX_BATCH], sc[mvc_refine::MAX_BATCH]; // SADs of the candidates of one batch (phase A, ring, mvc_refine batches)
@@ -609,6 +686,7 @@ namespace
 #ifdef MVC_PHASE_PROF
   // per-phase cycle counters of the block loop (development aid, build with -DMVC_PHASE_PROF): [log2(blocks per row)][phase]
   __device__ unsigned long long g_prof[16][8];
+  __device__ unsigned long long g_exh[6]; // exhaustive_fast: window, evaluation, reduction cycles, calls; runs, live runs
 #define PH_START() ph_t = clock64()
 #define PH(i) do { if (tid == 0) { long long n_ = clock64(); atomicAdd(&g_prof[bk][i], (unsigned long long)(n_ - ph_t)); ph_t = n_; } } while (0)
 #else
@@ -680,12 +758,510 @@ namespace
       }
       __syncthreads(); // the next batch overwrites b->sl / b->sc
     }
+
+    // ExpandingSearch rings 1..r around the current best vector (the exhaustive refine) in one parallel pass, for
+    // radii above 3 (GPU_PIPELINE_PLAN.md section 29). All candidates share the centre, so the CPU's sequence of CheckMV
+    // ends at the earliest candidate with the lowest full cost below the starting minimum, provided every part of the
+    // cost chain is >= 0 (then an early exit against the running minimum rejects exactly what the final sum would):
+    // a block-wide minimum of (cost << 15 | index). Thread per candidate, K candidates per thread and pass, the SADs
+    // accumulated over one walk of the source block (the source sample is a shared-memory broadcast). The reference area
+    // of all candidates is copied to shared memory (win, win_cap samples) when it fits, else read from the planes.
+    // Returns false (nothing changed) when a cost part was negative or a sum overflowed: the caller then runs the
+    // sequential batches. Called by every thread of the CUDA block.
+    // index of candidate (dx, dy) in the ExpandingSearch(1..r) sequence (inverse of mvc_refine::expanding_point)
+    __device__ __forceinline__ static int ring_index(int dx, int dy)
+    {
+      const int r = max(abs(dx), abs(dy));
+      int k;
+      if (abs(dy) == r && abs(dx) < r)
+        k = 2 * (dx + r - 1) + (dy > 0 ? 1 : 0);
+      else if (abs(dx) == r && abs(dy) < r)
+        k = 2 * (2 * r - 1) + 2 * (dy + r - 1) + (dx > 0 ? 1 : 0);
+      else
+        k = 4 * (2 * r - 1) + (dx > 0 ? 2 : 0) + (dy > 0 ? 1 : 0);
+      return 4 * r * (r - 1) + k;
+    }
+
+    // exhaustive_fast with the reference window in shared memory and a common block geometry: each thread takes runs of
+    // K candidates of one row, step pel << log_x_uv apart (pel without chroma), which share their luma and chroma
+    // sub-pel planes; candidate k of a run reads luma k * SL and chroma k samples further. One row of the window is
+    // loaded into registers per source row and serves all K candidates. The fold order does not matter (the key holds
+    // the ring index), so the runs may cover the square in any order.
+    template <int BX, int CW>
+    __device__ void exh_runs(int r, const pix *win, int WL, int nl, int WC, int nc, int lx0, int ly0, int cx0, int cy0,
+      long long &best, int &best_s, bool &odd, int *s_runs, int *s_nr) const
+    {
+      constexpr int K = 8, SL = (CW > 0 && 2 * CW == BX) ? 2 : 1;
+      constexpr int NWL = BX + (K - 1) * SL, NWC = CW > 0 ? CW + K - 1 : 1;
+      constexpr int SPWD = 4 / (int)sizeof(pix);
+      const LevelArgs &A = *a;
+      const int tid = warp * 32 + lane, nt = nwarps * 32;
+      const int mvx = bx, mvy = by, lp = A.log_pel, pm = A.pel - 1, nsub = A.pel * A.pel;
+      const int step = CW > 0 ? (A.pel << A.log_x_uv) : A.pel;
+      const int per = (2 * r) / step + 1, R = (per + K - 1) / K;
+      // packed sums need word-aligned window planes and source rows (the window base is 16-byte aligned, rows are
+      // multiples of 4 samples; the source buffers are aligned for the usual block sizes)
+      const bool pk = (((size_t)s_y | (size_t)s_u | (size_t)s_v | (size_t)win) & 3) == 0 && (CW == 0 || CW % SPWD == 0)
+        && BX % SPWD == 0;
+      const int nruns = (2 * r + 1) * step * R;
+      auto decode = [&](int run, int &dy, int &dx0) {
+        int t = run;
+        const int jr = t % R;
+        t /= R;
+        const int q = t % step;
+        dy = t / step - r;
+        dx0 = -r + q + jr * K * step;
+      };
+      // Pruning (the CPU's CheckMV does the same): the vector cost lam is the first part of the cost chain, so a
+      // candidate with lam >= the starting minimum can never be accepted and needs no SAD. Runs with a candidate left
+      // are compacted into a shared list (more than EXH_LIST runs: every run is evaluated).
+      auto lam_of = [&](int cx, int cy) {
+        const int dxp = pred_x - cx, dyp = pred_y - cy;
+        const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+        return (int)((unsigned)nlambda * (unsigned)dist) >> (16 - A.bits);
+      };
+      const bool listed = nruns <= EXH_LIST;
+      if (listed)
+      {
+        if (tid == 0)
+          *s_nr = 0;
+        __syncthreads();
+        for (int run = tid; run < nruns; run += nt)
+        {
+          int dy, dx0;
+          decode(run, dy, dx0);
+          bool live = false;
+          const int cy = mvy + dy;
+          #pragma unroll
+          for (int k = 0; k < K; k++)
+          {
+            const int dx = dx0 + k * step, cx = mvx + dx;
+            if (dx > r || (dx == 0 && dy == 0) || !ok(cx, cy))
+              continue;
+            live = live || lam_of(cx, cy) < min_cost; // lam < 0 (overflow) stays live: the fold reports it
+          }
+          if (live)
+            s_runs[atomicAdd(s_nr, 1)] = run;
+        }
+        __syncthreads();
+      }
+      const int nlist = listed ? *s_nr : nruns;
+#ifdef MVC_PHASE_PROF
+      if (tid == 0) { atomicAdd(&g_exh[4], (unsigned long long)nruns); atomicAdd(&g_exh[5], (unsigned long long)nlist); }
+#endif
+      // TPR consecutive lanes share a run, each summing every TPR-th row, the partial sums added by shuffles: keeps
+      // the threads busy when few runs are left (UHD 32x32 blocks, small radii, pruning). Packed form only.
+      int TPR = 1;
+      if (pk)
+        while (TPR < 8 && nlist * TPR * 2 <= nt)
+          TPR *= 2;
+      const int total = nlist * TPR;
+      for (int base = warp * 32; base < total; base += nt) // whole warps per iteration (the shuffles below)
+      {
+        const int it = base + lane, j = it & (TPR - 1);
+        const bool act = it < total;
+        int dy = 0, dx0 = r + 1;
+        if (act)
+          decode(listed ? s_runs[it / TPR] : it / TPR, dy, dx0);
+        const bool run_ok = act && dx0 <= r;
+        const int cy = mvy + dy, cxa = mvx + (run_ok ? dx0 : 0);
+        int sl[K], sc[K];
+        #pragma unroll
+        for (int k = 0; k < K; k++)
+          sl[k] = sc[k] = 0;
+        if (pk)
+        {
+          unsigned al[K], ac[K];
+          #pragma unroll
+          for (int k = 0; k < K; k++)
+            al[k] = ac[k] = 0;
+          if (run_ok)
+          {
+            const int xp = x0 * A.pel + cxa, yp = y0 * A.pel + cy;
+            const int col0 = (xp >> lp) - lx0;
+            const pix *bl = win + ((xp & pm) | ((yp & pm) << lp)) * nl + ((yp >> lp) - ly0) * WL + col0;
+            sad_rows_pk_o<BX, SL>(col0 % SPWD, A.bits <= 12, (const unsigned *)(bl - col0 % SPWD), WL / SPWD,
+              (const unsigned *)s_y, j, TPR, A.bs_y, al);
+            if constexpr (CW > 0)
+            {
+              const int xpc = x1 * A.pel + (cxa >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
+              const int cc = (xpc >> lp) - cx0, cc0 = cc % SPWD;
+              const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + cc;
+              sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu - cc0), WC / SPWD, (const unsigned *)s_u, j, TPR, A.ch, ac);
+              sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu + nsub * nc - cc0), WC / SPWD, (const unsigned *)s_v, j, TPR, A.ch, ac);
+            }
+          }
+          for (int o = 1; o < TPR; o <<= 1)
+          {
+            #pragma unroll
+            for (int k = 0; k < K; k++)
+            {
+              al[k] += __shfl_xor_sync(0xffffffffu, al[k], o);
+              ac[k] += __shfl_xor_sync(0xffffffffu, ac[k], o);
+            }
+          }
+          #pragma unroll
+          for (int k = 0; k < K; k++)
+          {
+            sl[k] = (int)al[k];
+            sc[k] = (int)ac[k];
+          }
+        }
+        else if (run_ok)
+        {
+          const int xp = x0 * A.pel + cxa, yp = y0 * A.pel + cy;
+          const pix *bl = win + ((xp & pm) | ((yp & pm) << lp)) * nl + ((yp >> lp) - ly0) * WL + ((xp >> lp) - lx0);
+          for (int row = 0; row < A.bs_y; row++)
+          {
+            int w[NWL];
+            #pragma unroll
+            for (int i = 0; i < NWL; i++)
+              w[i] = bl[row * WL + i];
+            #pragma unroll
+            for (int col = 0; col < BX; col++)
+            {
+              const int sv = s_y[row * BX + col];
+              #pragma unroll
+              for (int k = 0; k < K; k++)
+                sl[k] += abs(sv - w[col + k * SL]);
+            }
+          }
+          if constexpr (CW > 0)
+          {
+            const int xpc = x1 * A.pel + (cxa >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
+            const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + ((xpc >> lp) - cx0);
+            const pix *bv = bu + nsub * nc;
+            for (int row = 0; row < A.ch; row++)
+            {
+              int wu[NWC], wv[NWC];
+              #pragma unroll
+              for (int i = 0; i < NWC; i++)
+              {
+                wu[i] = bu[row * WC + i];
+                wv[i] = bv[row * WC + i];
+              }
+              #pragma unroll
+              for (int col = 0; col < CW; col++)
+              {
+                const int su = s_u[row * CW + col], sv = s_v[row * CW + col];
+                #pragma unroll
+                for (int k = 0; k < K; k++)
+                  sc[k] += abs(su - wu[col + k]) + abs(sv - wv[col + k]);
+              }
+            }
+          }
+        }
+        if (!run_ok || j != 0)
+          continue;
+        #pragma unroll
+        for (int k = 0; k < K; k++)
+        {
+          const int dx = dx0 + k * step;
+          if (dx > r || (dx == 0 && dy == 0))
+            continue;
+          const int cx = mvx + dx;
+          if (!ok(cx, cy))
+            continue;
+          const int scs = scale_chroma(sc[k], A.chroma_scale);
+          const int lam = lam_of(cx, cy);
+          const long long pl = sl[k] + (((long long)A.pnew * sl[k]) >> 8), pc = scs + (((long long)A.pnew * scs) >> 8);
+          const long long cost = (long long)lam + pl + pc;
+          if (lam < 0 || pl < 0 || pc < 0 || cost > 0x7fffffff)
+          {
+            odd = true;
+            continue;
+          }
+          if (cost >= min_cost)
+            continue;
+          const long long key = (cost << 15) | ring_index(dx, dy);
+          if (key < best)
+          {
+            best = key;
+            best_s = sl[k] + scs;
+          }
+        }
+      }
+    }
+
+    __device__ __noinline__ bool exhaustive_fast(int r, pix *win, int win_cap)
+    {
+      const LevelArgs &A = *a;
+      const int tid = warp * 32 + lane, nt = nwarps * 32;
+      const int mvx = bx, mvy = by;
+      const int lp = A.log_pel, pm = A.pel - 1, nsub = A.pel * A.pel;
+      const bool chr = A.has_chroma && A.cw > 0;
+      // reference area in full-sample coordinates of the sub-planes (luma, chroma)
+      const int lx0 = (x0 * A.pel + mvx - r) >> lp, lx1 = (x0 * A.pel + mvx + r) >> lp;
+      const int ly0 = (y0 * A.pel + mvy - r) >> lp, ly1 = (y0 * A.pel + mvy + r) >> lp;
+      // spare columns: a run of exh_runs reads up to 7 * 2 luma / 7 chroma samples past the last candidate of the square
+      const int WL = (lx1 - lx0 + A.bs_x + EXH_XL + 3) & ~3, HL = ly1 - ly0 + A.bs_y;
+      int cx0 = 0, cy0 = 0, WC = 0, HC = 0;
+      if (chr)
+      {
+        cx0 = (x1 * A.pel + ((mvx - r) >> A.log_x_uv)) >> lp;
+        cy0 = (y1 * A.pel + ((mvy - r) >> A.log_y_uv)) >> lp;
+        WC = (((x1 * A.pel + ((mvx + r) >> A.log_x_uv)) >> lp) - cx0 + A.cw + EXH_XC + 3) & ~3;
+        HC = ((y1 * A.pel + ((mvy + r) >> A.log_y_uv)) >> lp) - cy0 + A.ch;
+      }
+      const int nl = WL * HL, nc = WC * HC;
+      const bool use_win = nsub * (nl + 2 * nc) <= win_cap;
+#ifdef MVC_PHASE_PROF
+      long long et0 = clock64(), et1 = et0, et2 = et0;
+#endif
+      if (use_win)
+      {
+        // clamped copies: samples outside a plane are only used by candidates outside the search range (skipped)
+        // two areas, each a sequence of sub-plane segments of H rows x W samples stored back to back: luma (nsub
+        // segments), then chroma (U then V, nsub segments each). A thread walks its elements e = tid, tid + nt, ...
+        // with a (segments, rows, columns) position advanced by the fixed step nt (no divisions in the loop) and keeps
+        // U loads in flight (each is an L2 round trip).
+        constexpr int U = 8;
+        for (int area = 0; area < (chr ? 2 : 1); area++)
+        {
+          const int W = area ? WC : WL, H = area ? HC : HL, nseg = area ? 2 * nsub : nsub;
+          const int ox = area ? cx0 : lx0, oy = area ? cy0 : ly0;
+          const int tot_a = nseg * H * W;
+          pix *dst = win + (area ? nsub * nl : 0);
+          const int sdx = nt % W, sdy = (nt / W) % H, sds = nt / (W * H); // the step nt as (segments, rows, columns)
+          int x = tid % W, y = (tid / W) % H, sg = tid / (W * H);
+          for (int e0 = tid; e0 < tot_a; e0 += U * nt)
+          {
+            pix v[U];
+            #pragma unroll
+            for (int u = 0; u < U; u++)
+            {
+              if (e0 + u * nt < tot_a)
+              {
+                const int p = area ? 1 + (sg >= nsub ? 1 : 0) : 0, s = sg & (nsub - 1);
+                const int ew = A.ew[p], eh = p ? (A.ext_h >> A.log_y_uv) : A.ext_h;
+                const int gx = min(max(ox + x, 0), ew - 1), gy = min(max(oy + y, 0), eh - 1);
+                v[u] = A.ref[p][s][(size_t)gy * ew + gx];
+              }
+              x += sdx;
+              y += sdy;
+              sg += sds;
+              if (x >= W)
+              {
+                x -= W;
+                y++;
+              }
+              if (y >= H)
+              {
+                y -= H;
+                sg++;
+              }
+            }
+            #pragma unroll
+            for (int u = 0; u < U; u++)
+              if (e0 + u * nt < tot_a)
+                dst[e0 + u * nt] = v[u];
+          }
+        }
+        __syncthreads();
+      }
+#ifdef MVC_PHASE_PROF
+      et1 = clock64();
+#endif
+      const int pl_l = use_win ? WL : A.ew[0];
+      const int pl_c1 = use_win ? WC : A.ew[1], pl_c2 = use_win ? WC : A.ew[2];
+
+      const int n = 4 * r * (r + 1);
+      constexpr int K = 8;
+      long long best = 0x7fffffffffffffffLL;
+      int best_s = 0;
+      bool odd = false;
+      bool runs = false;
+      if (use_win)
+      {
+        const int cwx = chr ? A.cw : 0;
+        __shared__ int s_nr, s_runs[EXH_LIST]; // one list for every geometry (shared variables of a template are per instance)
+#define EXH_RUNS(BX_, CW_) if (A.bs_x == BX_ && cwx == CW_) { exh_runs<BX_, CW_>(r, win, WL, nl, WC, nc, lx0, ly0, cx0, cy0, best, best_s, odd, s_runs, &s_nr); runs = true; }
+        EXH_RUNS(8, 0) else EXH_RUNS(8, 4) else EXH_RUNS(8, 8)
+        else EXH_RUNS(16, 0) else EXH_RUNS(16, 8) else EXH_RUNS(16, 16)
+        else EXH_RUNS(32, 0) else EXH_RUNS(32, 16) else EXH_RUNS(32, 32)
+#undef EXH_RUNS
+      }
+      for (int c0 = 0; !runs && c0 < n; c0 += nt * K)
+      {
+        const pix *rl[K], *ru[K], *rv[K];
+        int cxs[K], cys[K];
+        bool val[K];
+        #pragma unroll
+        for (int k = 0; k < K; k++)
+        {
+          const int c = c0 + tid + k * nt;
+          int cx = mvx, cy = mvy;
+          val[k] = false;
+          if (c < n)
+          {
+            int rr = (int)((1.0f + sqrtf(1.0f + (float)c)) * 0.5f);
+            while (4 * rr * (rr + 1) <= c)
+              rr++;
+            while (rr > 1 && 4 * rr * (rr - 1) > c)
+              rr--;
+            int dx, dy;
+            mvc_refine::expanding_point(rr, c - 4 * rr * (rr - 1), dx, dy);
+            cx = mvx + dx;
+            cy = mvy + dy;
+            val[k] = ok(cx, cy);
+            if (val[k])
+            {
+              // pruning as in exh_runs: lam >= the starting minimum cannot be accepted (lam < 0 stays for the fold)
+              const int dxp = pred_x - cx, dyp = pred_y - cy;
+              const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+              const int lam = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - A.bits);
+              val[k] = lam < min_cost;
+            }
+          }
+          cxs[k] = cx;
+          cys[k] = cy;
+          // an invalid candidate reads from the centre position (always inside the area), its sums are not used
+          if (!val[k])
+          {
+            cx = mvx;
+            cy = mvy;
+          }
+          const int xp = x0 * A.pel + cx, yp = y0 * A.pel + cy;
+          const int sub = (xp & pm) | ((yp & pm) << lp);
+          rl[k] = use_win ? win + sub * nl + ((yp >> lp) - ly0) * WL + ((xp >> lp) - lx0)
+                          : A.ref[0][sub] + (size_t)(yp >> lp) * A.ew[0] + (xp >> lp);
+          ru[k] = rv[k] = nullptr;
+          if (chr)
+          {
+            const int xpc = x1 * A.pel + (cx >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
+            const int subc = (xpc & pm) | ((ypc & pm) << lp);
+            if (use_win)
+            {
+              ru[k] = win + nsub * nl + subc * nc + ((ypc >> lp) - cy0) * WC + ((xpc >> lp) - cx0);
+              rv[k] = ru[k] + nsub * nc;
+            }
+            else
+            {
+              ru[k] = A.ref[1][subc] + (size_t)(ypc >> lp) * A.ew[1] + (xpc >> lp);
+              rv[k] = A.ref[2][subc] + (size_t)(ypc >> lp) * A.ew[2] + (xpc >> lp);
+            }
+          }
+        }
+        int sl[K], sc[K];
+        bool any = false;
+        #pragma unroll
+        for (int k = 0; k < K; k++)
+        {
+          sl[k] = sc[k] = 0;
+          any = any || val[k];
+        }
+        for (int row = 0; any && row < A.bs_y; row++)
+          for (int col = 0; col < A.bs_x; col++)
+          {
+            const int s = s_y[row * A.bs_x + col];
+            #pragma unroll
+            for (int k = 0; k < K; k++)
+              sl[k] += abs(s - (int)rl[k][row * pl_l + col]);
+          }
+        if (chr && any)
+          for (int row = 0; row < A.ch; row++)
+            for (int col = 0; col < A.cw; col++)
+            {
+              const int su = s_u[row * A.cw + col], sv = s_v[row * A.cw + col];
+              #pragma unroll
+              for (int k = 0; k < K; k++)
+                sc[k] += abs(su - (int)ru[k][row * pl_c1 + col]) + abs(sv - (int)rv[k][row * pl_c2 + col]);
+            }
+        #pragma unroll
+        for (int k = 0; k < K; k++)
+        {
+          if (!val[k])
+            continue;
+          const int c = c0 + tid + k * nt;
+          const int scs = scale_chroma(sc[k], A.chroma_scale);
+          const int dxp = pred_x - cxs[k], dyp = pred_y - cys[k];
+          const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+          const int lam = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - A.bits);
+          const long long pl = sl[k] + (((long long)A.pnew * sl[k]) >> 8), pc = scs + (((long long)A.pnew * scs) >> 8);
+          const long long cost = (long long)lam + pl + pc;
+          if (lam < 0 || pl < 0 || pc < 0 || cost > 0x7fffffff)
+          {
+            odd = true;
+            continue;
+          }
+          if (cost >= min_cost)
+            continue;
+          const long long key = (cost << 15) | c;
+          if (key < best)
+          {
+            best = key;
+            best_s = sl[k] + scs;
+          }
+        }
+      }
+#ifdef MVC_PHASE_PROF
+      et2 = clock64();
+#endif
+      // block-wide minimum
+      __shared__ long long s_key[32];
+      __shared__ int s_sad;
+      long long m = best;
+      for (int o = 16; o > 0; o >>= 1)
+      {
+        const long long q = __shfl_xor_sync(0xffffffffu, m, o);
+        m = q < m ? q : m;
+      }
+      if (lane == 0)
+        s_key[warp] = m;
+      if (__syncthreads_or(odd ? 1 : 0))
+        return false;
+      m = s_key[0];
+      for (int w = 1; w < nwarps; w++)
+        m = s_key[w] < m ? s_key[w] : m;
+      if (m != 0x7fffffffffffffffLL && best == m)
+        s_sad = best_s; // the key holds the candidate index: one owner
+      __syncthreads();
+      if (m != 0x7fffffffffffffffLL)
+      {
+        const int c = (int)(m & 0x7fff);
+        int rr = (int)((1.0f + sqrtf(1.0f + (float)c)) * 0.5f);
+        while (4 * rr * (rr + 1) <= c)
+          rr++;
+        while (rr > 1 && 4 * rr * (rr - 1) > c)
+          rr--;
+        int dx, dy;
+        mvc_refine::expanding_point(rr, c - 4 * rr * (rr - 1), dx, dy);
+        bx = mvx + dx;
+        by = mvy + dy;
+        min_cost = (int)(m >> 15);
+        best_sad = s_sad;
+      }
+      __syncthreads(); // s_key / s_sad / the window are free again
+#ifdef MVC_PHASE_PROF
+      if (tid == 0)
+      {
+        const long long et3 = clock64();
+        atomicAdd(&g_exh[0], (unsigned long long)(et1 - et0));
+        atomicAdd(&g_exh[1], (unsigned long long)(et2 - et1));
+        atomicAdd(&g_exh[2], (unsigned long long)(et3 - et2));
+        atomicAdd(&g_exh[3], 1ull);
+      }
+#endif
+      return true;
+    }
+
+    // the refine step: the parallel exhaustive pass where it applies, else the CPU control flow of mvc_refine.
+    // win: start of the window space (aligned up to 16 bytes here; the launch reserves 16 bytes for it)
+    __device__ void refine_any(int type, int radius, pix *win, int win_cap)
+    {
+      win = (pix *)(((size_t)win + 15) & ~(size_t)15);
+      if (type == mvc_refine::S_EXHAUSTIVE && radius > 3 && a->exh_fast && nlambda >= 0 && a->pnew >= 0)
+        if (exhaustive_fast(radius, win, win_cap))
+          return;
+      mvc_refine::refine(*this, type, radius);
+    }
   };
 
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial.
   // Threads per block: with 768 the kernel was capped at 80 registers and the SAD code spilled 2.7 KB per thread, which
   // made the candidate rounds limited by local-memory traffic; 256 compiles without spills (GPU_PIPELINE_PLAN.md
   // section 25, S1: FRC chain -9%).
+  // (a 512-thread variant for the exhaustive_fast levels was measured: no gain, GPU_PIPELINE_PLAN.md section 29)
   constexpr int SEARCH_THREADS = 256;
   __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search(LevelArgs a)
   {
@@ -693,7 +1269,9 @@ namespace
     __shared__ BlockShared b;
     __shared__ LevelArgs s_args; // copy of the kernel argument for the mvc_refine path: taking the address of the by-value argument would make every field access a slow generic load
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
-    if (a.search_type != mvc_refine::S_EXHAUSTIVE && tid == 0)
+    // exhaustive levels with radius <= 3 use the ring fold below, everything else mvc_refine (AnaChecker)
+    const bool ring_fold = a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3 && !a.try_many;
+    if (!ring_fold && tid == 0)
       s_args = a;
     const int slice = blockIdx.x;
 #ifdef MVC_PHASE_PROF
@@ -703,7 +1281,7 @@ namespace
     const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
     const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
     const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
-    const int ring_radius = (a.search_type == mvc_refine::S_EXHAUSTIVE) ? a.radius : 0; // the ring tables are for the exhaustive fold only
+    const int ring_radius = ring_fold ? a.radius : 0; // the ring tables are for the exhaustive fold only
     const int ring_n = 4 * ring_radius * (ring_radius + 1);
     const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
     pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
@@ -914,6 +1492,13 @@ namespace
 
         // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
         int best_x, best_y, best_sad, min_cost;
+        int sl7[7], sc7[7]; // tryMany: the phase A SADs, kept for the refines (their batches overwrite b.sl / b.sc)
+        if (a.try_many)
+          for (int i = 0; i < 7; i++)
+          {
+            sl7[i] = b.sl[i];
+            sc7[i] = b.sc[i];
+          }
         {
           const int sad = b.sl[0] + b.sc[0];
           best_x = 0;
@@ -963,9 +1548,9 @@ namespace
         __syncthreads(); // everybody has read the phase A results before phase B overwrites them
         PH(2);
 
-        if (a.search_type != mvc_refine::S_EXHAUSTIVE)
+        if (!ring_fold)
         {
-          // any other search type: the CPU control flow of PlaneOfBlocks::Refine, run by every thread of the block with
+          // any other search type (or an exhaustive radius above 3): the CPU control flow of PlaneOfBlocks::Refine, run by every thread of the block with
           // identical scalar state; the candidate SADs of each batch are spread over the warps, see mvcuda_refine.cuh
           AnaChecker ck;
           ck.bx = best_x;
@@ -992,7 +1577,87 @@ namespace
           ck.nwarps = nwarps;
           ck.pair = pair_chroma;
           ck.b = &b;
-          mvc_refine::refine(ck, a.search_type, a.radius);
+          if (!a.try_many)
+            ck.refine_any(a.search_type, a.radius, s_dyn + 2 * blk_el, a.win_cap);
+          else
+          {
+            // PseudoEPZSearch with tryMany: a Refine around zero, global, the predictor and each of predictors[0..3],
+            // every one from its own start state, then the lowest saved cost (the first one on ties)
+            const int verybig = 3 * a.bs_x * a.bs_y << a.bits; // PlaneOfBlocks::verybigSAD (integer samples)
+            const Vec pv[4] = { p0, p1, p2, p3 };
+            int mx[7], my[7], ms[7], mc[7];
+            for (int m = 0; m < 7; m++)
+            {
+              if (m == 0)
+              {
+                const int sad = sl7[0] + sc7[0];
+                ck.bx = 0;
+                ck.by = 0;
+                ck.best_sad = sad;
+                ck.min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
+              }
+              else if (m == 1)
+              {
+                // "cost < nMinCost || tryMany": the global vector is taken whatever its cost
+                const int sad = sl7[1] + sc7[1];
+                ck.bx = glob.x;
+                ck.by = glob.y;
+                ck.best_sad = sad;
+                ck.min_cost = sad + (int)(((long long)a.pglobal * sad) >> 8);
+              }
+              else if (m == 2)
+              {
+                const int sad = sl7[2] + sc7[2];
+                ck.bx = pred.x;
+                ck.by = pred.y;
+                ck.best_sad = sad;
+                ck.min_cost = sad;
+              }
+              else
+              {
+                // nMinCost = verybigSAD + 1, then CheckMV0; bestMV stays the previous Refine's result when the
+                // predictor is out of range or not cheaper
+                const int i = m - 3, cx = pv[i].x, cy = pv[i].y;
+                ck.min_cost = verybig + 1;
+                if (ck.ok(cx, cy))
+                {
+                  const int dxp = pred.x - cx, dyp = pred.y - cy;
+                  const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+                  int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+                  if (cost < ck.min_cost)
+                  {
+                    cost += sl7[3 + i];
+                    if (cost < ck.min_cost)
+                    {
+                      cost += sc7[3 + i];
+                      if (cost < ck.min_cost)
+                      {
+                        ck.bx = cx;
+                        ck.by = cy;
+                        ck.best_sad = sl7[3 + i] + sc7[3 + i];
+                        ck.min_cost = cost;
+                      }
+                    }
+                  }
+                }
+              }
+              ck.refine_any(a.search_type, a.radius, s_dyn + 2 * blk_el, a.win_cap);
+              mx[m] = ck.bx;
+              my[m] = ck.by;
+              ms[m] = ck.best_sad;
+              mc[m] = ck.min_cost;
+            }
+            int sel_cost = verybig + 1;
+            for (int m = 0; m < 7; m++)
+              if (mc[m] < sel_cost)
+              {
+                ck.bx = mx[m];
+                ck.by = my[m];
+                ck.best_sad = ms[m];
+                sel_cost = mc[m];
+              }
+            ck.min_cost = sel_cost;
+          }
           best_x = ck.bx;
           best_y = ck.by;
           best_sad = ck.best_sad;
@@ -1870,7 +2535,7 @@ namespace
   __host__ __device__ inline int ring_radius_of(int search_type, int radius)
   {
     if (search_type == mvc_refine::S_EXHAUSTIVE)
-      return radius;
+      return radius <= 3 ? radius : 0; // larger radii: mvc_refine (batches of MAX_BATCH; the ring tables hold 48)
     if (search_type == mvc_refine::S_HEX2 && radius <= 1)
       return 1;
     return 0;
@@ -2521,7 +3186,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // meander=false: wavefront kernel = CPU result with meander=false, mt=false (slice_threads is ignored); meander=true:
   // slice kernel = CPU result with slice_threads threads. MVCUDA_WAVE=0 forces the slice kernel (comparisons only).
   static const bool wave_allowed = [] { const char *e = getenv("MVCUDA_WAVE"); return !(e && e[0] == '0'); }();
-  const bool wave = !ap->meander && wave_allowed;
+  // trymany: k_search only (with meander=false in one slice, the single-slice CPU result the wavefront kernel gives too)
+  const bool wave = !ap->meander && wave_allowed && !ap->try_many;
   int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
   for (int l = 0; l < nl; l++)
   {
@@ -2665,7 +3331,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       {
         const mvc::DevPlane &dr = s_ref->pl[l * 3 + p];
         a.src[p] = (const pix *)s_src->pl[l * 3 + p].sub[0];
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < MVCUDA_MAX_SUB; i++)
           a.ref[p][i] = (const pix *)dr.sub[i];
         a.ew[p] = dr.d.ew;
         a.hpad[p] = dr.d.hpad;
@@ -2681,7 +3347,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         for (int p = 0; p < (a.has_chroma ? 3 : 1) && pk; p++)
         {
           pk = a.ew[p] % 4 == 0;
-          for (int i = 0; i < 4; i++)
+          for (int i = 0; i < MVCUDA_MAX_SUB; i++)
             pk = pk && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
         }
         a.packed = pk ? 1 : 0;
@@ -2691,7 +3357,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         for (int p = 0; p < (a.has_chroma ? 3 : 1) && pks; p++)
         {
           pks = a.ew[p] % 4 == 0;
-          for (int i = 0; i < 4; i++)
+          for (int i = 0; i < MVCUDA_MAX_SUB; i++)
             pks = pks && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
         }
         a.packed_s = pks ? 1 : 0;
@@ -2711,13 +3377,14 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       a.bits = sp->bits_per_pixel;
       a.chroma_scale = ap->chroma_sad_scale;
       a.radius = (l == 0) ? ap->pel_search : ap->search_param;
+      a.try_many = (ap->try_many && l > 0) ? 1 : 0; // GroupOfPlanes::SearchMVs: never at the finest level
       a.meander = ap->meander;
       a.use_global = ap->use_global;
       a.bad_sad = ap->bad_sad;
       a.glob = wave ? d_glob + 2 * l : d_glob;
       a.vec = d_pay + offs[l];
       a.bad_flag = d_bad;
-      int slices = ap->slice_threads;
+      int slices = ap->meander ? ap->slice_threads : 1; // meander=false: the single-slice result, as the wavefront kernel
       if (slices > 64)
         slices = 64;
       if (slices > a.n_blk_y / 4)
@@ -2743,7 +3410,34 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       else
         AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
       {
-        const size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
+        size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
+        // exhaustive radius > 3: room for the reference window of AnaChecker::exhaustive_fast when it fits the device
+        static const bool exh_allowed = [] { const char *e = getenv("MVCUDA_EXH_FAST"); return !(e && e[0] == '0'); }();
+        a.exh_fast = (exh_allowed && a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius > 3) ? 1 : 0;
+        a.win_cap = 0;
+        if (a.exh_fast)
+        {
+          static const int smem_max = [] {
+            int dev = 0, v = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            cudaFuncAttributes fa = {};
+            cudaFuncGetAttributes(&fa, k_search);
+            const int dyn = v - (int)fa.sharedSizeBytes - 256;
+            cudaFuncSetAttribute(k_search, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+            return dyn;
+          }();
+          const int r = a.radius, nsub = a.pel * a.pel;
+          const size_t wl = (size_t)(((2 * r) >> a.log_pel) + 2 + a.bs_x + EXH_XL + 4) * (((2 * r) >> a.log_pel) + 2 + a.bs_y);
+          const size_t wc = a.has_chroma ? (size_t)(((((2 * r) >> a.log_x_uv) + 2) >> a.log_pel) + 2 + a.cw + EXH_XC + 4)
+            * (((((2 * r) >> a.log_y_uv) + 2) >> a.log_pel) + 2 + a.ch) : 0;
+          const size_t need = (size_t)nsub * (wl + 2 * wc) * sizeof(pix);
+          if (shm + need + 16 <= (size_t)smem_max)
+          {
+            a.win_cap = (int)(need / sizeof(pix));
+            shm += need + 16; // 16: alignment of the window (AnaChecker::refine_any)
+          }
+        }
         k_search<<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
       }
       AN_CHECK(cudaGetLastError());
@@ -2851,6 +3545,15 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     {
       unsigned long long h[16][8];
       cudaMemcpyFromSymbol(h, g_prof, sizeof(h));
+      {
+        unsigned long long e[6] = {};
+        cudaMemcpyFromSymbol(e, g_exh, sizeof(e));
+        if (e[3] && e[4])
+          std::fprintf(stderr, "exh runs per call %.1f, live after pruning %.1f\n", (double)e[4] / e[3], (double)e[5] / e[3]);
+        if (e[3])
+          std::fprintf(stderr, "exhaustive_fast cycles/call: window %.0f  eval %.0f  reduce %.0f  (n=%llu)\n",
+            (double)e[0] / e[3], (double)e[1] / e[3], (double)e[2] / e[3], e[3]);
+      }
       for (int k = 0; k < 16; k++)
         if (h[k][5])
           std::fprintf(stderr, "phase cycles/block, blocks-per-row 2^%d: wait+pred %.0f  A %.0f  foldA %.0f  B %.0f  foldB %.0f  (n=%llu)\n", k,

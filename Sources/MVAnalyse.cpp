@@ -436,9 +436,9 @@ MVAnalyse::MVAnalyse(
       && ((params.param >> 3) & 3) == 2 /* sharp */ && !(params.param & 0x20) /* no pelclip */;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
-      && !divideExtra && !_dctmode && !temporal_flag && !_tryMany && !multi_flag
+      && !divideExtra && !_dctmode && !temporal_flag && !multi_flag
       && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount)
-      && (nSuperPel == 1 || nSuperPel == 2) && analysisData.nBlkSizeX <= 32
+      && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && analysisData.nBlkSizeX <= 32
       && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)))
       && lstrlen(_outfilename) == 0 && analysisData.nLvCount <= 12;
     if (GpuBackend::log_enabled())
@@ -817,6 +817,7 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   ap.meander = meander ? 1 : 0;
   ap.bad_sad = (int)badSAD;
   ap.bad_range = badrange;
+  ap.try_many = tryMany ? 1 : 0;
   ap.search_param = nSearchParam;
   ap.pel_search = nPelSearch;
   ap.chroma_sad_scale = _gpu_effective_chroma_scale;

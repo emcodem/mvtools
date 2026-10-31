@@ -185,9 +185,11 @@ public:
     if (!known || p_fine < 1 || p_coarse < 1)
       return false;
     const bool horv = type == 64 || type == 128;
-    if (p_fine > (type == 8 ? 3 : 24))
+    // the coarse levels search exhaustively (GroupOfPlanes::SearchMVs), except for the horizontal / vertical types;
+    // exhaustive radii up to 64 (mvc_refine::max_param), every other type up to 24
+    if (p_fine > (type == 8 ? 64 : 24))
       return false;
-    if (n_levels > 1 && p_coarse > (horv ? 24 : 3))
+    if (n_levels > 1 && p_coarse > (horv ? 24 : 64))
       return false;
     return true;
   }

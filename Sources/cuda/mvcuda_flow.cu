@@ -228,8 +228,8 @@ namespace
     int w[3], h[3];          // plane sizes
     int hp[3], vp[3];        // padding of the super planes (samples)
     int ew[3];               // extended width of the super planes
-    const pix *left[3][4];   // sub-planes of the left frame (prefF)
-    const pix *right[3][4];  // sub-planes of the right frame (prefB)
+    const pix *left[3][MVCUDA_MAX_SUB];   // sub-planes of the left frame (prefF)
+    const pix *right[3][MVCUDA_MAX_SUB];  // sub-planes of the right frame (prefB)
     const short *svx[2][4], *svy[2][4];   // [kind][B, F, BB, FF]
     const unsigned char *smask[2];        // [B, F]
     UpGeo geo[2];
@@ -238,7 +238,7 @@ namespace
     pix *dst[3];
   };
 
-  __device__ __forceinline__ int fetch(const pix *const sub[4], int ew, int pel_mask, int lp, int xa, int ya)
+  __device__ __forceinline__ int fetch(const pix *const sub[MVCUDA_MAX_SUB], int ew, int pel_mask, int lp, int xa, int ya)
   {
     const int idx = (xa & pel_mask) | ((ya & pel_mask) << lp);
     return sub[idx][(size_t)(ya >> lp) * ew + (xa >> lp)];
@@ -354,7 +354,7 @@ static int flow_dev(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, con
   if (!sp || !fp || !fl || !fr || !vec_b || !vec_f || !vec_bb || !vec_ff || (!out && !host_dst))
     return -4;
   if (fp->mode != 2 || sp->levels != 1 || !sp->chroma || fp->time256 < 1 || fp->time256 > 255 || fp->width != sp->width
-    || fp->height != sp->height || (sp->pel != 1 && sp->pel != 2))
+    || fp->height != sp->height || (sp->pel != 1 && sp->pel != 2 && sp->pel != 4))
     return -4;
   if (!mvc::super_fits(*fl, *sp, (int)sizeof(pix)) || !mvc::super_fits(*fr, *sp, (int)sizeof(pix)))
     return -4;
@@ -467,7 +467,7 @@ static int flow_dev(const MvCudaSuperParams *sp, const MvCudaFlowParams *fp, con
       fa.hp[p] = dl.d.hpad;
       fa.vp[p] = dl.d.vpad;
       fa.ew[p] = dl.d.ew;
-      for (int i = 0; i < 4; i++)
+      for (int i = 0; i < MVCUDA_MAX_SUB; i++)
       {
         fa.left[p][i] = (const pix *)dl.sub[i];
         fa.right[p][i] = (const pix *)dr.sub[i];
