@@ -38,3 +38,10 @@ def load_mvtools(plugin_dir=None):
     d = plugin_dir or os.environ['MVPF_PLUGIN_DIR']
     if not hasattr(core, 'mvpf'):
         core.std.LoadPlugin(os.path.join(d, 'libmvtools2.so'))
+
+
+def load_cudafilters(plugin_dir=None):
+    """Loads libcudafilters.so (namespace cuda) from plugin_dir or $MVPF_PLUGIN_DIR."""
+    d = plugin_dir or os.environ['MVPF_PLUGIN_DIR']
+    if not hasattr(core, 'cuda'):
+        core.std.LoadPlugin(os.path.join(d, 'libcudafilters.so'))

@@ -164,7 +164,12 @@ it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOUR
   another VapourSynth filter (e.g. `std.Trim`) is not recognised.
 * Output is bit-identical with AviSynth+ on the same system (17 CPU and 7 GPU test chains, `vsbridge/test/compare.py`).
   `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
-  it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan, cudafilters (planned as namespace
-  `cuda`).
+  it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan.
+* cudafilters (in progress): namespace `cuda` (`core.cuda.CudaUpload`, ...), `libcudafilters.so` next to the bridge.
+  Tested: CudaUpload / CudaDownload, CudaMerge / MergeLuma / MergeChroma, and mvtools2 `gpu=true` chains on token frames,
+  bit-identical with AviSynth+. A cudafilter's CPU fallback (AviSynth core filters such as `Merge`) does not exist under
+  VapourSynth; it runs only when the GPU is unusable or fails for a frame. `MVBRIDGE_FALLBACK=strict` (default) makes such
+  a frame an error, so the output is AviSynth+'s or an error; `MVBRIDGE_FALLBACK=nearest` uses the closest VapourSynth
+  filter (`std.Merge`), which is not bit-identical. Other cudafilters are not available under VapourSynth yet.
 * Debugging: `MVBRIDGE_DEBUG=1` prints frame-request misses, instance counts and a backtrace on a crash;
   `MVBRIDGE_SERIAL=MAnalyse,MFlowFps` (or `all`) runs the named filters single-threaded.

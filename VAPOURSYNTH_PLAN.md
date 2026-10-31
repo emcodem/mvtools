@@ -147,10 +147,8 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
 
 1. **`Invoke`.** Done for mvtools2: `InternalCache` (MFlowBlur / MFlowFps / MFlowInter) is a pass-through; `Invoke`
    of a function registered through the bridge calls it directly (positional and named arguments). `MSuper` /
-   `MAnalyse` from CudaNVOFAnalyse will go that way. The CPU fallbacks of cudafilters (`Bob`,
-   `TemporalSoften`, `RemoveGrain`, `mt_lutxy`, `nnedi3`, `QTGMC_KeepOnlyBobShimmerFixes`) map to VS equivalents where
-   one exists (`std.*`, `rgvs.RemoveGrain`, `znedi3` / `nnedi3`, `std.Expr` for the LUT) and otherwise throw a clear
-   error at creation; the GPU path does not need them.
+   `MAnalyse` from CudaNVOFAnalyse will go that way. The CPU fallbacks of cudafilters: stand-ins (findings of step 4);
+   so far `Merge` / `MergeLuma` / `MergeChroma`, the others follow (VapourSynth todo list).
 2. **Threading / MT modes.** Done: `MT_NICE_FILTER` → `fmParallel` with one instance; `MT_MULTI_INSTANCE` (almost
    every mvtools filter) → `fmParallel` with an instance pool: an idle instance per call, a new one created on demand
    (one at a time per filter), as AviSynth+ creates one per prefetch thread; `MT_SERIALIZED` (MAnalyse with
@@ -226,6 +224,51 @@ the stored AviSynth+ reference `lin_gpu.md5`. Without `libmvtools_cuda.so` and w
 CPU fallback and stay identical (`lin_gpu` = `lin_cpu.md5`). python and vspipe exit cleanly (rc 0, no hang). The 17 CPU
 chains still identical, 3 rounds.
 
+## Findings of step 4 (cudafilters, in progress, 2026-10-31)
+
+- **Entry point.** `cudafilters/VapourSynthEntry.cpp` (namespace `cuda`), a copy of mvtools2's: loads the bridge from its
+  own folder, empty namespace plus the reason on stderr when it is missing. CMake picks it up by glob, the export map
+  already lists `VapourSynthPluginInit2`.
+- **Every cudafilter builds its CPU fallback in the constructor**, also when the GPU will compute every frame:
+  `_cpu = env->Invoke("Merge", ...)` (`CudaMerge.cpp:43`, likewise Bob, TemporalSoften, Gauss/BilinearResize,
+  RemoveGrain, nnedi3, mt_logic / mt_clamp / mt_expand / mt_inpand, QTGMC_KeepOnlyBobShimmerFixes) and takes `vi` from
+  it. Fallback frames are pulled only when the GPU is unusable (library / device missing, format not covered) or fails
+  for one frame (`make() != 0`: device allocation failed after freeing the pools, kernel error). An evicted token is
+  not such a failure: the consumer has its producer make it again. Under VS these AviSynth core / plugin filters do not
+  exist, so a missing `Invoke` target would also break the GPU path.
+- **Stand-ins** (`vsbridge/bridge.cpp`, `StandInClip`): `Invoke` of such a name returns a clip with the VideoInfo the
+  AviSynth+ filter reports (Merge*: the first clip's). On the GPU path it is never asked for a frame, so the output stays
+  bit-identical. A fallback frame depends on the global switch `MVBRIDGE_FALLBACK` (read when the stand-in is created):
+  `strict` (default) gives an error naming the filter and the causes (VS output = AviSynth+ output or an error, never
+  different); `nearest` builds the closest VS filter on the stand-in's inputs (Merge*: `std.Merge` with per-plane
+  weights), writes one line per stand-in to stderr at its first frame, and is not bit-identical in general. Names without
+  a nearest mapping stay an error in both modes. For `nearest` the bridge turns AviSynth clips back into VS nodes
+  (`clip_node`: one instance, no declared inputs, its fetches take the synchronous path).
+- **Lookup tables from masktools.** CudaKobs, CudaLutxy and CudaQtgmcSharpLimit read their device tables from a real
+  `mt_lutxy` frame at creation (`lut_from_cpu`, `CudaKobs.cpp:103`), so a stand-in cannot help there: whatever builds
+  that table under VS decides the GPU output. Open (todo list). Linux AviSynth+ has no masktools either.
+
+Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, RTX 5090): `compare.py cf`, 7 chains (CudaUpload / CudaDownload round
+trip; CudaMerge 0.3, 0.5, CudaMergeLuma 0.7, CudaMergeChroma 0.6 on three formats; CudaUpload -> MSuper / MAnalyse /
+MDegrain2 `gpu=true` -> CudaDownload; MFlowFps `gpu=true` on tokens merged with a CPU MFlowFps clip) identical in both
+hosts at 24 and 1 VS threads, with `MVCUDA_CACHE_MB=16` and `=1` (cf_merge at 1 MB: 160 evictions, 41 regenerations,
+nested through CudaMerge to CudaUpload; no fallback frame, the strict stand-in would have failed), and with
+`MVBRIDGE_FALLBACK=nearest` (no nearest frame used). Without `libmvtools_cuda.so` or with a truncated one: AviSynth+
+runs its CPU Merge; VS strict stops with the error; VS nearest runs (cf_merge 0.3 and cf_mergeluma 0.7 differ from
+AviSynth+ in every frame, 0.5, MergeChroma 0.6 and the 10-bit 0.4 merge happened to match; not measured further, todo);
+python and vspipe exit cleanly. `compare.py cpu` (17) and `gpu` (7) still identical after the `create_filter` refactor.
+
+## VapourSynth todo list
+
+- Measure `MVBRIDGE_FALLBACK=nearest` per mapping against AviSynth+ (runs without `libmvtools_cuda.so` send every frame
+  through the fallback): differing frames, share of differing pixels, largest difference; document per filter.
+- Stand-ins for the other fallback names (Bob, TemporalSoften, Gauss/BilinearResize, RemoveGrain, nnedi3, mt_logic /
+  mt_clamp / mt_expand / mt_inpand, QTGMC_KeepOnlyBobShimmerFixes, CudaQtgmc* chains): VideoInfo rule each, nearest
+  mapping where one exists (std.AverageFrames, resize.*, rgvs / zsmooth, znedi3, std.Maximum / Minimum / Expr).
+- masktools tables (CudaKobs, CudaLutxy, CudaQtgmcSharpLimit): error under VS, or a port of masktools' table builder
+  (RPN with scalef / range_half / use_expr) checked against masktools on Windows.
+- CudaNVOFAnalyse through the bridge (Invoke of MSuper / MAnalyse), planar RGB test.
+
 ## Files
 
 `vsbridge/` (decision 5: `avs_interface.cpp` and `avs_cpuid.cpp` from AviSynth+, `bridge.cpp`, `bridge_core.h`,
@@ -244,7 +287,8 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
 3. ~~MDegrain1..N, MRecalculate, MFlowFps / MFlowInter / MBlockFps (temporal requests), then the rest of
    `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path; GPU path (`gpu=true`) done 2026-10-31 (findings above).
    Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
-4. cudafilters through the same shim; CudaNVOFAnalyse.
+4. cudafilters through the same shim; CudaNVOFAnalyse. In progress: entry point, token frames end to end, Merge*
+   stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31 (findings above); the rest is on the todo list.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.
 

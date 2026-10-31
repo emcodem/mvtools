@@ -1256,6 +1256,197 @@ AVSValue call_function(const FuncDef &def, const AVSValue &args, const char *con
   return def.apply(AVSValue(out.data(), (int)out.size()), def.user_data, &g_env);
 }
 
+// AviSynth core filters that cudafilters Invoke as their CPU fallback. Each cudafilter builds its fallback in the
+// constructor (and takes its VideoInfo from it) even when the GPU computes every frame; it pulls fallback frames only
+// when the GPU is unusable (library or device missing, format not covered) or fails for a frame (device allocation
+// failed, kernel error). A stand-in has the VideoInfo the AviSynth+ filter would report, so the GPU path runs and stays
+// bit-identical. What a fallback frame is, is a global choice (VAPOURSYNTH_PLAN.md, step 4):
+//   MVBRIDGE_FALLBACK=strict   (default) an error naming the missing filter: VS output is AviSynth+'s or an error
+//   MVBRIDGE_FALLBACK=nearest  the closest VapourSynth filter (std.Merge, ...): not bit-identical to AviSynth+; names
+//                              without a mapping stay an error
+// Read when the stand-in is created, so a script can set it (os.environ) before creating the filters.
+enum class FallbackMode
+{
+  strict,
+  nearest
+};
+
+FallbackMode fallback_mode()
+{
+  const char *v = std::getenv("MVBRIDGE_FALLBACK");
+  if (v && !strcmp(lower(v).c_str(), "nearest"))
+    return FallbackMode::nearest;
+  if (v && *v && strcmp(lower(v).c_str(), "strict"))
+  {
+    static std::once_flag warned;
+    std::call_once(warned, [v] {
+      fprintf(stderr, "mvtools_vsbridge: MVBRIDGE_FALLBACK=%s not known (strict or nearest), using strict\n", v);
+    });
+  }
+  return FallbackMode::strict;
+}
+
+// a VS node computing the AviSynth clip c (defined after create_filter)
+VSNode *clip_node(const PClip &c, const std::string &name, VSCore *core, std::string &err);
+// the VideoInfo of a node the bridge did not create; acquire_vsclip takes the node
+VSClip *node_clip(VSNode *node, std::string &err)
+{
+  VideoInfo vi;
+  if (!registry_get(node, vi) && !avs_video_info(*g_vsapi->getVideoInfo(node), vi, err))
+  {
+    g_vsapi->freeNode(node);
+    return nullptr;
+  }
+  return acquire_vsclip(node, vi);
+}
+
+class StandInClip : public IClip
+{
+  std::string name, nearest_name; // nearest_name: the VS filter behind `nearest`, "" when strict / no mapping
+  PClip child, nearest;           // nearest: that filter's node as a clip (a shared VSClip, released at the end)
+  VideoInfo vi;
+  bool has_mapping;
+  std::once_flag logged;
+
+public:
+  StandInClip(const std::string &n, const PClip &c, const VideoInfo &v, bool mapping)
+      : name(n), child(c), vi(v), has_mapping(mapping)
+  {
+  }
+  ~StandInClip() override
+  {
+    if (nearest)
+      release_vsclip(static_cast<VSClip *>(nearest.operator->()));
+  }
+  void set_nearest(VSClip *c, const std::string &vs_name)
+  {
+    nearest = c;
+    nearest_name = vs_name;
+  }
+  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override
+  {
+    if (nearest)
+    {
+      std::call_once(logged, [&] {
+        fprintf(stderr, "mvtools_vsbridge: %s (CPU fallback of a cudafilters filter) from %s, first at frame %d: not "
+                        "bit-identical to AviSynth+ (MVBRIDGE_FALLBACK=nearest)\n",
+                name.c_str(), nearest_name.c_str(), n);
+      });
+      return nearest->GetFrame(n, env);
+    }
+    env->ThrowError("%s (CPU fallback of a cudafilters filter) is not available under VapourSynth; frame %d needed "
+                    "it (GPU library missing, format not supported on the GPU, or the GPU failed for this frame; "
+                    "MVTOOLS_GPU_LOG=1 tells which).%s",
+                    name.c_str(), n,
+                    has_mapping ? " MVBRIDGE_FALLBACK=nearest uses the closest VapourSynth filter instead (not "
+                                  "bit-identical to AviSynth+)."
+                                : "");
+    return PVideoFrame();
+  }
+  bool __stdcall GetParity(int n) override { return child->GetParity(n); }
+  void __stdcall GetAudio(void *, int64_t, int64_t, IScriptEnvironment *) override {}
+  int __stdcall SetCacheHints(int cachehints, int) override
+  {
+    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
+  }
+  const VideoInfo &__stdcall GetVideoInfo() override { return vi; }
+};
+
+// Invoke arguments by AviSynth parameter position: positional values first, then named ones at the position of their
+// name in `params` (lower case); undefined where not given
+std::vector<AVSValue> invoke_args(const AVSValue &args, const char *const *arg_names,
+                                  const std::vector<std::string> &params)
+{
+  std::vector<AVSValue> out(params.size());
+  const int n_in = args.IsArray() ? args.ArraySize() : 1;
+  size_t pos = 0;
+  for (int i = 0; i < n_in; ++i)
+  {
+    const AVSValue &v = args.IsArray() ? args[i] : args;
+    const char *nm = arg_names ? arg_names[i] : nullptr;
+    if (nm)
+    {
+      const auto it = std::find(params.begin(), params.end(), lower(nm));
+      if (it != params.end())
+        out[(size_t)(it - params.begin())] = v;
+    }
+    else if (pos < params.size())
+      out[pos++] = v;
+  }
+  return out;
+}
+
+// nearest for Merge / MergeLuma / MergeChroma: std.Merge with per-plane weights (AviSynth+: Merge weights all planes,
+// MergeLuma only Y, MergeChroma only U and V; default weight 0.5 / 1.0 / 1.0)
+bool nearest_merge(const std::string &l, const PClip &a, const PClip &b, const AVSValue &weight, StandInClip &s,
+                   std::string &err)
+{
+  VSCore *core = current_core();
+  if (!core)
+  {
+    err = "no VapourSynth core";
+    return false;
+  }
+  const double w = weight.Defined() ? weight.AsFloat() : (l == "merge" ? 0.5 : 1.0);
+  VSNode *na = clip_node(a, "MergeFallbackInput", core, err);
+  if (!na)
+    return false;
+  VSNode *nb = clip_node(b, "MergeFallbackInput", core, err);
+  if (!nb)
+  {
+    g_vsapi->freeNode(na);
+    return false;
+  }
+  VSMap *in = g_vsapi->createMap();
+  g_vsapi->mapConsumeNode(in, "clipa", na, maAppend);
+  g_vsapi->mapConsumeNode(in, "clipb", nb, maAppend);
+  const bool gray = a->GetVideoInfo().NumComponents() == 1;
+  if (l == "merge" || gray)
+    g_vsapi->mapSetFloat(in, "weight", l == "mergechroma" ? 0.0 : w, maAppend);
+  else
+  {
+    g_vsapi->mapSetFloat(in, "weight", l == "mergeluma" ? w : 0.0, maAppend);
+    g_vsapi->mapSetFloat(in, "weight", l == "mergeluma" ? 0.0 : w, maAppend);
+  }
+  VSMap *out = g_vsapi->invoke(g_vsapi->getPluginByID("com.vapoursynth.std", core), "Merge", in);
+  g_vsapi->freeMap(in);
+  if (const char *e = g_vsapi->mapGetError(out))
+  {
+    err = std::string("std.Merge: ") + e;
+    g_vsapi->freeMap(out);
+    return false;
+  }
+  VSNode *node = g_vsapi->mapGetNode(out, "clip", 0, nullptr);
+  g_vsapi->freeMap(out);
+  VSClip *c = node_clip(node, err);
+  if (!c)
+    return false;
+  s.set_nearest(c, "std.Merge");
+  return true;
+}
+
+// the stand-in for name, or null when name has none; args / arg_names as given to Invoke
+PClip stand_in(const std::string &l, const char *name, const AVSValue &args, const char *const *arg_names)
+{
+  if (l == "merge" || l == "mergeluma" || l == "mergechroma")
+  {
+    const std::vector<AVSValue> a = invoke_args(args, arg_names, {"clip", "clip2", "weight"});
+    if (!a[0].IsClip() || !a[1].IsClip())
+      return PClip();
+    PClip c = a[0].AsClip();
+    StandInClip *s = new StandInClip(name, c, c->GetVideoInfo(), true); // AviSynth+ Merge*: the first clip's VideoInfo
+    PClip keep(s);
+    if (fallback_mode() == FallbackMode::nearest)
+    {
+      std::string err;
+      if (!nearest_merge(l, c, a[1].AsClip(), a[2], *s, err))
+        g_env.ThrowError("%s: MVBRIDGE_FALLBACK=nearest: %s", name, err.c_str());
+    }
+    return keep;
+  }
+  return PClip();
+}
+
 AVSValue __stdcall BridgeEnv::Invoke(const char *name, const AVSValue args, const char *const *arg_names)
 {
   const std::string l = lower(name);
@@ -1263,7 +1454,11 @@ AVSValue __stdcall BridgeEnv::Invoke(const char *name, const AVSValue args, cons
     return args.IsArray() ? args[0] : args;
   const FuncDef *def = find_func(name);
   if (!def)
+  {
+    if (PClip s = stand_in(l, name, args, arg_names))
+      return s;
     throw NotFound();
+  }
   return call_function(*def, args, arg_names);
 }
 
@@ -1496,6 +1691,34 @@ bool vs_arg(const VSMap *in, const ArgDef &a, VSCore *core, std::vector<VSClip *
   return true;
 }
 
+// the output side of a filter: AviSynth and VS VideoInfo, plane geometry, frame count
+bool set_output_info(BridgeFilter &f, const VideoInfo &vi, VSCore *core, std::string &why)
+{
+  f.avs_vi = vi;
+  f.geo = geometry(f.avs_vi);
+  VSVideoInfo &v = f.vs_vi;
+  memset(&v, 0, sizeof(v));
+  if (!vs_format(f.avs_vi, core, v.format, v.width, v.height, why))
+    return false;
+  v.numFrames = f.avs_vi.num_frames;
+  v.fpsNum = f.avs_vi.fps_numerator;
+  v.fpsDen = f.avs_vi.fps_denominator;
+  if (v.fpsNum && v.fpsDen)
+  {
+    int64_t x = v.fpsNum, y = v.fpsDen;
+    while (y)
+    {
+      const int64_t t = x % y;
+      x = y;
+      y = t;
+    }
+    v.fpsNum /= x;
+    v.fpsDen /= x;
+  }
+  f.out_frames = f.avs_vi.num_frames;
+  return true;
+}
+
 void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *core, const VSAPI *vsapi)
 {
   g_vsapi = vsapi;
@@ -1573,34 +1796,14 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
   f->name = def.name;
   f->def = &def;
   f->args = args;
-  f->avs_vi = clip->GetVideoInfo();
-  f->geo = geometry(f->avs_vi);
   {
-    VSVideoInfo &v = f->vs_vi;
-    memset(&v, 0, sizeof(v));
     std::string why;
-    if (!vs_format(f->avs_vi, core, v.format, v.width, v.height, why))
+    if (!set_output_info(*f, clip->GetVideoInfo(), core, why))
     {
       vsapi->mapSetError(out, (def.name + ": " + why).c_str());
       return;
     }
-    v.numFrames = f->avs_vi.num_frames;
-    v.fpsNum = f->avs_vi.fps_numerator;
-    v.fpsDen = f->avs_vi.fps_denominator;
-    if (v.fpsNum && v.fpsDen)
-    {
-      int64_t x = v.fpsNum, y = v.fpsDen;
-      while (y)
-      {
-        const int64_t t = x % y;
-        x = y;
-        y = t;
-      }
-      v.fpsNum /= x;
-      v.fpsDen /= x;
-    }
   }
-  f->out_frames = f->avs_vi.num_frames;
   f->mtmode = clip->SetCacheHints(CACHE_GET_MTMODE, 0);
   // debugging: MVBRIDGE_SERIAL=MAnalyse,MFlowInter runs the named functions as one serialised instance
   if (const char *serial = std::getenv("MVBRIDGE_SERIAL"))
@@ -1652,6 +1855,38 @@ void VS_CC create_filter(const VSMap *in, VSMap *out, void *user_data, VSCore *c
     g_registry[node] = fp->avs_vi;
   }
   vsapi->mapConsumeNode(out, "clip", node, maAppend);
+}
+
+// A VS node computing an AviSynth clip that the bridge did not get from a registered function (the inputs of a nearest
+// fallback, e.g. cudafilters' CudaDownload in front of a VS node): one instance (no function to create more), no
+// declared inputs (its fetches take the synchronous path; a fallback only).
+VSNode *clip_node(const PClip &c, const std::string &name, VSCore *core, std::string &err)
+{
+  if (is_vsclip(c.operator->()))
+    return g_vsapi->addNodeRef(static_cast<VSClip *>(c.operator->())->node);
+  std::unique_ptr<BridgeFilter> f(new BridgeFilter);
+  f->name = name;
+  if (!set_output_info(*f, c->GetVideoInfo(), core, err))
+    return nullptr;
+  const int hint = c->SetCacheHints(CACHE_GET_MTMODE, 0);
+  f->mtmode = hint == MT_NICE_FILTER ? MT_NICE_FILTER : MT_SERIALIZED;
+  f->all.push_back(c);
+  BridgeFilter *fp = f.get();
+  VSNode *node = g_vsapi->createVideoFilter2(name.c_str(), &fp->vs_vi, filter_get_frame, filter_free,
+                                             fp->mtmode == MT_NICE_FILTER ? fmParallel : fmParallelRequests, nullptr,
+                                             0, fp, core);
+  if (!node)
+  {
+    err = "VapourSynth refused the clip";
+    return nullptr;
+  }
+  f.release(); // owned by VS now (filter_free)
+  fp->self = node;
+  {
+    std::lock_guard<std::mutex> l(g_registry_mutex);
+    g_registry[node] = fp->avs_vi;
+  }
+  return node;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

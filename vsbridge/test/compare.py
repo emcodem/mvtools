@@ -2,7 +2,7 @@
 raw input with the same libmvtools2.so; the framemd5 of both must be identical (VAPOURSYNTH_PLAN.md, verification).
 
 usage: python compare.py [chain ...]      (inside the Linux test setup; inputs from gen_inputs.py)
-       python compare.py cpu | gpu        (the CPU chains / the gpu_* chains; default: all)
+       python compare.py cpu | gpu | cf   (the CPU chains / the gpu_* chains / the cudafilters chains; default: cpu gpu)
 env:   MVPF_PLUGIN_DIR  folder with libmvtools2.so and libmvtools_vsbridge.so (+ libmvtools_cuda.so for the GPU chains;
                         without it the gpu_* chains run the CPU fallback in both hosts and must still match)
        AVSMD5           avsmd5 binary (default ~/opt/bin/avsmd5)
@@ -131,6 +131,45 @@ CPU_NAMES = list(CHAINS)
 for _name, (_src, _body) in GPU_CHAINS.items():
     CHAINS[_name] = (_src, _body, None if _body is None else vs_body(_body))
 
+# cudafilters chains (libcudafilters.so next to libmvtools2.so; namespace cuda as `cf`): token frames from CudaUpload
+# through GPU filters to CudaDownload. Under VapourSynth the CPU fallbacks that are AviSynth core filters are strict
+# stand-ins (the GPU path must run; a fallback frame is an error), so without libmvtools_cuda.so these chains fail under VS.
+# Bodies in AviSynth form; Cuda* -> cf.Cuda*, M* -> mv.M*, REV(x) -> Reverse(x) / core.std.Reverse(x).
+CF_CHAINS = {
+    'cf_roundtrip': ('uhd422p10', 'out = CudaDownload(CudaUpload(c))\n'),
+    'cf_merge': ('hd420p8', 'out = CudaDownload(CudaMerge(CudaUpload(c), CudaUpload(REV(c)), weight=0.3))\n'),
+    'cf_merge_avg': ('hd444p10', 'out = CudaDownload(CudaMerge(CudaUpload(c), CudaUpload(REV(c))))\n'),
+    'cf_mergeluma': ('uhd422p10', 'out = CudaDownload(CudaMergeLuma(CudaUpload(c), CudaUpload(REV(c)), weight=0.7))\n'),
+    'cf_mergechroma': ('hd420p8', 'out = CudaDownload(CudaMergeChroma(CudaUpload(c), CudaUpload(REV(c)), weight=0.6))\n'),
+    'cf_degrain2': ('hd420p8',
+                    'u = CudaUpload(c)\n'
+                    'sup = MSuper(u, pel=2, gpu=true)\n'
+                    'bv1 = MAnalyse(sup, isb=true, delta=1, blksize=16, overlap=8, gpu=true)\n'
+                    'fv1 = MAnalyse(sup, isb=false, delta=1, blksize=16, overlap=8, gpu=true)\n'
+                    'bv2 = MAnalyse(sup, isb=true, delta=2, blksize=16, overlap=8, gpu=true)\n'
+                    'fv2 = MAnalyse(sup, isb=false, delta=2, blksize=16, overlap=8, gpu=true)\n'
+                    'out = CudaDownload(MDegrain2(u, sup, bv1, fv1, bv2, fv2, thSAD=400, gpu=true))\n'),
+    'cf_flowfps_merge': ('uhd422p10',
+                         'u = CudaUpload(c)\n'
+                         'sup = MSuper(u, pel=2, hpad=16, vpad=16, gpu=true)\n'
+                         'bv = MAnalyse(sup, isb=true, blksize=32, overlap=16, gpu=true)\n'
+                         'fv = MAnalyse(sup, isb=false, blksize=32, overlap=16, gpu=true)\n'
+                         'f = MFlowFps(u, sup, bv, fv, num=60000, den=1001, gpu=true)\n'
+                         'out = CudaDownload(CudaMerge(f, CudaUpload(REV(MFlowFps(c, MSuper(c, pel=2, hpad=16, vpad=16), '
+                         'MAnalyse(MSuper(c, pel=2, hpad=16, vpad=16), isb=true, blksize=32, overlap=16), '
+                         'MAnalyse(MSuper(c, pel=2, hpad=16, vpad=16), isb=false, blksize=32, overlap=16), '
+                         'num=60000, den=1001))), weight=0.4))\n'),
+}
+
+
+def cf_vs_body(avs):
+    vs = re.sub(r'\bREV\(', 'core.std.Reverse(', vs_body(avs))
+    return re.sub(r'\b(Cuda\w*)\(', r'cf.\1(', vs)
+
+
+for _name, (_src, _body) in CF_CHAINS.items():
+    CHAINS[_name] = (_src, _body.replace('REV(', 'Reverse('), cf_vs_body(_body))
+
 
 def write(path, text):
     with open(path, 'w') as fh:
@@ -148,9 +187,12 @@ def run_chain(name):
         write(avs, avs_text)
         vpy = os.path.join(HERE, '%s.vpy' % name)
     else:
-        write(avs, 'LoadPlugin("%s/libmvtools2.so")\nc = %s\n%sreturn out\n' % (PLUGINS, avs_src, avs_body))
-        write(vpy, 'import vapoursynth as vs\nfrom vstest import core, load_mvtools, raw_source\nload_mvtools()\n'
-                   'mv = core.mvpf\nc = %s\n%sout.set_output()\n' % (vs_src, vs_body))
+        cf = name in CF_CHAINS
+        write(avs, 'LoadPlugin("%s/libmvtools2.so")\n%sc = %s\n%sreturn out\n'
+              % (PLUGINS, 'LoadPlugin("%s/libcudafilters.so")\n' % PLUGINS if cf else '', avs_src, avs_body))
+        write(vpy, 'import vapoursynth as vs\nfrom vstest import core, load_mvtools, load_cudafilters, raw_source\n'
+                   'load_mvtools()\n%smv = core.mvpf\nc = %s\n%sout.set_output()\n'
+              % ('load_cudafilters()\ncf = core.cuda\n' if cf else '', vs_src, vs_body))
     a_md5, v_md5 = avs[:-4] + '.avs.md5', vpy.replace('.vpy', '') + '.vs.md5'
     if avs_body is None:
         v_md5 = os.path.join(TMP, 'vsb_%s.vs.md5' % name)
@@ -177,7 +219,7 @@ def run_chain(name):
 def main():
     names = []
     for a in sys.argv[1:] or ['cpu', 'gpu']:
-        names += CPU_NAMES if a == 'cpu' else list(GPU_CHAINS) if a == 'gpu' else [a]
+        names += CPU_NAMES if a == 'cpu' else list(GPU_CHAINS) if a == 'gpu' else list(CF_CHAINS) if a == 'cf' else [a]
     bad = 0
     for name in names:
         status, info, ta, tv = run_chain(name)
