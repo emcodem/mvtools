@@ -1,6 +1,7 @@
 # NVENCMEAnalyse: motion vectors from the NVENC motion estimator (plan)
 
-**Status 2026-10-31: plan only, nothing built.** Decisions in this file are the user's unless marked "proposal".
+**Status 2026-10-31: plugin on hold, prototype results negative (section "Prototype results" below); next step:
+DTL's own DX12_ME build, unchanged.** Decisions in this file are the user's unless marked "proposal".
 Related: [NVOF_FILTER_PLAN.md](NVOF_FILTER_PLAN.md) (the NVOFA sibling, implemented), GPU_PIPELINE_PLAN.md section 26,
 [opticalflow.md](opticalflow.md), [compare/nvofa_frc/README.md](compare/nvofa_frc/README.md).
 
@@ -84,6 +85,50 @@ MRecalculate downstream (recommended): it accepts the clip like any MAnalyse out
 rescales the vectors to its own pel (`PlaneOfBlocks.cpp:3328`), searches a small radius around each one and recomputes
 the SAD (`:3358`). It fixes the 1/4-px rounding, the 8x8 coarseness and the SADs; it cannot recover vectors the NVENC
 search missed beyond its radius. On Pascal it runs on the CPU, on Ampere+ with `gpu=true`.
+
+## Prototype results (2026-10-31) and next step
+
+A throwaway filter (`NVENCMEProto`, [compare/nvencme_frc/](compare/nvencme_frc/README.md), source in its `proto/`) put
+NVENC vectors into the uc_FRC chain in place of MAnalyse (MRecalculate 16/8 + MFlowFps unchanged). Judged by eye
+(user): "extremely bad", also after every fix tried. Measured, against NVOFA medium (outlier score 0.009) and the exact
+search (0.038):
+- NVENC SDK, H.264 ME-only: P1 / P4 / P7 0.096-0.108; intra off 0.086; hinted pyramid (`meExternalHints`, fixes the
+  search range of 40-64 px, SADs near NVOFA's) 0.12; colour mixed into the luma: worse.
+- D3D12 video motion estimator (DTL's DX12_ME API, own reimplementation of his calls): 8x8 0.059, the best NVENC
+  variant, but in the tree section no better than the SDK and about 10x NVOFA.
+- The engine ignores chroma through both APIs (flat luma + textured U / V gives zero vectors). AV1 has no ME-only
+  mode; HEVC ME-only output is broken. NVENC SDK sessions keep state between calls (order-dependent output under
+  Prefetch); the D3D12 estimator does not.
+- Cause as measured: the encoder's ME picks the cheapest match per block (low SAD, incoherent fields), not the true
+  motion, and neither API has a smoothness control.
+
+**Next step (user, 2026-10-31): try DTL's implementation without changes**, before any further work of our own. He has
+a working build: release `r.2.7.46-a.29` (2024-04-15) of DTL2020/mvtools ships `DX12/{SSE2,AVX,AVX2}/mvtools2.dll`
+with `Compute.cso` (the SAD shader of `optSearchOption=5`); his latest release `post_r.2.7.47_822_2` has no DX12
+build. His call (doom9):
+```avisynth
+super = MSuper(mt=false, pel=4, pelrefine=false, chroma=true, levels=1)
+fv = MAnalyse(super, blksize=8, isb=false, delta=1, chroma=true, optSearchOption=5, levels=1)
+# optSearchOption=6: SAD on the CPU (PlaneOfBlocks.cpp) instead of the compute shader
+```
+`optSearchOption=5` needs his `Compute.cso` (SAD on a compute shader) next to the DLL; `=6` is the simpler test (vectors
+from the engine, SAD on the CPU). DTL (doom9, 2026-10-31) will check himself what happens when the chroma data is
+removed from MAnalyse's input — the chroma question from his side; our result: the engine ignores chroma through the
+NVENC SDK and through D3D12.
+Limits of his DX12 path (`MVAnalyse.cpp:253-283`): YV12 only (8-bit 4:2:0), no overlap, blksize 8 or 16, levels=1.
+So the test:
+1. Download `r.2.7.46-a.29`, `DX12/AVX2` build, into `profile\dtl_dx12` (own folder, not loaded together with our
+   mvtools2.dll).
+2. The whole chain in his DLL (his MSuper / MAnalyse / MRecalculate / MFlowFps), on the seg1 clip converted to 8-bit
+   4:2:0: optSearchOption=5 and =6, blksize 8 and 16, his call as above, then MRecalculate 16/8 + MFlowFps as in
+   uc_FRC.
+3. References on the same 8-bit 4:2:0 input: his build with the CPU search (optSearchOption default), our exact
+   search, our NVOFA medium.
+4. Score with `compare/nvencme_frc/scripts/prescreen.py` (vector dump of his MRecalculate output; check first that
+   the vector clip layout matches ours), slow motion of the tree section for the user's eye.
+5. Outcome into this section: if his build is clearly better than our D3D12 reimplementation, find out why (settings,
+   pel 4, his SAD shader) before deciding on the plugin; otherwise the plugin stays dropped and NVOFA is the hardware
+   path.
 
 ## Phase 0: CMake as the only build system, Linux for the whole repo (before the plugin)
 

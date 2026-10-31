@@ -4,6 +4,12 @@
 // own CUDA driver context). SADs are written as 0: use MRecalculate downstream, it recomputes them
 // (PlaneOfBlocks.cpp:3358-3362). half=true: ME on the luma downscaled 2x2 (twice the search range, half the precision).
 #include "nvme_core.h"
+#include "dx12me.h"
+
+#include <map>
+#include <mutex>
+#include <thread>
+#include <tuple>
 
 #include "avisynth.h"
 #include "MVAnalysisData.h"
@@ -20,6 +26,7 @@ namespace
     MVAnalysisData _ad = {};
     bool _isb, _half, _chroma_me = nvme::env_on("NVME_CHROMA");
     int _levels = 1;
+    int _dx12 = 0; // 0: NVENC SDK, 8 / 16: D3D12 video motion estimator with that block size (DTL's DX12_ME path)
     double _pseudo = std::getenv("NVME_PSEUDO") ? std::atof(std::getenv("NVME_PSEUDO")) : 0.0;
     int _delta, _pel, _words = 0, _big_sad = 0;
     nvme::Params _np;
@@ -108,8 +115,8 @@ namespace
 
   public:
     NVENCMEProto(PClip c, bool isb, int delta, int bx, int by, int ox, int oy, int pel, int hpad, int vpad, bool chroma, int preset,
-      bool hevc, bool half, int levels, IScriptEnvironment *env)
-      : GenericVideoFilter(c), _isb(isb), _half(half), _levels(levels), _delta(delta), _pel(pel), _src_vi(c->GetVideoInfo())
+      bool hevc, bool half, int levels, int dx12, IScriptEnvironment *env)
+      : GenericVideoFilter(c), _isb(isb), _half(half), _levels(levels), _dx12(dx12), _delta(delta), _pel(pel), _src_vi(c->GetVideoInfo())
     {
       const VideoInfo &svi = _src_vi;
       if (!svi.IsPlanar() || svi.IsRGB() || svi.BitsPerComponent() > 16 || svi.ComponentSize() == 4)
@@ -157,11 +164,20 @@ namespace
       _np.h = half ? (svi.height + 1) / 2 : svi.height;
       _np.hevc = hevc;
       _np.preset = preset;
-      std::string err; // open one session now: a configuration problem shows at script load
-      auto s = nvme::Pool::get().acquire(_np, err);
-      if (!s)
-        env->ThrowError("NVENCMEProto: %s", err.c_str());
-      nvme::Pool::get().release(std::move(s));
+      std::string err; // open one session / estimator now: a configuration problem shows at script load
+      if (_dx12)
+      {
+        auto *e = new dx12me::Estimator(); // check only; leaked on purpose (see GetFrame)
+        if (!e->open(_np.w, _np.h, _dx12))
+          env->ThrowError("NVENCMEProto: D3D12 ME: %s", e->err.c_str());
+      }
+      else
+      {
+        auto s = nvme::Pool::get().acquire(_np, err);
+        if (!s)
+          env->ThrowError("NVENCMEProto: %s", err.c_str());
+        nvme::Pool::get().release(std::move(s));
+      }
 
       vi.pixel_type = VideoInfo::CS_BGR32;
       vi.width = (HEADER + _words * 4 + 3) / 4;
@@ -201,7 +217,40 @@ namespace
       std::vector<nvme::Mv> grid;
       int gw = 0, gh = 0;
       bool ok;
-      if (_levels > 1 || uc.empty())
+      if (_dx12)
+      {
+        // one estimator per (thread, size, block size), stateless per call. Never destroyed: releasing D3D12 objects from
+        // thread_local / static destructors runs under the loader lock at process exit and hung the process there.
+        static std::mutex reg_m;
+        static auto *reg = new std::map<std::tuple<std::thread::id, int, int, int>, dx12me::Estimator *>();
+        dx12me::Estimator *e;
+        {
+          std::lock_guard<std::mutex> lk(reg_m);
+          dx12me::Estimator *&slot = (*reg)[{ std::this_thread::get_id(), _np.w, _np.h, _dx12 }];
+          if (!slot)
+          {
+            auto *ne = new dx12me::Estimator();
+            if (!ne->open(_np.w, _np.h, _dx12))
+            {
+              err = ne->err; // leaked as well (partly created D3D12 objects)
+              reg->erase({ std::this_thread::get_id(), _np.w, _np.h, _dx12 });
+              env->ThrowError("NVENCMEProto: frame %d: D3D12 ME: %s", n, err.c_str());
+            }
+            slot = ne;
+          }
+          e = slot;
+        }
+        std::vector<dx12me::Mv> g;
+        ok = e->run(gc.data(), gr.data(), uc.empty() ? nullptr : uc.data(), ur.empty() ? nullptr : ur.data(), g);
+        if (!ok)
+          err = e->err;
+        grid.resize(g.size());
+        for (size_t i = 0; i < g.size(); i++)
+          grid[i] = { g[i].x, g[i].y };
+        gw = e->gw;
+        gh = e->gh;
+      }
+      else if (_levels > 1 || uc.empty())
         ok = nvme::pyramid_me(gc, gr, _np.w, _np.h, _np, _levels, grid, gw, gh, err); // chroma: ignored by the ME anyway
       else
       {
@@ -220,7 +269,7 @@ namespace
 
       // per block: lower median (x, y separately) of the grid cells under it, quarter pel (of the ME picture) -> 1/pel
       // of the source, clamped to the area MAnalyse's search reaches (as k_of_blocks)
-      const int cell = _half ? 16 : 8, scale = _half ? 2 : 1;
+      const int cell = (_dx12 ? _dx12 : 8) * (_half ? 2 : 1), scale = _half ? 2 : 1;
       const int bx = _ad.nBlkSizeX, by = _ad.nBlkSizeY, sx = bx - _ad.nOverlapX, sy = by - _ad.nOverlapY;
       const int ext_w = _src_vi.width + 2 * _ad.nHPadding, ext_h = _src_vi.height + 2 * _ad.nVPadding;
       std::vector<int> vxs, vys;
@@ -274,19 +323,24 @@ namespace
       env->ThrowError("NVENCMEProto: overlap must be less or equal than half block size");
     const bool hevc = _stricmp(codec, "hevc") == 0;
     const int levels = args[14].AsInt(1);
+    const int dx12 = args[15].AsInt(0);
+    if (dx12 != 0 && dx12 != 8 && dx12 != 16)
+      env->ThrowError("NVENCMEProto: dx12 is 0 (NVENC SDK), 8 or 16 (D3D12 ME block size)");
+    if (dx12 && levels > 1)
+      env->ThrowError("NVENCMEProto: levels > 1 needs the NVENC SDK (dx12=0)");
     if (levels < 1 || levels > 4 || (hevc && levels > 1))
       env->ThrowError("NVENCMEProto: levels is 1..4 (H.264 only above 1)");
     if (!hevc && _stricmp(codec, "h264") != 0)
       env->ThrowError("NVENCMEProto: codec is \"h264\" or \"hevc\"");
     return new NVENCMEProto(c, args[1].AsBool(false), args[2].AsInt(1), bx, by, ox, oy, pel, args[8].AsInt(16), args[9].AsInt(16),
-      args[10].AsBool(true), preset, hevc, args[13].AsBool(false), levels, env);
+      args[10].AsBool(true), preset, hevc, args[13].AsBool(false), levels, dx12, env);
   }
 }
 
 extern "C" __declspec(dllexport) const char *__stdcall AvisynthPluginInit3(IScriptEnvironment *env, const AVS_Linkage *const vectors)
 {
   AVS_linkage = vectors;
-  env->AddFunction("NVENCMEProto", "c[isb]b[delta]i[blksize]i[blksizeV]i[overlap]i[overlapV]i[pel]i[hpad]i[vpad]i[chroma]b[preset]i[codec]s[half]b[levels]i",
+  env->AddFunction("NVENCMEProto", "c[isb]b[delta]i[blksize]i[blksizeV]i[overlap]i[overlapV]i[pel]i[hpad]i[vpad]i[chroma]b[preset]i[codec]s[half]b[levels]i[dx12]i",
     Create, nullptr);
   return "NVENC ME-only prototype";
 }

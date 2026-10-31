@@ -5,7 +5,7 @@
 > [img/slowmo_pyramid_1.7-2.6.mp4](img/slowmo_pyramid_1.7-2.6.mp4) "still extremely bad". Every NVENC lever was
 > tried: presets P1/P4/P7, half resolution, chroma (ignored by the ME), intra off, 16x16 only, a hinted pyramid
 > (fixes the search range, SADs near NVOFA's, fields even less coherent), colour mixed into the luma (worse); AV1 has
-> no ME-only mode, HEVC ME-only output
+> no ME-only mode, the D3D12 motion estimator (DTL's DX12_ME path) is the best of them but still far behind, HEVC ME-only output
 > is broken. The cause is the cost function: the encoder's ME picks the cheapest match per block, not the true motion,
 > and the API has no smoothness control. What remains would be our own processing (smoothing the field, stronger
 > MRecalculate), i.e. not NVENC's quality. NVOFA covers Ampere+; NVENC would only have added Pascal / Turing, which
@@ -100,6 +100,48 @@ in the sky: 3–4× the exact search's score and 10× NVOFA's, with SADs between
   previous call) to 0 %. The missing predictors, not the block size or chroma, look like the main weakness on fast
   motion. Next lever: `meExternalHints` (H.264 only) from a half-resolution pass or from the previous frame of the same
   direction — deterministic predictors instead of whatever the session saw last.
+
+### D3D12 video motion estimator (DTL's DX12_ME path), same board
+
+DTL's request (doom9): test the same NVENC engine through `ID3D12VideoMotionEstimator`, the API of his MAnalyse
+`optSearchOption=5 / 6`. [proto/dx12me.h](proto/dx12me.h) makes the same calls as his `Init_DX12_ME` /
+`EstimateMotion` / `ResolveMotionVectorHeap` (NV12, quarter pel, defaults, no hints); `NVENCMEProto(..., dx12=8|16)`
+uses it in place of the NVENC SDK, [proto/dx12probe.cpp](proto/dx12probe.cpp) runs the probe tests.
+
+Probe (RTX 5090, driver 616.92; supports 8x8 and 16x16, quarter pel only, 32x32..4096x4096):
+
+| | 8x8, 1080p | 8x8, UHD | 16x16, UHD |
+|---|---:|---:|---:|
+| shift (5, -3), (17, 9): blocks exact | 100 / 99.3 % | 100 / 99.9 % | 100 / 100 % |
+| shift (40, -24) | 72 % | 62 % | 79 % |
+| shift (64, 32) and larger | 0 % | 0 % | 0 % |
+| flat luma, texture only in U / V | 0 exact, all zero | 0 exact, all zero | 0 exact, all zero |
+| same pair after another pair / repeated | identical | identical | identical |
+| ms per pair, 1 thread, incl. upload + readback | 1.81 | 5.82 | 4.16 |
+
+- **Chroma is ignored through D3D12 as well**: not an issue of the NVENC SDK, the engine's ME is luma-only here.
+- **No session memory**: the D3D12 estimator gives the same vectors regardless of call order, so it needs no fresh
+  sessions (deterministic: md5 5495CC13974D twice).
+- Search range like the NVENC SDK without hints.
+
+On the clip:
+
+| variant | score all | score tree | mean SAD | cells > 0.5 | wall (112 frames) |
+|---|---:|---:|---:|---:|---:|
+| NVENC SDK P4 (fresh sessions) | 0.098 | 0.124 | 1219 | 3240 | 9.92 s |
+| **D3D12 ME 8x8** | **0.059** | 0.116 | 1007 | 2080 | 7.16 s |
+| D3D12 ME 16x16 | 0.087 | 0.152 | 987 | 2698 | 6.68 s |
+| D3D12 ME 8x8 half-res | 0.072 | 0.140 | 970 | 2452 | |
+| *exact search* | *0.038* | *0.031* | *1287* | *158* | *6.61 s* |
+| *NVOFA medium* | *0.009* | *0.011* | *820* | *2* | *4.64 s* |
+
+D3D12 8x8 is the best NVENC-engine variant so far (its defaults beat the SDK's P1–P7 presets on coherence), but
+in the tree section it is no better than the SDK's P4 and still about 10x NVOFA. Clip for the eye:
+[img/slowmo_dx12_1.7-2.6.mp4](img/slowmo_dx12_1.7-2.6.mp4) (exact | NVOFA medium / NVENC SDK P4 | D3D12 8x8).
+
+Prototype note: the first D3D12 integration hung at process exit — estimators in `thread_local` storage released
+their D3D12 objects under the loader lock. They are now created once per thread and never destroyed (as the NVENC
+session pool).
 
 ### Colour into the luma (`NVME_PSEUDO=k`), DTL: "luma only ME can greatly degrade ME quality on colour footage"
 

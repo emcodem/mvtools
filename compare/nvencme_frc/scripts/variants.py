@@ -31,6 +31,9 @@ ALL = [
     ('p7l3', 'NVENC P7 pyramid 3', (7, False, 3), ''),
     ('p4ps1', 'NVENC P4 pseudo-luma k=1', (4, False), '', {'NVME_PSEUDO': '1'}),
     ('p4ps2', 'NVENC P4 pseudo-luma k=2', (4, False), '', {'NVME_PSEUDO': '2'}),
+    ('dx8', 'D3D12 ME 8x8', (4, False, 1, 8), ''),
+    ('dx16', 'D3D12 ME 16x16', (4, False, 1, 16), ''),
+    ('dx8h', 'D3D12 ME 8x8 half-res', (4, True, 1, 8), ''),
     ('p4nl3ps2', 'NVENC P4 pyr 3, no intra, pseudo k=2', (4, False, 3), '', {'NVME_NOINTRA': '1', 'NVME_PSEUDO': '2'}),
 ]
 ALL = [v if len(v) == 5 else v + ({},) for v in ALL]
@@ -44,8 +47,9 @@ def script_text(key):
         return open(NVOFA_AVS).read()
     preset, half = nv[:2]
     levels = nv[2] if len(nv) > 2 else 1
-    head = ('global NVME_PLUGIN = "%s"\nglobal NVME_PRESET = %d\nglobal NVME_HALF = %s\nglobal NVME_LEVELS = %d\n'
-            % (PLUGIN, preset, 'true' if half else 'false', levels))
+    dx12 = nv[3] if len(nv) > 3 else 0
+    head = ('global NVME_PLUGIN = "%s"\nglobal NVME_PRESET = %d\nglobal NVME_HALF = %s\nglobal NVME_LEVELS = %d\nglobal NVME_DX12 = %d\n'
+            % (PLUGIN, preset, 'true' if half else 'false', levels, dx12))
     return head + open(NVME_AVS).read()
 
 
