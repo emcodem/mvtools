@@ -130,6 +130,22 @@ So the test:
    pel 4, his SAD shader) before deciding on the plugin; otherwise the plugin stays dropped and NVOFA is the hardware
    path.
 
+**Outcome (2026-10-31, [compare/dtl_dx12_frc/](compare/dtl_dx12_frc/README.md)): his build gives the same vectors as
+our reimplementation, not better ones.** His `r.2.7.46-a.29` DX12/AVX2 DLL unchanged, whole chain in his DLL, on the
+clip as 8-bit 4:2:0 (references re-run on the same input). It runs at UHD (no 1080p fallback needed). Outlier score
+(all / tree section): his DX12_ME 8x8 0.106 / 0.186 (opt5 and opt6 alike), 16x16 0.145 / 0.224; our D3D12 prototype
+8x8 0.058 / 0.115; exact search 0.047 / 0.035; NVOFA medium 0.009 / 0.011. Why his is worse than our prototype: our
+prototype with his block layout (one engine cell per 8x8 / 16x16 block, no overlap) scores the same as his build
+(0.1068 vs 0.1067). The engine field is identical; our 0.058 comes from the prototype's median of the engine cells
+per 32/16 block. Not from settings: pel 4 passes the engine's quarter-pel vectors through 1:1 (the engine sees the
+integer-pel plane), and the SAD path (opt5 shader vs opt6 CPU) changes the score by 0.0003. Side findings on his
+build: `Compute.cso` is read from the process's current directory, not the DLL's folder; opt6 with his MSuper needs
+`UseSubShift=1`; **opt5 crashes under Prefetch(3)** (8 of 12 runs, "Previous GetFrame did not finished properly",
+ffmpeg still exits 0), single-threaded it is deterministic. Preview frames of the tree section for the eye (not judged
+yet) and notes for DTL on these problems: in that README (exact | NVOFA medium / DTL DX12_ME 8x8 | our D3D12 8x8). So
+per step 5: no reason to look further at his implementation; the plugin stays dropped and NVOFA is the hardware path,
+unless the user's visual check says otherwise.
+
 ## Phase 0: CMake as the only build system, Linux for the whole repo (before the plugin)
 
 **Status 2026-10-31: Linux build and run done (steps 1, 2, 5, 6 below); open: step 3 (Windows CMake build bit-identical)
