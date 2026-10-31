@@ -961,7 +961,7 @@ coarse searchparam > 3 (MAnalyse, MRecalculate) -> S3 trymany -> S4 pel 4 with s
 -> rest of Part B. All bit-exact. neo-mv's new algorithms (predictors, chroma-wiener) are out of scope (other fork, no stable
 CPU reference).
 
-**S1 result (2026-10-30, uncommitted, test set `profile\build_s1` = build_rel14 + new mvtools_cuda.dll):**
+**S1 result (2026-10-30, committed in `1c7cf9b`, test set `profile\build_s1` = build_rel14 + new mvtools_cuda.dll):**
 - Phase counters (`-DMVC_PHASE_PROF`) of the slice kernel on the FRC chain, per block at 768 threads: wait+pred 4,200 cycles,
   phase A 4,650, fold A 2,950, ring (24 candidates) 13,300, fold B 1,800. The ring cost the same with 12 warps as with 24.
 - Cause: `__launch_bounds__(768, 1)` capped k_search at 80 registers; ptxas: 2.7 KB spill stores / 4.0 KB spill loads per
@@ -980,7 +980,7 @@ CPU reference).
   fallback with meander=false (8DB9CD4E). Different vectors than uc_FRC's meander=true: a picture-quality decision for the
   user (uconvert.avsi), not done.
 
-**B1 + B2 done (2026-10-30, uncommitted, library API 15, test set `profile\build_b2`):**
+**B1 + B2 done (2026-10-30, committed in `1c7cf9b`, library API 15, test set `profile\build_b2`):**
 - B1 `mvcuda_comp.cu`: k_blocks / k_subpel templated on the sample type; 16-bit overlap = 32-bit sum of sample * window,
   min((sum + 1024) >> 11, max) (Short2Bytes_Int32toWord16), degrain (sum + 128) >> 8 as at 8 bit, Wiener sub-pel clamped
   to max. Gates in MVCompensate.cpp / MVDegrain3.cpp accept pixelsize 2.
@@ -1033,7 +1033,7 @@ Speed (PAL 1500 frames, 'gpu all', Prefetch 12, best of 3): Fast 10 bit 3.34 s /
 Left of Part B: lookup tables above 10 bit (B2), NNEDI3 above 10 bit, B5 packed 16-bit SAD, the 4:2:0 + ChromaMotion
 search-clip difference (B4).
 
-**B5 done (2026-10-30, uncommitted, test set `profile\build_b5` = build_b3 + new mvtools_cuda.dll, API unchanged 15):**
+**B5 done (2026-10-30, committed in `9f08ddd`, test set `profile\build_b5` = build_b3 + new mvtools_cuda.dll, API unchanged 15):**
 packed SADs for 16-bit samples, in both search kernels. A/B first: 8-bit QTGMC Slower with `MVCUDA_WAVE_PACK=0` took 5.40 s
 (packed 4.35 s), about the 10-bit time (5.61 s): the missing packed form, not the doubled bytes, was the 10-bit gap.
 - k_wave (`pk_load` / `pk_sum`): same lane layout as at 8 bit (4 columns of every 4th row); a row's 4 samples are read as the
@@ -1055,14 +1055,25 @@ packed SADs for 16-bit samples, in both search kernels. A/B first: 8-bit QTGMC S
 1. S2: exhaustive radius > 3 and coarse searchparam > 3 on the GPU (MAnalyse, MRecalculate); today they fall back to the CPU.
 2. S3: trymany.
 3. S4: pel 4 with sub-pel samples computed on the fly.
-4. Part M (M1-M7): MAnalyse / MRecalculate / MFlowFps on the cudafilters model (one upload per picture, pyramids in the
-   registry budget, token in / out, submitter for every call).
-5. QTGMC default meander=true once 'gpu all' with the slice kernel is clearly faster than the CPU (needs M4).
+   Doom9 (DTL, 2026-10-30): load the pel-1 reference window once into shared memory, each thread applies its own filter
+   phase (MSuper's sharp filter, exact integer rounding as k_subpel) and computes the SAD, only the SAD leaves the core.
+   Consequences: (a) retry the S1 shared-memory window with it: the window is the pel-1 area plus the filter margin,
+   about 1/4 of the 4 stored planes that made the S1 window cost 6-7k cycles; the other S1 limit (shared-load latency
+   with 8 warps) stays, so measure before keeping it. (b) Same path for pel 2 as a VRAM option (no 4x sub-pel planes
+   per referenced frame; helps 4 concurrent jobs); expected speed gain at pel 2 small (k_search is latency-bound).
+   (c) MSuper with `pelclip` has no filter to recompute: those planes stay stored.
+   AreaMode (DTL's fork, shifted block grids, averaged vectors) noted, not planned: other algorithm, D5 / D7.
+4. ~~Part M (M1-M7): MAnalyse / MRecalculate / MFlowFps on the cudafilters model (one upload per picture, pyramids in the
+   registry budget, token in / out, submitter for every call).~~ Done (`4836ac9`, API 16, see "Part M done" below).
+   Left from it: 4 concurrent uc_FRC jobs 17.4 -> 18.5 s (+6%), cause not found; next: nsys of the 4-job run
+   (per-process timelines), the single upload stream per process.
+5. QTGMC default meander=true once 'gpu all' with the slice kernel is clearly faster than the CPU (M4 is done, so this
+   only waits for the measurement).
 Smaller Part B leftovers: 10-bit k_wave registers (16-bit packed rows hold an 8-byte window per 4 samples; try neighbour-lane
 shuffles instead of the second word; 10-bit Slower 5.08 s vs 8-bit 4.25 s); lookup tables and NNEDI3 above 10 bit; the 4:2:0
 + ChromaMotion search-clip difference (B4). After all of it: milestone F (FFT3DFilter on the GPU).
 
-**Part M done (2026-10-30, uncommitted, library API 16, test set `profile\build_m1`):** MAnalyse, MRecalculate and MFlowFps
+**Part M done (2026-10-30, committed in `4836ac9`, library API 16, test set `profile\build_m1`):** MAnalyse, MRecalculate and MFlowFps
 on the cudafilters model; MCompensate / MDegrain take normal frames too.
 - M1 `mvcuda_frame_upload_keyed(fmt, planes, key)`: a host picture is uploaded once under a content key
   (`GpuBackend::frame_key(clip, n)`); while that frame is in the registry, later requests get its token (stat
