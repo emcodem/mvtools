@@ -1,5 +1,12 @@
 # uc_FRC with NVIDIA's optical flow accelerator in place of MAnalyse's search
 
+> **Now a filter.** The `MVCUDA_NVOFA` hook described here was removed from MAnalyse (it is exact-only again); the same
+> computation is `CudaNVOFAnalyse` of cudafilters.dll (library API 17, [NVOF_FILTER_PLAN.md](../../NVOF_FILTER_PLAN.md)),
+> switched on in uconvert with `uc_frc_nvof`. `CudaNVOFAnalyse(pre, blksize=32, overlap=16, pel=2, preset=2)` ->
+> MRecalculate -> MFlowFps gives the medium md5 FA834251D140 below, and its vectors and SADs equal level 0 of the hook's
+> MAnalyse output in all 300 vector frames. The scripts here that set `MVCUDA_NVOFA` need the experiment's build
+> (`profile\build_nvofa`, source: commit 574cd22).
+
 Experiment of [opticalflow.md](../../opticalflow.md): MAnalyse's GPU block search (k_search) replaced by NVOFA vectors
 (Optical Flow SDK, `nvofapi64.dll` of the driver). MRecalculate refines them and MFlowFps interpolates, both unchanged.
 Switched by the environment of the process: `MVCUDA_NVOFA=fast|medium|slow`, off when unset. **Not bit-exact** with the

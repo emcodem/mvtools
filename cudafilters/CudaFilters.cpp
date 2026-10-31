@@ -63,9 +63,12 @@ namespace cf
     CF_LOAD(qtgmc_sharp, "mvcuda_qtgmc_sharp");
     CF_LOAD(qtgmc_backblend, "mvcuda_qtgmc_backblend");
     CF_LOAD(temporal_binomial, "mvcuda_temporal_binomial");
+    CF_LOAD(upload_keyed, "mvcuda_frame_upload_keyed");
+    CF_LOAD(nvof_token, "mvcuda_nvof_token");
+    CF_LOAD(nvof_available, "mvcuda_nvof_available");
 #undef CF_LOAD
     ok = version && count && upload && download && producer_register && producer_unregister && regenerate && stats
-      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_create_bits && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && version() == MVCUDA_API_VERSION && count() > 0;
+      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_create_bits && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && upload_keyed && nvof_token && nvof_available && version() == MVCUDA_API_VERSION && count() > 0;
   }
 
   bool make_format(const VideoInfo &vi, MvCudaFrameFormat &f)
@@ -308,6 +311,8 @@ AVSValue __cdecl Create_CudaQtgmcSharpLimit(AVSValue args, void *, IScriptEnviro
 AVSValue __cdecl Create_CudaQtgmcBinomial0(AVSValue args, void *, IScriptEnvironment *env);
 AVSValue __cdecl Create_CudaQtgmcBackBlend(AVSValue args, void *, IScriptEnvironment *env);
 AVSValue __cdecl Create_CudaQtgmcAddNoise(AVSValue args, void *, IScriptEnvironment *env);
+AVSValue __cdecl Create_CudaNVOFAnalyse(AVSValue args, void *, IScriptEnvironment *env); // CudaNvof.cpp
+AVSValue __cdecl Create_CudaNVOFAvailable(AVSValue args, void *, IScriptEnvironment *env);
 
 const AVS_Linkage *AVS_linkage = 0;
 
@@ -339,5 +344,7 @@ extern "C" __declspec(dllexport) const char *__stdcall AvisynthPluginInit3(IScri
   env->AddFunction("CudaQtgmcBackBlend", "ccff[edi]c[fComp1]c[bComp1]c[fComp3]c[bComp3]c[nref]i[sovs]i", Create_CudaQtgmcBackBlend, 0);
   env->AddFunction("CudaQtgmcAddNoise", "ccs[use_expr]i[clamp_float]b[lutUV]i[addUV]i", Create_CudaQtgmcAddNoise, 0);
   env->AddFunction("CudaQtgmcBinomial0", "c[luma_threshold]i[chroma_threshold]i[scenechange]i[chroma]b", Create_CudaQtgmcBinomial0, 0);
+  env->AddFunction("CudaNVOFAnalyse", "c[isb]b[delta]i[blksize]i[blksizeV]i[overlap]i[overlapV]i[pel]i[hpad]i[vpad]i[chroma]b[preset]i", Create_CudaNVOFAnalyse, 0);
+  env->AddFunction("CudaNVOFAvailable", "", Create_CudaNVOFAvailable, 0);
   return "cudafilters: GPU filters for AviSynth+ (token frames through mvtools_cuda.dll)";
 }

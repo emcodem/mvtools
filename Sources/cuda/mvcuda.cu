@@ -2,6 +2,7 @@
 
 #include "mvcuda.h"
 #include "mvcuda_internal.h"
+#include "mvcuda_nvofa.h"
 
 #include <cuda_runtime.h>
 
@@ -195,6 +196,24 @@ extern "C" int mvcuda_analyse_token(const MvCudaSuperParams *sp, const MvCudaAna
   return sp->bits_per_pixel <= 8
     ? mvcuda_analyse_token_8(sp, ap, src_token, ref_token, payload, payload_words)
     : mvcuda_analyse_token_16(sp, ap, src_token, ref_token, payload, payload_words);
+}
+
+extern "C" int mvcuda_nvof_token_8(const MvCudaSuperParams *, const MvCudaNvofParams *, unsigned long long, unsigned long long, int *, int);
+extern "C" int mvcuda_nvof_token_16(const MvCudaSuperParams *, const MvCudaNvofParams *, unsigned long long, unsigned long long, int *, int);
+
+extern "C" int mvcuda_nvof_token(const MvCudaSuperParams *sp, const MvCudaNvofParams *np, unsigned long long src_token,
+  unsigned long long ref_token, int *payload, int payload_words)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_nvof_token_8(sp, np, src_token, ref_token, payload, payload_words)
+    : mvcuda_nvof_token_16(sp, np, src_token, ref_token, payload, payload_words);
+}
+
+extern "C" int mvcuda_nvof_available(void)
+{
+  return mvc::use_device() && mvc_nvofa::available() ? 1 : 0;
 }
 
 extern "C" int mvcuda_flow_host_8(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],

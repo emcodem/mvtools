@@ -15,7 +15,6 @@
 // slices) are not supported: the call returns MVCUDA_NEEDS_CPU and the caller falls back to the CPU.
 
 #include "mvcuda_internal.h"
-#include "mvcuda_nvofa.h"
 #include "mvcuda_refine.cuh"
 
 #include <cuda_runtime.h>
@@ -133,112 +132,6 @@ namespace
       s += abs((int)a.src[p][(size_t)(y0 + r) * ew + x0 + c] - (int)rp[(size_t)(ry + r) * ew + rx + c]);
     }
     return warp_sum(s);
-  }
-
-  // ---- MVCUDA_NVOFA experiment (mvcuda_nvofa.h, opticalflow.md): vectors from the optical flow accelerator ----------
-  // Level-0 luma (inside the padding) as 8-bit grayscale for NVOFA: 9..16-bit samples rounded down to 8 bit.
-  __global__ void k_of_gray(const pix *src, int ew, int hpad, int vpad, int w, int h, int shift, uint8_t *dst, size_t dpitch)
-  {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h)
-      return;
-    int v = src[(size_t)(vpad + y) * ew + hpad + x];
-    if (shift > 0)
-      v = (v + (1 << (shift - 1))) >> shift;
-    dst[(size_t)y * dpitch + x] = (uint8_t)min(v, 255);
-  }
-
-  // 1/32-pixel flow -> 1/pel vector, rounded half away from zero; one level down per `down` (vector halved)
-  __device__ __forceinline__ int of_to_vec(int f, int pel, int down)
-  {
-    const int den = 32 << down, num = f * pel;
-    return num >= 0 ? (num + den / 2) / den : -((-num + den / 2) / den);
-  }
-
-  // Level 0, one warp per block: the median (x and y separately) of the flow cells under the block, clamped to the
-  // search area of MAnalyse, then its SAD (luma + scaled chroma, as the search stores it).
-  __global__ void k_of_blocks(LevelArgs a, const short2 *flow, size_t flow_pitch, int gw, int gh, int grid)
-  {
-    __shared__ short2 cells[4][100];
-    const int wib = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int idx = blockIdx.x * 4 + wib;
-    if (idx >= a.n_blk_x * a.n_blk_y)
-      return;
-    const int bx = idx % a.n_blk_x, by = idx / a.n_blk_x;
-    const int xi = bx * (a.bs_x - a.ov_x), yi = by * (a.bs_y - a.ov_y); // block origin inside the padding
-    const int gx0 = min(xi / grid, gw - 1), gx1 = min((xi + a.bs_x - 1) / grid, gw - 1);
-    const int gy0 = min(yi / grid, gh - 1), gy1 = min((yi + a.bs_y - 1) / grid, gh - 1);
-    const int cw_ = gx1 - gx0 + 1, n = min(cw_ * (gy1 - gy0 + 1), 100);
-    for (int i = lane; i < n; i += 32)
-    {
-      const int r = i / cw_, c = i - r * cw_;
-      cells[wib][i] = *(const short2 *)((const char *)flow + (size_t)(gy0 + r) * flow_pitch + (size_t)(gx0 + c) * sizeof(short2));
-    }
-    __syncwarp();
-    // lower median by rank: the candidate with (count < c) <= k < (count <= c)
-    const int k = (n - 1) / 2;
-    int med[2] = { 0, 0 };
-    for (int comp = 0; comp < 2; comp++)
-    {
-      int found = 0, val = 0;
-      for (int j = lane; j < n; j += 32)
-      {
-        const int c = comp ? cells[wib][j].y : cells[wib][j].x;
-        int lt = 0, le = 0;
-        for (int i = 0; i < n; i++)
-        {
-          const int v = comp ? cells[wib][i].y : cells[wib][i].x;
-          lt += v < c;
-          le += v <= c;
-        }
-        if (!found && lt <= k && k < le)
-        {
-          found = 1;
-          val = c;
-        }
-      }
-      const unsigned b = __ballot_sync(0xffffffffu, found);
-      med[comp] = __shfl_sync(0xffffffffu, val, __ffs(b) - 1);
-    }
-    const int x0 = a.hpad[0] + xi, y0 = a.vpad[0] + yi;
-    const int dx_min = -a.pel * x0, dy_min = -a.pel * y0;
-    const int dx_max = a.pel * (a.ext_w - x0 - a.bs_x), dy_max = a.pel * (a.ext_h - y0 - a.bs_y);
-    const int vx = max(dx_min, min(dx_max - 1, of_to_vec(med[0], a.pel, 0)));
-    const int vy = max(dy_min, min(dy_max - 1, of_to_vec(med[1], a.pel, 0)));
-    int sad = sad_block(a, 0, x0, y0, a.bs_x, a.bs_y, x0 * a.pel + vx, y0 * a.pel + vy, lane);
-    if (a.has_chroma)
-    {
-      int sc = 0;
-      for (int p = 1; p < 3; p++)
-      {
-        const int cx0 = a.hpad[p] + (xi >> a.log_x_uv), cy0 = a.vpad[p] + (yi >> a.log_y_uv);
-        sc += sad_block(a, p, cx0, cy0, a.cw, a.ch, cx0 * a.pel + (vx >> a.log_x_uv), cy0 * a.pel + (vy >> a.log_y_uv), lane);
-      }
-      sad += scale_chroma(sc, a.chroma_scale);
-    }
-    if (lane == 0)
-    {
-      a.vec[3 * idx + 0] = vx;
-      a.vec[3 * idx + 1] = vy;
-      a.vec[3 * idx + 2] = sad;
-    }
-  }
-
-  // Coarser levels (pel 1): the flow cell under the block centre, scaled to the level; SAD 0. Only the level sizes
-  // matter downstream (MRecalculate and MFlowFps read level 0).
-  __global__ void k_of_coarse(LevelArgs a, const short2 *flow, size_t flow_pitch, int gw, int gh, int grid)
-  {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= a.n_blk_x * a.n_blk_y)
-      return;
-    const int bx = idx % a.n_blk_x, by = idx / a.n_blk_x;
-    const int xi = bx * (a.bs_x - a.ov_x), yi = by * (a.bs_y - a.ov_y);
-    const int gx = min(((xi + a.bs_x / 2) << a.level) / grid, gw - 1), gy = min(((yi + a.bs_y / 2) << a.level) / grid, gh - 1);
-    const short2 f = *(const short2 *)((const char *)flow + (size_t)gy * flow_pitch + (size_t)gx * sizeof(short2));
-    const int x0 = a.hpad[0] + xi, y0 = a.vpad[0] + yi;
-    a.vec[3 * idx + 0] = max(-x0, min(a.ext_w - x0 - a.bs_x - 1, of_to_vec(f.x, 1, a.level)));
-    a.vec[3 * idx + 1] = max(-y0, min(a.ext_h - y0 - a.bs_y - 1, of_to_vec(f.y, 1, a.level)));
-    a.vec[3 * idx + 2] = 0;
   }
 
   struct Vec
@@ -2628,10 +2521,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // meander=false: wavefront kernel = CPU result with meander=false, mt=false (slice_threads is ignored); meander=true:
   // slice kernel = CPU result with slice_threads threads. MVCUDA_WAVE=0 forces the slice kernel (comparisons only).
   static const bool wave_allowed = [] { const char *e = getenv("MVCUDA_WAVE"); return !(e && e[0] == '0'); }();
-  // MVCUDA_NVOFA experiment: the per-level loop below fills the levels from NVOFA's flow instead of searching
-  const bool use_of = mvc_nvofa::perf_level() != 0;
-  mvc_nvofa::Session *of = nullptr;
-  const bool wave = !ap->meander && wave_allowed && !use_of;
+  const bool wave = !ap->meander && wave_allowed;
   int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
   for (int l = 0; l < nl; l++)
   {
@@ -2748,22 +2638,6 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       AN_CHECK(cudaMemcpyAsync(d_pay, h, pay_alloc, cudaMemcpyHostToDevice, st));
       AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
     }
-    if (use_of)
-    {
-      // level-0 luma of both pictures into the session's 8-bit buffers, then the flow source -> reference
-      of = mvc_nvofa::acquire(sp->width, sp->height);
-      if (!of)
-        return MVCUDA_NEEDS_CPU;
-      const int shift = sp->bits_per_pixel > 8 ? sp->bits_per_pixel - 8 : 0;
-      const dim3 gb(32, 8), gg((sp->width + 31) / 32, (sp->height + 7) / 8);
-      const mvc::DevPlane *pl[2] = { &s_src->pl[0], &s_ref->pl[0] };
-      for (int i = 0; i < 2; i++)
-        k_of_gray<<<gg, gb, 0, st>>>((const pix *)pl[i]->sub[0], pl[i]->d.ew, pl[i]->d.hpad, pl[i]->d.vpad, sp->width, sp->height,
-          shift, of->in[i], of->in_pitch);
-      AN_CHECK(cudaGetLastError());
-      if (mvc_nvofa::execute(of, st))
-        return MVCUDA_NEEDS_CPU;
-    }
     bool wave_gen = false;
 
     for (int l = nl - 1; l >= 0; l--)
@@ -2857,16 +2731,6 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN;
         wc.lv[l] = a;
         continue; // launched once for all levels below
-      }
-      if (use_of)
-      {
-        const int total = a.n_blk_x * a.n_blk_y;
-        if (l == 0)
-          k_of_blocks<<<(total + 3) / 4, 128, 0, st>>>(a, of->flow, of->flow_pitch, of->gw, of->gh, of->grid);
-        else
-          k_of_coarse<<<(total + 127) / 128, 128, 0, st>>>(a, of->flow, of->flow_pitch, of->gw, of->gh, of->grid);
-        AN_CHECK(cudaGetLastError());
-        continue;
       }
 
       if (l < nl - 1)
@@ -3015,7 +2879,6 @@ done:
     mvc::dev_free(d_pay, pay_alloc);
   mvc::dev_free(d_freq, freq_bytes);
   mvc::pin_free(h_stage, pay_alloc);
-  mvc_nvofa::release(of);
   if (!wave)
     mvc::dev_free(d_glob, 2 * sizeof(int));
   return rc;
