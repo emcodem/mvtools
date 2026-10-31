@@ -5,6 +5,26 @@ plans (`GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`) describe how 
 list of choices that later work must respect or consciously revisit. Status: **decided**, **open** (needs a decision),
 **superseded** (with a pointer).
 
+## D9. VapourSynth through an AviSynth+ host, not a port (2026-10-31, decided)
+
+**Decision.** mvtools2 (and later cudafilters) run under VapourSynth unchanged, through `mvtools_vsbridge`: a small
+AviSynth+ host on the VapourSynth API 4 that loads the AviSynth+ plugin. The plugins only gain a
+`VapourSynthPluginInit2` entry that opens the bridge. Namespaces `mvpf` (mvtools2) and `cuda` (cudafilters), so
+dubhater's port (`mv`) can be loaded next to it. Function and parameter names stay the AviSynth ones.
+
+**Why.** A rewrite of the filters for VapourSynth (as dubhater/vapoursynth-mvtools) would be a second code base that
+drifts from this one, GPU paths included. Through the bridge the same arithmetic runs, so VapourSynth output is
+bit-identical with AviSynth+ (17 test chains, `VAPOURSYNTH_PLAN.md`). The bridge is its own library because it compiles
+`avisynth.h` in core mode (the `AVS_Linkage` implementation), which must never share a binary with plugin-mode code.
+
+**Consequences.**
+- Every new filter works under VapourSynth without extra work, as long as it only uses the AviSynth+ API the bridge
+  implements (an unimplemented environment call throws "not supported under VapourSynth").
+- Rules the bridge must keep: frames of one format share one pitch (mvtools reads one frame with another's pitch);
+  MT_MULTI_INSTANCE filters get one instance per concurrent call; never a crash or hang when the bridge is missing.
+- Vector and super clips carry their parameters in the AviSynth `VideoInfo`, which only the bridge's node registry
+  keeps: they are not usable through other VapourSynth filters (`std.Trim` on a vector clip).
+
 ## D7. The mvtools GPU code stays in `mvtools2.dll`, with the CPU code (2026-10-30, decided)
 
 **Decision.** The GPU paths of MSuper, MAnalyse, MRecalculate, MCompensate, MDegrain1..6 and MFlowFps stay in this fork's

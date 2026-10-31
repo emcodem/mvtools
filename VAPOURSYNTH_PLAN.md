@@ -1,7 +1,7 @@
 # VapourSynth for mvtools2 and cudafilters (AviSynth-API shim, one code base)
 
-Moved out of `NVENCMEAnalyse.md` (Phase 0b) on 2026-10-31; work on branch `vs_shim` (worktree), merged into
-`gpu_work` when a step is verified. Phase 0 there (CMake as the only build system) is a prerequisite only for the
+Moved out of `NVENCMEAnalyse.md` (Phase 0b) on 2026-10-31. Steps 1-3 done on branch `vs_shim` and merged into
+`gpu_work` on 2026-10-31. User documentation: README section "VapourSynth"; decision log: `DECISIONS.md` D9. Phase 0 there (CMake as the only build system) is a prerequisite only for the
 Windows build of the VS entry point; Linux CMake already builds everything.
 
 User's decisions (2026-10-31):

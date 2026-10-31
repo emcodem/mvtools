@@ -149,8 +149,9 @@ unless the user's visual check says otherwise.
 ## Phase 0: CMake as the only build system, Linux for the whole repo (before the plugin)
 
 **Status 2026-10-31: Linux build and run done (steps 1, 2, 5, 6 below); open: step 3 (Windows CMake build bit-identical)
-and step 4 (remove vcxproj / bat files); after that VapourSynth (user's decision: an AviSynth-API shim over the
-VapourSynth API, one code base).** Done:
+and step 4 (remove vcxproj / bat files). VapourSynth: own plan, `VAPOURSYNTH_PLAN.md` (mvtools2 runs under
+VapourSynth on Linux through `mvtools_vsbridge`, bit-identical with AviSynth+; its Windows build waits for step 3).**
+Done:
 - `Sources/cuda/dyn_lib.h`: the one run-time loader (LoadLibraryW / dlopen RTLD_NOW, module folder via
   GetModuleHandleExW / dladdr); used by GpuBackend, cudafilters' CudaLib and the NVOFA loader. Rule (user): a missing or
   broken lazily loaded library never hangs or crashes, it only selects the fallback (SetThreadErrorMode, every symbol
@@ -224,6 +225,10 @@ Built by `nvencme/CMakeLists.txt`; output `nvencme.dll` / `libnvencme.so`; links
   Maxwell / Pascal / Volta support: use an NVENC API version that branch accepts, and check
   `NvEncodeAPIGetMaxSupportedVersion` at run time.
 
+Since `mvtools_vsbridge` (`VAPOURSYNTH_PLAN.md`): the AviSynth+ front end also runs under VapourSynth through the
+bridge and produces this repo's vector clips for `core.mvpf.*`; the separate VS front end and the research item below
+are only needed for interoperability with dubhater's `mv.*`.
+
 **Research item before the VapourSynth front end** (read the VS port's source): how its vector clips carry the
 analysis header and vectors (frame properties vs frame data; field list and order of its MVAnalysisData; versioning),
 its downstream checks (block sizes, overlap, pel, padding vs its Super), how its Recalculate uses incoming vectors.
@@ -290,7 +295,8 @@ independent of `uc_frc_gpu` (must work where mvtools_cuda refuses the device).
 2. Core + AviSynth+ front end, standalone mode; shared vector-clip header, CudaNvof.cpp moved to it.
 3. Integrated mode: session pool + exports in mvtools_cuda (API bump, `GpuBackend` version check), mode selection,
    token-frame input.
-4. VapourSynth front end (after the research item).
+4. VapourSynth: through `mvtools_vsbridge` for `core.mvpf.*` (no extra work); own VS front end only for `mv.*`
+   interoperability (after the research item).
 5. uc_FRC option; render the judgement spots (`compare/nvofa_frc/scripts/render.ps1`); the user judges by eye (crops +
    CSV, one question per spot).
 6. Docs: `Documentation/gpu.md` or a new `Documentation/nvencme.md`; GPU_PIPELINE_PLAN.md new section.

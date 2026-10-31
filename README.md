@@ -4,6 +4,7 @@ Supporting YUY2, 4:2:0, 4:2:2, 4:4:4 at native 8, 10, 12, 14 and 16 bit depths, 
 Still supporting Windows XP.
 x86 and x64 versions
 From December 20, 2020: Linux port
+This branch (gpu_work): VapourSynth support through `mvtools_vsbridge` (namespace `mvpf`, see "VapourSynth" below)
 
 File: mvtools2.dll
 
@@ -128,8 +129,40 @@ From the 'build' folder under project root:
         build/DePanEstimate/libdepanestimate.so
         build/Sources/cuda/libmvtools_cuda.so
         build/cudafilters/libcudafilters.so
+        build/vsbridge/libmvtools_vsbridge.so
 
 * Install binaries
 
         cd build
         sudo make install
+
+## VapourSynth (this branch)
+
+mvtools2 runs under VapourSynth (API 4.0, so R55 or newer; tested with R81) unchanged: `mvtools_vsbridge` is a small AviSynth+ host on top of
+the VapourSynth API, and `libmvtools2.so` / `mvtools2.dll` only gained a `VapourSynthPluginInit2` entry point that loads
+it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOURSYNTH_PLAN.md`.
+
+* Build: on by default (`-DMVTOOLS_VAPOURSYNTH=OFF` to skip); no VapourSynth installation needed (`VapourSynth4.h` is
+  in `Sources/include`). Status: Linux done; Windows waits for the CMake build of this branch (the MSVC solution does
+  not build the bridge yet).
+* Install: `libmvtools_vsbridge.so` must sit in the same folder as `libmvtools2.so` (VapourSynth's plugin folder, or
+  any folder used with `core.std.LoadPlugin`). Without it the namespace `mvpf` exists but is empty, and the reason is
+  printed to stderr.
+* Use: namespace `mvpf` (dubhater's VapourSynth port keeps `mv`, both can be loaded), the AviSynth function and
+  parameter names, so `Documentation/mvtools2.html` applies; booleans are 0 / 1 or True / False:
+
+        sup = core.mvpf.MSuper(clip, pel=2)
+        bv = core.mvpf.MAnalyse(sup, isb=True, blksize=16, overlap=8)
+        fv = core.mvpf.MAnalyse(sup, isb=False, blksize=16, overlap=8)
+        out = core.mvpf.MDegrain1(clip, sup, bv, fv, thSAD=400)
+
+  Positional clips have the documentation's names (`clip`, `super`, `vectors`, `mvbw`, `mvfw`, `mvbw2`, ...;
+  `MStoreVect` takes a list `clips`). Parameter names are case-sensitive in VapourSynth; where mvtools2 spells a name
+  differently between filters (`thsad` / `thSAD`), the most common spelling is used everywhere.
+* Formats: Gray, YUV 4:2:0 / 4:2:2 / 4:4:4, 8-16 bit, 32 bit float where mvtools2 supports it. Vector
+  clips appear in VapourSynth as Gray8 clips; pass them only to `mvpf` filters: a vector or super clip that went through
+  another VapourSynth filter (e.g. `std.Trim`) is not recognised.
+* Output is bit-identical with AviSynth+ on the same system (17 test chains, `vsbridge/test/compare.py`). Not verified
+  yet: `gpu=true` under VapourSynth, MDepan, cudafilters (planned as namespace `cuda`).
+* Debugging: `MVBRIDGE_DEBUG=1` prints frame-request misses, instance counts and a backtrace on a crash;
+  `MVBRIDGE_SERIAL=MAnalyse,MFlowFps` (or `all`) runs the named filters single-threaded.
