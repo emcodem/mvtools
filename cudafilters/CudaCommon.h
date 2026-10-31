@@ -45,6 +45,9 @@ namespace cf
     decltype(&mvcuda_qtgmc_sharp) qtgmc_sharp = nullptr;
     decltype(&mvcuda_qtgmc_backblend) qtgmc_backblend = nullptr;
     decltype(&mvcuda_temporal_binomial) temporal_binomial = nullptr;
+    decltype(&mvcuda_frame_upload_keyed) upload_keyed = nullptr;
+    decltype(&mvcuda_nvof_token) nvof_token = nullptr;
+    decltype(&mvcuda_nvof_available) nvof_available = nullptr;
 
     static CudaLib &get();
 

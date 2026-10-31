@@ -1,4 +1,4 @@
-// NVOFA sessions for the MAnalyse experiment (mvcuda_nvofa.h). The SDK headers (third_party/nvof, NVIDIA, BSD-3) only
+// NVOFA sessions (mvcuda_nvofa.h). The SDK headers (third_party/nvof, NVIDIA, BSD-3) only
 // declare types; nvofapi64.dll is loaded at run time, so the DLL has no new link dependency and works without it.
 #include "mvcuda_nvofa.h"
 
@@ -145,26 +145,19 @@ namespace mvc_nvofa
     }
   }
 
-  int perf_level()
+  namespace
   {
-    static const int level = [] {
-      const char *e = getenv("MVCUDA_NVOFA");
-      if (!e || !*e || e[0] == '0')
-        return 0;
-      if (!_stricmp(e, "fast"))
-        return (int)NV_OF_PERF_LEVEL_FAST;
-      if (!_stricmp(e, "slow"))
-        return (int)NV_OF_PERF_LEVEL_SLOW;
-      return (int)NV_OF_PERF_LEVEL_MEDIUM;
-    }();
-    return level;
+    int perf_level(int preset)
+    {
+      return preset == 1 ? (int)NV_OF_PERF_LEVEL_FAST : preset == 3 ? (int)NV_OF_PERF_LEVEL_SLOW : (int)NV_OF_PERF_LEVEL_MEDIUM;
+    }
   }
 
-  Session *acquire(int width, int height)
+  Session *acquire(int width, int height, int preset)
   {
-    const int level = perf_level();
+    const int level = perf_level(preset);
     std::lock_guard<std::mutex> lk(g_mutex);
-    if (!level || !load_locked())
+    if (!load_locked())
       return nullptr;
     for (Session *s : g_pool)
     {
@@ -206,6 +199,23 @@ namespace mvc_nvofa
       return -2;
     }
     return 0;
+  }
+
+  bool available()
+  {
+    static int result = -1; // under g_mutex: -1 not tested, 0 no, 1 yes
+    {
+      std::lock_guard<std::mutex> lk(g_mutex);
+      if (result >= 0)
+        return result > 0;
+    }
+    cudaFree(nullptr); // makes the primary context current on this thread
+    Session *s = acquire(160, 128, 2);
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (s)
+      ((Priv *)s->priv)->busy = false;
+    result = s ? 1 : 0;
+    return s != nullptr;
   }
 
   void release(Session *s)

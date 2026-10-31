@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 16
+#define MVCUDA_API_VERSION 17
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -137,6 +137,29 @@ MVCUDA_API int mvcuda_analyse_host(const MvCudaSuperParams *sp, const MvCudaAnal
 // MVCUDA_TOKEN_GONE when a token was evicted (make it again and retry).
 MVCUDA_API int mvcuda_analyse_token(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, unsigned long long src_token,
   unsigned long long ref_token, int *payload, int payload_words);
+
+// ---- vectors from NVIDIA's optical flow accelerator (cudafilters' CudaNVOFAnalyse, API 17), see mvcuda_nvof_vec.cu ------
+// NOT MAnalyse's search and not bit-exact with any CPU code: the median of NVOFA's flow under each block, at 1/pel pixel,
+// clamped to MAnalyse's search area, with its SAD.
+
+typedef struct
+{
+  int blk_x, blk_y, overlap_x, overlap_y; // block geometry
+  int n_blk_x, n_blk_y;                   // number of blocks (MAnalyse's formula)
+  int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left), as MAnalyse's
+  int preset;                             // NVOFA performance level: 1 fast, 2 medium, 3 slow
+} MvCudaNvofParams;
+
+// One vector field from the source picture (src_token) to the reference picture (ref_token), device frames of the
+// format sp describes. sp: levels 1, pel 1 or 2, the padding of the MSuper used downstream (the vectors are clamped to
+// it; the SAD is taken against MSuper(pel, hpad, vpad, sharp=2, levels=1) of the reference, kept with the frame).
+// payload receives a one-level MAnalyse payload: [3 + 3N, 1, 1 + 3N, (vx, vy, sad) * N]. MVCUDA_TOKEN_GONE when a token
+// was evicted, MVCUDA_NEEDS_CPU when NVOFA is not available or fails, -4 for bad arguments.
+MVCUDA_API int mvcuda_nvof_token(const MvCudaSuperParams *sp, const MvCudaNvofParams *np, unsigned long long src_token,
+  unsigned long long ref_token, int *payload, int payload_words);
+
+// 1 when NVOFA can be used (device present, nvofapi64.dll of the driver loaded, a session can be made), else 0.
+MVCUDA_API int mvcuda_nvof_available(void);
 
 // ---- GPU MFlowFps (M7), see mvcuda_flow.cu -----------------------------------------------------------------------
 

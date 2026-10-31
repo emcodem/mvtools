@@ -52,6 +52,7 @@
     <ClCompile Include="CudaNnedi3.cpp" />
     <ClCompile Include="CudaMt.cpp" />
     <ClCompile Include="CudaQtgmc.cpp" />
+    <ClCompile Include="CudaNvof.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

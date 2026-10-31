@@ -15,7 +15,8 @@ results.
 Filters: `CudaUpload`, `CudaDownload`, `CudaBob`, `CudaTemporalSoften`, `CudaMerge`, `CudaMergeLuma`, `CudaMergeChroma`,
 `CudaKeepOnlyBobShimmerFixes`, `CudaRemoveGrain`, `CudaGaussResize`, `CudaBilinearResize`, `CudaNNEDI3`, `CudaLogic`,
 `CudaClamp`, `CudaExpand`, `CudaInpand`, `CudaLutxy`, `CudaQtgmcSharpLimit`, `CudaQtgmcBinomial0`, `CudaQtgmcBackBlend`,
-`CudaQtgmcAddNoise`. QTGMC uses them through the patched script made by `..\qtgmc\make_qtgmc_gpu.py`. Parameters, defaults
+`CudaQtgmcAddNoise`, and `CudaNVOFAnalyse` / `CudaNVOFAvailable` (motion vectors from NVIDIA's optical flow
+accelerator, not bit-exact with anything: NVOF_FILTER_PLAN.md). QTGMC uses them through the patched script made by `..\qtgmc\make_qtgmc_gpu.py`. Parameters, defaults
 and what each filter covers on the GPU: `..\Documentation\gpu.md`.
 
 Build (Visual Studio 2026 Build Tools, toolset v145):

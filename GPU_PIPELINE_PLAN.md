@@ -1119,3 +1119,41 @@ on the cudafilters model; MCompensate / MDegrain take normal frames too.
 - QTGMC PAL 1500 frames 8 bit 'gpu all' (run_presettiming): Fast 1.80 -> 1.81 s, Slower 4.36 -> 4.36 s (unchanged, as
   expected: its search clip was on the device already). Final-build tests repeated: run_partm 36/36, cf_regression 65/65,
   qtgmc_vec 50/50 x2, run_presetcheck -Fallback Fast / Slower / Placebo ALL PASS, golden 85/85.
+
+## 26. CudaNVOFAnalyse: NVOFA vectors as a cudafilters filter (2026-10-31; library API 17)
+
+Plan: NVOF_FILTER_PLAN.md; experiment and the user's visual judgement: opticalflow.md, compare/nvofa_frc/README.md.
+- Step 0: the MVCUDA_NVOFA experiment committed as it stood (574cd22). Then `mvcuda_analyse.cu` restored to 6bfdc14
+  (MAnalyse exact-only, byte for byte the pre-experiment source).
+- Library: `mvcuda_nvof_token` / `mvcuda_nvof_available` (API 16 -> 17), unit `mvcuda_nvof_vec.cu` (+ `_8` / `_16`):
+  gray, NVOFA, per-block median + clamp + SAD. `mvcuda_nvofa.{h,cu}`: preset per call (sessions keyed by size and preset),
+  `available()`; the env var is gone. **Deviation from the plan:** the SAD planes come from `frame_super` with a levels=1
+  MSuper (kept with the device frame, as MAnalyse's) instead of `frame_subpel`, and the gray input from its level-0 plane;
+  the kernels are the hook's level-0 kernels unchanged. Payload copied back through pinned memory (a pageable copy would
+  block the submitter thread).
+- cudafilters: `CudaNvof.cpp` (`CudaNVOFAnalyse`, `CudaNVOFAvailable`), vector clip header from `Sources/MVAnalysisData.h`
+  and the x64 pointer hack; inputs uploaded keyed by (clip, n) (`mvcuda_frame_upload_keyed`, now in `CudaLib`), token
+  inputs used directly, `with_inputs` on MVCUDA_TOKEN_GONE. Fallback: without NVOFA the function returns MAnalyse itself;
+  a failed frame gets MAnalyse's level 0 repacked (MAnalyse's frames hold all levels, so they cannot pass through: the
+  clip's frame size is fixed).
+- uconvert.avsi (not in git; backup `uconvert.avsi.bak_before_nvof`): `global uc_frc_nvof = 0`; in uc_FRC, UHD only,
+  `nv = uc_frc_gpu && uc_frc_nvof > 0 && big && FunctionExists("CudaNVOFAvailable") ? CudaNVOFAvailable() : false`;
+  cudafilters.dll loaded from `dlls\` when it is deployed there (not yet). HD (pel 4) keeps the normal branch: pel-2
+  NVOFA vectors against a pel-4 MRecalculate super are not verified.
+- Tests (build `profile\build_nvof2`):
+  - same result as the judged experiment: `profile\avs\m\frc_nvof.avs.tpl` (run_frc.ps1 got `-Tpl`) md5 **FA834251D140**
+    in 3 of 3 runs; vectors **and** SADs equal level 0 of the hook's MAnalyse output in all 300 vector frames
+    (`profile\out\nvof_ref`).
+  - exact paths unchanged: golden 85/85, run_partm 27/27, run_cf_regression 65 PASS / 0 FAIL, uc_FRC BFE44775F811 = CPU
+    fallback. Note: a fresh build_all_dev folder has no avstp.dll; without it the CPU fallback runs single-sliced and
+    gives 09FDEBF10F3F (a valid result of another slice count, not a defect): copy avstp.dll into the test set.
+  - formats: 4:2:0 / 4:2:2 / 4:4:4 x 8 / 10 bit x pel 1 / 2, delta 1 + 2, both directions, into MFlowFps, MDegrain2,
+    MCompensate: all run. MCompensate of the previous frame, PSNR to the frame (960x540): none 33.9, NVOFA 44.6, MAnalyse
+    46.7 dB (MAnalyse minimises SAD; NVOFA follows motion).
+  - synthetic shift (+5, -3): 1793 / 1798 interior blocks exactly (10, -6) at pel 2, the rest off by one half-pel in y.
+  - fallbacks: MVTOOLS_GPU_DISABLE=1 -> CudaNVOFAvailable() false, CudaNVOFAnalyse md5 = MAnalyse's.
+  - uc_FRC through uconvert.avsi (`profile\avs\m\frc_uc_nvof{0,2}.avs.tpl`): uc_frc_nvof 2 -> FA834251D140 (5.20 s),
+    0 -> BFE44775F811 (7.00 s), 2 with MVTOOLS_GPU_DISABLE=1 -> BFE44775F811.
+- Speed (uc_FRC chain, Prefetch 3): 4.74 s best of 3 (hook: 4.90 s; exact search 6.75 s).
+- **Open:** the 4-concurrent-jobs figure; HD (pel 4) path; deployment of cudafilters.dll + mvtools_cuda.dll to
+  `C:\dev\uconvert\dlls`; the NVOFA defects of the user's judgement (AB15, AF13-16, Z13; NVOF_FILTER_PLAN.md).

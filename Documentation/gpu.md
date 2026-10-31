@@ -8,7 +8,7 @@ This page covers the CUDA part of this mvtools build:
 - the environment variables
 
 The design notes and measurements are in `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md` and `GPU_PIPELINE_PLAN.md`. They describe how
-the work got here; this page describes what the functions do now (library API version 16).
+the work got here; this page describes what the functions do now (library API version 17).
 
 ## Principles
 
@@ -19,6 +19,8 @@ the work got here; this page describes what the functions do now (library API ve
   when a device frame was evicted and cannot be made again. Nothing in the script has to change.
   Set `MVTOOLS_GPU_LOG=1` (mvtools2) or `CUDAFILTERS_LOG=1` (cudafilters) to see on stderr which path every filter takes.
 - **Default off.** All `gpu` parameters default to `false`.
+- **One exception: `CudaNVOFAnalyse`.** It is not a GPU version of a CPU filter but another motion search (NVIDIA's
+  optical flow accelerator), so its vectors match no CPU result. Use it only where that is wanted (see below).
 
 ## Installation
 
@@ -364,6 +366,30 @@ c.mt_adddiff(noise.mt_lut(expr, use_expr=use_expr, clamp_float=clamp_float, U=lu
 The tables are made by running that chain once on a 256 x 256 (10 bit: 1024 x 1024) pattern. Defaults: `use_expr` 0,
 `clamp_float` false, `lutUV` 1, `addUV` 2. On the GPU: 8 or 10 bit, both clips of one format, and `addUV=2`, or
 `lutUV=3` with `addUV=3`.
+
+### Motion vectors from the optical flow accelerator
+
+#### CudaNVOFAnalyse(clip c, bool isb, int delta, int blksize, int blksizeV, int overlap, int overlapV, int pel, int hpad, int vpad, bool chroma, int preset)
+
+A vector clip in MAnalyse's format (accepted by MRecalculate, MFlowFps, MDegrain, MCompensate) from NVIDIA's optical flow
+accelerator (NVOFA, `nvofapi64.dll` of the driver; Turing or newer). It takes the plain clip, not a super clip: no MSuper
+pyramid is built for the search. Per block: the median of NVOFA's 4x4-grid flow under the block (x and y separately),
+rounded to 1/pel pixel, clamped to the area MAnalyse could reach with that padding, and its SAD (luma + chroma as MAnalyse
+with `scaleCSAD=0`). One level (`nLvCount` 1). **Not bit-exact with anything**: a different algorithm that follows true
+motion better (fast pans) and minimises SAD less than MAnalyse. Made for uc_FRC's coarse pass, which MRecalculate refines.
+
+Defaults: `isb` false, `delta` 1, `blksize` 16, `blksizeV` = blksize (MAnalyse's sizes), `overlap` 0, `overlapV` =
+overlap, `pel` 2 (1 or 2), `hpad` / `vpad` 16 (must be those of the MSuper used downstream), `chroma` true, `preset` 2
+(1 fast, 2 medium, 3 slow). Planar YUV or Y, 8 to 16 bit. Frames without a reference get invalid vectors, as MAnalyse.
+
+Fallback: without NVOFA (or with `MVTOOLS_GPU_DISABLE`) the function returns
+`MAnalyse(MSuper(c, pel, hpad, vpad, chroma), isb, delta, blksize, blksizeV, overlap, overlapV, truemotion=true, chroma)`
+(mvtools2.dll must be loaded); a single frame NVOFA fails on gets that MAnalyse's level-0 vectors.
+
+#### CudaNVOFAvailable()
+
+True when CudaNVOFAnalyse will use NVOFA (library loaded, device present, a session can be made). For choosing a branch
+in a script, as uconvert's `uc_frc_nvof` does.
 
 ### Using cudafilters with QTGMC
 

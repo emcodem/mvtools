@@ -1,5 +1,8 @@
 # NVOFA as a standalone filter: CudaNVOFAnalyse (cudafilters.dll) + uc_FRC option
 
+**Status 2026-10-31: implemented** (step 0 = commit 574cd22, then the filter). Results and the deviations from this plan:
+GPU_PIPELINE_PLAN.md section 26.
+
 Implementation plan, written 2026-10-31 for a new session. Background and measurements: [opticalflow.md](opticalflow.md)
 (experiment plan + results) and [compare/nvofa_frc/README.md](compare/nvofa_frc/README.md) (speed, visual judgement,
 vector analysis, cause of the exact search's failure).
