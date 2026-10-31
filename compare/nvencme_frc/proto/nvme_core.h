@@ -101,8 +101,9 @@ namespace nvme
     int w = 0, h = 0;
     bool hevc = false;
     int preset = 4; // NVENC P1..P7
-    int tuning = -1; // NV_ENC_TUNING_INFO, -1: from NVME_TUNING or 2 (low latency)
-    bool operator==(const Params &o) const { return w == o.w && h == o.h && hevc == o.hevc && preset == o.preset; }
+    int tuning = -1; // NV_ENC_TUNING_INFO, -1: from NVME_TUNING or 1
+    int hints = 0;   // external hint candidates per 16x16 macroblock (H.264), 0: none
+    bool operator==(const Params &o) const { return w == o.w && h == o.h && hevc == o.hevc && preset == o.preset && hints == o.hints; }
   };
 
   inline const GUID &preset_guid(int p)
@@ -185,6 +186,11 @@ namespace nvme
       ip.enablePTD = 1;
       ip.enableMEOnlyMode = 1;
       ip.encodeConfig = &pc.presetCfg;
+      if (p.hints > 0 && !p.hevc)
+      {
+        ip.enableExternalMEHints = 1;
+        ip.maxMEHintCountsPerBlock[0].numCandsPerBlk16x16 = p.hints;
+      }
       ip.tuningInfo = NV_ENC_TUNING_INFO_UNDEFINED; // ME-only mode rejects every tuning; the preset config above still uses one
       s = d.api.nvEncInitializeEncoder(enc, &ip);
       if (s != NV_ENC_SUCCESS)
@@ -215,7 +221,7 @@ namespace nvme
     // H.264; (w+7)/8 x (h+7)/8 for HEVC), row-major, width gw().
     // cur_uv / ref_uv (optional): NV12 chroma, (h + 1) / 2 rows of w bytes (U, V interleaved); null: neutral grey
     bool run(const uint8_t *cur, const uint8_t *ref, int pitch, std::vector<Mv> &out, Stats *st = nullptr,
-      const uint8_t *cur_uv = nullptr, const uint8_t *ref_uv = nullptr)
+      const uint8_t *cur_uv = nullptr, const uint8_t *ref_uv = nullptr, const NVENC_EXTERNAL_ME_HINT *hints = nullptr)
     {
       Driver &d = Driver::get();
       // the session keeps state between calls (the previous vector field serves as predictors, and
@@ -241,6 +247,11 @@ namespace nvme
         mp.referenceFrame = in[1];
         mp.mvBuffer = mv;
         mp.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+        if (hints && p.hints > 0)
+        {
+          mp.meHintCountsPerBlock[0].numCandsPerBlk16x16 = p.hints;
+          mp.meExternalHints = const_cast<NVENC_EXTERNAL_ME_HINT *>(hints);
+        }
         NVENCSTATUS s = d.api.nvEncRunMotionEstimationOnly(enc, &mp);
         ok = s == NV_ENC_SUCCESS || fail("nvEncRunMotionEstimationOnly", s);
       }
@@ -498,4 +509,105 @@ namespace nvme
     std::vector<std::unique_ptr<Session>> idle;
     int open_count = 0, cap = 2;
   };
+  // 2x2 box downscale of an 8-bit picture
+  inline void downscale(const std::vector<uint8_t> &src, int w, int h, std::vector<uint8_t> &dst, int &dw, int &dh)
+  {
+    dw = (w + 1) / 2;
+    dh = (h + 1) / 2;
+    dst.resize((size_t)dw * dh);
+    for (int y = 0; y < dh; y++)
+      for (int x = 0; x < dw; x++)
+      {
+        const int x0 = 2 * x, x1 = std::min(2 * x + 1, w - 1), y0 = 2 * y, y1 = std::min(2 * y + 1, h - 1);
+        dst[(size_t)y * dw + x] = (uint8_t)((src[(size_t)y0 * w + x0] + src[(size_t)y0 * w + x1] + src[(size_t)y1 * w + x0]
+          + src[(size_t)y1 * w + x1] + 2) >> 2);
+      }
+  }
+
+  // Hints for the macroblocks of a picture twice the size of the coarse one: per MB the coarse vector under its centre
+  // and the median of the 3x3 coarse cells around it, in integer pixels of the fine picture (2 candidates).
+  inline void hints_from(const std::vector<Mv> &cg, int cgw, int cgh, int fw, int fh, std::vector<NVENC_EXTERNAL_ME_HINT> &out)
+  {
+    const int mbw = (fw + 15) / 16, mbh = (fh + 15) / 16;
+    out.assign((size_t)mbw * mbh * 2, NVENC_EXTERNAL_ME_HINT{});
+    auto conv = [](int q) { // coarse quarter pel -> fine integer pel: q * 2 / 4, rounded half away from zero
+      return q >= 0 ? (q + 1) / 2 : -((-q + 1) / 2);
+    };
+    int vx[9], vy[9];
+    for (int my = 0; my < mbh; my++)
+      for (int mx = 0; mx < mbw; mx++)
+      {
+        const int gx = std::min((mx * 16 + 8) / 2 / 8, cgw - 1), gy = std::min((my * 16 + 8) / 2 / 8, cgh - 1);
+        int n = 0;
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+          {
+            const int x = std::min(std::max(gx + dx, 0), cgw - 1), y = std::min(std::max(gy + dy, 0), cgh - 1);
+            vx[n] = cg[(size_t)y * cgw + x].x;
+            vy[n++] = cg[(size_t)y * cgw + x].y;
+          }
+        std::nth_element(vx, vx + 4, vx + 9);
+        std::nth_element(vy, vy + 4, vy + 9);
+        const Mv c = cg[(size_t)gy * cgw + gx];
+        const int cand[2][2] = { { conv(c.x), conv(c.y) }, { conv(vx[4]), conv(vy[4]) } };
+        for (int k = 0; k < 2; k++)
+        {
+          NVENC_EXTERNAL_ME_HINT &h = out[((size_t)my * mbw + mx) * 2 + k];
+          h.mvx = std::min(std::max(cand[k][0], -2047), 2047);
+          h.mvy = std::min(std::max(cand[k][1], -511), 511);
+          h.refidx = 0;
+          h.dir = 0;
+          h.partType = 0;
+          h.lastofPart = 1;
+          h.lastOfMB = k == 1;
+        }
+      }
+  }
+
+  // ME of (cur, ref) (8-bit luma, w x h, pitch w) through a pyramid of `levels` (1: plain); each finer level gets the
+  // coarser level's vectors as hints. Result: the 8x8 grid of the full picture, quarter pel. H.264 only.
+  inline bool pyramid_me(const std::vector<uint8_t> &cur, const std::vector<uint8_t> &ref, int w, int h, Params base, int levels,
+    std::vector<Mv> &out, int &gw, int &gh, std::string &err)
+  {
+    std::vector<std::vector<uint8_t>> pc(1, cur), pr(1, ref);
+    std::vector<int> ws(1, w), hs(1, h);
+    for (int l = 1; l < levels && ws.back() >= 64 && hs.back() >= 64; l++)
+    {
+      std::vector<uint8_t> a, b;
+      int dw, dh;
+      downscale(pc.back(), ws.back(), hs.back(), a, dw, dh);
+      downscale(pr.back(), ws.back(), hs.back(), b, dw, dh);
+      pc.push_back(std::move(a));
+      pr.push_back(std::move(b));
+      ws.push_back(dw);
+      hs.push_back(dh);
+    }
+    std::vector<Mv> grid;
+    std::vector<NVENC_EXTERNAL_ME_HINT> hints;
+    int cgw = 0, cgh = 0;
+    for (int l = (int)ws.size() - 1; l >= 0; l--)
+    {
+      Params p = base;
+      p.w = ws[l];
+      p.h = hs[l];
+      p.hints = l + 1 < (int)ws.size() ? 2 : 0;
+      if (p.hints)
+        hints_from(grid, cgw, cgh, p.w, p.h, hints);
+      auto s = Pool::get().acquire(p, err);
+      if (!s)
+        return false;
+      const bool ok = s->run(pc[l].data(), pr[l].data(), p.w, grid, nullptr, nullptr, nullptr, p.hints ? hints.data() : nullptr);
+      cgw = s->gw();
+      cgh = s->gh();
+      if (!ok)
+        err = s->err;
+      Pool::get().release(std::move(s));
+      if (!ok)
+        return false;
+    }
+    out.swap(grid);
+    gw = cgw;
+    gh = cgh;
+    return true;
+  }
 }

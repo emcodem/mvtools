@@ -18,6 +18,7 @@ namespace
   {
     MVAnalysisData _ad = {};
     bool _isb, _half, _chroma_me = nvme::env_on("NVME_CHROMA");
+    int _levels = 1;
     int _delta, _pel, _words = 0, _big_sad = 0;
     nvme::Params _np;
     VideoInfo _src_vi;
@@ -93,8 +94,8 @@ namespace
 
   public:
     NVENCMEProto(PClip c, bool isb, int delta, int bx, int by, int ox, int oy, int pel, int hpad, int vpad, bool chroma, int preset,
-      bool hevc, bool half, IScriptEnvironment *env)
-      : GenericVideoFilter(c), _isb(isb), _half(half), _delta(delta), _pel(pel), _src_vi(c->GetVideoInfo())
+      bool hevc, bool half, int levels, IScriptEnvironment *env)
+      : GenericVideoFilter(c), _isb(isb), _half(half), _levels(levels), _delta(delta), _pel(pel), _src_vi(c->GetVideoInfo())
     {
       const VideoInfo &svi = _src_vi;
       if (!svi.IsPlanar() || svi.IsRGB() || svi.BitsPerComponent() > 16 || svi.ComponentSize() == 4)
@@ -183,15 +184,23 @@ namespace
       gray(n, gc, uc, env);
       gray(nref, gr, ur, env);
       std::string err;
-      auto s = nvme::Pool::get().acquire(_np, err);
-      if (!s)
-        env->ThrowError("NVENCMEProto: frame %d: %s", n, err.c_str());
       std::vector<nvme::Mv> grid;
-      const bool ok = s->run(gc.data(), gr.data(), _np.w, grid, nullptr, uc.empty() ? nullptr : uc.data(), ur.empty() ? nullptr : ur.data());
-      const int gw = s->gw(), gh = s->gh();
-      if (!ok)
-        err = s->err;
-      nvme::Pool::get().release(std::move(s));
+      int gw = 0, gh = 0;
+      bool ok;
+      if (_levels > 1 || uc.empty())
+        ok = nvme::pyramid_me(gc, gr, _np.w, _np.h, _np, _levels, grid, gw, gh, err); // chroma: ignored by the ME anyway
+      else
+      {
+        auto s = nvme::Pool::get().acquire(_np, err);
+        if (!s)
+          env->ThrowError("NVENCMEProto: frame %d: %s", n, err.c_str());
+        ok = s->run(gc.data(), gr.data(), _np.w, grid, nullptr, uc.data(), ur.data());
+        gw = s->gw();
+        gh = s->gh();
+        if (!ok)
+          err = s->err;
+        nvme::Pool::get().release(std::move(s));
+      }
       if (!ok)
         env->ThrowError("NVENCMEProto: frame %d: %s", n, err.c_str());
 
@@ -250,17 +259,20 @@ namespace
     if (ox < 0 || ox > bx / 2 || oy < 0 || oy > by / 2)
       env->ThrowError("NVENCMEProto: overlap must be less or equal than half block size");
     const bool hevc = _stricmp(codec, "hevc") == 0;
+    const int levels = args[14].AsInt(1);
+    if (levels < 1 || levels > 4 || (hevc && levels > 1))
+      env->ThrowError("NVENCMEProto: levels is 1..4 (H.264 only above 1)");
     if (!hevc && _stricmp(codec, "h264") != 0)
       env->ThrowError("NVENCMEProto: codec is \"h264\" or \"hevc\"");
     return new NVENCMEProto(c, args[1].AsBool(false), args[2].AsInt(1), bx, by, ox, oy, pel, args[8].AsInt(16), args[9].AsInt(16),
-      args[10].AsBool(true), preset, hevc, args[13].AsBool(false), env);
+      args[10].AsBool(true), preset, hevc, args[13].AsBool(false), levels, env);
   }
 }
 
 extern "C" __declspec(dllexport) const char *__stdcall AvisynthPluginInit3(IScriptEnvironment *env, const AVS_Linkage *const vectors)
 {
   AVS_linkage = vectors;
-  env->AddFunction("NVENCMEProto", "c[isb]b[delta]i[blksize]i[blksizeV]i[overlap]i[overlapV]i[pel]i[hpad]i[vpad]i[chroma]b[preset]i[codec]s[half]b",
+  env->AddFunction("NVENCMEProto", "c[isb]b[delta]i[blksize]i[blksizeV]i[overlap]i[overlapV]i[pel]i[hpad]i[vpad]i[chroma]b[preset]i[codec]s[half]b[levels]i",
     Create, nullptr);
   return "NVENC ME-only prototype";
 }

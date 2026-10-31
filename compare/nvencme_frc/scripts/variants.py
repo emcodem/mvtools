@@ -24,6 +24,11 @@ ALL = [
     ('p4n', 'NVENC P4 no intra', (4, False), '', {'NVME_NOINTRA': '1'}),
     ('p4cn', 'NVENC P4 + chroma, no intra', (4, False), '', {'NVME_CHROMA': '1', 'NVME_NOINTRA': '1'}),
     ('p4cn16', 'NVENC P4 + chroma, no intra, 16x16', (4, False), '', {'NVME_CHROMA': '1', 'NVME_NOINTRA': '1', 'NVME_P16': '1'}),
+    ('p4l2', 'NVENC P4 pyramid 2', (4, False, 2), ''),
+    ('p4l3', 'NVENC P4 pyramid 3', (4, False, 3), ''),
+    ('p4l4', 'NVENC P4 pyramid 4', (4, False, 4), ''),
+    ('p4nl3', 'NVENC P4 pyramid 3, no intra', (4, False, 3), '', {'NVME_NOINTRA': '1'}),
+    ('p7l3', 'NVENC P7 pyramid 3', (7, False, 3), ''),
 ]
 ALL = [v if len(v) == 5 else v + ({},) for v in ALL]
 BY_KEY = {v[0]: v for v in ALL}
@@ -34,9 +39,10 @@ def script_text(key):
     nv = BY_KEY[key][2]
     if nv is None:
         return open(NVOFA_AVS).read()
-    preset, half = nv
-    head = ('global NVME_PLUGIN = "%s"\nglobal NVME_PRESET = %d\nglobal NVME_HALF = %s\n'
-            % (PLUGIN, preset, 'true' if half else 'false'))
+    preset, half = nv[:2]
+    levels = nv[2] if len(nv) > 2 else 1
+    head = ('global NVME_PLUGIN = "%s"\nglobal NVME_PRESET = %d\nglobal NVME_HALF = %s\nglobal NVME_LEVELS = %d\n'
+            % (PLUGIN, preset, 'true' if half else 'false', levels))
     return head + open(NVME_AVS).read()
 
 

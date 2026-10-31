@@ -1,12 +1,14 @@
 # uc_FRC with NVENC ME-only vectors (prototype, ahead of NVENCMEAnalyse)
 
-> **Status 2026-10-31: not judged by eye yet, on purpose.** First look (user): "extremely bad". On the vector scores
-> every NVENC variant is far behind NVOFA medium (outlier score ~0.09 vs 0.009). DTL's points are tested below:
-> chroma is ignored by NVENC's H.264 ME, intra off helps only partly. The likely main cause is the missing predictors
-> (fresh session per call, see the probe). **Next:** a hinted variant (`meExternalHints` from a half-resolution pass or
-> from the previous frame of the same direction), re-scored; the spots and the slow-motion clip are judged only if it
-> comes close to NVOFA. Gate for NVENCMEAnalyse.md steps 2–4: build the plugin only then; otherwise NVOFA covers
-> Ampere+, and NVENC would only add Pascal / Turing, which cannot be tested here.
+> **Status 2026-10-31: NVENC ME is not good enough for frame interpolation; recommendation: do not build
+> NVENCMEAnalyse.** Judged by eye (user): plain P4 "extremely bad", the hinted pyramid (P4, 3 levels, intra off) in
+> [img/slowmo_pyramid_1.7-2.6.mp4](img/slowmo_pyramid_1.7-2.6.mp4) "still extremely bad". Every NVENC lever was
+> tried: presets P1/P4/P7, half resolution, chroma (ignored by the ME), intra off, 16x16 only, a hinted pyramid
+> (fixes the search range, SADs near NVOFA's, fields even less coherent); AV1 has no ME-only mode, HEVC ME-only output
+> is broken. The cause is the cost function: the encoder's ME picks the cheapest match per block, not the true motion,
+> and the API has no smoothness control. What remains would be our own processing (smoothing the field, stronger
+> MRecalculate), i.e. not NVENC's quality. NVOFA covers Ampere+; NVENC would only have added Pascal / Turing, which
+> cannot be tested here. The spot crops and `spots_check.csv` below were not judged (not needed after the clips).
 >
 > Prototype switches (environment of the AviSynth process): `NVME_FRESH=0` keep sessions (faster, not deterministic),
 > `NVME_NOINTRA=1`, `NVME_CHROMA=1`, `NVME_P16=1` (16x16 partitions only), `NVME_SESSIONS=<n>` (pool size, default 2),
@@ -43,6 +45,9 @@ RTX 5090, driver 616.92, NVENC API 13.0 (header: FFmpeg/nv-codec-headers n13.0.1
   single-threaded it is stable. The prototype therefore opens a **fresh session per call** (`NVME_FRESH=0` turns it
   off): deterministic, but 42 ms instead of 10 ms per UHD pair. For the plugin: a session per clip and direction, called
   in frame order (temporal predictors as intended), or fresh sessions — open question.
+- **AV1: no ME-only mode.** The driver lists the AV1 encoder, but `NV_ENC_CAPS_SUPPORT_MEONLY_MODE` is 0 for AV1
+  (1 for H.264 and HEVC), and SDK 13.0 defines no AV1 MV output layout (only `NV_ENC_H264_MV_DATA` /
+  `NV_ENC_HEVC_MV_DATA`).
 - **HEVC: not usable yet.** Same setup, but most CUs come back as `cuType 0` with zero vectors and the rest are off
   (shift (5, -3) → (5.25, -0.5)), also at 64-aligned sizes. Left out of the comparison; to be investigated.
 
@@ -94,6 +99,39 @@ in the sky: 3–4× the exact search's score and 10× NVOFA's, with SADs between
   previous call) to 0 %. The missing predictors, not the block size or chroma, look like the main weakness on fast
   motion. Next lever: `meExternalHints` (H.264 only) from a half-resolution pass or from the previous frame of the same
   direction — deterministic predictors instead of whatever the session saw last.
+
+### Hinted pyramid (`levels=2..4`)
+
+NVENC ME on the picture downscaled 2x per level, coarsest first; each finer level gets two hint candidates per 16x16
+macroblock (`meExternalHints`, integer pel): the coarse vector under the MB centre and the median of the 3x3 coarse
+cells around it. Fresh sessions, so deterministic (md5 E11CE147046A twice for pyramid 3 no intra). Probe, UHD,
+P4, cells exact:
+
+| shift | 1 level | 2 levels | 3 levels |
+|---|---:|---:|---:|
+| (40, -24) | 84 % | 100 % | 100 % |
+| (64, 32) | 0 % | 71 % | 98 % |
+| (0, 100) | 0 % | 0 % | 88 % |
+| (120, -60) / (-150, 0) | 0 % | 0 % | 26 % / 8 % |
+| ms per pair (fresh sessions) | ~48 | ~87 | ~118 |
+
+On the clip:
+
+| variant | score all | score tree | mean SAD | cells > 0.5 |
+|---|---:|---:|---:|---:|
+| P4 (1 level) | 0.098 | 0.124 | 1219 | 3240 |
+| P4 pyramid 2 | 0.116 | 0.156 | 1152 | 3861 |
+| P4 pyramid 3 | 0.125 | 0.174 | 1105 | 4201 |
+| P4 pyramid 4 | 0.126 | 0.177 | 1078 | 4253 |
+| P4 pyramid 3, intra off | 0.121 | 0.192 | 875 | 2592 |
+| P7 pyramid 3 | 0.131 | 0.185 | 1087 | 4391 |
+| *NVOFA medium* | *0.009* | *0.011* | *820* | *2* |
+
+The range is fixed (SAD falls towards NVOFA's: 875 vs 820 with intra off), but the fields get *less* coherent, not
+more. The search range was not what separates NVENC from NVOFA: the encoder's ME picks the cheapest match per block,
+which in the trees jumps from block to block. Whether that is visible: [img/slowmo_pyramid_1.7-2.6.mp4](img/slowmo_pyramid_1.7-2.6.mp4)
+(exact | NVOFA medium / P4 | P4 pyramid 3 intra off). Speed of that variant: 21.2 s for 112 frames (three session
+re-opens per pair; kept sessions with hints would be far faster but need a fix for the session state).
 
 ## For the visual check
 

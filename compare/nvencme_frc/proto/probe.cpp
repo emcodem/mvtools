@@ -194,6 +194,75 @@ int main(int argc, char **argv)
     }
   }
 
+  // ME-only capability per codec, straight from the driver
+  {
+    Driver &dd = Driver::get();
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS op = {};
+    op.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    op.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+    op.device = dd.ctx;
+    op.apiVersion = NVENCAPI_VERSION;
+    void *enc = nullptr;
+    if (dd.api.nvEncOpenEncodeSessionEx(&op, &enc) == NV_ENC_SUCCESS)
+    {
+      uint32_t n = 0;
+      dd.api.nvEncGetEncodeGUIDCount(enc, &n);
+      std::vector<GUID> g(n);
+      dd.api.nvEncGetEncodeGUIDs(enc, g.data(), n, &n);
+      const struct { const GUID *g; const char *name; } codecs[] = { { &NV_ENC_CODEC_H264_GUID, "H.264" }, { &NV_ENC_CODEC_HEVC_GUID, "HEVC" },
+        { &NV_ENC_CODEC_AV1_GUID, "AV1" } };
+      for (const auto &c : codecs)
+      {
+        bool listed = false;
+        for (const GUID &x : g)
+          listed = listed || std::memcmp(&x, c.g, sizeof(GUID)) == 0;
+        NV_ENC_CAPS_PARAM cp = {};
+        cp.version = NV_ENC_CAPS_PARAM_VER;
+        cp.capsToQuery = NV_ENC_CAPS_SUPPORT_MEONLY_MODE;
+        int v = -1;
+        const NVENCSTATUS st = dd.api.nvEncGetEncodeCaps(enc, *c.g, &cp, &v);
+        std::printf("%s: encoder listed %d, ME-only cap %d (status %d)\n", c.name, listed, v, (int)st);
+      }
+      dd.api.nvEncDestroyEncoder(enc);
+    }
+    if (std::getenv("PROBE_CAPS_ONLY"))
+      return 0;
+  }
+
+  // search range through the hinted pyramid (fresh sessions, deterministic)
+  for (int levels = 1; levels <= 3; levels++)
+  {
+    Params p;
+    p.preset = 4;
+    std::printf("\npyramid, %d level(s), H.264 P4:\n", levels);
+    for (const Shift &sh : shifts)
+    {
+      const std::vector<uint8_t> cur = shifted(big, bw, w, h, M + sh.dx, M + sh.dy);
+      std::vector<Mv> out;
+      int gw = 0, gh = 0;
+      std::string err;
+      const auto t0 = std::chrono::steady_clock::now();
+      if (!pyramid_me(cur, ref, w, h, p, levels, out, gw, gh, err))
+      {
+        std::printf("  failed: %s\n", err.c_str());
+        break;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      long long exact = 0, total = 0;
+      for (int gy = 0; gy < gh; gy++)
+        for (int gx = 0; gx < gw; gx++)
+        {
+          const int x = gx * 8, y = gy * 8;
+          if (x < 16 + std::abs(sh.dx) || y < 16 + std::abs(sh.dy) || x + 24 + std::abs(sh.dx) > w || y + 24 + std::abs(sh.dy) > h)
+            continue;
+          const Mv m = out[(size_t)gy * gw + gx];
+          total++;
+          exact += (m.x == 4 * sh.dx && m.y == 4 * sh.dy);
+        }
+      std::printf("  shift %4d,%4d: exact %5.1f%%  (%.1f ms)\n", sh.dx, sh.dy, 100.0 * exact / std::max(1LL, total), ms);
+    }
+  }
+
   // does the ME use chroma? flat luma, texture only in U / V, shift (5, -3)
   {
     Params p;
