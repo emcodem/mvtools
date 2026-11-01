@@ -77,6 +77,11 @@ namespace vkrt
     VKFN(vkCmdPipelineBarrier)
     VKFN(vkCmdCopyBuffer)
     VKFN(vkCmdFillBuffer)
+    // MVVK_GPUTIME only
+    VKFN(vkCreateQueryPool)
+    VKFN(vkCmdResetQueryPool)
+    VKFN(vkCmdWriteTimestamp)
+    VKFN(vkGetQueryPoolResults)
 #undef VKFN
 
     struct Dev
@@ -99,6 +104,11 @@ namespace vkrt
     Dev g;
     std::once_flag g_once;
     std::atomic<bool> g_lost{ false };
+    // MVVK_GPUTIME (defined with the command contexts below)
+    extern bool g_gt;
+    extern double g_gt_period;
+    extern uint64_t g_gt_mask;
+    void gt_report();
 
     bool env_on(const char *n)
     {
@@ -383,6 +393,22 @@ namespace vkrt
         return;
       }
       g.ok = true;
+      if (env_on("MVVK_GPUTIME") && LOADD(vkCreateQueryPool) && LOADD(vkCmdResetQueryPool) && LOADD(vkCmdWriteTimestamp)
+          && LOADD(vkGetQueryPoolResults) && g.props.limits.timestampComputeAndGraphics)
+      {
+        uint32_t nf = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> qf(nf);
+        vkGetPhysicalDeviceQueueFamilyProperties(g.phys, &nf, qf.data());
+        const uint32_t bits = qf[g.qfamily].timestampValidBits;
+        if (bits)
+        {
+          g_gt_mask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+          g_gt_period = g.props.limits.timestampPeriod;
+          g_gt = true;
+          std::atexit(gt_report);
+        }
+      }
       if (log_enabled())
         std::fprintf(stderr, "mvtools_vulkan: using '%s' (%u queues, %.0f MB, float64 %d)\n", g.props.deviceName, nqueues,
           g.heap_bytes / 1048576.0, (int)g.float64);
@@ -569,6 +595,7 @@ namespace vkrt
       VkCommandPool pool = VK_NULL_HANDLE;
       VkCommandBuffer cb = VK_NULL_HANDLE;
       VkFence fence = VK_NULL_HANDLE;
+      VkQueryPool qp = VK_NULL_HANDLE; // MVVK_GPUTIME
       int queue = 0;
     };
     std::mutex g_cmutex;
@@ -612,6 +639,101 @@ namespace vkrt
       g_ctx_free->push_back(c);
     }
 
+    // ---- MVVK_GPUTIME: GPU timestamps per command buffer and per command, report at exit ----------------------------
+    // Diagnostics only. Every Cmd writes a timestamp at its start and after every command; the report gives the GPU
+    // busy time (union over all queues), the summed GPU time per kernel and the host time from submit to fence.
+    constexpr uint32_t GT_MAX = 256;
+    bool g_gt = false;
+    double g_gt_period = 1.0; // ns per tick
+    uint64_t g_gt_mask = ~0ull;
+    struct GtCmd
+    {
+      uint64_t g0, g1;          // GPU ns
+      double rec, sub, done;    // host s: Cmd made, vkQueueSubmit, fence signalled
+      uint32_t n;               // commands
+    };
+    struct GtKer
+    {
+      double ns = 0;
+      uint64_t n = 0;
+    };
+    std::mutex g_gtmutex;
+    std::vector<GtCmd> *g_gtcmds = new std::vector<GtCmd>;
+    std::map<std::string, GtKer> *g_gtker = new std::map<std::string, GtKer>;
+
+    double gt_now()
+    {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void gt_report()
+    {
+      std::lock_guard<std::mutex> lk(g_gtmutex);
+      std::vector<GtCmd> &v = *g_gtcmds;
+      if (v.empty())
+        return;
+      std::vector<std::pair<uint64_t, uint64_t>> iv;
+      double sum = 0, wait = 0, rec = 0;
+      uint64_t cmds = 0;
+      double h0 = 1e300, h1 = 0;
+      for (auto &c : v)
+      {
+        iv.push_back({ c.g0, c.g1 });
+        sum += (double)(c.g1 - c.g0);
+        wait += c.done - c.sub;
+        rec += c.sub - c.rec;
+        cmds += c.n;
+        h0 = std::min(h0, c.rec);
+        h1 = std::max(h1, c.done);
+      }
+      std::sort(iv.begin(), iv.end());
+      double busy = 0;
+      uint64_t cs = iv[0].first, ce = iv[0].second;
+      const uint64_t t0 = iv[0].first;
+      uint64_t t1 = 0;
+      for (auto &x : iv)
+      {
+        t1 = std::max(t1, x.second);
+        if (x.first > ce)
+        {
+          busy += (double)(ce - cs);
+          cs = x.first;
+          ce = x.second;
+        }
+        else
+          ce = std::max(ce, x.second);
+      }
+      busy += (double)(ce - cs);
+      const double span = (double)(t1 - t0);
+      std::fprintf(stderr, "mvtools_vulkan GPUTIME: %zu submits, %llu commands, host span %.1f ms\n", v.size(),
+        (unsigned long long)cmds, (h1 - h0) * 1e3);
+      std::fprintf(stderr, "  GPU span %.1f ms, busy (union) %.1f ms = %.0f%%, sum of command buffers %.1f ms (overlap %.2f)\n",
+        span / 1e6, busy / 1e6, 100.0 * busy / span, sum / 1e6, sum / busy);
+      std::fprintf(stderr, "  host: record %.1f ms total (%.1f us/submit), submit->fence %.1f ms total (%.1f us/submit, GPU part %.1f us)\n",
+        rec * 1e3, rec * 1e6 / v.size(), wait * 1e3, wait * 1e6 / v.size(), sum / 1e3 / v.size());
+      std::vector<std::pair<std::string, GtKer>> ks(g_gtker->begin(), g_gtker->end());
+      std::sort(ks.begin(), ks.end(), [](const std::pair<std::string, GtKer> &a, const std::pair<std::string, GtKer> &b) {
+        return a.second.ns > b.second.ns;
+      });
+      double ksum = 0;
+      for (auto &k : ks)
+        ksum += k.second.ns;
+      std::fprintf(stderr, "  per command (sum %.1f ms):\n", ksum / 1e6);
+      for (size_t i = 0; i < ks.size() && i < 25; i++)
+        std::fprintf(stderr, "    %-40s %9.1f ms %8llu x %8.1f us\n", ks[i].first.substr(0, 40).c_str(), ks[i].second.ns / 1e6,
+          (unsigned long long)ks[i].second.n, ks[i].second.ns / 1e3 / ks[i].second.n);
+      if (const char *path = std::getenv("MVVK_GPUTIME_CSV"))
+        if (FILE *f = std::fopen(path, "w"))
+        {
+          std::fprintf(f, "g0_ns,g1_ns,rec_s,sub_s,done_s,n\n");
+          for (auto &c : v)
+            std::fprintf(f, "%llu,%llu,%.7f,%.7f,%.7f,%u\n", (unsigned long long)(c.g0 - t0), (unsigned long long)(c.g1 - t0),
+              c.rec - h0, c.sub - h0, c.done - h0, c.n);
+          std::fclose(f);
+        }
+      v.clear();
+    }
+
     // ---- kernels -------------------------------------------------------------------------------------------------------
     std::mutex g_kmutex;
     std::map<std::string, Kernel *> *g_kernels = new std::map<std::string, Kernel *>;
@@ -620,6 +742,7 @@ namespace vkrt
   struct Kernel
   {
     VkPipeline pipe = VK_NULL_HANDLE;
+    std::string name;
   };
 
   bool log_enabled()
@@ -782,6 +905,7 @@ namespace vkrt
       delete k;
       return nullptr;
     }
+    k->name = key;
     (*g_kernels)[key] = k;
     return k;
   }
@@ -803,6 +927,18 @@ namespace vkrt
       size_t dpitch, row_bytes, rows;
     };
     std::vector<Down> downs;
+    // MVVK_GPUTIME
+    uint32_t nq = 0;
+    std::vector<const char *> qname;
+    double t_rec = 0;
+    void mark(const char *name)
+    {
+      if (nq && nq < GT_MAX)
+      {
+        vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->qp, nq++);
+        qname.push_back(name);
+      }
+    }
   };
 
   Cmd::Cmd() : d(new Impl)
@@ -816,6 +952,23 @@ namespace vkrt
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     d->ok = vkBeginCommandBuffer(d->c->cb, &bi) == VK_SUCCESS;
+    if (g_gt && d->ok)
+    {
+      if (!d->c->qp)
+      {
+        VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qci.queryCount = GT_MAX;
+        vkCreateQueryPool(g.dev, &qci, nullptr, &d->c->qp);
+      }
+      if (d->c->qp)
+      {
+        d->t_rec = gt_now();
+        vkCmdResetQueryPool(d->c->cb, d->c->qp, 0, GT_MAX);
+        vkCmdWriteTimestamp(d->c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, d->c->qp, 0);
+        d->nq = 1;
+      }
+    }
   }
 
   Cmd::~Cmd()
@@ -877,6 +1030,7 @@ namespace vkrt
     vkCmdPushConstants(d->c->cb, g.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &a);
     vkCmdDispatch(d->c->cb, gx, gy, gz);
     d->any = true;
+    d->mark(k->name.c_str());
     return true;
   }
 
@@ -895,6 +1049,7 @@ namespace vkrt
     VkBufferCopy r = { so, dof, bytes };
     vkCmdCopyBuffer(d->c->cb, sb, db, 1, &r);
     d->any = true;
+    d->mark("(copy)");
     return true;
   }
 
@@ -912,6 +1067,7 @@ namespace vkrt
       cmd_barrier(d->c->cb);
     vkCmdFillBuffer(d->c->cb, db, dof, bytes, value);
     d->any = true;
+    d->mark("(fill)");
     return true;
   }
 
@@ -953,6 +1109,7 @@ namespace vkrt
         r[y] = { so + y * dpitch, dof + y * dpitch, row_bytes };
       vkCmdCopyBuffer(d->c->cb, sb, db, (uint32_t)rows, r.data());
       d->any = true;
+      d->mark("(copy2d)");
       return true;
     }
     return copy(dst, b.addr, total);
@@ -998,6 +1155,7 @@ namespace vkrt
     si.commandBufferCount = 1;
     si.pCommandBuffers = &d->c->cb;
     VkResult r;
+    const double t_sub = d->nq ? gt_now() : 0;
     {
       std::lock_guard<std::mutex> lk(*g.qmutex[d->c->queue]);
       r = vkQueueSubmit(g.queues[d->c->queue], 1, &si, d->c->fence);
@@ -1021,6 +1179,24 @@ namespace vkrt
       g_lost = true;
       d->c = nullptr; // the context may still be in use by the GPU: leak it
       return -2;
+    }
+    if (d->nq > 1)
+    {
+      const double t_done = gt_now();
+      uint64_t ts[GT_MAX];
+      if (vkGetQueryPoolResults(g.dev, d->c->qp, 0, d->nq, sizeof(uint64_t) * d->nq, ts, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+      {
+        auto ns = [](uint64_t t) { return (uint64_t)((double)(t & g_gt_mask) * g_gt_period); };
+        std::lock_guard<std::mutex> lk(g_gtmutex);
+        g_gtcmds->push_back({ ns(ts[0]), ns(ts[d->nq - 1]), d->t_rec, t_sub, t_done, d->nq - 1 });
+        for (uint32_t i = 1; i < d->nq; i++)
+        {
+          GtKer &k = (*g_gtker)[d->qname[i - 1]];
+          k.ns += (double)(ns(ts[i]) - ns(ts[i - 1]));
+          k.n++;
+        }
+      }
     }
     for (size_t i = 0; i < d->downs.size(); i++)
     {

@@ -14,6 +14,7 @@
 
 #include "vk_internal.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -298,6 +299,15 @@ namespace
         std::chrono::duration<double, std::milli>(t2 - t1).count());
     }
     rc = aborted ? -4 : (bad ? MVCUDA_NEEDS_CPU : 0);
+    if (aborted)
+    {
+      // always visible: a timed-out wait gives the right result (CPU fallback) and would otherwise only show as slowness
+      static std::atomic<unsigned> n_abort{ 0 };
+      const unsigned n = ++n_abort;
+      if (n <= 10 || n % 100 == 0)
+        fprintf(stderr, "mvtools_vulkan: MAnalyse wavefront wait timed out (%u so far, MVVK_SPIN_MAX %d); frame made on the CPU\n",
+          n, spin_max);
+    }
     if (vkrt::log_enabled())
       fprintf(stderr, "mvvk analyse: %dx%d blocks, %d levels, %s, type %d, rc %d%s\n", ap->n_blk_x, ap->n_blk_y, nl,
         wave ? "wave" : "slices", user_type, rc, aborted ? " (wave wait timed out)" : "");

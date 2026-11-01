@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#extension GL_KHR_memory_scope_semantics : require
 // k_wave of Sources/cuda/mvcuda_analyse.cu for one level: meander=false and one slice, i.e. the CPU result of
 // MAnalyse(meander=false, mt=false). Without meander a block depends on its left neighbour, the block above and, on the
 // smallest level and on the last row, the block above-right; the bottom-right predictor of the other rows is the not yet
@@ -16,6 +17,12 @@
 // blocks before it in raster order is known, and runs the CPU's wide search (UMH / exhaustive rings) when it applies.
 
 #define ANA_WG 128
+// inter-workgroup hand-off with the Vulkan memory model (CUDA: ld.acquire / st.release / __ldcg): non-RMW atomic loads and
+// stores, which read and write L2 without the cost of an atomic read-modify-write on the wavefront's critical path
+#define LD_ACQ(ref) atomicLoad(ref, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsAcquire)
+#define LD_RLX(ref) atomicLoad(ref, gl_ScopeQueueFamily, 0, 0)
+#define ST_REL(ref, v) atomicStore(ref, v, gl_ScopeQueueFamily, gl_StorageSemanticsBuffer, gl_SemanticsRelease)
+#define ST_RLX(ref, v) atomicStore(ref, v, gl_ScopeQueueFamily, 0, 0)
 layout(local_size_x = ANA_WG) in;
 
 #define BAD_RANGE A.bad_range
@@ -30,17 +37,16 @@ bool wait_for(int pos, int need, inout int seen)
   int polls = 0;
   while (seen < need)
   {
-    seen = atomicOr(PI32(st).v[pos], 0);
+    seen = LD_ACQ(PI32(st).v[pos]);
     if (seen >= need)
       break;
-    if (atomicOr(PI32(st).v[ST_ABORT], 0) != 0 || ++polls > A.spin_max)
+    if ((++polls & 63) == 0 && LD_RLX(PI32(st).v[ST_ABORT]) != 0 || polls > A.spin_max)
     {
       atomicExchange(PI32(st).v[ST_ABORT], 1);
       return false;
     }
   }
-  memoryBarrierBuffer(); // acquire: the vectors published before the counter
-  return true;
+  return true; // the acquire load above orders the vector reads after it
 }
 
 void main()
@@ -98,15 +104,15 @@ void main()
             // vectors other workgroups wrote in this dispatch: atomic reads (a plain load may hit a stale L1 line of
             // this SM, e.g. the interpolated predictor read as the bottom-right neighbour of an earlier row)
             const int u = 3 * (idx - nbx);
-            s_nb[3] = atomicOr(PI32(vec).v[u], 0);
-            s_nb[4] = atomicOr(PI32(vec).v[u + 1], 0);
-            s_nb[5] = atomicOr(PI32(vec).v[u + 2], 0);
+            s_nb[3] = LD_RLX(PI32(vec).v[u]);
+            s_nb[4] = LD_RLX(PI32(vec).v[u + 1]);
+            s_nb[5] = LD_RLX(PI32(vec).v[u + 2]);
             if (!p3_below && side)
             {
               const int q = 3 * (idx - nbx + 1);
-              s_nb[6] = atomicOr(PI32(vec).v[q], 0);
-              s_nb[7] = atomicOr(PI32(vec).v[q + 1], 0);
-              s_nb[8] = atomicOr(PI32(vec).v[q + 2], 0);
+              s_nb[6] = LD_RLX(PI32(vec).v[q]);
+              s_nb[7] = LD_RLX(PI32(vec).v[q + 1]);
+              s_nb[8] = LD_RLX(PI32(vec).v[q + 2]);
               s_nb[13] = 1;
             }
           }
@@ -157,11 +163,10 @@ void main()
       {
         if (blkx == nbx - 1)
           PI32C(st).v[rowbad + row] = row_bad;
-        PI32(vec).v[3 * idx] = ck_bx;
-        PI32(vec).v[3 * idx + 1] = ck_by;
-        PI32(vec).v[3 * idx + 2] = ck_bsad;
-        memoryBarrierBuffer(); // release: the vector before the counter
-        atomicExchange(PI32(st).v[prog + row], blkx + 1);
+        ST_RLX(PI32(vec).v[3 * idx], ck_bx);
+        ST_RLX(PI32(vec).v[3 * idx + 1], ck_by);
+        ST_RLX(PI32(vec).v[3 * idx + 2], ck_bsad);
+        ST_REL(PI32(st).v[prog + row], blkx + 1); // release: the vector before the counter
       }
       memoryBarrierShared();
       barrier(); // the next block's neighbours and candidate lists
