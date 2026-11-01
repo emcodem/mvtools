@@ -1,0 +1,79 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "flow_common.glsl"
+// k_flow of Sources/cuda/mvcuda_flow.cu (FlowInterExtra per output sample; the full-size vectors and masks are evaluated
+// on the fly from the small arrays; the references are read through the pel-interleaved finest layout). Workgroups
+// (ceil(max w / 32), ceil(max h / 8), 3 planes).
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+struct Args
+{
+  uint64_t left[48], right[48];   // [plane * 16 + sub]
+  uint64_t svx[8], svy[8];        // [kind * 4 + (B, F, BB, FF)]
+  uint64_t smask[2];              // B, F
+  uint64_t dst[3];
+  int dpitch[3];                  // samples
+  int w[3], h[3], hp[3], vp[3], ew[3], kind[3];
+  int geo[8];                     // [kind * 4 + (new_w, new_h, old_w, old_h)]
+  int real_w[2], real_h[2];
+  int pel, lp, time256, pad_;
+};
+ARGS(Args)
+
+int fetch_l(int sb, int ew, int pel_mask, int lp, int xa, int ya)
+{
+  const int idx = (xa & pel_mask) | ((ya & pel_mask) << lp);
+  return ldpix(A.left[sb + idx], uint(ya >> lp) * uint(ew) + uint(xa >> lp));
+}
+
+int fetch_r(int sb, int ew, int pel_mask, int lp, int xa, int ya)
+{
+  const int idx = (xa & pel_mask) | ((ya & pel_mask) << lp);
+  return ldpix(A.right[sb + idx], uint(ya >> lp) * uint(ew) + uint(xa >> lp));
+}
+
+// reduced median, a <= c
+int median3r(int a, int b, int c)
+{
+  if (b <= a)
+    return a;
+  if (c <= b)
+    return c;
+  return b;
+}
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), p = int(gl_WorkGroupID.z);
+  if (x >= A.w[p] || y >= A.h[p])
+    return;
+  const int kind = A.kind[p];
+  const ivec4 g = ivec4(A.geo[kind * 4], A.geo[kind * 4 + 1], A.geo[kind * 4 + 2], A.geo[kind * 4 + 3]);
+  const UpPos pos = up_pos(g, x, y);
+  const int rw = A.real_w[kind], rh = A.real_h[kind];
+  const int t = A.time256, lp = A.lp;
+
+  // full-size vectors and masks at this sample (0 = B, 1 = F, 2 = BB, 3 = FF)
+  int vx[4], vy[4];
+  [[unroll]] for (int k = 0; k < 4; k++)
+  {
+    vx[k] = limit_x(up_value_s(A.svx[kind * 4 + k], pos), x, rw, lp);
+    vy[k] = limit_y(up_value_s(A.svy[kind * 4 + k], pos), y, rh, lp);
+  }
+  const int maskB = up_value_b(A.smask[0], pos) & 255;
+  const int maskF = up_value_b(A.smask[1], pos) & 255;
+
+  const int pm = A.pel - 1, ew = A.ew[p], sb = p * 16;
+  const int x0 = A.hp[p] * A.pel + (x << lp), y0 = A.vp[p] * A.pel + (y << lp); // finest coordinates incl. padding
+  const int dstF = fetch_l(sb, ew, pm, lp, x0 + ((vx[1] * t) >> 8), y0 + ((vy[1] * t) >> 8));
+  const int dstFF = fetch_l(sb, ew, pm, lp, x0 + ((vx[3] * t) >> 8), y0 + ((vy[3] * t) >> 8));
+  const int dstB = fetch_r(sb, ew, pm, lp, x0 + ((vx[0] * (256 - t)) >> 8), y0 + ((vy[0] * (256 - t)) >> 8));
+  const int dstBB = fetch_r(sb, ew, pm, lp, x0 + ((vx[2] * (256 - t)) >> 8), y0 + ((vy[2] * (256 - t)) >> 8));
+
+  const int minfb = min(dstF, dstB), maxfb = max(dstF, dstB);
+  const int r = (((median3r(minfb, dstBB, maxfb) * maskF + dstF * (255 - maskF) + 255) >> 8) * (256 - t)
+    + ((median3r(minfb, dstFF, maxfb) * maskB + dstB * (255 - maskB) + 255) >> 8) * t) >> 8;
+  stpix(A.dst[p], uint(y) * uint(A.dpitch[p]) + uint(x), r);
+}

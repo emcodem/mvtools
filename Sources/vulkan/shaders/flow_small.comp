@@ -1,0 +1,39 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_small of Sources/cuda/mvcuda_flow.cu: the padded small vector fields (CheckAndPadSmallY) of the four vector frames and
+// their chroma versions (VectorSmallMaskYToHalfUV). Workgroups (ceil(nb / 256), 1, 4 fields).
+
+layout(local_size_x = 256) in;
+
+struct Args
+{
+  uint64_t vec[4];
+  uint64_t svx[8], svy[8];   // [kind * 4 + field]
+  int blk_x, blk_y, blk_xp, blk_yp, lx, ly, distinct, pad_;
+};
+ARGS(Args)
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x), f = int(gl_WorkGroupID.z);
+  if (i >= A.blk_xp * A.blk_yp)
+    return;
+  const int cx = i % A.blk_xp, cy = i / A.blk_xp;
+  const uint64_t vec = A.vec[f];
+  const int bx = min(cx, A.blk_x - 1), by = min(cy, A.blk_y - 1);
+  int x = PI32(vec).v[3 * (by * A.blk_x + bx)];
+  int y = PI32(vec).v[3 * (by * A.blk_x + bx) + 1];
+  if (cx >= A.blk_x)
+    x = min(x, 0); // right padding: not positive
+  if (cy >= A.blk_y)
+    y = min(y, 0); // bottom padding: not positive
+  PI16(A.svx[f]).v[i] = int16_t(x);
+  PI16(A.svy[f]).v[i] = int16_t(y);
+  if (A.distinct != 0)
+  {
+    const int sx = bitfieldExtract(x, 0, 16), sy = bitfieldExtract(y, 0, 16);
+    PI16(A.svx[4 + f]).v[i] = int16_t(A.lx != 0 ? sx >> 1 : x);
+    PI16(A.svy[4 + f]).v[i] = int16_t(A.ly != 0 ? sy >> 1 : y);
+  }
+}

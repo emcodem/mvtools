@@ -1,0 +1,166 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "nn_common.glsl"
+// k_nn_pred of Sources/cuda/mvcuda_nnedi3.cu: one invocation per queued pixel (extract_m8_i16 + qual x (dotProd_i16,
+// e0 exp, weightedAvgElliottMul5) + castScale). The host dispatches enough workgroups of NT for the largest possible queue
+// (those past the count leave at once; the loop covers more than 65535 workgroups' worth). The pixel's window lives in
+// shared memory, [word][invocation], sample k in word k / SPW at bit (k % SPW) * (32 / SPW): four 8-bit samples or two
+// int16 samples per word (little shared memory per invocation: more workgroups resident, which matters on Intel).
+// Two neurons per pass over the window, so that each shared word read serves four dot products.
+// Specialization constants: the window size and network (CUDA reads them from the net at run time).
+
+layout(constant_id = 0) const int XDIA = 8;
+layout(constant_id = 1) const int YDIA = 6;
+layout(constant_id = 2) const int NNS = 16;
+layout(constant_id = 3) const int QUAL = 1;
+layout(constant_id = 4) const int NT = 64; // invocations per workgroup
+const int ASIZE = XDIA * YDIA;
+#ifdef MVC_PIX8
+const int SPW = 4;         // samples per shared word
+#else
+const int SPW = 2;
+#endif
+const int AW = ASIZE / SPW; // words per window
+const int AV = ASIZE / 8;  // uvec4 of weights per neuron
+
+layout(local_size_x_id = 4) in;
+
+shared uint sh[AW * NT];
+
+int lo16(uint w) { return int(w << 16) >> 16; }
+int hi16(uint w) { return int(w) >> 16; }
+
+void main()
+{
+  const uint n = PU32(A.count).v[0];
+  const int tid = int(gl_LocalInvocationID.x);
+  const int off = A.off;
+  for (uint base = gl_WorkGroupID.x * uint(NT); base < n; base += gl_NumWorkGroups.x * uint(NT)) // uniform loop
+  {
+    const uint qi = base + uint(tid);
+    const bool act = qi < n;
+    int p = 0, r = 0, c = 0;
+    if (act)
+    {
+      const uint e = PU32(A.queue).v[qi];
+      p = int(e >> 30);
+      r = int((e >> 16) & 0x3fffu);
+      c = int(e & 0xffffu);
+    }
+    const int L0 = (r - off - (YDIA - 1)) >> 1;
+    const int x0 = c - ((XDIA >> 1) - 1);
+    int sum = 0, sumsq = 0;
+    if (act)
+      for (int y = 0; y < YDIA; y++)
+        for (int x = 0; x < XDIA; x += SPW)
+        {
+          // extract_m8_i16_AVX2(_16): sum and sum of squares, int32
+          uint word = 0u;
+          [[unroll]] for (int i = 0; i < SPW; i++)
+          {
+            const int v = nn_in(nn_fld(p, off, L0 + y, x0 + x + i));
+            word |= (uint(v) & (SPW == 4 ? 0xffu : 0xffffu)) << (i * (32 / SPW));
+            sum += v;
+            sumsq += v * v;
+          }
+          sh[((y * XDIA + x) / SPW) * NT + tid] = word;
+        }
+    memoryBarrierShared();
+    barrier();
+    if (act)
+    {
+      // mean, variance with the CPU's rcpss(n); 1 / stddev by rsqrtss, stddev by rcpss of that
+      precise float mean = float(sum) * A.r_asize;
+      precise float msq = float(sumsq) * A.r_asize;
+      precise float var = msq - mean * mean;
+      precise float istd = 0.0, sd = 0.0;
+      if (var > 1.192092896e-07) // vcomiss / jbe FLT_EPSILON
+      {
+        istd = nn_rsq(A.rsq_tab, var);
+        sd = nn_rcp(A.rcp_tab, istd);
+      }
+      precise float acc = 0.0; // mstd[3]
+      [[unroll]] for (int q = 0; q < QUAL; q++)
+      {
+        NnPV4 w = NnPV4(A.pred_w[q]);
+        NnPF sc = NnPF(A.pred_scale[q]), bi = NnPF(A.pred_bias[q]);
+        precise float lw[8], lv[8]; // the 8 lanes of the ymm accumulators
+        [[unroll]] for (int i = 0; i < 8; i++)
+        {
+          lw[i] = 0.0;
+          lv[i] = 0.0;
+        }
+        for (int j0 = 0; j0 < NNS; j0 += 8)
+          [[unroll]] for (int ln = 0; ln < 8; ln += 2)
+          {
+            // softmax neurons j, j + 1 and elliott neurons nns + j, nns + j + 1: int16 dot products
+            const int j = j0 + ln;
+            int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            const int b0 = j * AV, b1 = (NNS + j) * AV;
+            [[dont_unroll]] for (int g = 0; g < AV; g++)
+            {
+#ifdef MVC_PIX8
+              const uint a0 = sh[(2 * g) * NT + tid], a1 = sh[(2 * g + 1) * NT + tid];
+              const int v0 = int(a0 & 255u), v1 = int((a0 >> 8) & 255u), v2 = int((a0 >> 16) & 255u), v3 = int(a0 >> 24);
+              const int v4 = int(a1 & 255u), v5 = int((a1 >> 8) & 255u), v6 = int((a1 >> 16) & 255u), v7 = int(a1 >> 24);
+#else
+              const uint a0 = sh[(4 * g) * NT + tid], a1 = sh[(4 * g + 1) * NT + tid];
+              const uint a2 = sh[(4 * g + 2) * NT + tid], a3 = sh[(4 * g + 3) * NT + tid];
+              const int v0 = lo16(a0), v1 = hi16(a0), v2 = lo16(a1), v3 = hi16(a1);
+              const int v4 = lo16(a2), v5 = hi16(a2), v6 = lo16(a3), v7 = hi16(a3);
+#endif
+              uvec4 w0 = w.v[b0 + g], w1 = w.v[b1 + g], w2 = w.v[b0 + AV + g], w3 = w.v[b1 + AV + g];
+              s0 += v0 * lo16(w0.x) + v1 * hi16(w0.x) + v2 * lo16(w0.y) + v3 * hi16(w0.y)
+                  + v4 * lo16(w0.z) + v5 * hi16(w0.z) + v6 * lo16(w0.w) + v7 * hi16(w0.w);
+              s1 += v0 * lo16(w1.x) + v1 * hi16(w1.x) + v2 * lo16(w1.y) + v3 * hi16(w1.y)
+                  + v4 * lo16(w1.z) + v5 * hi16(w1.z) + v6 * lo16(w1.w) + v7 * hi16(w1.w);
+              s2 += v0 * lo16(w2.x) + v1 * hi16(w2.x) + v2 * lo16(w2.y) + v3 * hi16(w2.y)
+                  + v4 * lo16(w2.z) + v5 * hi16(w2.z) + v6 * lo16(w2.w) + v7 * hi16(w2.w);
+              s3 += v0 * lo16(w3.x) + v1 * hi16(w3.x) + v2 * lo16(w3.y) + v3 * hi16(w3.y)
+                  + v4 * lo16(w3.z) + v5 * hi16(w3.z) + v6 * lo16(w3.w) + v7 * hi16(w3.w);
+            }
+            [[unroll]] for (int h = 0; h < 2; h++)
+            {
+              const int jj = j + h;
+              const int sa = h == 0 ? s0 : s2, sb = h == 0 ? s1 : s3;
+              // (float * scale) * istd + bias, unfused
+              precise float t0 = ((float(sa) * sc.v[jj]) * istd) + bi.v[jj];
+              precise float t1 = ((float(sb) * sc.v[NNS + jj]) * istd) + bi.v[NNS + jj];
+              // e0_m16_FMA3: min 80, max -80 (NaN -> 80), fma by (1 / ln 2) * 2^23 and the bias, round to int,
+              // reinterpret
+              precise float xe = t0 < 80.0 ? t0 : 80.0;
+              xe = xe > -80.0 ? xe : -80.0;
+              precise float fe = fma(xe, 12102203.161561486, 1064866805.0);
+              precise float ex = intBitsToFloat(int(roundEven(fe)));
+              // elliott with rcpps
+              precise float el = t1 * nn_rcp(A.rcp_tab, abs(t1) + 1.0);
+              lw[ln + h] = lw[ln + h] + ex;
+              lv[ln + h] = fma(ex, el, lv[ln + h]);
+            }
+          }
+        // horizontal sums: (l0 + l4) + (l2 + l6) + ((l1 + l5) + (l3 + l7))
+        precise float aw0 = lw[0] + lw[4], aw1 = lw[1] + lw[5], aw2 = lw[2] + lw[6], aw3 = lw[3] + lw[7];
+        precise float av0 = lv[0] + lv[4], av1 = lv[1] + lv[5], av2 = lv[2] + lv[6], av3 = lv[3] + lv[7];
+        precise float wsum = (aw0 + aw2) + (aw1 + aw3);
+        precise float vsum = (av0 + av2) + (av1 + av3);
+        if (wsum > 1.0e-10) // vcomiss / jbe min_weight_sum
+          vsum = (vsum * 5.0) * nn_rcp(A.rcp_tab, wsum);
+        else
+          vsum = 0.0;
+        acc = ((vsum * sd) + mean) + acc;
+      }
+      // castScale_AVX(_16): truncate(val * (1 / qual) + 0.5), clamp; cvttss2si gives INT_MIN for NaN / out of range
+      const float scale = QUAL == 2 ? 0.5 : 1.0;
+      precise float tv = (acc * scale) + 0.5;
+      int iv = (tv > -2147483648.0 && tv < 2147483648.0) ? int(tv) : int(0x80000000);
+      if (iv >= A.vmax[p])
+        iv = A.vmax[p];
+      if (iv <= A.vmin[p])
+        iv = A.vmin[p];
+      stpix(A.dst[p], uint(uint64_t(r) * A.pitch_d[p] + uint64_t(c)), iv);
+    }
+    memoryBarrierShared();
+    barrier(); // the next round reuses the shared window
+  }
+}

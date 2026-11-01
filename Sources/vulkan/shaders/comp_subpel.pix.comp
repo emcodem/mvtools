@@ -1,0 +1,77 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_subpel of Sources/cuda/mvcuda_comp.cu: the pel-2 sub-pel planes of a device frame (MSuper sharp = 2: HorizontalWiener /
+// VerticalWiener over the padded plane, Interpolation.cpp). Workgroups (ceil(max_ew / 128), max_eh, planes * 3);
+// gl_WorkGroupID.z = plane * 3 + sub (0 horizontal, 1 vertical, 2 horizontal of vertical); padded-plane coordinates.
+
+layout(local_size_x = 128) in;
+
+struct Args
+{
+  uint64_t src[3];
+  uint64_t ps[3];                // in samples
+  uint64_t dst[9];               // [plane * 3 + sub]
+  int w[3], h[3], hp[3], vp[3], ew[3], eh[3];
+  int maxv, pad_;
+};
+ARGS(Args)
+
+int wiener6(int a, int b, int c, int d, int e, int f, int maxv)
+{
+  const int v = (a + (-b + (c << 2) + (d << 2) - e) * 5 + f + 16) >> 5;
+  return min(maxv, max(0, v));
+}
+
+// sample (px, py) of the padded plane p (replicated edges)
+int P(int p, int px, int py)
+{
+  const int cx = clamp(px - A.hp[p], 0, A.w[p] - 1), cy = clamp(py - A.vp[p], 0, A.h[p] - 1);
+  return ldpix(A.src[p], uint(uint64_t(cy) * A.ps[p] + uint64_t(cx)));
+}
+
+// vertical Wiener at row t of column x (eh rows): two samples averaged at the first two and the last four positions,
+// the last one copied
+int vert(int p, int x, int t)
+{
+  const int n = A.eh[p];
+  if (t < 2 || (t >= n - 4 && t < n - 1))
+    return (P(p, x, t) + P(p, x, t + 1) + 1) >> 1;
+  if (t >= n - 1)
+    return P(p, x, t);
+  return wiener6(P(p, x, t - 2), P(p, x, t - 1), P(p, x, t), P(p, x, t + 1), P(p, x, t + 2), P(p, x, t + 3), A.maxv);
+}
+
+// line sample k of row y: the padded plane (V false) or its vertical Wiener plane (V true)
+int lsamp(int p, bool V, int k, int y)
+{
+  return V ? vert(p, k, y) : P(p, k, y);
+}
+
+int horiz(int p, bool V, int t, int y)
+{
+  const int n = A.ew[p];
+  if (t < 2 || (t >= n - 4 && t < n - 1))
+    return (lsamp(p, V, t, y) + lsamp(p, V, t + 1, y) + 1) >> 1;
+  if (t >= n - 1)
+    return lsamp(p, V, t, y);
+  return wiener6(lsamp(p, V, t - 2, y), lsamp(p, V, t - 1, y), lsamp(p, V, t, y), lsamp(p, V, t + 1, y), lsamp(p, V, t + 2, y),
+    lsamp(p, V, t + 3, y), A.maxv);
+}
+
+void main()
+{
+  const int p = int(gl_WorkGroupID.z) / 3, s = int(gl_WorkGroupID.z) % 3;
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+  const int ew = A.ew[p], eh = A.eh[p];
+  if (x >= ew || y >= eh)
+    return;
+  int v;
+  if (s == 0)
+    v = horiz(p, false, x, y);
+  else if (s == 1)
+    v = vert(p, x, y);
+  else
+    v = horiz(p, true, x, y);
+  stpix(A.dst[p * 3 + s], uint(uint64_t(y) * uint64_t(ew) + uint64_t(x)), v);
+}

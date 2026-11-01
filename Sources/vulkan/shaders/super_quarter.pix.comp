@@ -1,0 +1,46 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_quarter_v of Sources/cuda/mvcuda_super.cu: the 12 quarter-pel planes of pel 4 from the half-pel planes 0, 2, 8, 10
+// (MVPlane::refine_pel4, clamped reads at the last column / row). Workgroups (ceil(max W / 32), ceil(max H / 8), planes).
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+struct Args
+{
+  uint64_t q[48];   // [plane * 16 + i]
+  int W[3], H[3];
+};
+ARGS(Args)
+
+int avg(int a, int b) { return (a + b + 1) >> 1; }
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), p = int(gl_WorkGroupID.z);
+  const int W = A.W[p], H = A.H[p];
+  if (x >= W || y >= H)
+    return;
+  const int b = p * 16;
+  const uint64_t p0 = A.q[b], p2 = A.q[b + 2], p8 = A.q[b + 8], p10 = A.q[b + 10];
+  const int x1 = min(x + 1, W - 1), y1 = min(y + 1, H - 1);
+  const uint o = uint(y) * uint(W) + uint(x), ox = uint(y) * uint(W) + uint(x1), oy = uint(y1) * uint(W) + uint(x),
+    oxy = uint(y1) * uint(W) + uint(x1);
+  const int a0 = ldpix(p0, o), a2 = ldpix(p2, o), a8 = ldpix(p8, o), a10 = ldpix(p10, o);
+  const int v4 = avg(a0, a8), v6 = avg(a2, a10);
+  const int v4x = avg(ldpix(p0, ox), ldpix(p8, ox));
+  const int v12 = avg(ldpix(p0, oy), a8), v14 = avg(ldpix(p2, oy), a10);
+  const int v12x = avg(ldpix(p0, oxy), ldpix(p8, ox));
+  stpix(A.q[b + 1], o, avg(a0, a2));
+  stpix(A.q[b + 3], o, avg(ldpix(p0, ox), a2));
+  stpix(A.q[b + 4], o, v4);
+  stpix(A.q[b + 5], o, avg(v4, v6));
+  stpix(A.q[b + 6], o, v6);
+  stpix(A.q[b + 7], o, avg(v4x, v6));
+  stpix(A.q[b + 9], o, avg(a8, a10));
+  stpix(A.q[b + 11], o, avg(ldpix(p8, ox), a10));
+  stpix(A.q[b + 12], o, v12);
+  stpix(A.q[b + 13], o, avg(v12, v14));
+  stpix(A.q[b + 14], o, v14);
+  stpix(A.q[b + 15], o, avg(v12x, v14));
+}

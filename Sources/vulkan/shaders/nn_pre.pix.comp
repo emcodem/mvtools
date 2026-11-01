@@ -1,0 +1,65 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "nn_common.glsl"
+// k_nn_pre of Sources/cuda/mvcuda_nnedi3.cu: one invocation per output sample, workgroups (ceil(max_w / 128), max_h,
+// planes). Kept lines copied, missing lines made by the cubic kernel (processLine0_AVX2_ASM(_16)); the pixels the new
+// prescreener (computeNetwork0new_AVX2) sends to the predictor are queued. The counter is cleared by the host.
+
+layout(local_size_x = 128) in;
+
+void main()
+{
+  const int c = int(gl_GlobalInvocationID.x), r = int(gl_WorkGroupID.y), p = int(gl_WorkGroupID.z);
+  if (c >= A.width[p] || r >= A.height[p])
+    return;
+  const int off = A.off;
+  const uint di = uint(uint64_t(r) * A.pitch_d[p] + uint64_t(c));
+  if (A.interp[p] == 0 || (r & 1) == off)
+  {
+    stpix(A.dst[p], di, ldpix(A.src[p], uint(uint64_t(r) * A.pitch_s[p] + uint64_t(c))));
+    return;
+  }
+  const int L0 = (r - off - 3) >> 1; // field line of row r - 3
+
+  {
+    const int a = nn_fld(p, off, L0, c), b = nn_fld(p, off, L0 + 1, c), cc = nn_fld(p, off, L0 + 2, c), d = nn_fld(p, off, L0 + 3, c);
+    int t = 19 * (b + cc) - 3 * (a + d);
+    t = t < 0 ? 0 : t;
+    t = (t + 16) >> 5;
+    const int smax = PIX_BYTES == 1 ? 255 : 65535;
+    t = t > smax ? smax : t;
+    t = t > A.vmax[p] ? A.vmax[p] : t;
+    t = t < A.vmin[p] ? A.vmin[p] : t;
+    stpix(A.dst[p], di, t < 0 ? 0 : t > smax ? smax : t);
+  }
+
+  // computeNetwork0new_AVX2 for the group of 4 pixels this one belongs to: 4 field lines x 16 columns from gx - 6
+  const int gx = c & ~3, lane = c & 3;
+  int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+  for (int y = 0; y < 4; y++)
+    for (int x = 0; x < 16; x++)
+    {
+      const int v = nn_in(nn_fld(p, off, L0 + y, gx - 6 + x));
+      const int k = y * 16 + x;
+      s0 += v * int(PI16(A.pre_w).v[k]);
+      s1 += v * int(PI16(A.pre_w).v[64 + k]);
+      s2 += v * int(PI16(A.pre_w).v[128 + k]);
+      s3 += v * int(PI16(A.pre_w).v[192 + k]);
+    }
+  NnPF pf = NnPF(A.pre_f);
+  const int s[4] = int[4](s0, s1, s2, s3);
+  precise float h[4];
+  [[unroll]] for (int j = 0; j < 4; j++)
+  {
+    precise float t = float(s[j]) * pf.v[j] + pf.v[4 + j];
+    h[j] = nn_rcp(A.rcp_tab, abs(t) + 1.0) * t;
+  }
+  precise float o = ((h[0] * pf.v[8 + lane] + h[1] * pf.v[12 + lane]) + (h[2] * pf.v[16 + lane] + h[3] * pf.v[20 + lane]))
+    + pf.v[24 + lane];
+  if (o < 0.0) // vcmpps lt: these go through the predictor
+  {
+    const uint i = atomicAdd(PU32(A.count).v[0], 1u);
+    PU32(A.queue).v[i] = (uint(p) << 30) | (uint(r) << 16) | uint(c);
+  }
+}

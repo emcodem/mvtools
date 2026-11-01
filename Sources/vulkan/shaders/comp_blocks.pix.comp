@@ -1,0 +1,153 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_blocks of Sources/cuda/mvcuda_comp.cu (MCompensate / MDegrain1..6 on device frames, bit for bit with MVTools; see that
+// file for the rounding rules). One thread per output sample, workgroups (ceil(max_w / 128), max_h, planes).
+// Specialization constants: MODE 0 compensate (blocks: mvx, mvy, use_ref), 1 degrain; PEL 1 or 2.
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int MODE = 0;
+layout(constant_id = 1) const int PEL = 1;
+
+#define MAXR 12
+struct Args
+{
+  uint64_t src[3], fill[3], dst[3];
+  uint64_t ref[MAXR * 3];        // [r * 3 + p]: compensate ref 0; degrain 2k backward, 2k + 1 forward of radius k + 1
+  uint64_t sub[MAXR * 9];        // [(r * 3 + p) * 3 + s]: pel 2 Wiener planes of each reference
+  uint64_t win[3];               // overlap windows (int16) of this plane, 0 without overlap
+  uint64_t blocks;               // int table
+  uint64_t pitch[3];             // in samples
+  int maxv, lstep_x, lstep_y, nbx;
+  int width[3], height[3];
+  int bw[3], bh[3], step_x[3], step_y[3], log_x[3], log_y[3];
+  int wb[3], hb[3];
+  int ew[3], eh[3], hp[3], vp[3];
+  int act[3];
+  int nby, ov, L, pad_;
+};
+ARGS(Args)
+
+int at(uint64_t p, uint64_t pitch, int x, int y)
+{
+  return ldpix(p, uint(uint64_t(y) * pitch + uint64_t(x)));
+}
+
+int px(uint64_t p, uint64_t pitch, int w, int h, int x, int y)
+{
+  return at(p, pitch, clamp(x, 0, w - 1), clamp(y, 0, h - 1));
+}
+
+// sample (i, j) of the reference block that starts at (X, Y) (plane coordinates in 1 / PEL units) of reference r
+int ref_at(int r, int p, int X, int Y, int i, int j)
+{
+  if (PEL == 1)
+    return px(A.ref[r * 3 + p], A.pitch[p], A.width[p], A.height[p], X + i, Y + j);
+  const int idx = (X & 1) | ((Y & 1) << 1);
+  const int x = (X >> 1) + i, y = (Y >> 1) + j;
+  if (idx == 0)
+    return px(A.ref[r * 3 + p], A.pitch[p], A.width[p], A.height[p], x, y);
+  const int ew = A.ew[p], eh = A.eh[p];
+  const int ex = clamp(x + A.hp[p], 0, ew - 1), ey = clamp(y + A.vp[p], 0, eh - 1); // clamped only for safety
+  return at(A.sub[(r * 3 + p) * 3 + idx - 1], uint64_t(ew), ex, ey);
+}
+
+// the blocks along one axis covering coordinate v: [b0, b1]
+void cover(int v, int step, int bsize, int nb, out int b0, out int b1)
+{
+  int hi = v / step;
+  if (hi > nb - 1)
+    hi = nb - 1;
+  int lo = hi - 1;
+  if (lo < 0 || v >= lo * step + bsize)
+    lo = hi;
+  b0 = lo;
+  b1 = hi;
+}
+
+int window_index(int bx, int by, int nbx, int nby)
+{
+  const int wby = (by == 0) ? 0 : (by == nby - 1) ? 6 : 3;
+  const int wbx = (bx == 0) ? 0 : (bx == nbx - 1) ? 2 : 1;
+  return wby + wbx;
+}
+
+int s16(int v) { return (v << 16) >> 16; } // wrap to a signed 16-bit value
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y), p = int(gl_WorkGroupID.z);
+  if (x >= A.width[p] || y >= A.height[p])
+    return;
+  const uint64_t pitch = A.pitch[p];
+  const uint di = uint(uint64_t(y) * pitch + uint64_t(x));
+  if (A.act[p] == 0 || x >= A.wb[p] || y >= A.hb[p])
+  {
+    stpix(A.dst[p], di, ldpix(A.fill[p], di));
+    return;
+  }
+  const int bw = A.bw[p], bh = A.bh[p], sx = A.step_x[p], sy = A.step_y[p];
+  const int L = A.L, nbx = A.nbx, nby = A.nby, ov = A.ov;
+  const int logx = A.log_x[p], logy = A.log_y[p];
+  const int stride = MODE == 0 ? 3 : 4 * L + 2 * (1 + 2 * L);
+  int bx0, bx1, by0, by1;
+  cover(x, sx, bw, nbx, bx0, bx1);
+  cover(y, sy, bh, nby, by0, by1);
+  const int srcv = ldpix(A.src[p], di);
+  int acc = 0;
+  int single = 0;
+  for (int by = by0; by <= by1; by++)
+    for (int bx = bx0; bx <= bx1; bx++)
+    {
+      const int i = x - bx * sx, j = y - by * sy;
+      if (i < 0 || i >= bw || j < 0 || j >= bh)
+        continue;
+      const uint b = uint(stride * (by * nbx + bx));
+      // block origin in the plane: (luma origin * pel + vector) >> chroma shift, as GetPointer(blx >> log, bly >> log)
+      const int lx = bx * A.lstep_x * PEL, ly = by * A.lstep_y * PEL;
+      int v;
+      if (MODE == 0)
+      {
+        if (PI32(A.blocks).v[b + 2] != 0)
+          v = ref_at(0, p, (lx + PI32(A.blocks).v[b]) >> logx, (ly + PI32(A.blocks).v[b + 1]) >> logy, i, j);
+        else
+          v = srcv;
+      }
+      else
+      {
+        const uint w = b + uint(4 * L + (p == 0 ? 0 : 1 + 2 * L)); // WSrc, WRefB[L], WRefF[L]
+        int s = srcv * PI32(A.blocks).v[w];
+        for (int k = 0; k < L; k++)
+        {
+          const uint mv = b + uint(4 * k);
+          const int rb = ref_at(2 * k, p, (lx + PI32(A.blocks).v[mv]) >> logx, (ly + PI32(A.blocks).v[mv + 1]) >> logy, i, j);
+          const int rf = ref_at(2 * k + 1, p, (lx + PI32(A.blocks).v[mv + 2]) >> logx, (ly + PI32(A.blocks).v[mv + 3]) >> logy, i, j);
+          s += rf * PI32(A.blocks).v[w + uint(1 + L + k)] + rb * PI32(A.blocks).v[w + uint(1 + k)];
+        }
+        v = (s + 128) >> 8;
+      }
+      if (ov != 0)
+      {
+        const int wv = int(PI16(A.win[p]).v[uint(window_index(bx, by, nbx, nby) * bw * bh + j * bw + i)]);
+#ifdef MVC_PIX8
+        acc = s16(acc + ((v * wv + 32) >> 6)); // 16-bit sum, as the CPU's short buffer
+#else
+        acc += v * wv; // 32-bit sum (Overlaps_C<uint16_t>)
+#endif
+      }
+      else
+        single = v;
+    }
+  int r;
+  if (ov != 0)
+  {
+#ifdef MVC_PIX8
+    r = clamp(s16(acc + 16) >> 5, 0, 255); // _mm_srai_epi16 on the signed 16-bit sum, then packus
+#else
+    r = clamp((acc + 1024) >> 11, 0, A.maxv); // Short2Bytes_Int32toWord16: srai, packus, min with the max pixel value
+#endif
+  }
+  else
+    r = single;
+  stpix(A.dst[p], di, r);
+}

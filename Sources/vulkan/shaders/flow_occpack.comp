@@ -1,0 +1,24 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_occ_pack of Sources/cuda/mvcuda_flow.cu (CheckAndPadMaskSmall): the accumulators as byte masks, the last column / row
+// copied into the padding. Workgroups (ceil(nb / 256), 1, 2 masks).
+
+layout(local_size_x = 256) in;
+
+struct Args
+{
+  uint64_t acc[2], mask[2];
+  int blk_x, blk_y, blk_xp, blk_yp;
+};
+ARGS(Args)
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x), m = int(gl_WorkGroupID.z);
+  if (i >= A.blk_xp * A.blk_yp)
+    return;
+  const int cx = i % A.blk_xp, cy = i / A.blk_xp;
+  const int sx = min(cx, A.blk_x - 1), sy = min(cy, A.blk_y - 1);
+  PU8(A.mask[m]).v[i] = uint8_t(uint(PI32(A.acc[m]).v[sy * A.blk_xp + sx]) & 255u);
+}

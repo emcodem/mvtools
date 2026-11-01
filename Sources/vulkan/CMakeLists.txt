@@ -13,8 +13,11 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 find_program(MVTOOLS_GLSLANG NAMES glslangValidator glslang HINTS ENV VULKAN_SDK PATH_SUFFIXES bin Bin)
-if(NOT MVTOOLS_GLSLANG)
-  message(WARNING "mvtools_vulkan: glslangValidator not found (Vulkan SDK / glslang-tools; or set MVTOOLS_GLSLANG); not built")
+# Without glslangValidator: MVTOOLS_SPV_PREBUILT = a folder with the <kernel>.h files of another build (its build dir's
+# spv/ folder; SPIR-V does not depend on the host OS, so e.g. a Linux build can use the shaders compiled on Windows).
+set(MVTOOLS_SPV_PREBUILT "" CACHE PATH "folder with precompiled SPIR-V headers (<kernel>.h), used when glslangValidator is missing")
+if(NOT MVTOOLS_GLSLANG AND NOT MVTOOLS_SPV_PREBUILT)
+  message(WARNING "mvtools_vulkan: glslangValidator not found (Vulkan SDK / glslang-tools; or set MVTOOLS_GLSLANG or MVTOOLS_SPV_PREBUILT); not built")
   return()
 endif()
 
@@ -48,12 +51,23 @@ foreach(src ${MVVK_SHADERS})
       endif()
     endif()
     set(out "${MVVK_SPV_DIR}/${name}.h")
-    add_custom_command(OUTPUT "${out}"
-      COMMAND "${MVTOOLS_GLSLANG}" -V --target-env vulkan1.2 ${defs} "-I${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-              --vn "mvvk_spv_${name}" -o "${out}" "${src}"
-      DEPENDS "${src}" ${MVVK_SHADER_INCLUDES}
-      COMMENT "SPIR-V ${name}"
-      VERBATIM)
+    if(MVTOOLS_GLSLANG)
+      add_custom_command(OUTPUT "${out}"
+        COMMAND "${MVTOOLS_GLSLANG}" -V --target-env vulkan1.2 ${defs} "-I${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+                --vn "mvvk_spv_${name}" -o "${out}" "${src}"
+        DEPENDS "${src}" ${MVVK_SHADER_INCLUDES}
+        COMMENT "SPIR-V ${name}"
+        VERBATIM)
+    else()
+      if(NOT EXISTS "${MVTOOLS_SPV_PREBUILT}/${name}.h")
+        message(FATAL_ERROR "mvtools_vulkan: ${MVTOOLS_SPV_PREBUILT}/${name}.h missing (rebuild the shaders with glslangValidator)")
+      endif()
+      add_custom_command(OUTPUT "${out}"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${MVTOOLS_SPV_PREBUILT}/${name}.h" "${out}"
+        DEPENDS "${MVTOOLS_SPV_PREBUILT}/${name}.h"
+        COMMENT "SPIR-V ${name} (prebuilt)"
+        VERBATIM)
+    endif()
     list(APPEND MVVK_SPV_HEADERS "${out}")
     string(APPEND MVVK_TABLE_INCLUDES "#include \"${name}.h\"\n")
     string(APPEND MVVK_TABLE_ENTRIES "  { \"${name}\", mvvk_spv_${name}, sizeof(mvvk_spv_${name}) / 4 },\n")

@@ -1,0 +1,26 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_level0 of Sources/cuda/mvcuda_super.cu: level 0 with its padding (every sample of the extended plane takes the source
+// sample at the clamped inner position). Workgroups (ceil(max ew / 32), ceil(max eh / 8), planes).
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+struct Args
+{
+  uint64_t dst[3], src[3];
+  int d[18];          // per plane w, h, hpad, vpad, ew, eh
+  int src_pitch[3];   // samples
+  int pad_;
+};
+ARGS(Args)
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y), p = int(gl_WorkGroupID.z);
+  const int w = A.d[p * 6], h = A.d[p * 6 + 1], hpad = A.d[p * 6 + 2], vpad = A.d[p * 6 + 3], ew = A.d[p * 6 + 4], eh = A.d[p * 6 + 5];
+  if (x >= ew || y >= eh)
+    return;
+  const int cx = min(max(x - hpad, 0), w - 1), cy = min(max(y - vpad, 0), h - 1);
+  stpix(A.dst[p], uint(y) * uint(ew) + uint(x), ldpix(A.src[p], uint(cy) * uint(A.src_pitch[p]) + uint(cx)));
+}

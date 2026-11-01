@@ -1,0 +1,65 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_occ of Sources/cuda/mvcuda_flow.cu (MakeVectorOcclusionMaskTime): per-block maximum accumulation into acc[m] (zeroed
+// before). Both masks in one dispatch: workgroups (ceil(blk_x * blk_y / 256), 1, 2), mask m from vector field vec[m] at
+// time tt[m]. The CPU value min(int(255 * occlusion * occ_norm), 255) (a double multiply) is monotone in occlusion > 0:
+// the host passes thr[k - 1] = the smallest occlusion whose value is >= k (k = 1..255), so no float64 is needed here.
+
+layout(local_size_x = 256) in;
+
+struct Args
+{
+  uint64_t vec[2], acc[2];
+  int tt[2];
+  int blk_x, blk_y, blk_xp, step_x, step_y, pad_;
+  int thr[256];   // thr[0..254] ascending, thr[255] unused
+};
+ARGS(Args)
+
+int occ_value(int occlusion)
+{
+  // number of thresholds <= occlusion
+  int lo = 0, hi = 255;
+  while (lo < hi)
+  {
+    const int mid = (lo + hi) >> 1;
+    if (A.thr[mid] <= occlusion)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
+
+void main()
+{
+  const int i = int(gl_GlobalInvocationID.x), m = int(gl_WorkGroupID.z);
+  const int bx_n = A.blk_x, by_n = A.blk_y;
+  if (i >= bx_n * by_n)
+    return;
+  const uint64_t vec = A.vec[m], acc = A.acc[m];
+  const int bx = i % bx_n, by = i / bx_n;
+  const int time4096x = A.tt[m] * 16 / A.step_x, time4096y = A.tt[m] * 16 / A.step_y;
+  const int vx = PI32(vec).v[3 * i], vy = PI32(vec).v[3 * i + 1];
+  if (bx < bx_n - 1)
+  {
+    const int vx1 = PI32(vec).v[3 * (i + 1)];
+    if (vx1 < vx)
+    {
+      const int v = occ_value(vx - vx1);
+      for (int bxi = bx + vx1 * time4096x / 4096; bxi <= bx + vx * time4096x / 4096 + 1 && bxi >= 0 && bxi < bx_n; bxi++)
+        atomicMax(PI32(acc).v[bxi + by * A.blk_xp], v);
+    }
+  }
+  if (by < by_n - 1)
+  {
+    const int vy1 = PI32(vec).v[3 * (i + bx_n) + 1];
+    if (vy1 < vy)
+    {
+      const int v = occ_value(vy - vy1);
+      for (int byi = by + vy1 * time4096y / 4096; byi <= by + vy * time4096y / 4096 + 1 && byi >= 0 && byi < by_n; byi++)
+        atomicMax(PI32(acc).v[bx + byi * A.blk_xp], v);
+    }
+  }
+}

@@ -1,0 +1,33 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "flow_common.glsl"
+// k_mat_vec / k_mat_mask of Sources/cuda/mvcuda_flow.cu (golden-data tests only): one full-size array from a small one.
+// mode 0: vector x (shorts), 1: vector y (shorts), 2: mask (bytes). Workgroups (ceil(new_w / 32), ceil(new_h / 8), 1).
+
+layout(local_size_x = 32, local_size_y = 8) in;
+
+struct Args
+{
+  uint64_t small_, out_;
+  int geo[4];
+  int real_w, real_h, lp, pitch, mode, pad_;
+};
+ARGS(Args)
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+  const ivec4 g = ivec4(A.geo[0], A.geo[1], A.geo[2], A.geo[3]);
+  if (x >= g.x || y >= g.y)
+    return;
+  const UpPos pos = up_pos(g, x, y);
+  const uint o = uint(y) * uint(A.pitch) + uint(x);
+  if (A.mode == 2)
+    PU8(A.out_).v[o] = uint8_t(uint(up_value_b(A.small_, pos)) & 255u);
+  else
+  {
+    const int v = up_value_s(A.small_, pos);
+    PI16(A.out_).v[o] = int16_t(A.mode == 0 ? limit_x(v, x, A.real_w, A.lp) : limit_y(v, y, A.real_h, A.lp));
+  }
+}
