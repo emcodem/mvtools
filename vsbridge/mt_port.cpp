@@ -531,10 +531,12 @@ public:
     bits = vi.BitsPerComponent();
     nplanes = vi.NumComponents();
     const bool rgb = vi.IsPlanarRGB();
-    const int yuv[3] = {PLANAR_Y, PLANAR_U, PLANAR_V}, gbr[3] = {PLANAR_G, PLANAR_B, PLANAR_R};
+    // masktools' plane order (avs2x/clip.h): Y, U, V and for planar RGB R, G, B (not AviSynth's storage order G, B, R),
+    // so Y= / yExpr address R; Expr takes its RGB expressions in the same order
+    const int yuv[3] = {PLANAR_Y, PLANAR_U, PLANAR_V}, rgbp[3] = {PLANAR_R, PLANAR_G, PLANAR_B};
     for (int i = 0; i < 3; ++i)
     {
-      planes[i] = rgb ? gbr[i] : yuv[i];
+      planes[i] = rgb ? rgbp[i] : yuv[i];
       mode[i] = m[i];
       prog_of[i] = -1;
     }

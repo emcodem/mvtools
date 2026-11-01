@@ -185,10 +185,11 @@ it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOUR
 * Output is bit-identical with AviSynth+ on the same system (17 CPU and 7 GPU test chains, `vsbridge/test/compare.py`).
   `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
   it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan.
-* cudafilters: namespace `cuda` (`core.cuda.CudaUpload`, ...), `libcudafilters.so` next to the bridge. All filters except
-  CudaNVOFAnalyse (not yet) work and give AviSynth+'s output bit for bit (tested against AviSynth+ with the original
-  masktools2 / RgTools / nnedi3 / QTGMC.avsi, and with mvtools2 `gpu=true` chains on token frames). CudaNNEDI3 needs
-  `nnedi3_weights.bin` (the standard 13574928-byte file) next to `libcudafilters.so` on Linux.
+* cudafilters: namespace `cuda` (`core.cuda.CudaUpload`, ...), `libcudafilters.so` next to the bridge. All filters work
+  and give AviSynth+'s output bit for bit (tested against AviSynth+ with the original masktools2 / RgTools / nnedi3 /
+  QTGMC.avsi, with mvtools2 `gpu=true` chains on token frames, and CudaNVOFAnalyse with NVOFA or its MAnalyse
+  fallback, which needs `libmvtools2.so` loaded too). CudaNNEDI3 needs `nnedi3_weights.bin` (the standard
+  13574928-byte file) next to `libcudafilters.so` on Linux. Planar RGB passes through, but has no GPU path.
   A cudafilter's CPU fallback (AviSynth filters such as `Merge`, `Bob`, `RemoveGrain`, `nnedi3`, masktools) does not exist
   under VapourSynth; it runs only when the GPU is unusable or fails for a frame. `MVBRIDGE_FALLBACK=strict` (default) makes
   such a frame an error, so the output is AviSynth+'s or an error; `MVBRIDGE_FALLBACK=nearest` uses the closest

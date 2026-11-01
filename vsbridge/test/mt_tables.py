@@ -72,6 +72,12 @@ for bits in (8, 10):
     CASES['modes_b_%d' % bits] = ('lutxy', 'x y - abs', 3, {'Y': 2, 'U': 3, 'V': 1}, '420', bits, 'full')
     CASES['grain_qtgmc_%d' % bits] = ('addnoise', 'x 128.5 scalef - 0.700000 * range_half +', 2,
                                       {'lutUV': 1, 'addUV': 2}, '420', bits, 'full')
+    # planar RGB: plane-specific modes (G processed, B from the first clip, R from the second) show the bridge's
+    # G, B, R <-> R, G, B plane mapping; Expr's scalef uses the luma rule on every RGB plane
+    CASES['modes_rgb_%d' % bits] = ('lutxy', 'x y - abs 2 *', 0, {'Y': 3, 'U': 2, 'V': 4}, 'rgb', bits, 'full')
+    CASES['scalef_rgb_%d' % bits] = ('lutxy', 'x 100 scalef - abs y +', 3, P3, 'rgb', bits, 'full')
+    # different content per R / G/ B plane (built per named plane on both sides): the input side of the mapping
+    CASES['modes_rgbmix_%d' % bits] = ('lutxy', 'x y - abs 2 *', 0, {'Y': 3, 'U': 2, 'V': 4}, 'rgb', bits, 'mixrgb')
 for bits in (12, 16):
     for name, expr, ue in [q for q in QTGMC if q[0] in ('kobs1', 'sharp075', 'tw2')] + [
             ('absminmax_ue0', OPS[0][1], 0), ('absminmax_ue3', OPS[0][1], 3), ('frac_ue0', OPS[6][1], 0),
@@ -82,8 +88,9 @@ for bits in (12, 16):
     CASES['noise_%d' % bits] = ('addnoise', 'x 128.5 scalef - 0.300000 * range_half +', 3,
                                 {'clamp_float': True, 'lutUV': 3, 'addUV': 3}, '444', bits, 'mix')
 
-# 'mix' patterns: sample = (column * a + row * b + c) mod 2^bits, 1024 x 1024
+# 'mix' patterns: sample = (column * a + row * b + c) mod 2^bits, 1024 x 1024; 'mixrgb': plus an offset per R, G, B
 MIX = {'x': (37, 101, 0), 'y': (53, 29, 7)}
+RGB_OFFSET = (0, 85, 170)
 
 
 def balanced(expr):
@@ -125,7 +132,14 @@ def size(bits, pattern):
 
 def avs_pattern(which, layout, bits, pattern):
     n = size(bits, pattern)
-    pt = {('444', 8): 'YV24', ('420', 8): 'YV12'}.get((layout, bits), 'YUV%sP%d' % (layout, bits))
+    pt = {('444', 8): 'YV24', ('420', 8): 'YV12', ('rgb', 8): 'RGBP'}.get(
+        (layout, bits), 'RGBP%d' % bits if layout == 'rgb' else 'YUV%sP%d' % (layout, bits))
+    if pattern == 'mixrgb':
+        a, b, c = MIX[which]
+        y = 'Y8' if bits == 8 else 'Y%d' % bits
+        g = ['BlankClip(width=%d, height=%d, pixel_type="%s", length=1).Expr("sx %d * sy %d * + %d + %d %%")'
+             % (n, n, y, a, b, c + o, 1 << bits) for o in RGB_OFFSET]
+        return 'CombinePlanes(%s, %s, %s, planes="RGB", source_planes="YYY", pixel_type="%s")' % (g[0], g[1], g[2], pt)
     if pattern == 'full':
         e = 'sx' if which == 'x' else 'sy'
     else:
@@ -147,7 +161,8 @@ def avs_script(case, masktools):
 
 
 def pix_fmt(layout, bits):
-    return 'yuv%sp' % layout + ('' if bits == 8 else '%dle' % bits)
+    # planar RGB: ffmpeg's gbrp, planes G, B, R as AviSynth stores them
+    return ('gbrp' if layout == 'rgb' else 'yuv%sp' % layout) + ('' if bits == 8 else '%dle' % bits)
 
 
 def make_ref():
@@ -187,7 +202,7 @@ def vs_run(names):
 
     def pattern(which, layout, bits, pattern):
         side = size(bits, pattern)
-        fmt = getattr(vs, 'YUV%sP%d' % (layout, bits))
+        fmt = getattr(vs, 'RGB%d' % (3 * bits) if layout == 'rgb' else 'YUV%sP%d' % (layout, bits))
         blank = core.std.BlankClip(width=side, height=side, format=fmt, length=1)
         dtype = np.uint8 if bits == 8 else np.uint16
 
@@ -202,6 +217,8 @@ def vs_run(names):
                     v = col if which == 'x' else row
                 else:
                     ka, kb, kc = MIX[which]
+                    if pattern == 'mixrgb':
+                        kc += RGB_OFFSET[p]  # VS planes R, G, B
                     v = (col * ka + row * kb + kc) % (1 << bits)
                 a[:, :] = v.astype(dtype)
             return o
@@ -219,7 +236,7 @@ def vs_run(names):
                 c = cf.CudaQtgmcAddNoise(u, v, expr, use_expr=ue, **pa)
             fr = cf.CudaDownload(c).get_frame(0)
             m = hashlib.md5()
-            for p in range(3):
+            for p in ((1, 2, 0) if layout == 'rgb' else (0, 1, 2)):  # VS R, G, B -> G, B, R as AviSynth / gbrp
                 m.update(np.ascontiguousarray(np.asarray(fr[p])).tobytes())
             got = m.hexdigest()
         except vs.Error as e:

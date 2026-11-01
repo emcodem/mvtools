@@ -289,6 +289,17 @@ chains still identical, 3 rounds.
   same output as the JPSDR resource (`cf_chains.py` nnedi3 cases).
 - **Test tool:** avsmd5's RawSource has no parity; Bob in Linux AviSynth+ then crashes in `C_VideoFilter::GetParity`. The
   Bob chains of `compare.py` put `AssumeBFF` on the AviSynth side (BFF is also what the bridge reports for VS clips).
+- **CudaNVOFAnalyse (2026-11-01).** Works unchanged: its vector clip gets MAnalyse's VideoInfo (pointer hack included)
+  into the registry like any bridge filter; without NVOFA (no / truncated `libmvtools_cuda.so`) its `FunctionExists` /
+  `Invoke` of MSuper / MAnalyse reach mvtools2's functions registered through the same bridge. NVOFA output is
+  deterministic run to run (9 AviSynth+ runs, one checksum), so it is compared like any other chain.
+- **Planar RGB (2026-11-01).** A round trip or MSuper cannot show a plane mapping error (every plane is treated alike, so
+  a consistent permutation cancels; MSuper `chroma=false` changes nothing on RGB either). The masktools port with
+  per-plane modes can, and found a bug in the port, not in the bridge: masktools addresses planar RGB as R, G, B
+  (`avs2x/clip.h`, `PlaneOrderRGB`), the port had used AviSynth's storage order G, B, R. Fixed; `mt_tables.py` now has
+  RGB cases with identical and with different content per plane (built per named plane on both sides), which check
+  the bridge's mapping in both directions. cudafilters have no planar-RGB GPU path (CudaUpload keeps RGB on the CPU),
+  so their RGB chains end in the strict stand-in error under VS, by design.
 
 Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, RTX 5090): `compare.py cf`, 7 chains (CudaUpload / CudaDownload round
 trip; CudaMerge 0.3, 0.5, CudaMergeLuma 0.7, CudaMergeChroma 0.6 on three formats; CudaUpload -> MSuper / MAnalyse /
@@ -321,12 +332,19 @@ CudaQtgmcAddNoise: exact masktools port, still identical); nearest runs the mapp
 matched AviSynth+ on this input, Bob and BilinearResize differ in every frame, Merge as before) and stops on the unmapped
 ones; python and vspipe exit cleanly.
 
+Result 2026-11-01 (NVOF, planar RGB): `compare.py cf` + `cf_nvof` (CudaNVOFAnalyse -> MFlowFps, UHD 4:2:2 10-bit) and
+`cf_nvof_degrain` (token input -> MDegrain1), identical with AviSynth+ at 24 and 1 threads with NVOFA, without
+`libmvtools_cuda.so` and with a truncated one (both hosts: the MAnalyse fallback). `cf_rgb_roundtrip`, `cf_rgb_super`
+identical. `mt_tables.py` 100 cases (+ 6 planar RGB) identical with and without the GPU library.
+
 ## VapourSynth todo list
 
 - Measure `MVBRIDGE_FALLBACK=nearest` per mapping against AviSynth+ (runs without `libmvtools_cuda.so` send every frame
   through the fallback): differing frames, share of differing pixels, largest difference; document per filter.
   (Postponed by the user, 2026-10-31.)
-- CudaNVOFAnalyse through the bridge (Invoke of MSuper / MAnalyse), planar RGB test.
+- Windows: build and run the bridge there (waits for CMake on Windows, NVENCMEAnalyse.md Phase 0 step 3); then the
+  same tests with VS portable on Windows, where the references of `mt_tables.py` / `stand_ins.py` / `cf_chains.py` were
+  made.
 - Optional: nearest mappings to VS plugins when loaded (zsmooth TemporalSoften / RemoveGrain, znedi3); QTGMC_gpu.avsi
   as a whole under VS (needs the script's non-GPU parts in VS form).
 
@@ -350,7 +368,8 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
    Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
 4. cudafilters through the same shim; CudaNVOFAnalyse. In progress: entry point, token frames end to end, Merge*
    stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31, masktools port (`mt_lut` / `mt_lutxy` / `mt_adddiff`, D10)
-   and stand-ins for every other fallback name 2026-11-01 (findings above); CudaNVOFAnalyse is on the todo list.
+   and stand-ins for every other fallback name, CudaNVOFAnalyse and the planar RGB test 2026-11-01 (findings above).
+   Done on Linux except the nearest measurement (postponed); Windows waits for CMake.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.
 

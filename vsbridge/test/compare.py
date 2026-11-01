@@ -168,6 +168,19 @@ CF_CHAINS = {
     'cf_gauss': ('hd420p8', 'out = CudaDownload(CudaGaussResize(CudaUpload(c), 1280, 720, p=5.0))\n'),
     'cf_bilinear': ('hd444p10', 'out = CudaDownload(CudaBilinearResize(CudaUpload(c), 960, 540, src_left=2.5))\n'),
     'cf_binomial0': ('hd420p8', 'out = CudaDownload(CudaQtgmcBinomial0(CudaUpload(c)))\n'),
+    # NVOFA vectors (deterministic run to run); without libmvtools_cuda.so CudaNVOFAnalyse Invokes MSuper / MAnalyse
+    'cf_nvof': ('uhd422p10', 'sup = MSuper(c, pel=2, hpad=16, vpad=16, levels=1)\n'
+                             'bv = CudaNVOFAnalyse(c, isb=true, blksize=16, overlap=8, pel=2)\n'
+                             'fv = CudaNVOFAnalyse(c, isb=false, blksize=16, overlap=8, pel=2)\n'
+                             'out = MFlowFps(c, sup, bv, fv, num=60000, den=1001)\n'),
+    'cf_nvof_degrain': ('hd420p8', 'u = CudaUpload(c)\n'
+                                   'sup = MSuper(c, pel=2, hpad=16, vpad=16)\n'
+                                   'bv = CudaNVOFAnalyse(u, isb=true, blksize=16, overlap=8, pel=2)\n'
+                                   'fv = CudaNVOFAnalyse(u, isb=false, blksize=16, overlap=8, pel=2)\n'
+                                   'out = MDegrain1(c, sup, bv, fv, thSAD=400)\n'),
+    # planar RGB: the bridge maps AviSynth's G, B, R planes to VS's R, G, B
+    'cf_rgb_roundtrip': ('hdrgbp10', 'out = CudaDownload(CudaUpload(c))\n'),
+    'cf_rgb_super': ('hdrgbp10', 'out = MSuper(c, pel=2)\n'),
 }
 
 
