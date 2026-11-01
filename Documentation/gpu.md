@@ -56,10 +56,16 @@ does not understand tokens shows obvious stripes, not a plausible picture.
 - **Readers.** Every `Cuda*` filter, `MSuper`, `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept
   token frames as input and use the device frame directly; when one of them runs on the CPU, it downloads the picture.
   Any other filter needs `CudaDownload` in front of it.
-- **Usage rule.** Token frames in, token frames out; normal frames in, normal frames out. A GPU filter given normal frames
-  uploads the pictures itself, computes on the GPU and returns normal frames. The mvtools2 filters upload each picture
-  of a super clip once, shared by every GPU filter that reads that super clip (both MAnalyse directions, MRecalculate,
-  MFlowFps, MCompensate, MDegrain).
+- **Usage rule.** The two plugins differ here:
+  - mvtools2 (`gpu=true`): token frames in, token frames out; normal frames in, normal frames out. Given normal frames,
+    the filter uploads the pictures itself, computes on the GPU and returns normal frames, so a chain of mvtools2 filters
+    alone needs neither `CudaUpload` nor `CudaDownload`. The mvtools2 filters upload each picture of a super clip once,
+    shared by every GPU filter that reads that super clip (both MAnalyse directions, MRecalculate, MFlowFps, MCompensate,
+    MDegrain).
+  - cudafilters (`Cuda*`): token frames out whenever the filter runs on the GPU, also when its input is normal frames
+    (it uploads them itself). A script that uses any `Cuda*` filter needs `CudaDownload` at the end and in front of
+    every filter that does not read token frames.
+  Token frames therefore only appear after a `Cuda*` filter (including `CudaUpload`); the mvtools2 filters pass them on.
 - **Eviction.** The device frames live in a registry with a memory budget (`MVCUDA_CACHE_MB`). When a frame is evicted
   before it is read, the filter that produced it makes it again (an uploaded picture is uploaded again), so evictions cost
   time but never change the result. The super pyramids that MAnalyse, MRecalculate and MFlowFps make on the device are
@@ -73,12 +79,15 @@ does not understand tokens shows obvious stripes, not a plausible picture.
 A typical chain:
 
 ```
-CudaUpload()                         # or start with a Cuda* filter (without it: normal frames in and out, GPU inside)
+CudaUpload()                         # or start with a Cuda* filter: either way token frames from here on
 ...Cuda* filters...
 sup = MSuper(pel=2, gpu=true)        # "lite" super of the token clip
 ...MAnalyse / MDegrain / MCompensate with gpu=true...
 CudaDownload()                       # pixels again for the rest of the script
 ```
+
+Without `CudaUpload` and without `Cuda*` filters, the mvtools2 part of this chain still runs on the GPU and returns normal
+frames; `CudaDownload` is then not needed (it passes normal frames through unchanged).
 
 ---
 
@@ -238,7 +247,8 @@ filter takes **the same parameters and defaults as its CPU counterpart**, and th
 below list the parameters and what part runs on the GPU. For the meaning of each parameter, see the documentation of the
 CPU filter.
 
-All filters return token frames when they run on the GPU, and are `MT_NICE_FILTER`.
+All filters return token frames when they run on the GPU, also when their input is normal frames (unlike the mvtools2
+filters, which return normal frames for normal input), and are `MT_NICE_FILTER`. End a chain of them with `CudaDownload`.
 
 ### Transfer
 
@@ -247,10 +257,11 @@ All filters return token frames when they run on the GPU, and are `MT_NICE_FILTE
 Uploads every frame to the device and returns token frames. Token frames pass through unchanged. If the GPU or the format
 is not usable, the frames pass through as normal frames; every consumer accepts those.
 
-Upload is not needed in front of a GPU filter, because they all upload normal frames themselves. Put it where the rest of
-the chain should stay on the device: after it, the GPU filters return token frames. Frames uploaded by `CudaUpload` can be
-made again after eviction (it reads its input again); a filter that uploads normal frames itself uploads them again when
-needed.
+Upload is not needed in front of a GPU filter, because they all upload normal frames themselves. Use it in front of
+mvtools2 filters when their output should stay on the device: after it, MSuper / MCompensate / MDegrain / MFlowFps
+return token frames instead of normal frames. (Cuda* filters return token frames with or without it.) Frames uploaded by
+`CudaUpload` can be made again after eviction (it reads its input again); a filter that uploads normal frames itself
+uploads them again when needed.
 
 #### CudaDownload(clip)
 
