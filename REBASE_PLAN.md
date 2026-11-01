@@ -163,3 +163,14 @@ all in the conflicting files, so resolving the conflicts takes care of them.
     identical to the 19.51 build in every chain, so the compiler plays no part. Reference for the merged CPU code:
     `C:\dev\mvtools\profile\baseline\upstream_a74dcb6_msvc1944`.
   - `lin_cpu` does not run on base / upstream (`mt=` in MFlowFps is ours); expected.
+- 2026-11-01, steps 1-4: merge committed (17c5bb5). Issues 1-5 resolved in it: D4 layout with helpers (issue 1),
+  `gpu` last in every signature (2), MAnalyse GPU off for `search_coarse != 3` / `trymanyall` (3), lsb with gpu=true
+  falls back because the GPU MDegrain excludes out16 (4), GPU MCompensate never sees cclip (needs tr = 0) (5).
+  Beyond the conflicts: MVBlockFps's sliced compensation got upstream's #59 `pos_to_chroma` (git took our side
+  silently); SimpleResize combines upstream's per-pixel C limiter with our row ranges; the bridge needed the
+  AVS_Linkage V13 / V14 entries for upstream's avisynth.h. A script compared every line upstream added in files both
+  sides changed with the merged tree: only our deliberate signature / param changes differ.
+  Tests (Windows, build `C:\dev\mvtools\profile\build_merge\bin` + avstp): merged CPU = upstream a74dcb6 in all 25
+  chains (`baseline\merge_wip1`); AviSynth+ = VapourSynth in all 44 compare.py chains; GPU = CPU only for the 4:4:4
+  chains (`gpu_vectors_normalsuper`, `gpu_compensate`), the 4:2:0 / 4:2:2 ones differ as predicted (issue 8).
+  Not done yet: Linux build and tests. Next: step 5, port #59 to the CUDA kernels.
