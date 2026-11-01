@@ -75,3 +75,29 @@ mvtools2 and cudafilters load one of the two libraries at run time (`Sources/cud
   other subgroup sizes) - run your tests there too. `MVVK_VALIDATION=1` enables the validation layer if installed.
 * Linux: the same sources build with the root CMake (`MVTOOLS_VULKAN=ON`); Mesa lavapipe (`MVVK_ALLOW_CPU=1`) runs the
   kernels on the CPU for functional tests.
+
+## Status (2026-11-01)
+
+Every entry point of mvcuda.h is ported except NVOFA (`mvcuda_nvof_token` returns MVCUDA_NEEDS_CPU; `CudaNVOFAnalyse`
+then uses its MAnalyse fallback). Verified bit-identical on an RTX 5090 and an Intel iGPU (no float64):
+
+| Check | Result |
+|---|---|
+| golden `run_all.py 10 f8 f420 f420b8 f444` (super, analyse, recalc, flow) | 85/85 |
+| C API cross-checks against mvtools_cuda (super/flow 120, analyse/recalc 124, comp 120, nnedi3 35 random configurations) | all identical |
+| `run_cf_regression.ps1` (pwsh 7) with every stage on Vulkan | 65/65 PASS, tokens 42/42, 0 failed GPU calls |
+| QTGMC Fast / Slower, 1500 PAL frames, Prefetch 12, all GPU stages | md5 = CUDA = CPU fallback |
+| VapourSynth vs AviSynth+ (`vsbridge/test/compare.py`), Windows and Linux | 44/44 |
+| Linux build (GCC 15), lavapipe selftest | ok |
+
+Speed on the RTX 5090 (QTGMC, 1500 frames): Fast 3.40 s Vulkan vs 1.82 s CUDA vs 6.9 s CPU; Slower 8.53 / 4.33 / 14.3 s.
+Throughput per stage with several threads equals CUDA; the gap is the synchronous call model (every call waits for its
+fence) and MAnalyse's packed SAD / next-block prefetch, which are not ported (1.1-1.9x slower per call).
+
+Open:
+* Asynchronous submission: per-frame timeline semaphore values (consumers wait instead of producers), deferred
+  `dev_free` until the GPU passed the last use; would remove most of the gap to CUDA.
+* MAnalyse packed SADs (4 samples per load) and next-block prefetch.
+* Not run on AMD hardware or real Pascal hardware yet (Pascal: Vulkan path tested on Intel and NVIDIA RTX only; the CUDA
+  Pascal path as PTX 6.1 JIT on the RTX 5090).
+* `super_covers` in vk_flow.cpp duplicates `covers` in vk_core.cpp (keep them equal).

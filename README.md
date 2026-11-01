@@ -204,7 +204,8 @@ From the 'build' folder under project root:
 
 CUDA paths for MSuper / MAnalyse / MRecalculate / MCompensate / MDegrain1..6 / MFlowFps (`gpu=true`, default false),
 bit-exact with the CPU result; settings, formats or machines the GPU does not cover run the CPU code with the same
-output. Needs an NVIDIA GPU with compute capability 8.0+ (RTX 30xx and newer) and `mvtools_cuda.dll` next to
+output. Needs an NVIDIA GPU with compute capability 6.0+ (GTX 10xx and newer; `mvtools_cuda` built with CUDA 12.x) and `mvtools_cuda.dll`, or any
+Vulkan 1.2 GPU (AMD, Intel, NVIDIA) and `mvtools_vulkan.dll` (same results bit for bit, `MVTOOLS_GPU_BACKEND`), next to
 `mvtools2.dll`.
 
 * Reference of every GPU parameter, the `cudafilters` plugin and the environment variables: `Documentation/gpu.md`.

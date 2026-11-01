@@ -27,8 +27,11 @@ the work got here; this page describes what the functions do now (library API ve
 | File | Built by | Notes |
 |---|---|---|
 | `mvtools2.dll` | `mvtools.sln` | The plugin as before |
-| `mvtools_cuda.dll` | `Sources\cuda\build.bat` (CUDA 13.x toolkit + MSVC build tools) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
+| `mvtools_cuda.dll` | `Sources\cuda\build.bat` or CMake (CUDA 12.9 for compute capability 6.0+, with the VS 2022 v143 toolset on Windows; CUDA 13.x builds start at 7.5) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
 | `cudafilters.dll` | `cudafilters\cudafilters.vcxproj` (see `cudafilters\README.md`) | Optional. Must sit in the same folder as the other two |
+| `mvtools_vulkan.dll` | `Sources\vulkan` (CMake; needs glslangValidator at build time) | Optional. The same functions on any Vulkan 1.2 GPU (AMD, Intel, NVIDIA incl. GTX 10xx); used when `mvtools_cuda.dll` is missing or finds no usable device |
+
+All the files are built by the root CMake too (README "Build"); `build_windows.ps1` makes a release folder.
 
 All three files must come from one build: the plugins check the library API version and run on the CPU when it does not
 match.
@@ -41,8 +44,18 @@ Requirements:
   through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"), `gpu=true` included (same output as AviSynth+;
   `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under VapourSynth (namespace `cuda`) covers only
   CudaUpload / CudaDownload and the Merge filters so far (`VAPOURSYNTH_PLAN.md`).
-- An NVIDIA GPU with compute capability 8.0 or newer (RTX 30xx, 40xx, 50xx, A100, H100). Older cards count as "no usable
-  device". The first device with cc >= 8.0 is used; `MVCUDA_DEVICE=n` picks another.
+- **GPU backends.** `gpu=true` and cudafilters run on one of two libraries with the same functions and the same,
+  bit-identical results: `mvtools_cuda.dll` (CUDA, NVIDIA) or `mvtools_vulkan.dll` (Vulkan 1.2 with buffer device
+  address, 8/16-bit storage, scalar block layout and 64-bit integers: AMD GCN 4+ / RDNA, Intel Gen9+ / Arc / Xe,
+  NVIDIA Maxwell 2+ incl. GTX 10xx). `MVTOOLS_GPU_BACKEND=auto` (default) takes CUDA when it has a usable device, else
+  Vulkan; `cuda` or `vulkan` forces one. Both plugins make the same choice (they share the library's frame registry).
+  Not on Vulkan: `CudaNVOFAnalyse`'s optical flow accelerator (it uses its MAnalyse fallback there). On NVIDIA the
+  CUDA library is faster (MAnalyse 1.1-1.9x; the other stages about equal); Vulkan calls wait for the GPU, so use
+  Prefetch for throughput.
+- CUDA: an NVIDIA GPU with compute capability 6.0 or newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx) when
+  `mvtools_cuda.dll` is built with CUDA 12.x (7.5 or newer with CUDA 13.x); other cards count as "no usable device" and
+  the Vulkan library takes over. The first usable device is used; `MVCUDA_DEVICE=n` picks another. Pascal / Volta paths
+  are verified as PTX 6.1 on an RTX 50xx, not yet on real 6.x / 7.0 hardware.
 - `CudaNNEDI3` and `CudaKeepOnlyBobShimmerFixes` call into other plugins: they need `plugins_JPSDR.dll` (nnedi3), and
   `QTGMC.avsi` (`QTGMC_KeepOnlyBobShimmerFixes`) with masktools2 and RgTools, loaded.
 
@@ -464,8 +477,22 @@ Read once per process.
 
 | Variable | Effect |
 |---|---|
-| `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 8.0 or newer) |
+| `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 6.0 or newer) |
 | `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames, uploaded pictures and the super pyramids kept with them), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
 | `MVCUDA_WAVE=0` | MAnalyse with `meander=false` uses the slice kernel instead of the wavefront kernel (for comparisons) |
 | `MVCUDA_SPIN` | Waits for the GPU spin a CPU core instead of sleeping |
 | `MVCUDA_TIMING` | Kernel timings to stderr |
+
+### Vulkan library (`mvtools_vulkan.dll`)
+
+| Variable | Effect |
+|---|---|
+| `MVTOOLS_GPU_BACKEND=auto\|cuda\|vulkan` | Which library mvtools2 and cudafilters load (read by both plugins) |
+| `MVVK_DEVICE=n` | Use the n-th usable Vulkan device (discrete GPUs first, then integrated) |
+| `MVVK_ALLOW_CPU=1` | Also accept CPU implementations such as Mesa lavapipe (tests only; slower than the CPU code) |
+| `MVVK_LOG=1` | Device selection, failed calls and per-entry-point call counts to stderr |
+| `MVVK_VALIDATION=1` | Enable the Khronos validation layer when installed |
+| `MVVK_TIMEOUT_S=n` | A GPU wait longer than n seconds (default 60) marks the device lost; later calls use the CPU instead of hanging |
+| `MVCUDA_CACHE_MB=n` | As for the CUDA library |
+| `MVVK_WAVE=0` | MAnalyse `meander=false` uses the slice kernel instead of the wavefront kernel |
+| `MVVK_WAVE_GROUPS`, `MVVK_SPIN_MAX`, `MVVK_CHUNK_BLOCKS` | Tuning of the MAnalyse kernels (workgroups of the wavefront, bound of its inter-workgroup waits, rows per slice-kernel dispatch) |
