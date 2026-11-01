@@ -5,6 +5,8 @@
 #ifndef MV_DYN_LIB_H
 #define MV_DYN_LIB_H
 
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -83,10 +85,14 @@ namespace dynlib
 
 #ifdef _WIN32
   constexpr const char *cuda_lib_name = "mvtools_cuda.dll";
+  constexpr const char *vulkan_lib_name = "mvtools_vulkan.dll";
+  constexpr const char *vulkan_loader_name = "vulkan-1.dll";
   constexpr const char *nvofa_lib_name = "nvofapi64.dll";
   constexpr const char *vsbridge_lib_name = "mvtools_vsbridge.dll";
 #else
   constexpr const char *cuda_lib_name = "libmvtools_cuda.so";
+  constexpr const char *vulkan_lib_name = "libmvtools_vulkan.so";
+  constexpr const char *vulkan_loader_name = "libvulkan.so.1";
   constexpr const char *nvofa_lib_name = "libnvidia-opticalflow.so.1";
   constexpr const char *vsbridge_lib_name = "libmvtools_vsbridge.so";
 #endif
@@ -182,6 +188,44 @@ namespace dynlib
     std::filesystem::path p = std::filesystem::absolute(info.dli_fname, ec);
     return ec ? std::filesystem::path() : p.parent_path();
 #endif
+  }
+
+  // The GPU backend library (the mvcuda.h C API) in folder dir: mvtools_cuda (CUDA, NVIDIA) or mvtools_vulkan (any Vulkan
+  // 1.2 GPU), both export the same functions. MVTOOLS_GPU_BACKEND=cuda / vulkan picks one; otherwise (auto) mvtools_cuda
+  // when it loads and reports a usable device, else mvtools_vulkan when it does. Every plugin of a process must make the
+  // same choice (the frame registry lives in the library), which this function does deterministically. nullptr when no
+  // backend is usable; *which receives "cuda" or "vulkan"; log: print the decisions to stderr with that prefix.
+  inline void *open_gpu_backend(const std::filesystem::path &dir, const char **which, const char *log)
+  {
+    static const char *names[2] = { cuda_lib_name, vulkan_lib_name };
+    static const char *tags[2] = { "cuda", "vulkan" };
+    const char *e = std::getenv("MVTOOLS_GPU_BACKEND");
+    const std::string want = e ? e : "auto";
+    for (int i = 0; i < 2; i++)
+    {
+      if (want != "auto" && want != tags[i])
+        continue;
+      void *lib = open(dir / names[i]);
+      if (lib == nullptr)
+      {
+        if (log)
+          std::fprintf(stderr, "%s: %s not loaded (%s)\n", log, names[i], last_error().c_str());
+        continue;
+      }
+      auto count = reinterpret_cast<int (*)()>(symbol(lib, "mvcuda_device_count"));
+      const int n = count ? count() : -1;
+      if (n > 0)
+      {
+        if (which)
+          *which = tags[i];
+        if (log)
+          std::fprintf(stderr, "%s: using %s (%d device(s))\n", log, names[i], n);
+        return lib;
+      }
+      if (log)
+        std::fprintf(stderr, "%s: %s reports no usable device (%d)\n", log, names[i], n);
+    }
+    return nullptr;
   }
 } // namespace dynlib
 

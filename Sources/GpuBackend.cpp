@@ -284,12 +284,13 @@ GpuBackend::GpuBackend()
     return;
   }
 
-  void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
+  // mvtools_cuda or mvtools_vulkan (same C API); cudafilters makes the same choice through the same function
+  const char *which = nullptr;
+  void *lib = dynlib::open_gpu_backend(dir, &which, log_enabled() ? "mvtools gpu" : nullptr);
   if (lib == nullptr)
   {
     if (log_enabled())
-      std::fprintf(stderr, "mvtools gpu: %s not loaded from the plugin folder (%s), using the CPU\n", dynlib::cuda_lib_name,
-        dynlib::last_error().c_str());
+      std::fprintf(stderr, "mvtools gpu: no GPU backend in the plugin folder, using the CPU\n");
     return;
   }
   auto version = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_api_version"));

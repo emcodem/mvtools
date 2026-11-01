@@ -26,13 +26,11 @@ namespace cf
     if (dir.empty())
       return;
     // the same file mvtools2 loads: one process-wide instance, so both plugins share one frame registry
-    void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
+    // (mvtools_cuda or mvtools_vulkan: dynlib::open_gpu_backend makes the same choice in both plugins)
+    const char *which = nullptr;
+    void *lib = dynlib::open_gpu_backend(dir, &which, log_enabled() ? "cudafilters" : nullptr);
     if (!lib)
-    {
-      if (log_enabled())
-        std::fprintf(stderr, "cudafilters: %s not loaded (%s)\n", dynlib::cuda_lib_name, dynlib::last_error().c_str());
       return;
-    }
     auto version = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_api_version"));
     auto count = reinterpret_cast<int (*)()>(dynlib::symbol(lib, "mvcuda_device_count"));
 #define CF_LOAD(member, name) member = reinterpret_cast<decltype(member)>(dynlib::symbol(lib, name))

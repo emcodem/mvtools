@@ -1,0 +1,45 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_merge of Sources/cuda/mvcuda_merge.cu (AviSynth+ Merge / MergeLuma / MergeChroma), the reference port: one thread per
+// sample, workgroups (ceil(max_w / 128), max_h, planes).
+
+layout(local_size_x = 128) in;
+
+struct Args
+{
+  uint64_t a[3], b[3], dst[3];
+  uint64_t pitch_a[3], pitch_b[3], pitch_d[3]; // in samples
+  int width[3], height[3], mode[3], tail[3];
+  int weight_i, invweight_i, bits, pad_;
+};
+ARGS(Args)
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y), p = int(gl_WorkGroupID.z);
+  if (x >= A.width[p] || y >= A.height[p])
+    return;
+  const int a = ldpix(A.a[p], uint(uint64_t(y) * A.pitch_a[p] + uint64_t(x)));
+  const int mode = A.mode[p];
+  int r = a;
+  if (mode != 0)
+  {
+    const int b = ldpix(A.b[p], uint(uint64_t(y) * A.pitch_b[p] + uint64_t(x)));
+    if (mode == 3)
+      r = b;
+    else if (mode == 2)
+      r = (a + b + 1) >> 1;
+#ifndef MVC_PIX8
+    else if (A.bits == 16 && x < A.tail[p])
+    {
+      int s = ((a - 32768) * A.invweight_i + (b - 32768) * A.weight_i + 16384) >> 15;
+      s = clamp(s, -32768, 32767);
+      r = (s + 32768) & 0xffff;
+    }
+#endif
+    else
+      r = (a * A.invweight_i + b * A.weight_i + 16384) >> 15;
+  }
+  stpix(A.dst[p], uint(uint64_t(y) * A.pitch_d[p] + uint64_t(x)), r);
+}

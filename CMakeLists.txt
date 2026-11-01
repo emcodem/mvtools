@@ -241,6 +241,14 @@ if(MVTOOLS_GPU)
   endif()
 endif()
 
+# Vulkan backend: mvtools_vulkan, the same C API as mvtools_cuda on any Vulkan 1.2 GPU (NVIDIA incl. Pascal / GTX 10xx, AMD,
+# Intel). Needs glslangValidator at build time only; mvtools2 / cudafilters pick it at run time when mvtools_cuda has no
+# usable device (MVTOOLS_GPU_BACKEND=cuda|vulkan|auto).
+option(MVTOOLS_VULKAN "Build mvtools_vulkan (needs glslangValidator)" ON)
+if(MVTOOLS_VULKAN)
+  add_subdirectory("Sources/vulkan")
+endif()
+
 # uninstall target
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake_uninstall.cmake.in"
