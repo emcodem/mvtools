@@ -124,3 +124,9 @@ all in the conflicting files, so resolving the conflicts takes care of them.
 
 - 2026-11-01: branch created, trial merge done and aborted, plan written; D4 decided (marker kept, combined
   rfilter / sharp code); repo git identity set to emcodem. Next: step 0.
+- 2026-11-01, step 0 (ours): `vsbridge/test/baseline.py` (AviSynth+ framemd5 of compare.py's chains into a folder;
+  `diff` between two folders; GPU chains checked against their twins without `gpu=true`). Baseline of `gpu_work`
+  f9553c5 (build `C:\dev\mvtools\profile\build_rel20\bin`, Windows, RTX 5090) in
+  `C:\dev\mvtools\profile\baseline\gpu_work_f9553c5`: 50 chains (20 CPU, 6 GPU CPU twins, 7 GPU, 17 cudafilters),
+  all run; GPU = CPU for all 6 GPU chains and lin_gpu = lin_cpu; a second run (`..._run2`) is identical in every
+  chain. Still to do: the same CPU groups (`cpu gpucpu`) with a plain upstream a74dcb6 build.
