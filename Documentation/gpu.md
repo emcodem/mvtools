@@ -164,8 +164,11 @@ reference), or when the GPU reports that the frame needs the CPU's bad-vector wi
 result depends on the number of slices. The GPU reproduces that:
 
 - `meander=true` (default): the GPU searches in as many slices as the CPU uses. That is the avstp thread count with
-  `mt=true`; 24 when `mt=true` but no thread pool is available; 1 with `mt=false`. `MVTOOLS_GPU_SLICES=n` overrides the
-  count, which gives a different vector field from the CPU default.
+  `mt=true`; 1 with `mt=false`, and 1 when there is no thread pool (avstp not loaded, VapourSynth, Linux), because the
+  CPU then searches in one slice too. One slice is a long serial chain, so the GPU is slow there: under VapourSynth and
+  on Linux use `meander=false` for speed. `MVTOOLS_GPU_SLICES=n` overrides the count, which gives a different vector
+  field from the CPU default. (Before 2026-11-01c the GPU used 24 slices without a thread pool and so differed from
+  the CPU and from its own CPU fallback.)
 - `meander=false` together with `gpu=true`: the GPU runs a wavefront search over the whole frame in one slice. This is the
   faster GPU mode. To keep the output independent of where a frame was searched, the CPU fallback of such a filter
   searches in one slice too, whatever `mt` says.

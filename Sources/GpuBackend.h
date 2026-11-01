@@ -162,7 +162,8 @@ public:
   bool download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, const VideoInfo &vi);
 
   // number of block-row slices to use: the CPU thread count when mt is on (so the result equals the CPU result with
-  // that many threads), 1 without mt; 24 when mt is on but no thread pool is available (the GPU needs slices)
+  // that many threads), 1 without mt; 1 when mt is on but no thread pool is available (avstp missing, VapourSynth,
+  // Linux), because the CPU then runs one slice too
   static int slice_threads(bool mt_flag);
 
   // MVTOOLS_GPU_LOG=1 prints every GPU call / fallback to stderr
