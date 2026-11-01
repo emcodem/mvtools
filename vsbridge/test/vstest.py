@@ -1,5 +1,6 @@
 """Helpers for the VapourSynth test scripts of mvtools_vsbridge (see vsmd5.py)."""
 import os
+import sys
 
 import numpy as np
 import vapoursynth as vs
@@ -33,15 +34,20 @@ def raw_source(path, width, height, fmt, fpsnum, fpsden):
     return core.std.ModifyFrame(clip, clip, fill)
 
 
+def lib_name(name):
+    """File name of a library of this repo on this platform: mvtools2 -> libmvtools2.so / mvtools2.dll."""
+    return name + '.dll' if sys.platform == 'win32' else 'lib%s.so' % name
+
+
 def load_mvtools(plugin_dir=None):
-    """Loads libmvtools2.so (namespace mvpf) from plugin_dir or $MVPF_PLUGIN_DIR."""
+    """Loads libmvtools2.so / mvtools2.dll (namespace mvpf) from plugin_dir or $MVPF_PLUGIN_DIR."""
     d = plugin_dir or os.environ['MVPF_PLUGIN_DIR']
     if not hasattr(core, 'mvpf'):
-        core.std.LoadPlugin(os.path.join(d, 'libmvtools2.so'))
+        core.std.LoadPlugin(os.path.join(d, lib_name('mvtools2')))
 
 
 def load_cudafilters(plugin_dir=None):
-    """Loads libcudafilters.so (namespace cuda) from plugin_dir or $MVPF_PLUGIN_DIR."""
+    """Loads libcudafilters.so / cudafilters.dll (namespace cuda) from plugin_dir or $MVPF_PLUGIN_DIR."""
     d = plugin_dir or os.environ['MVPF_PLUGIN_DIR']
     if not hasattr(core, 'cuda'):
-        core.std.LoadPlugin(os.path.join(d, 'libcudafilters.so'))
+        core.std.LoadPlugin(os.path.join(d, lib_name('cudafilters')))

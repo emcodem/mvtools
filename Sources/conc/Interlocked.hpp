@@ -28,7 +28,7 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 	#include <intrin.h>
 #elif defined (_WIN32) || defined (WIN32) || defined (__WIN32__) || defined (__CYGWIN__) || defined (__CYGWIN32__)
 	#define  WIN32_LEAN_AND_MEAN
-	#include <Windows.h>
+	#include <windows.h>
 	#include <winnt.h>
 #elif defined (__APPLE__)
 	#include <libkern/OSAtomic.h>

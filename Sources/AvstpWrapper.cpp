@@ -38,7 +38,7 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 #include "AvstpWrapper.h"
 
 #if defined (_MSC_VER)
- #include "Windows.h"
+ #include <windows.h>
 #endif
 
 #include <stdexcept>

@@ -1,207 +1,110 @@
-# We need CMake 3.8 at least, because we require
-# CMAKE_CXX_STANDARD to be set to C++17.
-# Visual Studio 2019 is supported from CMake 3.14.1
-# Possible generators:
-# "MinGW Makefiles": MSYS2/Mingw32 GCC 8.3 build
-# "Visual Studio 15 2017" optional platform generator Win32 and x64
-# "Visual Studio 16 2019" optional platform generator Win32 and x64
-# "Visual Studio 16 2019" + LLVM 8.0 (clang) optional platform generator Win32 and x64
-CMAKE_MINIMUM_REQUIRED( VERSION 3.8.2 )
+# mvtools2 + DePan + DePanEstimate (AviSynth+ plugins), their VapourSynth bridge and the optional GPU libraries.
+#
+# Builds (README "Build Instructions"):
+#   Windows, MSVC + Ninja (x64): build_windows.ps1, or by hand from a "x64 Native Tools" prompt:
+#     cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_NASM_COMPILER=C:/path/nasm.exe
+#     cmake --build build
+#   Linux (GCC / Clang): build_linux.sh, or cmake -G Ninja -S . -B build && cmake --build build
+#   Windows from Linux (MinGW-w64, CPU plugins + bridge + Vulkan): cmake/toolchain-mingw64.cmake
+#
+# Targets and outputs:
+#   mvtools2        mvtools2.dll / libmvtools2.so          (MSVC: with the NASM sources of the .vcxproj)
+#   depan           DePan.dll / libdepan.so
+#   depanestimate   DePanEstimate.dll / libdepanestimate.so
+#   mvtools_vsbridge  VapourSynth host for the plugins above (MVTOOLS_VAPOURSYNTH)
+#   mvtools_cuda, cudafilters   GPU part (MVTOOLS_GPU, needs a CUDA compiler for mvtools_cuda)
+#   mvtools_vulkan  Vulkan backend (MVTOOLS_VULKAN, needs glslangValidator or prebuilt SPIR-V)
+# The Visual Studio solution (mvtools.sln) still works and builds the same AviSynth+ DLLs.
+cmake_minimum_required(VERSION 3.18)
 
-project("MvTools2" LANGUAGES CXX)
-  include(GNUInstallDirs)
+project("MvTools2" LANGUAGES C CXX)
+include(GNUInstallDirs)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release, RelWithDebInfo, Debug)" FORCE)
+endif()
 
 # Avoid uselessly linking to unused libraries
-set(CMAKE_STANDARD_LIBRARIES "" CACHE STRING "" FORCE)
 set(CMAKE_C_STANDARD_LIBRARIES "" CACHE STRING "" FORCE)
 set(CMAKE_CXX_STANDARD_LIBRARIES "" CACHE STRING "" FORCE)
+if(WIN32)
+  # what the default list provided and the plugins use
+  set(CMAKE_C_STANDARD_LIBRARIES "kernel32.lib user32.lib gdi32.lib advapi32.lib ole32.lib uuid.lib" CACHE STRING "" FORCE)
+  set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
+  if(MINGW)
+    set(CMAKE_C_STANDARD_LIBRARIES "-lkernel32 -luser32 -lgdi32 -ladvapi32 -lole32 -luuid" CACHE STRING "" FORCE)
+    set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES}" CACHE STRING "" FORCE)
+  endif()
+endif()
 
-# We require C++17 or higher.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS FALSE)
-
-# Detect Intel processors and turn Intel SIMD on or off automatically.
-message("-- Detected target processor as: ${CMAKE_SYSTEM_PROCESSOR}")
-string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCHID)
-if( ("${ARCHID}" STREQUAL "x86") OR
-    ("${ARCHID}" STREQUAL "x64") OR
-    ("${ARCHID}" STREQUAL "i686") OR
-    ("${ARCHID}" STREQUAL "amd64") OR
-    ("${ARCHID}" STREQUAL "x86_64") )
-  set(INTEL_SIMD "ON")
-else()
-  set(INTEL_SIMD "OFF")
-endif()
-
-option(ENABLE_INTEL_SIMD "Enable SIMD intrinsics for Intel processors" "${INTEL_SIMD}")
 
 if(CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_CONFIGURATION_TYPES Debug Release RelWithDebInfo)
   set(CMAKE_CONFIGURATION_TYPES "${CMAKE_CONFIGURATION_TYPES}" CACHE STRING "Reset the configurations to what we need" FORCE)
 endif()
 
-IF( MSVC )  # Check for Visual Studio
-  # We do not allow creating Visual Studio solutions, existing .sln file contains 
-  # all x86/x64 versions of MSVC and LLVM builds.
-  MESSAGE(FATAL_ERROR "Please use the existing sln file both for MS VC and also for LLVM toolset in VS")
-  # anyway we keep all things below
-  # ** not tested **
+message(STATUS "Target processor: ${CMAKE_SYSTEM_PROCESSOR}")
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCHID)
+if(ARCHID MATCHES "^(x86|x64|i686|amd64|x86_64)$")
+  set(INTEL_SIMD "ON")
+else()
+  set(INTEL_SIMD "OFF")
+endif()
+option(ENABLE_INTEL_SIMD "Enable SIMD intrinsics for Intel processors" "${INTEL_SIMD}")
 
-
-
-
-  #1910-1919 = VS 15.0 (v141 toolset) Visual Studio 2017
-  #1920      = VS 16.0 (v142 toolset) Visual Studio 2019
-
-  IF( MSVC_VERSION VERSION_LESS 1910 )
-    MESSAGE(FATAL_ERROR "Visual C++ 2017 or newer required.")
-  ENDIF()
-
-  IF(MSVC_IDE)
-    message("Reported CMAKE_GENERATOR_TOOLSET is: ${CMAKE_GENERATOR_TOOLSET}")
-    
-      # For LLVM Clang installed separately, specify llvm or LLVM
-      # Since Visual Studio 2019 v16.4, LLVM 9.0 is integrated, for this use Toolset: ClangCL
-      IF(CMAKE_GENERATOR_TOOLSET STREQUAL "LLVM" OR CMAKE_GENERATOR_TOOLSET STREQUAL "llvm" OR CMAKE_GENERATOR_TOOLSET STREQUAL "ClangCL")
-        if(${CMAKE_CXX_COMPILER_ID} STREQUAL "Clang")  # hope: always
-          message("LLVM toolset was specified via -T. Compiler ID is: ${CMAKE_CXX_COMPILER_ID}; CMAKE_CXX_COMPILER_VERSION is: ${CMAKE_CXX_COMPILER_VERSION}")
-          # Clang; 9.0.0
-          # These are probably not supported when clang is downloaded as a ready-made binary: CLANG_VERSION_MAJOR CLANG_VERSION_MINOR CLANG_VERSION_STRING
-          # string (REGEX REPLACE ".*clang version ([0-9]+\\.[0-9]+).*" "\\1" CLANG_VERSION_STRING ${clang_full_version_string})
-          if( CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0.1 )
-            MESSAGE(FATAL_ERROR "Clang 7.0.1 or newer required") # as of 2019.december actually we are using 9.0
-          endif()
-        endif()
-        set(CLANG_IN_VS "1")
-      ELSEIF(CMAKE_GENERATOR_TOOLSET STREQUAL "v141_clang_c2")
-         #1900 is reported
-        message("v141_clang_c2 toolset was specified via -T. Reported MSVC_VERSION is: ${MSVC_VERSION}")
-        message("May not work, try LLVM")
-        set(CLANG_IN_VS "1")
-      ENDIF()
-
-      option(WINXP_SUPPORT "Make binaries compatible with Windows XP and Vista" OFF)
-      if(WINXP_SUPPORT)
-        # We want our project to also run on Windows XP
-        # Not for LLVM: Clang stopped XP support in 2016
-        # 1900 (VS2015) is not supported but we leave here
-        IF(MSVC_VERSION VERSION_LESS 1910 )
-          IF(NOT CLANG_IN_VS STREQUAL "1")
-            set(CMAKE_GENERATOR_TOOLSET "v140_xp" CACHE STRING "The compiler toolset to use for Visual Studio." FORCE) # VS2015
-            # https://connect.microsoft.com/VisualStudio/feedback/details/1789709/visual-c-2015-runtime-broken-on-windows-server-2003-c-11-magic-statics
-            message("CMAKE_GENERATOR_TOOLSET is forced to: ${CMAKE_GENERATOR_TOOLSET}")
-            add_definitions("/Zc:threadSafeInit-")
-          ENDIF()
-        ELSE()
-          IF(NOT CLANG_IN_VS STREQUAL "1")
-            set(CMAKE_GENERATOR_TOOLSET "v141_xp" CACHE STRING "The compiler toolset to use for Visual Studio." FORCE) # VS2017, also choosable for VS2019
-            # https://connect.microsoft.com/VisualStudio/feedback/details/1789709/visual-c-2015-runtime-broken-on-windows-server-2003-c-11-magic-statics
-            message("CMAKE_GENERATOR_TOOLSET is forced to: ${CMAKE_GENERATOR_TOOLSET}")
-            add_definitions("/Zc:threadSafeInit-")
-          ENDIF()
-        ENDIF()
-      endif()
-  ENDIF()
-
-  IF(CLANG_IN_VS STREQUAL "1")
-      #these are unknown
-      #set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions")
-      #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
-      STRING( REPLACE "/EHsc" "/EHa" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-      STRING( REPLACE "/EHsc" "/EHa" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-inconsistent-missing-override")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-inconsistent-missing-override")
-  ELSE()
-      # Enable C++ with SEH exceptions
-      # Avoid an obnoxious 'overrriding /EHsc with /EHa' warning when
-      # using something other than MSBuild
-      STRING( REPLACE "/EHsc" "/EHa" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-      STRING( REPLACE "/EHsc" "/EHa" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-  ENDIF()
-  # Prevent VC++ from complaining about not using MS-specific functions
-  add_definitions("/D _CRT_SECURE_NO_WARNINGS /D _SECURE_SCL=0")
-  
-  # Enable CRT heap debugging - only effective in debug builds
-  add_definitions("/D _CRTDBG_MAP_ALLOC")
-
-  # Set additional optimization flags
-  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Oy /Ot /GS- /Oi")
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Oy /Ot /GS- /Oi")
-
-  # CPU_ARCH can be overridden with the corresponding values when using MSVC:
-  # IA32 (disabled),
-  # SSE (Pentium III and higher, 1999),
-  # SSE2 (Pentium 4 and higher, 2000/2001),
-  # AVX (Sandy Bridge and higher, 2011),
-  # AVX2 (Haswell and higher, 2013)
-  set(MSVC_CPU_ARCH "SSE2" CACHE STRING "Set MSVC architecture optimization level (default: SSE2)")
-
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /arch:${MSVC_CPU_ARCH}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:${MSVC_CPU_ARCH}")
-
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-  # MSVC doesn't allow 64-bit builds to have their /arch set to SSE2 (no-op) or below
-    if("${MSVC_CPU_ARCH}" MATCHES "(IA32|SSE|SSE2)")
-      set(DELETE_THIS "/arch:${MSVC_CPU_ARCH}")
-      message("MSVC doesn't allow x86-64 builds to define /arch:${MSVC_CPU_ARCH}. Setting will be ignored.")
-      STRING( REPLACE "${DELETE_THIS}" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-      STRING( REPLACE "${DELETE_THIS}" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-    endif()
+if(MSVC)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    message(FATAL_ERROR "clang-cl is not supported by this CMake build (the Visual Studio solution has LLVM configurations)")
   endif()
-
-  IF(CLANG_IN_VS STREQUAL "1")
-      # suppress other frequent but harmless/unavoidable warnings
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-function")
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-function")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-reorder")
-      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-reorder")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-value")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-value")
-    # allow per-function attributes like __attribute__((__target__("sse4.1")))
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-gcc-compat")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-gcc-compat")
-  ENDIF()
-
-# Set C++17 flag
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /std:c++17")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++17")
-
-  # Enable standards-conformance mode for MSVC compilers that support this
-  # flag (Visual C++ 2017 and later).
-  if (NOT (MSVC_VERSION LESS 1910))
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /permissive-")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /permissive-")
+  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Only x64 is supported by the CMake build (use the Visual Studio solution for Win32)")
   endif()
+  # Static CRT for every DLL (no Visual C++ redistributable needed). Note: the .vcxproj of mvtools2 uses /MD.
+  option(MVTOOLS_STATIC_CRT "MSVC: link the C runtime statically (/MT)" ON)
+  if(MVTOOLS_STATIC_CRT)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  else()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:C,CXX>:_CRT_SECURE_NO_WARNINGS>)
+endif()
 
+# Release code generation of the Visual Studio projects (mvtools.vcxproj Release|x64): full optimisation, favour speed,
+# intrinsics, frame-pointer omission, fiber-safe TLS, string pooling, function-level linking, no buffer checks, whole
+# program optimisation + link-time code generation, /OPT:REF /OPT:ICF. Per target, so that the CUDA target keeps its own.
+function(mv_msvc_release_flags target)
+  if(NOT MSVC)
+    return()
+  endif()
+  target_compile_options(${target} PRIVATE
+    $<$<COMPILE_LANGUAGE:C,CXX>:/W3 /permissive- /Zc:inline /EHsc>
+    $<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<NOT:$<CONFIG:Debug>>>:/O2 /Ob2 /Oi /Ot /Oy /GT /GF /Gy /GS- /GL>)
+  target_link_options(${target} PRIVATE
+    $<$<NOT:$<CONFIG:Debug>>:/LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO>)
+endfunction()
+
+if(NOT MSVC)
   if(ENABLE_INTEL_SIMD)
-    add_definitions("/D INTEL_INTRINSICS")
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-msse2>")
+    add_compile_definitions(INTEL_INTRINSICS)
   endif()
-
-ELSE()
-
-  if(ENABLE_INTEL_SIMD)
-    SET( CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -msse2 -DINTEL_INTRINSICS" )
+  if(WIN32)
+    # MinGW: GCC does not align the stack to 32 bytes on Win64 (GCC bug 54412), so AVX spills with aligned moves crash;
+    # let the assembler turn them into unaligned moves
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-Wa,-muse-unaligned-vector-move>")
+    # MinGW: no runtime DLLs of GCC next to the plugins
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--enable-stdcall-fixup -static-libgcc -static-libstdc++ -static")
+  elseif(APPLE)
+    # macOS uses Clang's linker, doesn't like --no-undefined
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-undefined,error")
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # make sure there are no undefined symbols
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined")
   endif()
-  IF(WIN32)
-    SET( CMAKE_SHARED_LINKER_FLAGS "-Wl,--enable-stdcall-fixup" )
-  ELSE()
-    if(APPLE)
-      # macOS uses Clang's linker, doesn't like --no-undefined
-      SET( CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-undefined,error" )
-    else()
-      if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        # make sure there are no undefined symbols
-        SET( CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-undefined" )
-      endif()
-    endif()
-  ENDIF()
-ENDIF()
-
-#add_subdirectory("MvTools2")
-add_subdirectory("Sources")
-add_subdirectory("DePan")
-add_subdirectory("DePanEstimate")
+endif()
 
 # ELF platforms: export only the plugin entry points (cmake/plugin_exports.map). Otherwise plugin globals are interposed
 # by same-named symbols of the host or other plugins (AVS_linkage of libavisynth.so: crash in AvisynthPluginInit3).
@@ -211,11 +114,20 @@ function(mv_plugin_exports target)
     set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${PROJECT_SOURCE_DIR}/cmake/plugin_exports.map")
   endif()
 endfunction()
-if(NOT WIN32)
-  mv_plugin_exports(mvtools2)
-  mv_plugin_exports(depan)
-  mv_plugin_exports(depanestimate)
-endif()
+
+# MinGW: plugin DLLs without the lib prefix, like the MSVC ones
+function(mv_windows_names target)
+  if(MINGW)
+    set_target_properties(${target} PROPERTIES PREFIX "" IMPORT_PREFIX "")
+  endif()
+endfunction()
+
+add_subdirectory("Sources")
+add_subdirectory("DePan")
+add_subdirectory("DePanEstimate")
+mv_plugin_exports(mvtools2)
+mv_plugin_exports(depan)
+mv_plugin_exports(depanestimate)
 
 # VapourSynth: mvtools_vsbridge, an AviSynth+ host for VapourSynth that runs the plugins unchanged (VAPOURSYNTH_PLAN.md).
 # The plugins only gain a VapourSynthPluginInit2 export that opens it at run time; no VapourSynth installation is needed to
@@ -226,28 +138,53 @@ if(MVTOOLS_VAPOURSYNTH)
 endif()
 
 # GPU part: mvtools_cuda (needs the CUDA toolkit) and the cudafilters plugin. mvtools2 itself never links against it:
-# it opens mvtools_cuda at run time and uses the CPU when the library, the driver or a device is missing.
-option(MVTOOLS_GPU "Build mvtools_cuda and cudafilters (needs the CUDA toolkit)" ON)
+# it opens mvtools_cuda (or mvtools_vulkan) at run time and uses the CPU when the library, the driver or a device is
+# missing. cudafilters is plain C++ and is built whenever MVTOOLS_GPU is on, also without a CUDA compiler (it then works
+# with mvtools_vulkan or its CPU fallbacks).
+option(MVTOOLS_GPU "Build cudafilters and (MVTOOLS_CUDA) mvtools_cuda" ON)
+option(MVTOOLS_CUDA "Build mvtools_cuda (needs a CUDA compiler: CMAKE_CUDA_COMPILER)" ON)
 if(MVTOOLS_GPU)
-  include(CheckLanguage)
-  check_language(CUDA)
-  if(CMAKE_CUDA_COMPILER)
+  if(MVTOOLS_CUDA AND NOT MINGW)
+    include(CheckLanguage)
+    check_language(CUDA)
+  endif()
+  if(MVTOOLS_CUDA AND CMAKE_CUDA_COMPILER AND NOT MINGW)
     enable_language(CUDA)
     add_subdirectory("Sources/cuda")
-    add_subdirectory("cudafilters")
-    mv_plugin_exports(cudafilters)
-  else()
-    message(WARNING "MVTOOLS_GPU: no CUDA compiler found (set CMAKE_CUDA_COMPILER or -DMVTOOLS_GPU=OFF); building the CPU plugins only")
+  elseif(MINGW)
+    message(STATUS "MVTOOLS_GPU: mvtools_cuda needs nvcc with MSVC; MinGW builds only cudafilters (Vulkan / CPU)")
+  elseif(MVTOOLS_CUDA)
+    message(WARNING "MVTOOLS_GPU: no CUDA compiler found (set CMAKE_CUDA_COMPILER); building cudafilters without mvtools_cuda")
   endif()
+  add_subdirectory("cudafilters")
+  mv_plugin_exports(cudafilters)
 endif()
 
 # Vulkan backend: mvtools_vulkan, the same C API as mvtools_cuda on any Vulkan 1.2 GPU (NVIDIA incl. Pascal / GTX 10xx, AMD,
-# Intel). Needs glslangValidator at build time only; mvtools2 / cudafilters pick it at run time when mvtools_cuda has no
-# usable device (MVTOOLS_GPU_BACKEND=cuda|vulkan|auto).
+# Intel). Needs glslangValidator at build time only (MVTOOLS_GLSLANG); mvtools2 / cudafilters pick it at run time when
+# mvtools_cuda has no usable device (MVTOOLS_GPU_BACKEND=cuda|vulkan|auto).
 option(MVTOOLS_VULKAN "Build mvtools_vulkan (needs glslangValidator)" ON)
 if(MVTOOLS_VULKAN)
   add_subdirectory("Sources/vulkan")
 endif()
+
+# Everything the plugins load from their own folder, in one place: <build>/bin (copied after each build).
+set(MVTOOLS_DIST_DIR "${CMAKE_BINARY_DIR}/bin" CACHE PATH "Folder that receives all plugin libraries after the build")
+set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda mvtools_vulkan)
+set(_mv_dist_cmds "")
+set(_mv_dist_deps "")
+foreach(t ${_mv_dist_targets})
+  if(TARGET ${t})
+    list(APPEND _mv_dist_cmds COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${t}>" "${MVTOOLS_DIST_DIR}/")
+    list(APPEND _mv_dist_deps ${t})
+  endif()
+endforeach()
+add_custom_target(dist ALL
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${MVTOOLS_DIST_DIR}"
+  ${_mv_dist_cmds}
+  DEPENDS ${_mv_dist_deps}
+  COMMENT "Collecting the plugin libraries in ${MVTOOLS_DIST_DIR}"
+  VERBATIM)
 
 # uninstall target
 configure_file(
