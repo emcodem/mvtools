@@ -2,9 +2,10 @@ Depan and DepanEstimate
 =======================
 
 Motion estimation and compensation plugin for Avisynth+ and Avisynth v2.6 family.
-Supporting YUY2, 4:2:0, 4:2:2, 4:4:4, planar RGB* at native 8-16 bit depths
+Supporting Y, YUY2, YUV 4:2:0, 4:2:2, 4:4:4 (also 4:1:0, 4:1:1, 4:4:0, with or without alpha),
+planar RGB(A)* at native 8-16 bit depths
 Still supporting Windows XP.
-x86 and x64 version
+Windows x86, x64 and ARM64; Linux x86-64 and aarch64
 *in DepanStabilize
 
 Files: depan.dll, depanestimate.dll 
@@ -18,6 +19,70 @@ Modification base:
 http://avisynth.org.ru/depan/depan.html
 
 Change log (modifications by pinterf: https://github.com/pinterf/):
+
+- (20261029)
+  Depan 2.16
+  - Support Y with alpha (YA) and YUVA, all subsamplings incl. 4:1:0, 4:1:1, 4:4:0.
+    DePanScenes copies the alpha from the source.
+  - DePan, DePanInterleave, DePanStabilize: the alpha plane marks the new empty borders (#67, #43).
+    Alpha is moved like luma, without mirror and blur: the borders get alpha 0, the rest keeps the moved source
+    alpha (DePanStabilize: areas filled from prev, next frames count as picture). Works with zoom and rotation too.
+    New parameter alphainvert (default false): the borders get the maximum alpha value instead. E.g. with
+    AddAlphaPlane(0) before DePan the alpha plane is a mask of the borders, usable to fill them later.
+    Formats with alpha: YUVA, YA (DePanStabilize: planar RGBA too).
+  - 32 bit float input is rejected with an error (was not supported).
+  - Fix: DePanStabilize on YUY2 produced garbage. Regression since 2.13.1.0 (mvtools 2.7.5.22): the packed
+    YUY2 frame was processed as one plane, the YUY2 <-> planar conversion of the original DePan was lost.
+  - Fix: DePanScenes on planar formats marked only the top-left part of the planes (half width and height,
+    a quarter of the width for 4:1:1, 4:1:0 chroma), the rest was uninitialized, so AverageLuma-style scene change
+    checks could read garbage. Regression since 2.13.1.0 (mvtools 2.7.5.22). YUY2 was not affected.
+  - Fix: info=true at 10-16 bits: possible crash (access violation), or text shading at the wrong place.
+    The chroma part of the text was drawn at double row offset, with 4:4:4 it could write past the frame buffer.
+    Characters not fitting into the frame are skipped.
+  - Fix: info=true on Y (greyscale) clips: "GetPlaneWidthSubsampling not available on Y or YA pixel type" error.
+  - Fix: subpixel=2 (bicubic, default) with pure shifts (no zoom, rotation): the 16 interpolation weights summed
+    to 2046..2051 instead of 2048 (truncated), so areas were made slightly darker or brighter, depending on the
+    subpixel position. Visible from 10 bits, e.g. 16 bit mid grey was off by -32..+48. 8 bit: rarely +-1.
+  - Fix: DePanStabilize with prev, next (border fill from neighbor frames): the remaining empty border parts,
+    covered by none of the used frames, were not written: they showed garbage (usually picture leftovers
+    from earlier frames). Now they are filled like the border without prev, next: luma (RGB: all planes) 0,
+    chroma neutral.
+  - Fix: DePanStabilize addzoom=true: the right and bottom frame edges used for the adaptive zoom limits were
+    never initialized (garbage values). Since 2.13.1, the first version of this mod (Fizick's DePan 1.10.1
+    used the frame size directly). Effect in a test before the fix on a DV clip: no stabilization at all, the
+    output was identical to the source (and no zoom was applied). Being uninitialized, other builds may have
+    behaved differently. Now the clip is stabilized and the adaptive zoom hides the borders as intended.
+    addzoom=false was not affected.
+  - Fix: DePan, DePanInterleave, DePanStabilize with inputlog and without a motion data clip: DePanStabilize and
+    DePanInterleave crashed or failed (they always accessed the data clip, Fizick's original included), DePan worked,
+    but a debug build of Avisynth stopped with an assertion. Now the data clip is optional with inputlog;
+    without both a clear error is given.
+  DepanEstimate 2.13
+  - Support Y with alpha (YA) and YUVA (was: "input must be YUV or YUY2"). Alpha is copied when info or show is set.
+  - 32 bit float input is rejected with an error.
+  - Fix: info=true at 10-16 bits: crash (4:4:4) or misplaced text; text position was outside the right edge.
+  - Fix: zoom window and info position used the row size in bytes instead of pixels at 10-16 bits.
+  - Fix: zoommax with an explicit wleft: the right fft window (starting at wleft + width/2) could reach past the
+    right frame edge, reading outside the frame (since wleft was added in Fizick's 1.10). Now an error is given
+    ("WLeft + WINX/2 must not be greater than WIDTH/2"); with automatic winx the window size is reduced to fit.
+  - Fix: the trust value of frame 0 was uninitialized (Fizick's original included). It is used by the scene change
+    check of frame 1 (sharp drop of trust), which could randomly reset the motion of frame 1, and it was written
+    to extlog. Now 0.
+  - (internal cosmetics): clear the unused part of the motion data clip (luma 0, chroma neutral, alpha opaque).
+    Was uninitialized memory outside the data area: harmless for DePan, but the output differed from run to run,
+    and DePanScenes copied it into its not marked planes. Deterministic output helps testing (frame hashes,
+    comparing the output of different versions).
+  - (internal cosmetics): the reserved field of the motion data header was uninitialized (4 random bytes in the
+    data clip, the output depended on the memory contents). Readers ignore the field.
+  Both
+  - Build: aarch64 (Linux, CMake) and Windows on ARM64 (build_arm64_mingw.bat: cross-compiled on x64 Windows with
+    llvm-mingw, libc++ linked statically). DepanEstimate needs an ARM64 libfftw3f-3.dll on Windows on ARM64,
+    the fftw library (libfftw3-single3 / fftw) on Linux.
+    Output on aarch64 can differ from x86 by a few float rounding steps in DepanEstimate's motion data (fftw, fused
+    multiply-add), as between different compilers.
+  - The sources compile with MSVC for ARM64 as well.
+  - CMake builds for Windows (MinGW, llvm-mingw) include the version resource. Its copyright sign is the ASCII "(C)"
+    now (was a broken character).
 
 - (20260421)
   Depan 2.15

@@ -1,14 +1,16 @@
 # mvtools
 Motion estimation and compensation plugin for Avisynth+ and Avisynth v2.6 family.\
-Supporting YUY2, 4:2:0, 4:2:2, 4:4:4 at native 8, 10, 12, 14 and 16 bit depths, 32bit float in selected filters.\
-Still supporting Windows XP.
-x86 and x64 versions
-From December 20, 2020: Linux port
-This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 (`gpu=true`, the `cudafilters` plugin and QTGMC
-on the GPU, see "GPU" below); VapourSynth support for mvtools2 and cudafilters through `mvtools_vsbridge` (namespaces
-`mvpf` and `cuda`, output bit-identical with AviSynth+; Linux and Windows; see "VapourSynth" below)
+Supporting Y, YUV 4:2:0, 4:2:2, 4:4:4 (also 4:1:0, 4:1:1, 4:4:0, with or without alpha) at native 8, 10, 12, 14 and 16 bit depths,
+32 bit float and planar RGB in selected filters, YUY2 (converted to YV16 internally).\
+Upstream (pinterf/mvtools) also builds Windows XP (v141_xp), x86 and ARM64 versions with its Visual Studio solution.\
+From December 20, 2020: Linux port; since 2.7.48 also Linux aarch64 (ARM64) with NEON optimizations.
 
-File: mvtools2.dll
+This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 and Linux (`gpu=true`, the `cudafilters` plugin and
+QTGMC on the GPU, see "GPU" below); VapourSynth support for mvtools2 and cudafilters through `mvtools_vsbridge`
+(namespaces `mvpf` and `cuda`, output bit-identical with AviSynth+; Linux and Windows; see "VapourSynth" below). It is
+built with CMake only (see "Build Instructions").
+
+Files: mvtools2.dll, and the DePan plugins depan.dll, depanestimate.dll (see README_depans.txt)
 
 ## Credits: 
 
@@ -23,32 +25,23 @@ File: mvtools2.dll
 
 For more information see also documents folder.
 
-Note:
-For a more experimental feature set (new parameters, use hw devices for motion estimation, but Windows only)
-have a look at DTL's fork: https://github.com/DTL2020/mvtools
-
 ## External dependencies: 
 
-- libfftw3f-3.dll (or renamed to FFT3W.DLL)
-from http://www.fftw.org/ or look at ICL builds at http://forum.doom9.org/showthread.php?t=173229
-  It is used only at specific dct parameter values
+- fftw3 single precision library, used only at specific dct parameter values (MAnalyse, MRecalculate) and by DePanEstimate
+  - Windows: libfftw3f-3.dll (or fftw3.dll) from http://www.fftw.org/ or look at ICL builds at http://forum.doom9.org/showthread.php?t=173229.
+    Windows on ARM64 needs an ARM64 build of the dll, e.g. from the MSYS2 package mingw-w64-clang-aarch64-fftw (not tested).
+  - Linux: libfftw3f_threads.so.3, package libfftw3-single3 (deb) or fftw-devel (rpm), x86-64 and aarch64 alike.
   
-- May require Microsoft Visual C++ Redistributables https://www.visualstudio.com/downloads/
-  
-
-Others
-Modification base:
-
-- mvtools2, 2.6.0.5 64 bit version from
-http://avisynth.nl/index.php/AviSynth%2B#AviSynth.2B_x64_plugins
-
-Source code:
+- MSVC builds of upstream's solution may require Microsoft Visual C++ Redistributables https://www.visualstudio.com/downloads/
+  (this branch's CMake build links the C runtime statically; the Windows ARM64 llvm-mingw build links its C++ runtime
+  statically, it needs nothing else).
 
 ## Build Instructions
 
 One CMake build (root `CMakeLists.txt`) makes every library of this repo on Windows (MSVC + Ninja) and Linux (GCC /
 Clang): the AviSynth+ plugins, the VapourSynth bridge and the optional GPU libraries. All of them go into one folder
 (`<build dir>/bin`), which is also the layout they expect at run time (each plugin loads its helpers from its own folder).
+This is the only build this branch maintains and tests.
 
 | Library (Windows / Linux) | What | Needs to build |
 |---|---|---|
@@ -65,10 +58,12 @@ not fit.
 Options: `MVTOOLS_CUDA_ARCH` (CUDA architectures, e.g. `120-real` for a fast build for the local RTX 50xx only,
 `61-virtual` for the Pascal code paths only, JIT-compiled by the driver for the local GPU; default: the release list in
 `Sources/cuda/CMakeLists.txt`, compute capability 6.1 .. 12.0), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
-default ON: `/MT`, no Visual C++ redistributable needed), `MVTOOLS_DIST_DIR` (the collect folder).
+default ON: `/MT`, no Visual C++ redistributable needed), `MVTOOLS_DIST_DIR` (the collect folder), `ENABLE_INTEL_SIMD` /
+`ENABLE_NEON_SIMD` (set from the target processor; both OFF gives a C-only build for testing).
 
-Note: Windows MSVC builds use the external assembler sources (`Sources/asm`, NASM); all other builds (Linux, MinGW) use the
-internal SIMD code, governed by defines in `def.h`.
+Windows MSVC builds use the external assembler sources (`Sources/asm`, NASM) where they exist. All other builds use the
+internal SIMD code: x86 intrinsics (MinGW, Linux x86-64; SSE2 base, governed by defines in `def.h`), NEON intrinsics on
+aarch64 (Windows ARM64, Linux aarch64). Every SIMD path has a C equivalent with the same output.
 
 ### Windows (CMake + Ninja + MSVC, x64)
 
@@ -86,51 +81,23 @@ installer the component "MSVC v143 - VS 2022 C++ x64/x86 build tools". CUDA 12 d
 newest installed 12.x toolkit / `CUDA_PATH` / the PATH (the first CUDA 12.8+ one), loads `vcvars64.bat` into the session
 (with CUDA: the newest MSVC 14.4x toolset, or `-VcvarsVer`), takes CMake and Ninja from Visual Studio, NASM from `-Nasm` /
 `NASMPATH` / the PATH, and passes further arguments with `-CMakeArgs '-DX=Y'`. With CUDA the whole build uses the 14.4x
-toolset (the toolset of `Sources/mvtools.vcxproj` too). By hand, from a prompt with that toolset
-(`vcvars64.bat -vcvars_ver=14.44`):
+toolset. By hand, from a prompt with that toolset (`vcvars64.bat -vcvars_ver=14.44`):
 
     cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_NASM_COMPILER=C:/tools/nasm/nasm.exe ^
           -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/bin/nvcc.exe"
     cmake --build build
 
-mvtools2.dll gets the code generation of `Sources/mvtools.vcxproj` (Release|x64): `/O2 /Ob2 /Oi /Ot /Oy /GT /GF /Gy /GS-`,
-whole-program optimisation (`/GL`, `/LTCG`, `/OPT:REF /OPT:ICF`), `/arch:AVX2` for the `*_avx2.cpp` files only, the NASM
-sources with the project's per-file defines and include paths, the version resource; same output (framemd5) and speed as
-the solution build. Differences: static CRT (the project uses `/MD`) and the VapourSynth entry point
-(`VapourSynthPluginInit2`, `Sources/VapourSynthEntry.cpp`), which the solution does not compile.
+mvtools2.dll gets the code generation of upstream's `Sources/mvtools.vcxproj` (Release|x64): `/O2 /Ob2 /Oi /Ot /Oy /GT
+/GF /Gy /GS-`, whole-program optimisation (`/GL`, `/LTCG`, `/OPT:REF /OPT:ICF`), `/arch:AVX2` for the `*_avx2.cpp` files
+only, the NASM sources with the project's per-file defines and include paths, the version resource. Differences: static
+CRT (the project uses `/MD`) and the VapourSynth entry point (`VapourSynthPluginInit2`, `Sources/VapourSynthEntry.cpp`).
 
-The Visual Studio solution still works for the AviSynth+ DLLs (mvtools2, DePan, DePanEstimate, cudafilters):
+### Visual Studio solution (upstream's)
 
-- Prerequisite: for asm compilation use nasm https://www.nasm.us/
-  Visual Studio integration: https://github.com/ShiftMediaProject/VSNASM/releases
-
-  Compiler nasm.exe can appear in e.g. `C:\Program Files\Microsoft Visual Studio\18\Community\VC\`
-
-  You can check the files nasm.targets, nasm.props and nasm.xml in e.g. `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Microsoft\VC\v170\BuildCustomizations\`
-
-  For XP compatible (v141_xp) build, copy them to the v150 BuildCustomizations folder as well:
-  `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Microsoft\VC\v150\BuildCustomizations\`
-
-  **Important for VS2026 + v141_xp:** The VSNASM files released for VS2026 use task parameters
-  (`TrackFileAccess` on `GetOutOfDateItems`, and `AcceptableNonZeroExitCodes`, `StdOutEncoding`,
-  `StdErrEncoding`, `UseMsbuildResourceManager` on `ParallelCustomBuild`/`CustomBuild`) that are
-  not supported by the older `Microsoft.Build.CppTasks.Common.dll` (v15.0) shipped with the v150
-  toolset folder. The v170 copy is fine as-is. In the **v150 copy only**, remove those attributes
-  from `nasm.targets`:
-  - In both `<GetOutOfDateItems>` calls: remove `TrackFileAccess="$(TrackFileAccess)"`
-  - In `<ParallelCustomBuild>`: remove `AcceptableNonZeroExitCodes`, `StdOutEncoding`, `StdErrEncoding`, `UseMsbuildResourceManager`
-  - In `<CustomBuild>`: remove `AcceptableNonZeroExitCodes`, `StdOutEncoding`, `StdErrEncoding`
-
-  Some nasm versions (e.g. the one valid around 2022.Dec.) will throw a lot of warnings on x265 assembler files. Temporarily they are silenced with -w-macro-params-legacy parameter.
-
-* build from IDE, or `MSBuild Sources\mvtools.vcxproj /p:Configuration=Release /p:Platform=x64` (add
-  `/p:PlatformToolset=v145` when only VS 2026 is installed). `Sources\cuda\build.bat` still builds mvtools_cuda.dll alone.
-
-### Windows Visual Studio + Intel C++ Compiler ICX and ICL
-
-- Prerequisite: Intel C++ compilers + Visual Studio integration
-
-* build from IDE
+`mvtools.sln` / `mvtools.slnx` and the `.vcxproj` files are upstream's, kept unchanged in this branch and not tested
+here. They build upstream's CPU plugins only (mvtools2 without the GPU and VapourSynth parts, DePan, DePanEstimate),
+including the Windows XP (v141_xp), x86, ClangCL and Intel C++ configurations; see upstream's README for their NASM
+setup.
 
 ### Linux
 
@@ -141,6 +108,9 @@ or by hand:
     cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build
 
+* x86-64 and aarch64 (ARM64) alike; on aarch64 the NEON code paths are enabled automatically (ENABLE_NEON_SIMD), on
+  x86-64 the SSE/AVX ones (ENABLE_INTEL_SIMD). GCC and Clang (upstream tested aarch64 with GCC 11, 12 and Clang 15; this
+  branch is tested on x86-64). A C-only build for testing: `-DENABLE_INTEL_SIMD=OFF -DENABLE_NEON_SIMD=OFF`.
 * `build_linux.sh` reads `NVCC`, `CUDA_HOST_CXX`, `CUDA_ARCH`, `BUILD_TYPE`, `CMAKE_EXTRA` from the environment
   (`NVCC=none` skips libmvtools_cuda.so); CMake and Ninja can come from `pip install cmake ninja`.
 * GPU part: `libmvtools_cuda.so` is built when a CUDA 12.8 .. 12.x compiler is found (CUDA 12.9 recommended; CUDA 13 is
@@ -174,6 +144,39 @@ or by hand:
 
   Useful hints: build after clean `cmake --build build --clean-first`; delete the CMake cache `rm build/CMakeCache.txt`.
 
+* Packaging note
+
+  Build with the bundled Avisynth headers (`Sources/include`, `DePan/include`, `DePanEstimate/include`);
+  do not remove them or replace them with the system headers (e.g. `pkg-config --cflags avisynth`).
+  The plugins do not link against an Avisynth+ library, the header only describes the interface, and it
+  works with older hosts as well: features of a newer interface version (e.g. the V12 global lock used
+  around fftw plan creation) are called only when the host reports that version, otherwise a fallback is used.
+  A plugin built with the bundled header runs on older Avisynth+ releases (e.g. 3.7.5) too, while an older
+  system header fails to compile (`'class IScriptEnvironment' has no member named 'AcquireGlobalLock'`).
+
+### Windows on ARM64
+
+Upstream's recipes, not tested with this branch's CMake files (CPU plugins only; no CUDA on ARM64 Windows).
+
+Cross-compiled on x64 Windows (llvm-mingw, UCRT flavour from https://github.com/mstorsjo/llvm-mingw/releases, CMake and
+Ninja on PATH), from the project root:
+
+    set LLVM_MINGW_ROOT=C:\path\to\llvm-mingw-<tag>-ucrt-x86_64
+    build_arm64_mingw.bat
+
+The DLLs (MvTools2, DePan, DePanEstimate) are copied to `out\ARM64\llvm-mingw`; the build directory is
+`build\arm64_mingw`. The toolchain file is `cmake/toolchains/llvm-mingw-aarch64.cmake`, it can be used with
+plain cmake as well (`-G Ninja -DCMAKE_TOOLCHAIN_FILE=... -DLLVM_MINGW_ROOT=...`).
+
+On an ARM64 Windows machine (MSYS2 CLANGARM64 shell, not tested):
+
+    pacman -S mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-cmake mingw-w64-clang-aarch64-ninja
+    cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DMVTOOLS_GPU=OFF
+    cmake --build build
+
+The NEON code paths are enabled automatically for the aarch64 target. The DLLs depend on the libc++
+runtime of the environment unless linked statically (add `-DCMAKE_SHARED_LINKER_FLAGS=-static` to the first cmake line).
+
 ### Cross compiling the Windows DLLs on Linux (MinGW-w64): experimental, not for releases
 
     cmake -G Ninja -S . -B build/mingw -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake   # -DMINGW_ROOT=~/opt/mingw/usr for unpacked packages
@@ -192,8 +195,8 @@ Windows release DLLs therefore come from MSVC (`build_windows.ps1`). Further lim
 * The GCC mvtools2.dll uses the intrinsic code instead of the NASM sources and has no avstp support (`def.h`), so the
   CPU search runs single-sliced under AviSynth+, as on Linux: slower than the MSVC build.
 
-## Windows GCC
-(mingw installed by msys2)
+### Windows GCC
+(mingw installed by msys2, x86/x64; not tested with this branch)
 From the 'build' folder under project root:
 
     del ..\CMakeCache.txt
@@ -271,8 +274,8 @@ VapourSynth replacement; details below).
 
 * Build: on by default (`-DMVTOOLS_VAPOURSYNTH=OFF` to skip); no VapourSynth installation needed (`VapourSynth4.h` is
   in `Sources/include`). Status: Linux and Windows (CMake build: `build_linux.sh` / `build_windows.ps1`;
-  the MSVC solution does not build the bridge). Windows test: `vsbridge/test/compare.py` with `pip install vapoursynth`
-  in a venv, the AviSynth+ side through `avsmd5.py` (docstring of compare.py).
+  upstream's Visual Studio solution does not build the bridge). Windows test: `vsbridge/test/compare.py` with
+  `pip install vapoursynth` in a venv, the AviSynth+ side through `avsmd5.py` (docstring of compare.py).
 * Install: `libmvtools_vsbridge.so` must sit in the same folder as `libmvtools2.so` (VapourSynth's plugin folder, or
   any folder used with `core.std.LoadPlugin`). Without it the namespace `mvpf` exists but is empty, and the reason is
   printed to stderr.
@@ -290,6 +293,7 @@ VapourSynth replacement; details below).
 * Formats: Gray, YUV 4:2:0 / 4:2:2 / 4:4:4, 8-16 bit, 32 bit float where mvtools2 supports it. Vector
   clips appear in VapourSynth as Gray8 clips; pass them only to `mvpf` filters: a vector or super clip that went through
   another VapourSynth filter (e.g. `std.Trim`) is not recognised.
+
 ### Details
 
 * Output is bit-identical with AviSynth+ on the same system (17 CPU, 7 GPU and 17 cudafilters test chains,
@@ -312,3 +316,17 @@ VapourSynth replacement; details below).
   exp, log or trigonometric functions are refused).
 * Debugging: `MVBRIDGE_DEBUG=1` prints frame-request misses, instance counts and a backtrace on a crash;
   `MVBRIDGE_SERIAL=MAnalyse,MFlowFps` (or `all`) runs the named filters single-threaded.
+
+## Support
+
+If you find this project useful, you can support the development:
+
+- Buy Me a Coffee: https://www.buymeacoffee.com/pinterf
+- PayPal: https://www.paypal.com/donate/?business=LHUTN4H5N9B86&no_recurring=0&item_name=Avisynth+and+occasional+VapourSynth+developer.+&currency_code=EUR
+
+## History
+
+Modification base:
+
+- mvtools2, 2.6.0.5 64 bit version from
+  http://avisynth.nl/index.php/AviSynth%2B#AviSynth.2B_x64_plugins

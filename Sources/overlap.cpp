@@ -22,10 +22,17 @@
 #include <cmath>
 #include <tuple>
 #include <map>
+#include <vector>
 #include "avs/minmax.h"
 #include <cassert>
+#ifdef INTEL_INTRINSICS
 #include <emmintrin.h>
 #include <smmintrin.h>
+#endif
+#include "BlockSizes.h"
+#ifdef NEON_INTRINSICS
+#include "overlap_neon.h"
+#endif
 
 #ifndef min
 #define min(a,b)            (((a) < (b)) ? (a) : (b))
@@ -100,70 +107,24 @@ OverlapWindows::OverlapWindows(int _nx, int _ny, int _ox, int _oy)
   oy = _oy;
   size = nx*ny;
 
-     //  windows
-     fWin1UVx = new float[nx];
-     fWin1UVxfirst = new float[nx];
-     fWin1UVxlast = new float[nx];
+     // 1D weights of the overlapping left (top) zone: rising cos^2, 0..1.
+     // The right (bottom) zone of a block is the complement of the next block's left (top) zone.
      // FFFFFFFF                LLLLLLLL   F=First block, L=Last block
      //       ========    ========
      // ========    ========    ========
      //       AABBBBCC                     A:0..ox-1 ; B:ox..nx-ox-1 ; C:nx-ox..nx-1
      // For BlkSize=8, Overlap=2           A:0..1  B:2..5  C:6..7
-     
-     // Horizontal part of weights
-     // overlapping left area weights
-     for (int i=0; i<ox; i++)
-     {
-      fWin1UVx[i] = float (cos(PI*(i-ox+0.5f)/(ox*2)));
-      fWin1UVx[i] = fWin1UVx[i]*fWin1UVx[i];// left window (rised cosine)
-      fWin1UVxfirst[i] = 1; // very first window, leftmost block, no overlap on the left side here
-      fWin1UVxlast[i] = fWin1UVx[i]; // very last, rightmost block, but yes, we still have overlap on the left side
+     std::vector<float> wx(ox), wy(oy);
+     for (int i = 0; i < ox; i++) {
+       wx[i] = float(cos(PI * (i - ox + 0.5f) / (ox * 2)));
+       wx[i] = wx[i] * wx[i];
      }
-     // non-overlapping middle area weights. No overlap: weight=1!
-     for (int i=ox; i<nx-ox; i++)
-     {
-       // overlapping left area weights
-       fWin1UVx[i] = 1;
-      fWin1UVxfirst[i] = 1; // very first window
-      fWin1UVxlast[i] = 1; // very last
+     for (int i = 0; i < oy; i++) {
+       wy[i] = float(cos(PI * (i - oy + 0.5f) / (oy * 2)));
+       wy[i] = wy[i] * wy[i];
      }
-     // overlapping right area weights
-     for (int i=nx-ox; i<nx; i++)
-     {
-      fWin1UVx[i] = float (cos(PI*(i-nx+ox+0.5f)/(ox*2)));
-      fWin1UVx[i] = fWin1UVx[i]*fWin1UVx[i];// right window (falled cosine)
-      fWin1UVxfirst[i] = fWin1UVx[i]; // very first window, leftmost block, but yes, we still have overlap on the right side
-      fWin1UVxlast[i] = 1; // very last, rightmost block, no overlap on the right side here
-     }
-
-     // Similar to the horizontal: vertical part of weights
-     fWin1UVy = new float[ny];
-     fWin1UVyfirst = new float[ny];
-     fWin1UVylast = new float[ny];
-     for (int i=0; i<oy; i++)
-     {
-      fWin1UVy[i] = float (cos(PI*(i-oy+0.5f)/(oy*2))); // -3.5 -2.5 -1.5 -0.5 / 2*4
-      fWin1UVy[i] = fWin1UVy[i]*fWin1UVy[i];// left window (rised cosine)
-      fWin1UVyfirst[i] = 1; // very first window
-      fWin1UVylast[i] = fWin1UVy[i]; // very last
-     }
-     for (int i=oy; i<ny-oy; i++)
-     {
-      fWin1UVy[i] = 1;
-      fWin1UVyfirst[i] = 1; // very first window
-      fWin1UVylast[i] = 1; // very last
-     }
-     for (int i=ny-oy; i<ny; i++)
-     {
-      fWin1UVy[i] = float (cos(PI*(i-ny+oy+0.5f)/(oy*2))); // 0.5 1.5 2.5 3.5 / 2*4
-      fWin1UVy[i] = fWin1UVy[i]*fWin1UVy[i];// right window (falled cosine)
-      fWin1UVyfirst[i] = fWin1UVy[i]; // very first window
-      fWin1UVylast[i] = 1; // very last
-     }
-
 
     Overlap9Windows = new short[size*9];
-    Overlap9WindowsF = new float[size * 9];
 
     // short
     {
@@ -189,20 +150,49 @@ OverlapWindows::OverlapWindows(int _nx, int _ny, int _ox, int _oy)
       // a2+a3  a2+a3| a2+a3+b2+b3   a2+a3+b2+b3 | b2+b3   b2+b3 | b2+b3+c2+c3   b2+b3+c2+c3 | c2+c3   c2+c3
       // ...
 
-      // Combine precomputed horizontal and vertical weights for 3x3 special areas
+      // Integer weights. Where blocks overlap, the weights of the 2 or 4 blocks covering a pixel must sum to exactly 2048,
+      // otherwise a flat area changes (at 16 bit up to +-32, 2047..2049 sum when the 2D products were rounded one by one).
+      // Rounded once per axis: Ix (left zone), Iy (top zone), the partner block gets the complement (2048 - Ix);
+      // in the corners one product P is rounded, the other three are derived from it.
+      // Same idea as the differential coefficients of the Avisynth+ resizers (sum of rounded differences), in 2D.
+      // Zones per axis: 0: no overlap (weight 1), 1: left/top zone (rising), 2: right/bottom zone (falling)
+      std::vector<int> Ix(ox), Iy(oy);
+      for (int k = 0; k < ox; k++) Ix[k] = (int)(wx[k] * 2048 + 0.5f);
+      for (int m = 0; m < oy; m++) Iy[m] = (int)(wy[m] * 2048 + 0.5f);
+      // first: no overlap on the left/top side, last: no overlap on the right/bottom side
+      auto zone = [](int i, int n, int o, bool first, bool last, int &k) {
+        if (i < o) { k = i; return first ? 0 : 1; }
+        if (i >= n - o) { k = i - (n - o); return last ? 0 : 2; }
+        k = 0; return 0;
+      };
+      auto weight = [&](int i, int j, bool xfirst, bool xlast, bool yfirst, bool ylast) -> short {
+        int k, m;
+        const int zx = zone(i, nx, ox, xfirst, xlast, k);
+        const int zy = zone(j, ny, oy, yfirst, ylast, m);
+        if (zy == 0) return (short)(zx == 0 ? 2048 : zx == 1 ? Ix[k] : 2048 - Ix[k]);
+        if (zx == 0) return (short)(zy == 1 ? Iy[m] : 2048 - Iy[m]);
+        // left-top; limited so that none of the four weights is negative (SIMD overlaps read the window as unsigned)
+        const int P = max(max(0, Ix[k] + Iy[m] - 2048), min(min(Ix[k], Iy[m]), (int)(wx[k] * wy[m] * 2048 + 0.5f)));
+        if (zx == 1 && zy == 1) return (short)P;
+        if (zx == 2 && zy == 1) return (short)(Iy[m] - P);
+        if (zx == 1 && zy == 2) return (short)(Ix[k] - P);
+        return (short)(2048 - Ix[k] - Iy[m] + P); // right-bottom
+      };
+
+      // 3x3 special areas: T/M/B: top, middle, bottom block row; L/M/R: left, middle, right block column
       for (int j = 0; j < ny; j++)
       {
         for (int i = 0; i < nx; i++)
         {
-          winOverUVTL[i] = (int)(fWin1UVyfirst[j] * fWin1UVxfirst[i] * 2048 + 0.5f); // Top Left
-          winOverUVTM[i] = (int)(fWin1UVyfirst[j] * fWin1UVx[i] * 2048 + 0.5f);      // Top Middle
-          winOverUVTR[i] = (int)(fWin1UVyfirst[j] * fWin1UVxlast[i] * 2048 + 0.5f);  // Top Right
-          winOverUVML[i] = (int)(fWin1UVy[j] * fWin1UVxfirst[i] * 2048 + 0.5f);      // Middle Left
-          winOverUVMM[i] = (int)(fWin1UVy[j] * fWin1UVx[i] * 2048 + 0.5f);           // Middle Middle
-          winOverUVMR[i] = (int)(fWin1UVy[j] * fWin1UVxlast[i] * 2048 + 0.5f);       // Middle Right
-          winOverUVBL[i] = (int)(fWin1UVylast[j] * fWin1UVxfirst[i] * 2048 + 0.5f);  // Bottom Left
-          winOverUVBM[i] = (int)(fWin1UVylast[j] * fWin1UVx[i] * 2048 + 0.5f);       // Bottom Middle
-          winOverUVBR[i] = (int)(fWin1UVylast[j] * fWin1UVxlast[i] * 2048 + 0.5f);   // Bottom Right
+          winOverUVTL[i] = weight(i, j, true, false, true, false);   // Top Left
+          winOverUVTM[i] = weight(i, j, false, false, true, false);  // Top Middle
+          winOverUVTR[i] = weight(i, j, false, true, true, false);   // Top Right
+          winOverUVML[i] = weight(i, j, true, false, false, false);  // Middle Left
+          winOverUVMM[i] = weight(i, j, false, false, false, false); // Middle Middle
+          winOverUVMR[i] = weight(i, j, false, true, false, false);  // Middle Right
+          winOverUVBL[i] = weight(i, j, true, false, false, true);   // Bottom Left
+          winOverUVBM[i] = weight(i, j, false, false, false, true);  // Bottom Middle
+          winOverUVBR[i] = weight(i, j, false, true, false, true);   // Bottom Right
         }
         winOverUVTL += nx;
         winOverUVTM += nx;
@@ -216,69 +206,12 @@ OverlapWindows::OverlapWindows(int _nx, int _ny, int _ox, int _oy)
       }
     } // end of short coeffs
 
-     {
-       // float *
-       auto winOverUVTL = Overlap9WindowsF;
-       auto winOverUVTM = Overlap9WindowsF + size;
-       auto winOverUVTR = Overlap9WindowsF + size * 2;
-       auto winOverUVML = Overlap9WindowsF + size * 3;
-       auto winOverUVMM = Overlap9WindowsF + size * 4;
-       auto winOverUVMR = Overlap9WindowsF + size * 5;
-       auto winOverUVBL = Overlap9WindowsF + size * 6;
-       auto winOverUVBM = Overlap9WindowsF + size * 7;
-       auto winOverUVBR = Overlap9WindowsF + size * 8;
-
-       // Cos^2 based weigthing factors with 11 bits precision. (0-2048)
-       // SourceBlocks overlap sample for Blocksize=4 Overlaps=2:
-       // a1     a1   | a1+b1         a1+b1       | b1      b1    | b1+c1         b1+c1       | c1       c1   
-       // a1     a1   | a1+b1         a1+b1       | b1      b1    | b1+c1         b1+c1       | c1      c1   
-       // ------------+---------------------------+---------------+---------------------------+--------------
-       // a1+a2  a1+a2| a1+a2+b1+b2   a1+a2+b1+b2 | b1+b2   b1+b2 | b1+b2+c1+c2   b1+b2+c1+c2 | c1+c2   c1+c2
-       // a1+a2  a1+a2| a1+a2+b1+b2   a1+a2+b1+b2 | b1+b2   b1+b2 | b1+b2+c1+c2   b1+b2+c1+c2 | c1+c2   c1+c2
-       // ------------+---------------------------+---------------+---------------------------+--------------
-       // a2+a3  a2+a3| a2+a3+b2+b3   a2+a3+b2+b3 | b2+b3   b2+b3 | b2+b3+c2+c3   b2+b3+c2+c3 | c2+c3   c2+c3
-       // a2+a3  a2+a3| a2+a3+b2+b3   a2+a3+b2+b3 | b2+b3   b2+b3 | b2+b3+c2+c3   b2+b3+c2+c3 | c2+c3   c2+c3
-       // ...
-
-       // Combine precomputed horizontal and vertical weights for 3x3 special areas
-       for (int j = 0; j < ny; j++)
-       {
-         for (int i = 0; i < nx; i++)
-         {
-           winOverUVTL[i] = fWin1UVyfirst[j] * fWin1UVxfirst[i]; // Top Left
-           winOverUVTM[i] = fWin1UVyfirst[j] * fWin1UVx[i];      // Top Middle
-           winOverUVTR[i] = fWin1UVyfirst[j] * fWin1UVxlast[i];  // Top Right
-           winOverUVML[i] = fWin1UVy[j] * fWin1UVxfirst[i];      // Middle Left
-           winOverUVMM[i] = fWin1UVy[j] * fWin1UVx[i];           // Middle Middle
-           winOverUVMR[i] = fWin1UVy[j] * fWin1UVxlast[i];       // Middle Right
-           winOverUVBL[i] = fWin1UVylast[j] * fWin1UVxfirst[i];  // Bottom Left
-           winOverUVBM[i] = fWin1UVylast[j] * fWin1UVx[i];       // Bottom Middle
-           winOverUVBR[i] = fWin1UVylast[j] * fWin1UVxlast[i];   // Bottom Right
-         }
-         winOverUVTL += nx;
-         winOverUVTM += nx;
-         winOverUVTR += nx;
-         winOverUVML += nx;
-         winOverUVMM += nx;
-         winOverUVMR += nx;
-         winOverUVBL += nx;
-         winOverUVBM += nx;
-         winOverUVBR += nx;
-       }
-     }
 
 }
 
 OverlapWindows::~OverlapWindows()
 {
   delete[] Overlap9Windows;
-  delete [] Overlap9WindowsF;
-  delete [] fWin1UVx;
-  delete [] fWin1UVxfirst;
-  delete [] fWin1UVxlast;
-  delete [] fWin1UVy;
-  delete [] fWin1UVyfirst;
-  delete [] fWin1UVylast;
 }
 
 // v2.7.25 Let's round 1<<4
@@ -287,6 +220,7 @@ OverlapWindows::~OverlapWindows()
 // Here originally there was no rounding at all
 // So instead of: Sum((overlapped + 256)>>6) >> 5
 // So we do: (Sum((overlapped + 32) >> 6) + 16) >> 5
+#ifdef INTEL_INTRINSICS
 void Short2Bytes_sse2(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, int dstShortPitch, int nWidth, int nHeight)
 {
   // v.2.7.25-: round 16 here, round 32 earlier. See comments in C
@@ -324,6 +258,7 @@ void Short2Bytes_sse2(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, i
     pSrc8 += nSrcPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 void Short2Bytes(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, int dstShortPitch, int nWidth, int nHeight)
 {
@@ -336,112 +271,6 @@ void Short2Bytes(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, int ds
     }
     pDst += nDstPitch;
     pDstShort += dstShortPitch;
-  }
-}
-
-template<typename pixel_t>
-void OverlapsBuf_Float2Bytes_sse4(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel)
-{
-  // our temporary Overlaps buffer is float. For integer targets we convert it back
-  // for float output: simple copy, this function is not called
-  auto pDst = reinterpret_cast<pixel_t*>(pDst0);
-  nDstPitch /= sizeof(pixel_t);
-  const auto max_pixel_value = _mm_set1_epi16((short)((1 << bits_per_pixel) - 1));
-  for (int y = 0; y < nHeight; y++)
-  {
-    // aligned to 32, safe.
-    for (int x = 0; x < nWidth; x += 8) { // 32 source bytes = 8 float sized pixels
-      auto src07 = _mm_load_ps((float*)(pTmpFloat + x)); // 8 float pixels
-      auto src8f = _mm_load_ps((float*)(pTmpFloat + x + 4)); // 8 float pixels
-      const auto scaleback = _mm_set1_ps(1.0f / 256 /* (1 << DEGRAIN_WEIGHT_BITS)*/);
-      src07 = _mm_mul_ps(src07, scaleback);
-      src8f = _mm_mul_ps(src8f, scaleback);
-
-      auto src07_32 = _mm_cvtps_epi32(src07); // round
-      auto src8f_32 = _mm_cvtps_epi32(src8f); // round
-      auto res_16 = _mm_packus_epi32(src07_32, src8f_32);
-
-      if constexpr (sizeof(pixel_t) == 1) {
-        // fixme: bitdepth aware max value check for 10-14 bits/float  pDst[i] = min(255, a);
-        auto res_8 = _mm_packus_epi16(res_16, res_16);
-        _mm_storel_epi64((__m128i*)(pDst + x), res_8);
-      }
-      else if constexpr (sizeof(pixel_t) == 2) {
-        // fixme: bitdepth aware max value check _ONLY_ for 10-14 bits/float  pDst[i] = min(255, a);
-        res_16 = _mm_min_epu16(res_16, max_pixel_value);
-        _mm_storeu_si128((__m128i*)(pDst + x), res_16);
-      }
-    }
-    pDst += nDstPitch;
-    pTmpFloat += tmpPitch;
-  }
-}
-
-// instantiate
-template void OverlapsBuf_Float2Bytes_sse4<uint8_t>(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void OverlapsBuf_Float2Bytes_sse4<uint16_t>(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
-
-// generic 32 bit float overlaps temporary buffer -> back to integer
-template<typename pixel_t>
-void OverlapsBuf_Float2Bytes(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel)
-{
-  // fixme: specialize for float bitblt
-  auto pDst = reinterpret_cast<pixel_t*>(pDst0);
-  for (int h = 0; h < nHeight; h++)
-  {
-    for (int i = 0; i < nWidth; i++)
-    {
-      // fixme: int or float
-      int a = (int)(pTmpFloat[i] +0.5f); // no scaling!
-      if constexpr (sizeof(pixel_t) == 2) {
-        // fixme: only for 10-14 bits
-        const auto max_pixel_value = (1 << bits_per_pixel) - 1;
-        a = min(a, max_pixel_value);
-      }
-      pDst[i] = a;
-    }
-    pDst += nDstPitch;
-    pTmpFloat += tmpPitch;
-  }
-}
-
-// specialize for float
-template<>
-void OverlapsBuf_Float2Bytes<float>(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel)
-{
-  // fixme: specialize for float bitblt
-  auto pDst = reinterpret_cast<float*>(pDst0);
-  for (int h = 0; h < nHeight; h++)
-  {
-    for (int i = 0; i < nWidth; i++)
-    {
-      pDst[i] = pTmpFloat[i];
-    }
-    pDst += nDstPitch;
-    pTmpFloat += tmpPitch;
-  }
-}
-
-
-// instantiate
-template void OverlapsBuf_Float2Bytes<uint8_t>(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void OverlapsBuf_Float2Bytes<uint16_t>(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
-
-
-void Short2BytesLsb(unsigned char *pDst, unsigned char *pDstLsb, int nDstPitch, int *pDstInt, int dstIntPitch, int nWidth, int nHeight)
-{
-  for (int h = 0; h < nHeight; h++)
-  {
-    for (int i = 0; i < nWidth; i++)
-    {
-      // origin: overlap windows have 11 bits precision
-      const int		a = (pDstInt[i] + (1 << 10)) >> 11; // v2.7.25 round
-      pDst[i] = a >> 8;
-      pDstLsb[i] = (unsigned char)(a);
-    }
-    pDst += nDstPitch;
-    pDstLsb += nDstPitch;
-    pDstInt += dstIntPitch;
   }
 }
 
@@ -462,6 +291,10 @@ void Short2Bytes_Int32toWord16(uint16_t *pDst, int nDstPitch, int *pDstInt, int 
   }
 }
 
+#ifdef INTEL_INTRINSICS
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
 void Short2Bytes_Int32toWord16_sse4(uint16_t *pDst, int nDstPitch, int *pDstInt, int dstIntPitch, int nWidth, int nHeight, int bits_per_pixel)
 {
   const int max_pixel_value = (1 << bits_per_pixel) - 1;
@@ -496,6 +329,7 @@ void Short2Bytes_Int32toWord16_sse4(uint16_t *pDst, int nDstPitch, int *pDstInt,
     pSrc8 += nSrcPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 void Short2Bytes_FloatInInt32ArrayToFloat(float *pDst, int nDstPitch, float *pDstInt, int dstIntPitch, int nWidth, int nHeight)
 {
@@ -511,6 +345,7 @@ void Short2Bytes_FloatInInt32ArrayToFloat(float *pDst, int nDstPitch, float *pDs
   }
 }
 
+#ifdef INTEL_INTRINSICS
 MV_FORCEINLINE __m128i _MM_CMPLE_EPU16(__m128i x, __m128i y)
 {
   // Returns 0xFFFF where x <= y:
@@ -538,7 +373,7 @@ MV_FORCEINLINE __m128i _MM_MAX_EPU16(__m128i x, __m128i y)
 }
 
 // MVDegrains-a.asm ported to intrinsics + 16 bit PF 161002
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 void LimitChanges_sse2_new(unsigned char *pDst8, int nDstPitch, const unsigned char *pSrc8, int nSrcPitch, const int nWidth, int nHeight, float nLimit_f)
 {
   const int nLimit = (int)(nLimit_f + 0.5f);
@@ -565,10 +400,7 @@ void LimitChanges_sse2_new(unsigned char *pDst8, int nDstPitch, const unsigned c
 
         __m128i src_plus_limit = _mm_adds_epu16(src, limits);   //  max possible
         __m128i src_minus_limit = _mm_subs_epu16(src, limits);   //  min possible
-        if(hasSSE41)
-          res = _mm_min_epu16(_mm_max_epu16(src_minus_limit, dst), src_plus_limit); // SSE4
-        else
-          res = _MM_MIN_EPU16(_MM_MAX_EPU16(src_minus_limit, dst), src_plus_limit); // SSE4
+        res = _MM_MIN_EPU16(_MM_MAX_EPU16(src_minus_limit, dst), src_plus_limit);
       }
       _mm_stream_si128((__m128i *)(pDst8 + x), res);
     }
@@ -578,6 +410,7 @@ void LimitChanges_sse2_new(unsigned char *pDst8, int nDstPitch, const unsigned c
     pSrc8 += nSrcPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 // out16=true case
 void LimitChanges_src8_target16_c(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit_f)
@@ -623,16 +456,21 @@ void LimitChanges_float_c(unsigned char *pDst, int nDstPitch, const unsigned cha
 // if a non-static template function is in cpp, we have to instantiate it
 template void LimitChanges_c<uint8_t>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
 template void LimitChanges_c<uint16_t>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
-template void LimitChanges_sse2_new<uint8_t,0>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
-template void LimitChanges_sse2_new<uint16_t,0>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
-template void LimitChanges_sse2_new<uint16_t,1>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
+#ifdef INTEL_INTRINSICS
+template void LimitChanges_sse2_new<uint8_t>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
+template void LimitChanges_sse2_new<uint16_t>(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit);
+#endif // INTEL_INTRINSICS
 
+#ifdef INTEL_INTRINSICS
 template <int blockWidth, int blockHeight>
 // pDst is short* for 8 bit, int * for 16 bit
 // works for blockWidth >= 4 && uint16_t
 // only src_pitch is byte-level
 // dstPitch knows int* or short* 
 // winPitch knows short *
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
 void Overlaps_uint16_t_sse4(uint16_t *pDst0, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, short *pWin, int nWinPitch)
 {
   // pWin from 0 to 2048, 11 bit integer arithmetic
@@ -754,11 +592,14 @@ void Overlaps_uint16_t_sse4(uint16_t *pDst0, int nDstPitch, const unsigned char 
 }
 
 template <int blockWidth, int blockHeight>
-// pDst is short* for 8 bit, int * for 16 bit, float * for out32
+// pDst is short* for 8 bit, int * for 16 bit
 // works for blockWidth >= 4 && uint16_t
 // only src_pitch is byte-level
 // dstPitch knows int* or short* 
 // winPitch knows short *
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
 void Overlaps_uint8_t_sse4(uint16_t* pDst0, int nDstPitch, const unsigned char* pSrc, int nSrcPitch, short* pWin, int nWinPitch)
 {
   // pWin from 0 to 2048, 11 bit integer arithmetic
@@ -876,108 +717,10 @@ void Overlaps_uint8_t_sse4(uint16_t* pDst0, int nDstPitch, const unsigned char* 
     pWin += nWinPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
-// see Overlaps_float_new_C
-template <int blockWidth, int blockHeight>
-// pDst is short* for 8 bit, int * for 16 bit, float * for out32
-// works for blockWidth >= 4 && uint16_t
-// only src_pitch is byte-level
-// dstPitch knows int* or short* 
-// winPitch knows short *
-void Overlaps_float_new_sse2(uint16_t* pDst0, int nDstPitch, const unsigned char* pSrc0, int nSrcPitch, short* pWin0, int nWinPitch)
+OverlapsFunction *get_overlaps_function(int BlockX, int BlockY, int pixelsize, arch_t arch)
 {
-  // pWin from 0 to 2048, 11 bit integer arithmetic
-  // when pixel_t == uint16_t, dst should be int*
-
-  // src is tmpBlock, for this new method it is always float
-  auto pWin = reinterpret_cast<float*>(pWin0); // overlap windows constants are now float
-
-  // in integer 8-16 bit format originally pWin from 0 to 2048 total shift 11
-  // for float internal working formats no scaling occurs in overlaps constants
-
-  float* pDst = reinterpret_cast<float*>(pDst0);
-  __m128 zero = _mm_setzero_ps();
-
-  for (int j = 0; j < blockHeight; j++)
-  {
-    __m128 dst;
-    __m128 win, src;
-
-    // pDst[i] = pDst[i] + (val * win);
-    const float* pSrc = reinterpret_cast<const float*>(pSrc0);
-
-    if constexpr (blockWidth % 8 == 0) {
-      for (int x = 0; x < blockWidth; x += 8) {
-        win = _mm_loadu_ps(reinterpret_cast<float*>(pWin + x));
-        src = _mm_loadu_ps(reinterpret_cast<const float*>(pSrc + x));
-        auto res = _mm_mul_ps(src, win);
-        dst = _mm_loadu_ps(reinterpret_cast<float*>(pDst + x));
-        dst = _mm_add_ps(dst, res);
-        _mm_storeu_ps(reinterpret_cast<float*>(pDst + x), dst);
-
-        win = _mm_loadu_ps(reinterpret_cast<float*>(pWin + x + 4));
-        src = _mm_loadu_ps(reinterpret_cast<const float*>(pSrc + x + 4));
-        res = _mm_mul_ps(src, win);
-        dst = _mm_loadu_ps(reinterpret_cast<float*>(pDst + x + 4));
-        dst = _mm_add_ps(dst, res);
-        _mm_storeu_ps(reinterpret_cast<float*>(pDst + x + 4), dst);
-      }
-    }
-    else if constexpr (blockWidth % 4 == 0) {
-      for (int x = 0; x < blockWidth; x +=4) {
-        win = _mm_loadu_ps(reinterpret_cast<float*>(pWin + x));
-        src = _mm_loadu_ps(reinterpret_cast<const float*>(pSrc + x));
-        auto res = _mm_mul_ps(src,win);
-        dst = _mm_loadu_ps(reinterpret_cast<float*>(pDst + x));
-        dst = _mm_add_ps(dst, res);
-        _mm_storeu_ps(reinterpret_cast<float*>(pDst + x), dst);
-      }
-    }
-    else if constexpr (blockWidth == 6) {
-      // 4+2
-      // 1st 4
-      win = _mm_loadu_ps(reinterpret_cast<float*>(pWin));
-      src = _mm_loadu_ps(reinterpret_cast<const float*>(pSrc));
-      auto res = _mm_mul_ps(src, win);
-      dst = _mm_loadu_ps(reinterpret_cast<float*>(pDst));
-      dst = _mm_add_ps(dst, res);
-      _mm_storeu_ps(reinterpret_cast<float*>(pDst), dst);
-
-      // last 2 pixels
-      win = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pWin + 4))); // 2x float
-      src = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pSrc + 4))); // 2x float
-      res = _mm_mul_ps(src, win);
-      dst = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<__m128i*>(pDst + 4)));
-      dst = _mm_add_ps(dst, res);
-      _mm_storel_epi64(reinterpret_cast<__m128i*>(pDst + 4), _mm_castps_si128(dst));
-    }
-    else if constexpr (blockWidth % 2 == 0) {
-      // width==2,(4),6,(8)
-      for (int x = 0; x < blockWidth; x += 2) {
-        win = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<__m128i*>(pWin + x))); // 2x float
-        src = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pSrc + x))); // 2x float
-        auto res = _mm_mul_ps(src, win);
-        dst = _mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<__m128i*>(pDst + x))); // 4x short: destination pixels
-        dst = _mm_add_ps(dst, res);
-        _mm_storel_epi64(reinterpret_cast<__m128i*>(pDst + x), _mm_castps_si128(dst));
-      }
-    }
-    else {
-      assert(0);
-    }
-
-    pDst += nDstPitch;
-    pSrc0 += nSrcPitch;
-    pWin += nWinPitch;
-  }
-}
-
-
-OverlapsFunction *get_overlaps_function(int BlockX, int BlockY, int pixelsize, bool out32_flag, arch_t arch)
-{
-    constexpr int OUT32_MARKER = 16;
-    if (out32_flag)
-      pixelsize += OUT32_MARKER;
     //---------- OVERLAPS
     // BlkSizeX, BlkSizeY, pixelsize, arch_t
     std::map<std::tuple<int, int, int, arch_t>, OverlapsFunction*> func_overlaps;
@@ -985,64 +728,19 @@ OverlapsFunction *get_overlaps_function(int BlockX, int BlockY, int pixelsize, b
     // define C for 8/16/32 bits
 #define MAKE_OVR_FN(x, y) \
 func_overlaps[make_tuple(x, y, 1, NO_SIMD)] = Overlaps_C<uint8_t, x, y>; \
-func_overlaps[make_tuple(x, y, 1+ OUT32_MARKER, NO_SIMD)] = Overlaps_float_new_C<x, y>; \
 func_overlaps[make_tuple(x, y, 2, NO_SIMD)] = Overlaps_C<uint16_t, x, y>; \
-func_overlaps[make_tuple(x, y, 2+ OUT32_MARKER, NO_SIMD)] = Overlaps_float_new_C<x, y>; \
-func_overlaps[make_tuple(x, y, 4, NO_SIMD)] = Overlaps_float_C<x, y>; \
-func_overlaps[make_tuple(x, y, 4+ OUT32_MARKER, NO_SIMD)] = Overlaps_float_new_C<x, y>; \
-    // sad, copy, overlap, luma, should support the blocksize list
-    MAKE_OVR_FN(64, 64)
-      MAKE_OVR_FN(64, 48)
-      MAKE_OVR_FN(64, 32)
-      MAKE_OVR_FN(64, 16)
-      MAKE_OVR_FN(48, 64)
-      MAKE_OVR_FN(48, 48)
-      MAKE_OVR_FN(48, 24)
-      MAKE_OVR_FN(48, 12)
-      MAKE_OVR_FN(32, 64)
-      MAKE_OVR_FN(32, 32)
-      MAKE_OVR_FN(32, 24)
-      MAKE_OVR_FN(32, 16)
-      MAKE_OVR_FN(32, 8)
-      MAKE_OVR_FN(24, 48)
-      MAKE_OVR_FN(24, 32)
-      MAKE_OVR_FN(24, 24)
-      MAKE_OVR_FN(24, 12)
-      MAKE_OVR_FN(24, 6)
-      MAKE_OVR_FN(16, 64)
-      MAKE_OVR_FN(16, 32)
-      MAKE_OVR_FN(16, 16)
-      MAKE_OVR_FN(16, 12)
-      MAKE_OVR_FN(16, 8)
-      MAKE_OVR_FN(16, 4)
-      MAKE_OVR_FN(16, 2)
-      MAKE_OVR_FN(16, 1)
-      MAKE_OVR_FN(12, 48)
-      MAKE_OVR_FN(12, 24)
-      MAKE_OVR_FN(12, 16)
-      MAKE_OVR_FN(12, 12)
-      MAKE_OVR_FN(12, 6)
-      MAKE_OVR_FN(12, 3)
-      MAKE_OVR_FN(8, 32)
-      MAKE_OVR_FN(8, 16)
-      MAKE_OVR_FN(8, 8)
-      MAKE_OVR_FN(8, 4)
-      MAKE_OVR_FN(8, 2)
-      MAKE_OVR_FN(8, 1)
-      MAKE_OVR_FN(6, 24)
-      MAKE_OVR_FN(6, 12)
-      MAKE_OVR_FN(6, 6)
-      MAKE_OVR_FN(6, 3)
-      MAKE_OVR_FN(4, 8)
-      MAKE_OVR_FN(4, 4)
-      MAKE_OVR_FN(4, 2)
-      MAKE_OVR_FN(4, 1)
-      MAKE_OVR_FN(3, 6)
-      MAKE_OVR_FN(3, 3)
-      MAKE_OVR_FN(2, 4)
-      MAKE_OVR_FN(2, 2)
-      MAKE_OVR_FN(2, 1)
+func_overlaps[make_tuple(x, y, 4, NO_SIMD)] = Overlaps_float_C<x, y>;
+    MVTOOLS_BLOCKSIZES(MAKE_OVR_FN) // BlockSizes.h: the same list for all C tables
 #undef MAKE_OVR_FN
+
+#ifdef NEON_INTRINSICS
+#define MAKE_OVR_FN(x, y) \
+func_overlaps[make_tuple(x, y, 1, USE_NEON)] = Overlaps_neon<uint8_t, x, y>; \
+func_overlaps[make_tuple(x, y, 2, USE_NEON)] = Overlaps_neon<uint16_t, x, y>; \
+func_overlaps[make_tuple(x, y, 4, USE_NEON)] = Overlaps_float_neon<x, y>;
+    MVTOOLS_BLOCKSIZES(MAKE_OVR_FN)
+#undef MAKE_OVR_FN
+#endif
 
 #ifdef USE_OVERLAPS_ASM
     // in overlap-a.asm
@@ -1090,19 +788,16 @@ func_overlaps[make_tuple(x, y, 4+ OUT32_MARKER, NO_SIMD)] = Overlaps_float_new_C
     func_overlaps[make_tuple(2 , 4 , 1, USE_SSE2)] = Overlaps2x4_sse2;
     func_overlaps[make_tuple(2 , 2 , 1, USE_SSE2)] = Overlaps2x2_sse2;
 #endif
+#ifdef INTEL_INTRINSICS
     // define sse4 for 16 bits
 #ifdef USE_OVERLAPS_ASM
 #define MAKE_OVR_FN(x, y) \
-func_overlaps[make_tuple(x, y, 2, USE_SSE41)] = Overlaps_uint16_t_sse4<x, y>; \
-func_overlaps[make_tuple(x, y, 1 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new_sse2<x, y>; \
-func_overlaps[make_tuple(x, y, 2 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new_sse2<x, y>; \
-func_overlaps[make_tuple(x, y, 4 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new_sse2<x, y>;
+func_overlaps[make_tuple(x, y, 2, USE_SSE41)] = Overlaps_uint16_t_sse4<x, y>;
 #else
     // plus: 8 bit SSE internally everybody has at least sse4
 #define MAKE_OVR_FN(x, y) \
 func_overlaps[make_tuple(x, y, 2, USE_SSE41)] = Overlaps_uint16_t_sse4<x, y>; \
-func_overlaps[make_tuple(x, y, 1, USE_SSE41)] = Overlaps_uint8_t_sse4<x, y>; \
-func_overlaps[make_tuple(x, y, 1 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new_sse2<x, y>;
+func_overlaps[make_tuple(x, y, 1, USE_SSE41)] = Overlaps_uint8_t_sse4<x, y>;
 #endif
     MAKE_OVR_FN(64, 64)
       MAKE_OVR_FN(64, 48)
@@ -1146,18 +841,21 @@ func_overlaps[make_tuple(x, y, 1 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new
       MAKE_OVR_FN(6, 12)
       MAKE_OVR_FN(6, 6)
       MAKE_OVR_FN(6, 3)
+      MAKE_OVR_FN(4, 16)
       MAKE_OVR_FN(4, 8)
       MAKE_OVR_FN(4, 4)
       MAKE_OVR_FN(4, 2)
       MAKE_OVR_FN(4, 1)
+      MAKE_OVR_FN(2, 8)
       MAKE_OVR_FN(2, 4)
       MAKE_OVR_FN(2, 2)
       MAKE_OVR_FN(2, 1)
 #undef MAKE_OVR_FN
+#endif // INTEL_INTRINSICS
 
     OverlapsFunction *result = nullptr;
 
-    arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+    arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
     int index = 0;
     while (result == nullptr) {
       arch_t current_arch_try = archlist[index++];
@@ -1169,82 +867,6 @@ func_overlaps[make_tuple(x, y, 1 + OUT32_MARKER, USE_SSE2)] = Overlaps_float_new
     return result;
 }
 
-// lsb: old stacked16 heritage
-OverlapsLsbFunction *get_overlaps_lsb_function(int BlockX, int BlockY, int pixelsize, arch_t arch)
-{
-    // 8 bit only (pixelsize==1)
-    // BlkSizeX, BlkSizeY, pixelsize, arch_t
-    std::map<std::tuple<int, int, int, arch_t>, OverlapsLsbFunction*> func_overlaps_lsb;
-    using std::make_tuple;
-    // define C for 8 bits
-#define MAKE_OVR_FN(x, y) func_overlaps_lsb[make_tuple(x, y, 1, NO_SIMD)] = OverlapsLsb_C<x, y>;
-    // sad, copy, overlap, luma, should be the same list
-    MAKE_OVR_FN(64, 64)
-      MAKE_OVR_FN(64, 48)
-      MAKE_OVR_FN(64, 32)
-      MAKE_OVR_FN(64, 16)
-      MAKE_OVR_FN(48, 64)
-      MAKE_OVR_FN(48, 48)
-      MAKE_OVR_FN(48, 24)
-      MAKE_OVR_FN(48, 12)
-      MAKE_OVR_FN(32, 64)
-      MAKE_OVR_FN(32, 32)
-      MAKE_OVR_FN(32, 24)
-      MAKE_OVR_FN(32, 16)
-      MAKE_OVR_FN(32, 8)
-      MAKE_OVR_FN(24, 48)
-      MAKE_OVR_FN(24, 32)
-      MAKE_OVR_FN(24, 24)
-      MAKE_OVR_FN(24, 12)
-      MAKE_OVR_FN(24, 6)
-      MAKE_OVR_FN(16, 64)
-      MAKE_OVR_FN(16, 32)
-      MAKE_OVR_FN(16, 16)
-      MAKE_OVR_FN(16, 12)
-      MAKE_OVR_FN(16, 8)
-      MAKE_OVR_FN(16, 4)
-      MAKE_OVR_FN(16, 2)
-      MAKE_OVR_FN(16, 1)
-      MAKE_OVR_FN(12, 48)
-      MAKE_OVR_FN(12, 24)
-      MAKE_OVR_FN(12, 16)
-      MAKE_OVR_FN(12, 12)
-      MAKE_OVR_FN(12, 6)
-      MAKE_OVR_FN(12, 3)
-      MAKE_OVR_FN(8, 32)
-      MAKE_OVR_FN(8, 16)
-      MAKE_OVR_FN(8, 8)
-      MAKE_OVR_FN(8, 4)
-      MAKE_OVR_FN(8, 2)
-      MAKE_OVR_FN(8, 1)
-      MAKE_OVR_FN(6, 24)
-      MAKE_OVR_FN(6, 12)
-      MAKE_OVR_FN(6, 6)
-      MAKE_OVR_FN(6, 3)
-      MAKE_OVR_FN(4, 8)
-      MAKE_OVR_FN(4, 4)
-      MAKE_OVR_FN(4, 2)
-      MAKE_OVR_FN(4, 1)
-      MAKE_OVR_FN(3, 6)
-      MAKE_OVR_FN(3, 3)
-      MAKE_OVR_FN(2, 4)
-      MAKE_OVR_FN(2, 2)
-      MAKE_OVR_FN(2, 1)
-#undef MAKE_OVR_FN
-
-    OverlapsLsbFunction *result = nullptr;
-    arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
-    int index = 0;
-    while (result == nullptr) {
-      arch_t current_arch_try = archlist[index++];
-      if (current_arch_try > arch) continue;
-      result = func_overlaps_lsb[make_tuple(BlockX, BlockY, pixelsize, current_arch_try)];
-      if (result == nullptr && current_arch_try == NO_SIMD)
-        break;
-    }
-
-    return result;
-}
 
 
 

@@ -20,20 +20,32 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #ifdef _WIN32
+// The Windows SDK's minwindef.h defines STRICT as 1, avs/win.h (external) defines
+// it as empty: drop the previous definition to avoid a redefinition warning.
+#ifdef STRICT
+#undef STRICT
+#endif
 #include "avs/win.h"
 #endif
 
 #include "Interpolation.h"
 
+#include "types.h"
+#ifdef INTEL_INTRINSICS
 #include <emmintrin.h>
 #include <smmintrin.h> // sse 4.1
 #include <immintrin.h>
+#endif
 #include	<algorithm>
 #include	<cassert>
 #include <stdint.h>
 #include "def.h"
 #include "avs/cpuid.h"
+#ifdef NEON_INTRINSICS
+#include "Interpolation_neon.h"
+#endif
 
+#ifdef INTEL_INTRINSICS
 MV_FORCEINLINE __m128i _MM_CMPLE_EPU16(__m128i x, __m128i y)
 {
   // Returns 0xFFFF where x <= y:
@@ -90,6 +102,7 @@ static MV_FORCEINLINE __m128i _MM_PACKUS_EPI32(__m128i a, __m128i b)
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
+#endif // INTEL_INTRINSICS
 
 #define RB2_jump(y_new, y, pDst, pSrc, nDstPitch, nSrcPitch) \
 { const int dif = y_new - y; \
@@ -130,7 +143,8 @@ void RB2F_C(
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void RB2F_sse2(
   pixel_t* pDst, const pixel_t* pSrc, int nDstPitch, int nSrcPitch,
   int nWidth, int nHeight)
@@ -171,10 +185,7 @@ void RB2F_sse2(
         auto sum = _mm_add_epi32(_mm_add_epi32(m2, m3), _mm_add_epi32(m4, m5));
         sum = _mm_add_epi32(sum, _mm_set1_epi32(2));
         res = _mm_srli_epi32(sum, 2);
-        if constexpr (hasSSE41)
-          res = _mm_packus_epi32(res, res);
-        else
-          m2 = _MM_PACKUS_EPI32(res, res);
+        res = _MM_PACKUS_EPI32(res, res);
       }
       _mm_storel_epi64((__m128i*) & pDst[x], res);
     }
@@ -186,6 +197,7 @@ void RB2F_sse2(
     pSrc += nSrcPitch * 2;
   }
 }
+#endif // INTEL_INTRINSICS
 
 // 8-32bits
 template<typename pixel_t>
@@ -200,18 +212,22 @@ void RB2F(
   const pixel_t *pSrc = reinterpret_cast<const pixel_t *>(pSrc8);
 
   bool isse2 = !!(cpuFlags & CPUF_SSE2);
-  bool isse4 = !!(cpuFlags & CPUF_SSE4_1);
 
   int y = 0;
   RB2_jump(y_beg, y, pDst, pSrc, nDstPitch, nSrcPitch);
   if constexpr(sizeof(pixel_t) == 4)
     RB2F_C<pixel_t>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
   else {
-    if (isse4 && sizeof(pixel_t) == 2)
-      RB2F_sse2<pixel_t, true>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
-    else if (isse2)
-      RB2F_sse2<pixel_t, false>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
+#ifdef INTEL_INTRINSICS
+    if (isse2)
+      RB2F_sse2<pixel_t>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
     else
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if (cpuFlags & CPUF_ARM_NEON)
+      RB2F_neon<pixel_t>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
+    else
+#endif
       RB2F_C<pixel_t>(pDst, pSrc, nDstPitch, nSrcPitch, nWidth, y_end - y_beg);
   }
 }
@@ -369,7 +385,8 @@ void RB2Cubic_C(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch,
 // filtered qubic with 1/32, 5/32, 10/32, 10/32, 5/32, 1/32 filter for smoothing and anti-aliasing
 // Width is reduced by 2
 // 8-16bits
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 static void RB2CubicHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX) {
   __m128i everySecondMask;
   if constexpr(sizeof(pixel_t) == 1)
@@ -426,16 +443,13 @@ static void RB2CubicHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX) {
 
       m2 = _mm_add_epi32(m2, _mm_set1_epi32(16));
       m2 = _mm_srli_epi32(m2, 5);
-      if constexpr(hasSSE41)
-        m2 = _mm_packus_epi32(m2, m2);
-      else
-        m2 = _MM_PACKUS_EPI32(m2, m2);
+      m2 = _MM_PACKUS_EPI32(m2, m2);
     }
     _mm_storel_epi64((__m128i *)&pSrc[x], m2);
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2CubicVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, int nSrcPitch, int nWidthMMX) {
   const __m128i zeroes = _mm_setzero_si128();
   // pitch is byte-level here
@@ -495,16 +509,13 @@ static void RB2CubicVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, int nS
 
       m2 = _mm_add_epi32(m2, _mm_set1_epi32(16));
       m2 = _mm_srli_epi32(m2, 5);
-      if constexpr(hasSSE41)
-        m2 = _mm_packus_epi32(m2, m2);
-      else
-        m2 = _MM_PACKUS_EPI32(m2, m2);
+      m2 = _MM_PACKUS_EPI32(m2, m2);
     }
     _mm_storel_epi64((__m128i *)&pDst[x], m2);
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2QuadraticHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX) {
   __m128i everySecondMask;
   if constexpr(sizeof(pixel_t) == 1)
@@ -546,10 +557,7 @@ static void RB2QuadraticHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX)
     }
     else {
       m2 = _mm_add_epi32(m2, m3);
-      if constexpr(hasSSE41)
-        m2 = _mm_mullo_epi32(m2, _mm_set1_epi32(22));
-      else
-        m2 = _MM_MULLO_EPI32(m2, _mm_set1_epi32(22));
+      m2 = _MM_MULLO_EPI32(m2, _mm_set1_epi32(22));
 
       m1 = _mm_add_epi32(m1, m4);
       m4 = _mm_slli_epi32(m1, 3);
@@ -561,10 +569,7 @@ static void RB2QuadraticHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX)
 
       m2 = _mm_add_epi32(m2, _mm_set1_epi32(32));
       m2 = _mm_srli_epi32(m2, 6);
-      if constexpr(hasSSE41)
-        m2 = _mm_packus_epi32(m2, m2);
-      else
-        m2 = _MM_PACKUS_EPI32(m2, m2);
+      m2 = _MM_PACKUS_EPI32(m2, m2);
     }
     _mm_storel_epi64((__m128i *)&pSrc[x], m2);
   }
@@ -572,7 +577,7 @@ static void RB2QuadraticHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX)
 
 // filtered Quadratic with 1/64, 9/64, 22/64, 22/64, 9/64, 1/64 filter for smoothing and anti-aliasing
 // nHeight is dst height which is reduced by 2 source height
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2QuadraticVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, int nSrcPitch, int nWidthMMX) {
 
   const __m128i zeroes = _mm_setzero_si128();
@@ -617,10 +622,7 @@ static void RB2QuadraticVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, in
       m5 = _mm_unpacklo_epi16(m5, zeroes);
 
       m2 = _mm_add_epi32(m2, m3);
-      if constexpr(hasSSE41)
-        m2 = _mm_mullo_epi32(m2, _mm_set1_epi32(22));
-      else
-        m2 = _MM_MULLO_EPI32(m2, _mm_set1_epi32(22));
+      m2 = _MM_MULLO_EPI32(m2, _mm_set1_epi32(22));
 
       m1 = _mm_add_epi32(m1, m4);
       m4 = _mm_slli_epi32(m1, 3);
@@ -632,17 +634,14 @@ static void RB2QuadraticVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, in
 
       m2 = _mm_add_epi32(m2, _mm_set1_epi32(32));
       m2 = _mm_srli_epi32(m2, 6);
-      if constexpr(hasSSE41)
-        m2 = _mm_packus_epi32(m2, m2);
-      else
-        m2 = _MM_PACKUS_EPI32(m2, m2);
+      m2 = _MM_PACKUS_EPI32(m2, m2);
     }
     _mm_storel_epi64((__m128i *)&pDst[x], m2);
   }
 }
 
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2BilinearFilteredVerticalLine_sse2(uint8_t *pDst, const uint8_t *pSrc, intptr_t nSrcPitch, intptr_t nWidthMMX) {
   const __m128i zeroes = _mm_setzero_si128();
 
@@ -684,16 +683,13 @@ static void RB2BilinearFilteredVerticalLine_sse2(uint8_t *pDst, const uint8_t *p
       m0 = _mm_add_epi32(m0, _mm_set1_epi32(4));
       m0 = _mm_srli_epi32(m0, 3);
 
-      if constexpr(hasSSE41)
-        m0 = _mm_packus_epi32(m0, m0);
-      else
-        m0 = _MM_PACKUS_EPI32(m0, m0);
+      m0 = _MM_PACKUS_EPI32(m0, m0);
     }
     _mm_storel_epi64((__m128i *)&pDst[x], m0);
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2BilinearFilteredHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWidthMMX, int nWidth) {
   __m128i everySecondMask;
   if constexpr(sizeof(pixel_t) == 1)
@@ -740,16 +736,13 @@ static void RB2BilinearFilteredHorizontalInplaceLine_sse2(pixel_t *pSrc, int nWi
       m0 = _mm_add_epi32(m0, _mm_set1_epi32(4));
       m0 = _mm_srli_epi32(m0, 3);
 
-      if constexpr(hasSSE41)
-        m0 = _mm_packus_epi32(m0, m0);
-      else
-        m0 = _MM_PACKUS_EPI32(m0, m0);
+      m0 = _MM_PACKUS_EPI32(m0, m0);
     }
     _mm_storel_epi64((__m128i *)&pSrc[x], m0);
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 static void RB2FilteredVerticalLine_sse2(pixel_t* pDst, const pixel_t* pSrc, int nSrcPitch, int nWidthMMX) {
   // srcPitch is pixel_t level
   for (int x = 0; x < nWidthMMX; x += 8 / sizeof(pixel_t)) {
@@ -776,14 +769,12 @@ static void RB2FilteredVerticalLine_sse2(pixel_t* pDst, const pixel_t* pSrc, int
       m0 = _mm_add_epi32(m0, _mm_set1_epi32(2));
       m0 = _mm_srli_epi32(m0, 2);
 
-      if constexpr (hasSSE41)
-        m0 = _mm_packus_epi32(m0, m0);
-      else
-        m0 = _MM_PACKUS_EPI32(m0, m0);
+      m0 = _MM_PACKUS_EPI32(m0, m0);
     }
     _mm_storel_epi64((__m128i*) & pDst[x], m0);
   }
 }
+#endif // INTEL_INTRINSICS
 
 
 //8-32 bits
@@ -796,7 +787,6 @@ void RB2FilteredVertical(
 {
 
   bool isse2 = !!(cpuFlags & CPUF_SSE2);
-  bool isse4 = !!(cpuFlags & CPUF_SSE4_1);
 
   pixel_t *pDst = reinterpret_cast<pixel_t *>(pDst8);
   const pixel_t *pSrc = reinterpret_cast<const pixel_t *>(pSrc8);
@@ -837,24 +827,12 @@ void RB2FilteredVertical(
       pSrc += nSrcPitch * 2;
     }
   }
-  else if ((sizeof(pixel_t) == 2) && isse4 && nWidthMMX >= pixels_at_a_time) {
-    for (; y < y_end; ++y)
-    {
-      RB2FilteredVerticalLine_sse2<pixel_t, true>(pDst, pSrc, nSrcPitch, nWidthMMX);
-      for (int x = nWidthMMX; x < nWidth; x++)
-      {
-        pDst[x] = (pSrc[x - nSrcPitch] + pSrc[x] * 2 + pSrc[x + nSrcPitch] + 2) >> 2;
-      }
-
-      pDst += nDstPitch;
-      pSrc += nSrcPitch * 2;
-    }
-  }
+#ifdef INTEL_INTRINSICS
   else if (isse2 && nWidthMMX >= pixels_at_a_time)
   {
     for (; y < y_end; ++y)
     {
-      RB2FilteredVerticalLine_sse2<pixel_t, false>(pDst, pSrc, nSrcPitch, nWidthMMX);
+      RB2FilteredVerticalLine_sse2<pixel_t>(pDst, pSrc, nSrcPitch, nWidthMMX);
       for (int x = nWidthMMX; x < nWidth; x++)
       {
         pDst[x] = (pSrc[x - nSrcPitch] + pSrc[x] * 2 + pSrc[x + nSrcPitch] + 2) >> 2;
@@ -864,6 +842,20 @@ void RB2FilteredVertical(
       pSrc += nSrcPitch * 2;
     }
   }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+  else if (cpuFlags & CPUF_ARM_NEON)
+  {
+    for (; y < y_end; ++y)
+    {
+      const int xs = RB2FilteredVerticalLine_neon<pixel_t>(pDst, pSrc, nSrcPitch, nWidth);
+      for (int x = xs; x < nWidth; x++)
+        pDst[x] = (pSrc[x - nSrcPitch] + pSrc[x] * 2 + pSrc[x + nSrcPitch] + 2) >> 2;
+      pDst += nDstPitch;
+      pSrc += nSrcPitch * 2;
+    }
+  }
+#endif
   else
   {
     // pure C 
@@ -883,7 +875,8 @@ void RB2FilteredVertical(
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 static void RB2FilteredHorizontalInplaceLine_sse2(pixel_t* pSrc, int nWidthMMX) {
   __m128i everySecondMask;
   if constexpr (sizeof(pixel_t) == 1)
@@ -918,14 +911,12 @@ static void RB2FilteredHorizontalInplaceLine_sse2(pixel_t* pSrc, int nWidthMMX) 
 
       m0 = _mm_add_epi32(m0, _mm_set1_epi32(2));
       m0 = _mm_srli_epi32(m0, 2);
-      if constexpr (hasSSE41)
-        m0 = _mm_packus_epi32(m0, m0);
-      else
-        m0 = _MM_PACKUS_EPI32(m0, m0);
+      m0 = _MM_PACKUS_EPI32(m0, m0);
     }
     _mm_storel_epi64((__m128i*) & pSrc[x], m0);
   }
 }
+#endif // INTEL_INTRINSICS
 
 
 //8-32bits
@@ -947,7 +938,6 @@ void RB2FilteredHorizontalInplace(
   RB2_jump_1(y_beg, y, pSrc, nSrcPitch);
 
   bool isse2 = !!(cpuFlags & CPUF_SSE2) && nWidthMMX > 1 + pixels_per_cycle;
-  bool isse4 = !!(cpuFlags & CPUF_SSE4_1) && nWidthMMX > 1 + pixels_per_cycle;
   for (; y < y_end; ++y)
   {
     const int x = 0;
@@ -968,23 +958,26 @@ void RB2FilteredHorizontalInplace(
       }
     }
     else {
-      if (sizeof(pixel_t) == 2 && isse4)
+#ifdef INTEL_INTRINSICS
+      if (isse2)
       {
-        RB2FilteredHorizontalInplaceLine_sse2<uint16_t, true>((uint16_t*)pSrc, nWidthMMX); // very first is skipped
-        for (int x = nWidthMMX; x < nWidth; x++)
-        {
-          pSrc[x] = (pSrc[x * 2 - 1] + pSrc[x * 2] * 2 + pSrc[x * 2 + 1] + 2) >> 2;
-        }
-      }
-      else if (sizeof(pixel_t) == 1 && isse2)
-      {
-        RB2FilteredHorizontalInplaceLine_sse2<uint8_t, false>((uint8_t *)pSrc, nWidthMMX); // very first is skipped
+        RB2FilteredHorizontalInplaceLine_sse2<pixel_t>(pSrc, nWidthMMX); // very first is skipped
         for (int x = nWidthMMX; x < nWidth; x++)
         {
           pSrc[x] = (pSrc[x * 2 - 1] + pSrc[x * 2] * 2 + pSrc[x * 2 + 1] + 2) >> 2;
         }
       }
       else
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+      if (cpuFlags & CPUF_ARM_NEON)
+      {
+        const int xs = RB2FilteredHorizontalInplaceLine_neon<pixel_t>(pSrc, nWidth);
+        for (int x = xs; x < nWidth; x++)
+          pSrc[x] = (pSrc[x * 2 - 1] + pSrc[x * 2] * 2 + pSrc[x * 2 + 1] + 2) >> 2;
+      }
+      else
+#endif
       {
         // pure C
         for (int x = 1; x < nWidth; x++)
@@ -1026,7 +1019,6 @@ void RB2BilinearFilteredVertical(
 {
 
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t);
@@ -1056,17 +1048,21 @@ void RB2BilinearFilteredVertical(
   for (; y < y_loop_e; ++y)
   {
     int startx = 0;
+#ifdef INTEL_INTRINSICS
     if (sizeof(pixel_t) <= 2 && isse2 && nWidthMMX >= pixels_per_cycle) {
       if constexpr(sizeof(pixel_t) == 1)
-        RB2BilinearFilteredVerticalLine_sse2<uint8_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-      else  {
-        if(isse41)
-          RB2BilinearFilteredVerticalLine_sse2<uint16_t, true>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-        else
-          RB2BilinearFilteredVerticalLine_sse2<uint16_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-      }
+        RB2BilinearFilteredVerticalLine_sse2<uint8_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
+      else
+        RB2BilinearFilteredVerticalLine_sse2<uint16_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
       startx = nWidthMMX;
     }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        startx = RB2BilinearFilteredVerticalLine_neon<pixel_t>(pDst, pSrc, nSrcPitch / sizeof(pixel_t), nWidth);
+    }
+#endif
 
     for (int x = startx; x < nWidth; x++)
     {
@@ -1111,7 +1107,6 @@ void RB2BilinearFilteredHorizontalInplace(
   int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags)
 {
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t);
@@ -1144,22 +1139,26 @@ void RB2BilinearFilteredHorizontalInplace(
 
     int xstart = 1;
 
+#ifdef INTEL_INTRINSICS
     if (isse2) {
       if constexpr(sizeof(pixel_t) <= 2)
       {
         if constexpr (sizeof(pixel_t) == 1) {
-          RB2BilinearFilteredHorizontalInplaceLine_sse2<uint8_t, false>(pSrc, nWidthMMX, nWidth); // very first is skipped
+          RB2BilinearFilteredHorizontalInplaceLine_sse2<uint8_t>(pSrc, nWidthMMX, nWidth); // very first is skipped
         }
-        else {
-          if (isse41)
-            RB2BilinearFilteredHorizontalInplaceLine_sse2<uint16_t, true>(pSrc, nWidthMMX, nWidth);
-          else
-            RB2BilinearFilteredHorizontalInplaceLine_sse2<uint16_t, false>(pSrc, nWidthMMX, nWidth);
-        }
+        else
+          RB2BilinearFilteredHorizontalInplaceLine_sse2<uint16_t>(pSrc, nWidthMMX, nWidth);
         xstart = nWidthMMX;
       }
     }
-    
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        xstart = RB2BilinearFilteredHorizontalInplaceLine_neon<pixel_t>(pSrc, nWidth);
+    }
+#endif
+
     for (int x = xstart; x < nWidth - 1; x++)
     {
       if constexpr(sizeof(pixel_t) <= 2)
@@ -1204,7 +1203,6 @@ void RB2QuadraticVertical(
   int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags)
 {
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t);
@@ -1234,17 +1232,21 @@ void RB2QuadraticVertical(
   for (; y < y_loop_e; ++y)
   {
     int xstart = 0;
+#ifdef INTEL_INTRINSICS
     if (sizeof(pixel_t) <= 2 && isse2 && nWidthMMX >= pixels_per_cycle) {
       if constexpr(sizeof(pixel_t) == 1)
-        RB2QuadraticVerticalLine_sse2<uint8_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-      else  {
-        if(isse41)
-          RB2QuadraticVerticalLine_sse2<uint16_t, true>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-        else
-          RB2QuadraticVerticalLine_sse2<uint16_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-      }
+        RB2QuadraticVerticalLine_sse2<uint8_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
+      else
+        RB2QuadraticVerticalLine_sse2<uint16_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
       xstart = nWidthMMX;
     }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        xstart = RB2Tap6VerticalLine_neon<pixel_t, 9, 22, 6>(pDst, pSrc, nSrcPitch / sizeof(pixel_t), nWidth);
+    }
+#endif
 
     for (int x = xstart; x < nWidth; x++)
     {
@@ -1293,7 +1295,6 @@ void RB2QuadraticHorizontalInplace(
   int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags)
 {
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t);
@@ -1316,20 +1317,24 @@ void RB2QuadraticHorizontalInplace(
 
     int xstart = 1;
 
+#ifdef INTEL_INTRINSICS
     if (isse2) {
       if constexpr(sizeof(pixel_t) <= 2)
       {
         if constexpr (sizeof(pixel_t) == 1)
-          RB2QuadraticHorizontalInplaceLine_sse2<uint8_t, false>(pSrc, nWidthMMX);
-        else {
-          if (isse41)
-            RB2QuadraticHorizontalInplaceLine_sse2<uint16_t, true>(pSrc, nWidthMMX);
-          else
-            RB2QuadraticHorizontalInplaceLine_sse2<uint16_t, false>(pSrc, nWidthMMX);
-        }
+          RB2QuadraticHorizontalInplaceLine_sse2<uint8_t>(pSrc, nWidthMMX);
+        else
+          RB2QuadraticHorizontalInplaceLine_sse2<uint16_t>(pSrc, nWidthMMX);
         xstart = nWidthMMX;
       }
     }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        xstart = RB2Tap6HorizontalInplaceLine_neon<pixel_t, 9, 22, 6>(pSrc, nWidth);
+    }
+#endif
     
     for (int x = xstart; x < nWidth - 1; x++)
     {
@@ -1378,7 +1383,6 @@ void RB2CubicVertical(
   int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags)
 {
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t);
@@ -1408,19 +1412,23 @@ void RB2CubicVertical(
   {
     int xstart = 0;
 
+#ifdef INTEL_INTRINSICS
     if constexpr(sizeof(pixel_t) <= 2) {
       if (isse2 && nWidthMMX >= pixels_per_cycle) {
         if constexpr(sizeof(pixel_t) == 1)
-          RB2CubicVerticalLine_sse2<uint8_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
-        else  {
-          if (!isse41)
-            RB2CubicVerticalLine_sse2<uint16_t, false>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX); // 16 bit nonsse41
-          else
-            RB2CubicVerticalLine_sse2<uint16_t, true>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX); // 16 bit sse41
-        }
+          RB2CubicVerticalLine_sse2<uint8_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
+        else
+          RB2CubicVerticalLine_sse2<uint16_t>((uint8_t *)pDst, (uint8_t *)pSrc, nSrcPitch, nWidthMMX);
         xstart = nWidthMMX;
       }
     }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        xstart = RB2Tap6VerticalLine_neon<pixel_t, 5, 10, 5>(pDst, pSrc, nSrcPitch / sizeof(pixel_t), nWidth);
+    }
+#endif
 
     for (int x = xstart; x < nWidth; x++)
     {
@@ -1469,7 +1477,6 @@ void RB2CubicHorizontalInplace(
   int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags)
 {
   bool isse2 = (cpuFlags & CPUF_SSE2) != 0;
-  bool isse41 = (cpuFlags & CPUF_SSE4_1) != 0;
 
   // 8 pixels at 8 bit, 4 pixels at 16 bit
   const int pixels_per_cycle = 8 / sizeof(pixel_t); 
@@ -1511,23 +1518,27 @@ void RB2CubicHorizontalInplace(
 
     int xstart = 1;
 
+#ifdef INTEL_INTRINSICS
     if constexpr(sizeof(pixel_t) <= 2) {
       if (isse2)
       {
         if constexpr(sizeof(pixel_t) == 1)
         {
-          RB2CubicHorizontalInplaceLine_sse2<uint8_t, false>((uint8_t *)pSrc, nWidthMMX);
+          RB2CubicHorizontalInplaceLine_sse2<uint8_t>((uint8_t *)pSrc, nWidthMMX);
         }
-        else  {
-          if (isse41)
-            RB2CubicHorizontalInplaceLine_sse2<uint16_t, true>(pSrc, nWidthMMX);
-          else
-            RB2CubicHorizontalInplaceLine_sse2<uint16_t, false>(pSrc, nWidthMMX);
-        }
+        else
+          RB2CubicHorizontalInplaceLine_sse2<uint16_t>(pSrc, nWidthMMX);
 
         xstart = nWidthMMX;
       }
     }
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+    if constexpr (sizeof(pixel_t) <= 2) {
+      if (cpuFlags & CPUF_ARM_NEON)
+        xstart = RB2Tap6HorizontalInplaceLine_neon<pixel_t, 5, 10, 5>(pSrc, nWidth);
+    }
+#endif
 
     for (int x = xstart; x < nWidth - 1; x++)
     {
@@ -1598,6 +1609,7 @@ void VerticalBilin(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPit
     pDst[i] = pSrc[i];
 }
 
+#ifdef INTEL_INTRINSICS
 template<typename pixel_t>
 void VerticalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel) {
@@ -1622,6 +1634,7 @@ void VerticalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nD
   for (int x = 0; x < nWidth; x++)
     reinterpret_cast<pixel_t *>(pDst8)[x] = reinterpret_cast<const pixel_t *>(pSrc8)[x];
 }
+#endif // INTEL_INTRINSICS
 
 
 // 8-32 bits
@@ -1651,6 +1664,7 @@ void HorizontalBilin(unsigned char *pDst8, const unsigned char *pSrc8, int nDstP
 }
 
 
+#ifdef INTEL_INTRINSICS
 template<typename pixel_t>
 void HorizontalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel) {
@@ -1711,6 +1725,7 @@ void HorizontalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int 
     pDst += nDstPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 
 // 8-32 bits
@@ -1757,7 +1772,8 @@ void DiagonalBilin(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPit
 
 
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void DiagonalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel)
 {
@@ -1828,10 +1844,7 @@ void DiagonalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nD
         m0 = _mm_add_epi32(m0, m2);
 
         m0 = _mm_srli_epi32(m0, 2);
-        if(hasSSE41)
-          m0 = _mm_packus_epi32(m0, m0);
-        else
-          m0 = _MM_PACKUS_EPI32(m0, m0);
+        m0 = _MM_PACKUS_EPI32(m0, m0);
       }
       _mm_storel_epi64((__m128i *)&pDst[x], m0);
     }
@@ -1875,6 +1888,7 @@ void DiagonalBilin_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nD
   // bottom rightmost
   pDst[nWidth - 1] = pSrc[nWidth - 1];
 }
+#endif // INTEL_INTRINSICS
 
 // so called Wiener interpolation. (sharp, similar to Lanczos ?)
 // invarint simplified, 6 taps. Weights: (1, -5, 20, 20, -5, 1)/32 - added by Fizick
@@ -1940,7 +1954,8 @@ void VerticalWiener(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPi
 }
 
 // 8 bit from vs
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void VerticalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel)
 {
@@ -1956,7 +1971,7 @@ void VerticalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int n
   auto zeroes = _mm_setzero_si128();
 
   for (int y = 0; y < 2; y++) {
-    for (int x = 0; x < nWidth * (int)sizeof(pixel_t); x += 16 / sizeof(pixel_t)) {
+    for (int x = 0; x < nWidth; x += 16 / sizeof(pixel_t)) {
       __m128i m0 = _mm_loadu_si128((const __m128i *)&pSrc[x]);
       __m128i m1 = _mm_loadu_si128((const __m128i *)&pSrc[x + nSrcPitch]);
 
@@ -2028,14 +2043,8 @@ void VerticalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int n
         m0 = _mm_add_epi32(m0, _mm_set1_epi32(16));
 
         m0 = _mm_srai_epi32(m0, 5);
-        if (hasSSE41) {
-          m0 = _mm_packus_epi32(m0, m0);
-          m0 = _mm_min_epu16(m0, max_pixel_value);
-        }
-        else {
-          m0 = _MM_PACKUS_EPI32(m0, m0);
-          m0 = _MM_MIN_EPU16(m0, max_pixel_value);
-        }
+        m0 = _MM_PACKUS_EPI32(m0, m0);
+        m0 = _MM_MIN_EPU16(m0, max_pixel_value);
       }
       _mm_storel_epi64((__m128i *)&pDst[x], m0);
     }
@@ -2045,7 +2054,7 @@ void VerticalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int n
   }
 
   for (int y = nHeight - 4; y < nHeight - 1; y++) {
-    for (int x = 0; x < nWidth * (int)sizeof(pixel_t); x += 16 / sizeof(pixel_t)) {
+    for (int x = 0; x < nWidth; x += 16 / sizeof(pixel_t)) {
       __m128i m0 = _mm_loadu_si128((const __m128i *)&pSrc[x]);
       __m128i m1 = _mm_loadu_si128((const __m128i *)&pSrc[x + nSrcPitch]);
 
@@ -2063,6 +2072,7 @@ void VerticalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int n
   for (int x = 0; x < nWidth; x++)
     pDst[x] = pSrc[x];
 }
+#endif // INTEL_INTRINSICS
 
 // 8-32 bits
 template<typename pixel_t>
@@ -2109,7 +2119,8 @@ void HorizontalWiener(unsigned char *pDst8, const unsigned char *pSrc8, int nDst
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void HorizontalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel) {
 
@@ -2209,14 +2220,8 @@ void HorizontalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int
         m0 = _mm_add_epi32(m0, _mm_set1_epi32(16));
 
         m0 = _mm_srai_epi32(m0, 5);
-        if (hasSSE41) {
-          m0 = _mm_packus_epi32(m0, m0);
-          m0 = _mm_min_epu16(m0, max_pixel_value);
-        }
-        else {
-          m0 = _MM_PACKUS_EPI32(m0, m0);
-          m0 = _MM_MIN_EPU16(m0, max_pixel_value);
-        }
+        m0 = _MM_PACKUS_EPI32(m0, m0);
+        m0 = _MM_MIN_EPU16(m0, max_pixel_value);
       }
       _mm_storel_epi64((__m128i *)&pDst[x], m0);
     }
@@ -2236,6 +2241,7 @@ void HorizontalWiener_sse2(unsigned char *pDst8, const unsigned char *pSrc8, int
     pSrc += nSrcPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 #if 0 // not used
 template<typename pixel_t>
@@ -2350,7 +2356,8 @@ void VerticalBicubic(unsigned char *pDst8, const unsigned char *pSrc8, int nDstP
     pDst[i] = pSrc[i];
 }
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel)
 {
@@ -2366,7 +2373,7 @@ void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int 
   auto zeroes = _mm_setzero_si128();
 
   for (int y = 0; y < 1; y++) {
-    for (int x = 0; x < nWidth * (int)sizeof(pixel_t); x += 16 / sizeof(pixel_t)) {
+    for (int x = 0; x < nWidth; x += 16 / sizeof(pixel_t)) {
       __m128i m0 = _mm_loadu_si128((const __m128i*) & pSrc[x]);
       __m128i m1 = _mm_loadu_si128((const __m128i*) & pSrc[x + nSrcPitch]);
 
@@ -2396,18 +2403,10 @@ void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int 
       {
         const auto rounder_eight = _mm_set1_epi16(8);
 
-        if constexpr (hasSSE41) {
-          m1 = _mm_cvtepu8_epi16(m1);
-          m2 = _mm_cvtepu8_epi16(m2);
-          m3 = _mm_cvtepu8_epi16(m3);
-          m4 = _mm_cvtepu8_epi16(m4);
-        }
-        else {
-          m1 = _mm_unpacklo_epi8(m1, zeroes);
-          m2 = _mm_unpacklo_epi8(m2, zeroes);
-          m3 = _mm_unpacklo_epi8(m3, zeroes);
-          m4 = _mm_unpacklo_epi8(m4, zeroes);
-        }
+        m1 = _mm_unpacklo_epi8(m1, zeroes);
+        m2 = _mm_unpacklo_epi8(m2, zeroes);
+        m3 = _mm_unpacklo_epi8(m3, zeroes);
+        m4 = _mm_unpacklo_epi8(m4, zeroes);
 
         auto tmp1 = _mm_add_epi16(m2, m3);
         auto tmp2 = _mm_add_epi16(_mm_slli_epi16(tmp1, 3), tmp1); // *9
@@ -2427,14 +2426,8 @@ void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int 
         auto tmp3 = _mm_sub_epi32(_mm_sub_epi32(tmp2, m1), m4);
         res = _mm_srai_epi32(_mm_add_epi32(tmp3, rounder_eight), 4);
 
-        if constexpr(hasSSE41) {
-          res = _mm_packus_epi32(res, res);
-          res = _mm_min_epu16(res, max_pixel_value);
-        }
-        else {
-          res = _MM_PACKUS_EPI32(res, res);
-          res = _MM_MIN_EPU16(res, max_pixel_value);
-        }
+        res = _MM_PACKUS_EPI32(res, res);
+        res = _MM_MIN_EPU16(res, max_pixel_value);
       }
       _mm_storel_epi64((__m128i*) & pDst[x], res);
     }
@@ -2444,7 +2437,7 @@ void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int 
   }
 
   for (int y = nHeight - 3; y < nHeight - 1; y++) {
-    for (int x = 0; x < nWidth * (int)sizeof(pixel_t); x += 16 / sizeof(pixel_t)) {
+    for (int x = 0; x < nWidth; x += 16 / sizeof(pixel_t)) {
       __m128i m0 = _mm_loadu_si128((const __m128i*) & pSrc[x]);
       __m128i m1 = _mm_loadu_si128((const __m128i*) & pSrc[x + nSrcPitch]);
 
@@ -2462,6 +2455,7 @@ void VerticalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int 
   for (int x = 0; x < nWidth; x++)
     pDst[x] = pSrc[x];
 }
+#endif // INTEL_INTRINSICS
 
 // 8-32bits
 template<typename pixel_t>
@@ -2503,7 +2497,8 @@ void HorizontalBicubic(unsigned char *pDst8, const unsigned char *pSrc8, int nDs
   }
 }
 
-template<typename pixel_t, bool hasSSE41>
+#ifdef INTEL_INTRINSICS
+template<typename pixel_t>
 void HorizontalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, int nDstPitch,
   int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel) {
 
@@ -2578,14 +2573,8 @@ void HorizontalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, in
         auto tmp3 = _mm_sub_epi32(_mm_sub_epi32(tmp2, m1), m4);
         res = _mm_srai_epi32(_mm_add_epi32(tmp3, rounder_eight), 4);
 
-        if (hasSSE41) {
-          res = _mm_packus_epi32(res, res);
-          res = _mm_min_epu16(res, max_pixel_value);
-        }
-        else {
-          res = _MM_PACKUS_EPI32(res, res);
-          res = _MM_MIN_EPU16(res, max_pixel_value);
-        }
+        res = _MM_PACKUS_EPI32(res, res);
+        res = _MM_MIN_EPU16(res, max_pixel_value);
       }
       _mm_storel_epi64((__m128i*) & pDst[x], res);
     }
@@ -2605,6 +2594,7 @@ void HorizontalBicubic_sse2(unsigned char* pDst8, const unsigned char* pSrc8, in
     pSrc += nSrcPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 #if 0
 // not used
@@ -2663,6 +2653,7 @@ void DiagonalBicubic(unsigned char *pDst8, const unsigned char *pSrc8, int nDstP
 #endif
 
 
+#ifdef INTEL_INTRINSICS
 template<typename pixel_t>
 void Average2_sse2(unsigned char *pDst8, const unsigned char *pSrc1_8, const unsigned char *pSrc2_8,
   int nPitch, int nWidth, int nHeight) {
@@ -2683,6 +2674,7 @@ void Average2_sse2(unsigned char *pDst8, const unsigned char *pSrc1_8, const uns
     pDst8 += nPitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 // 8-32 bits
 template<typename pixel_t>
@@ -2716,23 +2708,28 @@ template void VerticalBilin<uint8_t>(unsigned char *pDst, const unsigned char *p
 template void VerticalBilin<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void VerticalBilin<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
+#ifdef INTEL_INTRINSICS
 template void VerticalBilin_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeigh, int bits_per_pixelt);
 template void VerticalBilin_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 template void HorizontalBilin<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalBilin<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalBilin<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
+#ifdef INTEL_INTRINSICS
 template void HorizontalBilin_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalBilin_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 template void DiagonalBilin<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void DiagonalBilin<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void DiagonalBilin<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
-template void DiagonalBilin_sse2<uint8_t, 0>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void DiagonalBilin_sse2<uint16_t, 0>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void DiagonalBilin_sse2<uint16_t, 1>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+template void DiagonalBilin_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+template void DiagonalBilin_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 template void RB2F<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags);
 template void RB2F<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int y_beg, int y_end, int cpuFlags);
@@ -2758,17 +2755,19 @@ template void VerticalWiener<uint8_t>(unsigned char *pDst, const unsigned char *
 template void VerticalWiener<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void VerticalWiener<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
-template void VerticalWiener_sse2<uint8_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void VerticalWiener_sse2<uint16_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void VerticalWiener_sse2<uint16_t, true>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+template void VerticalWiener_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+template void VerticalWiener_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 template void HorizontalWiener<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalWiener<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalWiener<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
-template void HorizontalWiener_sse2<uint8_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void HorizontalWiener_sse2<uint16_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void HorizontalWiener_sse2<uint16_t, true>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+template void HorizontalWiener_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+template void HorizontalWiener_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 #if 0 // not used
 template void DiagonalWiener<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
@@ -2779,18 +2778,19 @@ template void VerticalBicubic<uint8_t>(unsigned char *pDst, const unsigned char 
 template void VerticalBicubic<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void VerticalBicubic<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
-template void VerticalBicubic_sse2<uint8_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void VerticalBicubic_sse2<uint8_t, true>(unsigned char* pDst, const unsigned char* pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void VerticalBicubic_sse2<uint16_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void VerticalBicubic_sse2<uint16_t, true>(unsigned char* pDst, const unsigned char* pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+template void VerticalBicubic_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+template void VerticalBicubic_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 template void HorizontalBicubic<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalBicubic<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 template void HorizontalBicubic<float>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
 
-template void HorizontalBicubic_sse2<uint8_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void HorizontalBicubic_sse2<uint16_t, false>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
-template void HorizontalBicubic_sse2<uint16_t, true>(unsigned char* pDst, const unsigned char* pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+template void HorizontalBicubic_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+template void HorizontalBicubic_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif // INTEL_INTRINSICS
 
 #if 0 // not used
 template void DiagonalBicubic<uint8_t>(unsigned char *pDst, const unsigned char *pSrc, int nDstPitch, int nSrcPitch, int nWidth, int nHeight, int bits_per_pixel);
@@ -2802,6 +2802,8 @@ template void Average2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc1,
 template void Average2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc1, const unsigned char *pSrc2, int nPitch, int nWidth, int nHeight);
 template void Average2<float>(unsigned char *pDst, const unsigned char *pSrc1, const unsigned char *pSrc2, int nPitch, int nWidth, int nHeight);
 
+#ifdef INTEL_INTRINSICS
 template void Average2_sse2<uint8_t>(unsigned char *pDst, const unsigned char *pSrc1, const unsigned char *pSrc2, int nPitch, int nWidth, int nHeight);
 template void Average2_sse2<uint16_t>(unsigned char *pDst, const unsigned char *pSrc1, const unsigned char *pSrc2, int nPitch, int nWidth, int nHeight);
+#endif // INTEL_INTRINSICS
 

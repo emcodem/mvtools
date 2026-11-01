@@ -59,6 +59,15 @@
 // 20251127  V12 CACHE_INFORM_NUM_THREADS CachePolicyHint enum to inform the filter about the number of threads by SetCacheHints
 //               New env property AEP_CACHESIZE_L2
 // 20251202      GetCPUFlagsEx returning full 64 bit flags, new AVX-512 group flags, ARM64 CPU flags.
+// 202608xx  V13 New pixel formats: YUV(A) 4:4:0, 4:1:1, 4:1:0 at all bit depths, YA (Y plus alpha)
+//               CS_GENERIC_YUV440/411/410, CS_GENERIC_YA and CS_xxx constants
+//               New VideoInfo::Is440, IsYA, Is410, Is411
+// 20261018  V13.1 CACHE_USER_FORWARD_BEGIN..CACHE_USER_FORWARD_END CachePolicyHint range: passed upstream through
+//               the core's cache/MT guard/Prefetch/OnCPU/OnCUDA wrappers (#521)
+//               CS_xxx_CHROMA_PLACEMENT (AvsChromaPlacement) marked deprecated: never implemented, use _ChromaLocation
+// 20261019  V14 AVSValue::AsFunction exported (was internal): get the PFunction of an 'n' type value
+//               for Invoke3/Invoke3Try.
+//               C API V14 additions in parallel (see avisynth_c.h)
 
 // http://avisynth.nl
 
@@ -95,8 +104,8 @@
 // graphical user interfaces.
 
 
-#ifndef __AVISYNTH_12_H__
-#define __AVISYNTH_12_H__
+#ifndef __AVISYNTH_14_H__
+#define __AVISYNTH_14_H__
 
 #include "avs/config.h"
 #include "avs/capi.h"
@@ -129,7 +138,7 @@ enum AvsVersion {
   AVISYNTH_CLASSIC_INTERFACE_VERSION_25 = 3,
   AVISYNTH_CLASSIC_INTERFACE_VERSION_26BETA = 5,
   AVISYNTH_CLASSIC_INTERFACE_VERSION = 6,
-  AVISYNTH_INTERFACE_VERSION = 12,
+  AVISYNTH_INTERFACE_VERSION = 14,
   AVISYNTHPLUS_INTERFACE_BUGFIX_VERSION = 0 // reset to zero whenever the normal interface version bumps
 };
 
@@ -480,9 +489,18 @@ struct AVS_Linkage {
   void          (VideoInfo::* SetChannelMask)(bool isChannelMaskKnown, unsigned int dwChannelMask);
   unsigned int  (VideoInfo::* GetChannelMask)() const;
 
+  // V13
+  bool          (VideoInfo::*Is440)() const;
+  bool          (VideoInfo::*IsYA)() const;
+  bool          (VideoInfo::*Is410)() const;
+  bool          (VideoInfo::*Is411)() const;
+
+  // V14
+  PFunction     (AVSValue::*AVSValue_AsFunction)() const;
+
   /**********************************************************************/
   // Reserve pointer space for Avisynth+
-  void          (VideoInfo::* reserved2[64 - 31])();
+  void          (VideoInfo::* reserved2[64 - 36])();
   /**********************************************************************/
 
   // AviSynth Neo additions
@@ -515,17 +533,22 @@ extern const AVS_Linkage* AVS_linkage;
 # endif
 
 # define AVS_BakedCode(arg) { arg ; }
-# define AVS_LinkCall(arg)  !AVS_linkage || offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size ?     0 : (this->*(AVS_linkage->arg))
-# define AVS_LinkCall_Void(arg)  !AVS_linkage || offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size ?     (void)0 : (this->*(AVS_linkage->arg))
-# define AVS_LinkCallV(arg) !AVS_linkage || offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size ? *this : (this->*(AVS_linkage->arg))
+// Linkage entry validity check:
+// - AVS_linkage exists
+// - the entry fits within the runtime's AVS_Linkage (Size)
+// - the entry is not null: new entries fill up the reserved area, which older runtimes have zero-filled
+# define AVS_LinkIsMissing(arg) (!AVS_linkage || offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size || !AVS_linkage->arg)
+# define AVS_LinkCall(arg)  AVS_LinkIsMissing(arg) ?     0 : (this->*(AVS_linkage->arg))
+# define AVS_LinkCall_Void(arg)  AVS_LinkIsMissing(arg) ?     (void)0 : (this->*(AVS_linkage->arg))
+# define AVS_LinkCallV(arg) AVS_LinkIsMissing(arg) ? *this : (this->*(AVS_linkage->arg))
 // Helper macros for fallback option when a function does not exists
 #define CALL_MEMBER_FN(object,ptrToMember)  ((object)->*(ptrToMember))
 #define AVS_LinkCallOpt(arg, argOpt)  !AVS_linkage ? 0 : \
-                                      ( offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size ? \
-                                        (offsetof(AVS_Linkage, argOpt) >= (size_t)AVS_linkage->Size ? 0 : CALL_MEMBER_FN(this, AVS_linkage->argOpt)() ) : \
+                                      ( AVS_LinkIsMissing(arg) ? \
+                                        (AVS_LinkIsMissing(argOpt) ? 0 : CALL_MEMBER_FN(this, AVS_linkage->argOpt)() ) : \
                                         CALL_MEMBER_FN(this, AVS_linkage->arg)() )
 // AVS_LinkCallOptDefault puts automatically () only after arg
-# define AVS_LinkCallOptDefault(arg, argDefaultValue)  !AVS_linkage || offsetof(AVS_Linkage, arg) >= (size_t)AVS_linkage->Size ? (argDefaultValue) : ((this->*(AVS_linkage->arg))())
+# define AVS_LinkCallOptDefault(arg, argDefaultValue)  AVS_LinkIsMissing(arg) ? (argDefaultValue) : ((this->*(AVS_linkage->arg))())
 
 #endif
 
@@ -659,7 +682,7 @@ struct VideoInfo {
     for packed RGB(A): only 8 and 16 bits are valid
     
     Other YV12 specific (will never be used)
-      C  20-23 Chroma Placement values 0-4; see CS_xxx_CHROMA_PLACEMENT
+      C  20-23 Chroma Placement values 0-4; see CS_xxx_CHROMA_PLACEMENT (deprecated, unused)
     
     Color family and layout
                            Packed      Planar               Planar  Planar
@@ -730,21 +753,28 @@ struct VideoInfo {
     CS_GENERIC_YUV422  = CS_PLANAR | CS_YUV | CS_VPlaneFirst | CS_Sub_Width_2 | CS_Sub_Height_1,  // 4:2:2 planar
     CS_GENERIC_YUV420  = CS_PLANAR | CS_YUV | CS_VPlaneFirst | CS_Sub_Width_2 | CS_Sub_Height_2,  // 4:2:0 planar
     CS_GENERIC_Y       = CS_PLANAR | CS_INTERLEAVED | CS_YUV,                                     // Y only (4:0:0)
+    CS_GENERIC_YA      = CS_PLANAR | CS_INTERLEAVED | CS_YUVA,                                    // Y plus alpha (4:0:0:A)
     CS_GENERIC_RGBP    = CS_PLANAR | CS_BGR | CS_RGB_TYPE,                                        // planar RGB. Though name is RGB but plane order G,B,R
     CS_GENERIC_RGBAP   = CS_PLANAR | CS_BGR | CS_RGBA_TYPE,                                       // planar RGBA
     CS_GENERIC_YUVA444 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_1 | CS_Sub_Height_1, // 4:4:4:A planar
     CS_GENERIC_YUVA422 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_2 | CS_Sub_Height_1, // 4:2:2:A planar
     CS_GENERIC_YUVA420 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_2 | CS_Sub_Height_2, // 4:2:0:A planar
+    CS_GENERIC_YUV440  = CS_PLANAR | CS_YUV  | CS_VPlaneFirst | CS_Sub_Width_1 | CS_Sub_Height_2, // 4:4:0 planar, 2026-07-29
+    CS_GENERIC_YUVA440 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_1 | CS_Sub_Height_2, // 4:4:0:A planar, 2026-07-29
+    CS_GENERIC_YUV411  = CS_PLANAR | CS_YUV  | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_1, // 4:1:1 planar, 2026-08-25
+    CS_GENERIC_YUVA411 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_1, // 4:1:1:A planar, 2026-08-25
+    CS_GENERIC_YUV410  = CS_PLANAR | CS_YUV  | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_4, // 4:1:0 planar, 2026-08-25
+    CS_GENERIC_YUVA410 = CS_PLANAR | CS_YUVA | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_4, // 4:1:0:A planar, 2026-08-25
 
     CS_YV24  = CS_GENERIC_YUV444 | CS_Sample_Bits_8,  // YVU 4:4:4 planar
     CS_YV16  = CS_GENERIC_YUV422 | CS_Sample_Bits_8,  // YVU 4:2:2 planar
     CS_YV12  = CS_GENERIC_YUV420 | CS_Sample_Bits_8,  // YVU 4:2:0 planar
     CS_I420  = CS_PLANAR | CS_YUV | CS_Sample_Bits_8 | CS_UPlaneFirst | CS_Sub_Width_2 | CS_Sub_Height_2,  // YUV 4:2:0 planar
     CS_IYUV  = CS_I420,
-    CS_YUV9  = CS_PLANAR | CS_YUV | CS_Sample_Bits_8 | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_4,  // YUV 4:1:0 planar
-    CS_YV411 = CS_PLANAR | CS_YUV | CS_Sample_Bits_8 | CS_VPlaneFirst | CS_Sub_Width_4 | CS_Sub_Height_1,  // YUV 4:1:1 planar
+    CS_YUV9  = CS_GENERIC_YUV410 | CS_Sample_Bits_8,  // YUV 4:1:0 planar
+    CS_YV411 = CS_GENERIC_YUV411 | CS_Sample_Bits_8,  // YUV 4:1:1 planar
 
-    CS_Y8    = CS_GENERIC_Y | CS_Sample_Bits_8,                                                            // Y   4:0:0 planar
+    CS_Y8    = CS_GENERIC_Y | CS_Sample_Bits_8,       // Y   4:0:0 planar
 
     //-------------------------
     // AVS16: new planar constants go live! Experimental PF 160613
@@ -820,9 +850,64 @@ struct VideoInfo {
     CS_YUVA422P16 = CS_GENERIC_YUVA422 | CS_Sample_Bits_16, // YUVA 4:2:2 16bit samples
     CS_YUVA420P16 = CS_GENERIC_YUVA420 | CS_Sample_Bits_16, // YUVA 4:2:0 16bit samples
 
-    CS_YUVA444PS  = CS_GENERIC_YUVA444 | CS_Sample_Bits_32,  // YUVA 4:4:4 32bit samples
-    CS_YUVA422PS  = CS_GENERIC_YUVA422 | CS_Sample_Bits_32,  // YUVA 4:2:2 32bit samples
-    CS_YUVA420PS  = CS_GENERIC_YUVA420 | CS_Sample_Bits_32,  // YUVA 4:2:0 32bit samples
+    CS_YUVA444PS  = CS_GENERIC_YUVA444 | CS_Sample_Bits_32, // YUVA 4:4:4 32bit samples
+    CS_YUVA422PS  = CS_GENERIC_YUVA422 | CS_Sample_Bits_32, // YUVA 4:2:2 32bit samples
+    CS_YUVA420PS  = CS_GENERIC_YUVA420 | CS_Sample_Bits_32, // YUVA 4:2:0 32bit samples
+
+    // Planar YUV(A) 4:4:0, 2026-07-29
+    CS_YUV440     = CS_GENERIC_YUV440 | CS_Sample_Bits_8,  // YUV 4:4:0 8bit samples
+    CS_YUV440P10  = CS_GENERIC_YUV440 | CS_Sample_Bits_10, // YUV 4:4:0 10bit samples
+    CS_YUV440P12  = CS_GENERIC_YUV440 | CS_Sample_Bits_12, // YUV 4:4:0 12bit samples
+    CS_YUV440P14  = CS_GENERIC_YUV440 | CS_Sample_Bits_14, // YUV 4:4:0 14bit samples
+    CS_YUV440P16  = CS_GENERIC_YUV440 | CS_Sample_Bits_16, // YUV 4:4:0 16bit samples
+    CS_YUV440PS   = CS_GENERIC_YUV440 | CS_Sample_Bits_32, // YUV 4:4:0 32bit samples
+
+    CS_YUVA440    = CS_GENERIC_YUVA440 | CS_Sample_Bits_8,  // YUVA 4:4:0 8bit samples
+    CS_YUVA440P10 = CS_GENERIC_YUVA440 | CS_Sample_Bits_10, // YUVA 4:4:0 10bit samples
+    CS_YUVA440P12 = CS_GENERIC_YUVA440 | CS_Sample_Bits_12, // YUVA 4:4:0 12bit samples
+    CS_YUVA440P14 = CS_GENERIC_YUVA440 | CS_Sample_Bits_14, // YUVA 4:4:0 14bit samples
+    CS_YUVA440P16 = CS_GENERIC_YUVA440 | CS_Sample_Bits_16, // YUVA 4:4:0 16bit samples
+    CS_YUVA440PS  = CS_GENERIC_YUVA440 | CS_Sample_Bits_32, // YUVA 4:4:0 32bit samples
+
+    // Planar YUV(A) 4:1:1 additional bitdepths, 2026-08-25
+    CS_YUV411     = CS_YV411,                              // YUV 4:1:1 8bit samples
+    CS_YUV411P10  = CS_GENERIC_YUV411 | CS_Sample_Bits_10, // YUV 4:1:1 10bit samples
+    CS_YUV411P12  = CS_GENERIC_YUV411 | CS_Sample_Bits_12, // YUV 4:1:1 12bit samples
+    CS_YUV411P14  = CS_GENERIC_YUV411 | CS_Sample_Bits_14, // YUV 4:1:1 14bit samples
+    CS_YUV411P16  = CS_GENERIC_YUV411 | CS_Sample_Bits_16, // YUV 4:1:1 16bit samples
+    CS_YUV411PS   = CS_GENERIC_YUV411 | CS_Sample_Bits_32, // YUV 4:1:1 32bit samples
+
+    CS_YUVA411    = CS_GENERIC_YUVA411 | CS_Sample_Bits_8,  // YUVA 4:1:1 8bit samples
+    CS_YUVA411P10 = CS_GENERIC_YUVA411 | CS_Sample_Bits_10, // YUVA 4:1:1 10bit samples
+    CS_YUVA411P12 = CS_GENERIC_YUVA411 | CS_Sample_Bits_12, // YUVA 4:1:1 12bit samples
+    CS_YUVA411P14 = CS_GENERIC_YUVA411 | CS_Sample_Bits_14, // YUVA 4:1:1 14bit samples
+    CS_YUVA411P16 = CS_GENERIC_YUVA411 | CS_Sample_Bits_16, // YUVA 4:1:1 16bit samples
+    CS_YUVA411PS  = CS_GENERIC_YUVA411 | CS_Sample_Bits_32, // YUVA 4:1:1 32bit samples
+
+    // Planar YUV(A) 4:1:0, 2026-08-25
+    CS_YUV410     = CS_YUV9,                               // YUV 4:1:0 8bit samples
+    CS_YUV410P10  = CS_GENERIC_YUV410 | CS_Sample_Bits_10, // YUV 4:1:0 10bit samples
+    CS_YUV410P12  = CS_GENERIC_YUV410 | CS_Sample_Bits_12, // YUV 4:1:0 12bit samples
+    CS_YUV410P14  = CS_GENERIC_YUV410 | CS_Sample_Bits_14, // YUV 4:1:0 14bit samples
+    CS_YUV410P16  = CS_GENERIC_YUV410 | CS_Sample_Bits_16, // YUV 4:1:0 16bit samples
+    CS_YUV410PS   = CS_GENERIC_YUV410 | CS_Sample_Bits_32, // YUV 4:1:0 32bit samples
+
+    CS_YUVA410    = CS_GENERIC_YUVA410 | CS_Sample_Bits_8,  // YUVA 4:1:0 8bit samples
+    CS_YUVA410P10 = CS_GENERIC_YUVA410 | CS_Sample_Bits_10, // YUVA 4:1:0 10bit samples
+    CS_YUVA410P12 = CS_GENERIC_YUVA410 | CS_Sample_Bits_12, // YUVA 4:1:0 12bit samples
+    CS_YUVA410P14 = CS_GENERIC_YUVA410 | CS_Sample_Bits_14, // YUVA 4:1:0 14bit samples
+    CS_YUVA410P16 = CS_GENERIC_YUVA410 | CS_Sample_Bits_16, // YUVA 4:1:0 16bit samples
+    CS_YUVA410PS  = CS_GENERIC_YUVA410 | CS_Sample_Bits_32, // YUVA 4:1:0 32bit samples
+
+    // Y plus alpha 4:0:0, 2026-08-25
+    CS_YA8  = CS_GENERIC_YA | CS_Sample_Bits_8,  // Y plus alpha 4:0:0 8bit samples
+    CS_YA10 = CS_GENERIC_YA | CS_Sample_Bits_10, // Y plus alpha 4:0:0 10bit samples
+    CS_YA12 = CS_GENERIC_YA | CS_Sample_Bits_12, // Y plus alpha 4:0:0 12bit samples
+    CS_YA14 = CS_GENERIC_YA | CS_Sample_Bits_14, // Y plus alpha 4:0:0 14bit samples
+    CS_YA16 = CS_GENERIC_YA | CS_Sample_Bits_16, // Y plus alpha 4:0:0 16bit samples
+    CS_YAS  = CS_GENERIC_YA | CS_Sample_Bits_32, // Y plus alpha 4:0:0 32bit samples, float
+
+    CS_YS  = CS_Y32 // Y   4:0:0 32bit samples, float
   };
 
   int pixel_type;                // changed to int as of 2.5
@@ -871,7 +956,8 @@ struct VideoInfo {
     IT_NEXT_AVAILABLE = 1 << 23
   };
 
-  // Chroma placement bits 20 -> 23  ::FIXME:: Really want a Class to support this
+  // DEPRECATED, do not use. Classic 2.6 leftover, never implemented: pixel_type bits 20 -> 23
+  // are neither set nor read anywhere. Use the _ChromaLocation frame property instead.
   enum AvsChromaPlacement {
     CS_UNKNOWN_CHROMA_PLACEMENT = 0 << 20,
     CS_MPEG1_CHROMA_PLACEMENT   = 1 << 20,
@@ -991,6 +1077,12 @@ struct VideoInfo {
   bool IsChannelMaskKnown() const AVS_BakedCode(return AVS_LinkCallOptDefault(IsChannelMaskKnown, false) )
   void SetChannelMask(bool isChannelMaskKnown, unsigned int dwChannelMask) AVS_BakedCode(AVS_LinkCall_Void(SetChannelMask)(isChannelMaskKnown, dwChannelMask))
   unsigned int GetChannelMask() const AVS_BakedCode(return AVS_LinkCallOptDefault(GetChannelMask, 0) )
+
+  // v13
+  bool Is440() const AVS_BakedCode( return AVS_LinkCallOptDefault(Is440, false) )
+  bool IsYA() const AVS_BakedCode( return AVS_LinkCallOptDefault(IsYA, false) )
+  bool Is410() const AVS_BakedCode( return AVS_LinkCallOptDefault(Is410, false) )
+  bool Is411() const AVS_BakedCode( return AVS_LinkCallOpt(Is411, IsYV411) )
 
 }; // end struct VideoInfo
 
@@ -1252,7 +1344,14 @@ enum CachePolicyHint {
   CACHE_GET_DEV_TYPE,          // Device types a filter can return
   CACHE_GET_CHILD_DEV_TYPE,    // Device types a filter can receive
 
-  CACHE_USER_CONSTANTS = 1000       // Smaller values are reserved for the core
+  CACHE_USER_CONSTANTS = 1000,      // Smaller values are reserved for the core
+
+  // v13.1
+  // User defined hints in this range are passed upstream through the core's internal
+  // wrappers (cache, MT guard, Prefetch, OnCPU/OnCUDA), returning the result of the
+  // filter.
+  CACHE_USER_FORWARD_BEGIN = 0x40000000,
+  CACHE_USER_FORWARD_END = 0x7FFFFFFF // inclusive
 };
 
 // Base class for all filters.
@@ -1395,7 +1494,9 @@ public:
   double AsFloat(float def) const AVS_BakedCode( return AVS_LinkCall(AsFloat2)(def) )
   float AsFloatf(float def) const AVS_BakedCode( return float( AVS_LinkCall(AsFloat2)(def) ) )
   const char* AsString(const char* def) const AVS_BakedCode( return AVS_LinkCall(AsString2)(def) )
-  PFunction AsFunction() const; // internal use only
+  // V14: function value ('n' type) for Invoke3/Invoke3Try. Check IsFunction() first.
+  // Empty PFunction on a runtime older than V14. Plugin-side body is after class PFunction (needs complete type).
+  PFunction AsFunction() const;
 
   int ArraySize() const AVS_BakedCode( return AVS_LinkCall(ArraySize)() )
 
@@ -1515,6 +1616,11 @@ public:
   void DESTRUCTOR();
 #endif
 };
+
+#if !defined(BUILDING_AVSCORE) && !defined(AVS_STATIC_LIB)
+// V14, out of class AVSValue: PFunction must be a complete type here
+inline PFunction AVSValue::AsFunction() const { return AVS_LinkCallOptDefault(AVSValue_AsFunction, PFunction()); }
+#endif
 
 
 #undef CALL_MEMBER_FN
@@ -2009,7 +2115,7 @@ struct PNeoEnv {
 #if defined(BUILDING_AVSCORE) || defined(AVS_STATIC_LIB)
     ;
 #else
-  : p(!AVS_linkage || offsetof(AVS_Linkage, GetNeoEnv) >= (size_t)AVS_linkage->Size ? 0 : AVS_linkage->GetNeoEnv(env)) { }
+  : p(AVS_LinkIsMissing(GetNeoEnv) ? 0 : AVS_linkage->GetNeoEnv(env)) { }
 #endif
 
   int operator!() const { return !p; }
@@ -2054,4 +2160,4 @@ AVSC_API(IScriptEnvironment2*, CreateScriptEnvironment2)(int version = AVISYNTH_
 
 #pragma pack(pop)
 
-#endif //__AVISYNTH_12_H__
+#endif //__AVISYNTH_14_H__

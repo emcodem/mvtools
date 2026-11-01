@@ -38,6 +38,9 @@
 */
 #include "MVDegrain3.h"
 #include "MDegrainN.h"
+#include "Stacked16.h"
+#include "SuperParams64Bits.h"
+#include "Yuy2Planar.h"
 #include "MVBlockFps.h"
 
 // Analysing filter
@@ -57,15 +60,15 @@
 
 
 
-AVSValue __cdecl Create_Padding(AVSValue args, void* user_data, IScriptEnvironment* env)
+// YUY2 source: the filter is made on its YV16 conversion, the result goes back to YUY2 (Yuy2Planar.h)
+template <typename Make>
+static AVSValue yuy2_wrapped(const PClip& source, bool planar, IScriptEnvironment* env, Make make)
 {
-  return new Padding(
-    args[0].AsClip(),
-    args[1].AsInt(8),
-    args[2].AsInt(8),
-    args[3].AsBool(false), // planar
-    env
-  );
+  const bool yuy2 = source->GetVideoInfo().IsYUY2();
+  PClip result = make(yuy2_to_yv16(source, planar, env));
+  if (yuy2)
+    return yv16_to_yuy2(result, planar, env);
+  return result;
 }
 
 AVSValue __cdecl Create_MVShow(AVSValue args, void* user_data, IScriptEnvironment* env)
@@ -73,7 +76,12 @@ AVSValue __cdecl Create_MVShow(AVSValue args, void* user_data, IScriptEnvironmen
   int sc = 1;
   int sil = 0;
   int tol = 20000;
-  return new MVShow(
+  // a super clip made from a YUY2 source is YV16: the result goes back to YUY2 (Yuy2Planar.h)
+  SuperParams64Bits params;
+  memcpy(&params, &args[0].AsClip()->GetVideoInfo().num_audio_samples, 8);
+  const bool yuy2 = (params.param & SUPER_PARAM_YUY2_SOURCE) != 0;
+  const bool planar = args[10].AsBool(false);
+  PClip show = new MVShow(
     args[0].AsClip(),       // super
     args[1].AsClip(),       // vec
     args[2].AsInt(sc),
@@ -84,17 +92,21 @@ AVSValue __cdecl Create_MVShow(AVSValue args, void* user_data, IScriptEnvironmen
     args[7].AsInt(MV_DEFAULT_SCD1),
     args[8].AsInt(MV_DEFAULT_SCD2),
     args[9].AsBool(true),
-    args[10].AsBool(false), // planar
     env
   );
+  if (yuy2)
+    return yv16_to_yuy2(show, planar, env);
+  return show;
 }
 
 AVSValue __cdecl Create_MVCompensate(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   const sad_t thsad = args[5].AsInt(10000);   // thSAD
 
+  const bool planar = args[11].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVCompensate(
-    args[0].AsClip(),       // source
+    source,       // source
     args[1].AsClip(),       // super
     args[2].AsClip(),       // vec
     args[3].AsBool(true),
@@ -105,28 +117,29 @@ AVSValue __cdecl Create_MVCompensate(AVSValue args, void* user_data, IScriptEnvi
     args[8].AsInt(MV_DEFAULT_SCD1),
     args[9].AsInt(MV_DEFAULT_SCD2),
     args[10].AsBool(true),
-    args[11].AsBool(false), // planar
     args[12].AsBool(true),  // mt
     args[13].AsInt(0),		// tr
     args[14].AsBool(true),	// center
-    args[15].IsClip() ? args[16].AsClip() : 0, // cclip
+    args[15].IsClip() ? yuy2_to_yv16(args[15].AsClip(), planar, env) : 0, // cclip
     args[16].AsInt(thsad),  // thSAD2  todo sad_t float
     args[17].AsBool(false), // gpu
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVSCDetection(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
+  const bool planar = false;
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVSCDetection(
-    args[0].AsClip(),
+    source,
     args[1].AsClip(),
     args[2].AsFloatf(-9999.0f),
     args[3].AsInt(MV_DEFAULT_SCD1),
     args[4].AsInt(MV_DEFAULT_SCD2),
     args[5].AsBool(true),
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnvironment* env)
@@ -192,7 +205,9 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
     args[30].AsBool(false),  // multi
     args[31].AsBool(true),   // mt
     args[32].AsInt(0),   // scaleCSAD
-    args[33].AsBool(false), // gpu
+    args[33].AsInt(3),   // search_coarse default EXHAUSTIVE - svp
+    args[34].AsBool(false),   // trymanyall default false
+    args[35].AsBool(false),   // gpu (ours: after upstream's parameters)
     env
   );
 }
@@ -204,8 +219,10 @@ AVSValue __cdecl Create_MVMask(AVSValue args, void*, IScriptEnvironment* env)
     env->ThrowError("MVMask: ML must be > 0.0");
   float gamma = 1;
   int Ysc = 0;
+  const bool planar = args[10].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVMask(
-    args[0].AsClip(), // source
+    source, // source
     args[1].AsClip(), // vec
     ml,
     args[3].AsFloat(gamma),
@@ -215,9 +232,8 @@ AVSValue __cdecl Create_MVMask(AVSValue args, void*, IScriptEnvironment* env)
     args[7].AsInt(MV_DEFAULT_SCD1),
     args[8].AsInt(MV_DEFAULT_SCD2),
     args[9].AsBool(true),
-    args[10].AsBool(false),
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVDepan(AVSValue args, void*, IScriptEnvironment* env) // Added by Fizick
@@ -252,8 +268,10 @@ AVSValue __cdecl Create_MVFlow(AVSValue args, void*, IScriptEnvironment* env)
     env->ThrowError("MVFlow: Time must be from 0 to 100 percent.");
   }
   int time256 = int(time*256.0 / 100.0);
+  const bool planar = args[9].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVFlow(
-    args[0].AsClip(),      // source
+    source,      // source
     args[1].AsClip(),      // super
     args[2].AsClip(),      // vec
     time256,
@@ -262,10 +280,9 @@ AVSValue __cdecl Create_MVFlow(AVSValue args, void*, IScriptEnvironment* env)
     args[6].AsInt(MV_DEFAULT_SCD1),
     args[7].AsInt(MV_DEFAULT_SCD2),
     args[8].AsBool(true),
-    args[9].AsBool(false), // planar
-    args[10].IsClip() ? args[10].AsClip() : 0,
+    args[10].IsClip() ? yuy2_to_yv16(args[10].AsClip(), planar, env) : 0, // tclip
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVFlowInter(AVSValue args, void*, IScriptEnvironment* env)
@@ -281,8 +298,10 @@ AVSValue __cdecl Create_MVFlowInter(AVSValue args, void*, IScriptEnvironment* en
   {
     env->ThrowError("MVFlowInter: ML must be > 0.0");
   }
+  const bool planar = args[10].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVFlowInter(
-    args[0].AsClip(),       // source
+    source,       // source
     args[1].AsClip(),       // finest
     args[2].AsClip(),       // mvbw
     args[3].AsClip(),       // mvfw
@@ -292,8 +311,7 @@ AVSValue __cdecl Create_MVFlowInter(AVSValue args, void*, IScriptEnvironment* en
     args[7].AsInt(MV_DEFAULT_SCD1),
     args[8].AsInt(MV_DEFAULT_SCD2),
     args[9].AsBool(true),   // isse
-    args[10].AsBool(false), // planar
-    env);
+    env); });
 }
 
 AVSValue __cdecl Create_MVFlowFps(AVSValue args, void*, IScriptEnvironment* env)
@@ -303,8 +321,10 @@ AVSValue __cdecl Create_MVFlowFps(AVSValue args, void*, IScriptEnvironment* env)
   {
     env->ThrowError("MVFlowFps: ML must be > 0.0");
   }
+  const bool planar = args[12].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVFlowFps(
-    args[0].AsClip(),       // source
+    source,       // source
     args[1].AsClip(),       // finest
     args[2].AsClip(),       // mvbw
     args[3].AsClip(),       // mvfw
@@ -316,12 +336,11 @@ AVSValue __cdecl Create_MVFlowFps(AVSValue args, void*, IScriptEnvironment* env)
     args[9].AsInt(MV_DEFAULT_SCD1),
     args[10].AsInt(MV_DEFAULT_SCD2),
     args[11].AsBool(true),  // isse
-    args[12].AsBool(false), // planar
     args[13].AsInt(0), // optDebug
     args[14].AsBool(true),  // mt
     args[15].AsBool(false), // gpu
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVFlowBlur(AVSValue args, void*, IScriptEnvironment* env)
@@ -332,8 +351,10 @@ AVSValue __cdecl Create_MVFlowBlur(AVSValue args, void*, IScriptEnvironment* env
     env->ThrowError("MVFlowBlur: Blur time must be from 0 to 200 percent.");
   }
   int blur256 = int(time*256.0 / 200.0);
+  const bool planar = args[9].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVFlowBlur(
-    args[0].AsClip(),      // source
+    source,      // source
     args[1].AsClip(),      // finest
     args[2].AsClip(),      // mvbw
     args[3].AsClip(),      // mvfw
@@ -342,9 +363,17 @@ AVSValue __cdecl Create_MVFlowBlur(AVSValue args, void*, IScriptEnvironment* env
     args[6].AsInt(MV_DEFAULT_SCD1),
     args[7].AsInt(MV_DEFAULT_SCD2),
     args[8].AsBool(true),  // isse
-    args[9].AsBool(false), // planar
     env
-  );
+  ); });
+}
+
+// lsb=true: the out16=true result in the stacked 16 bit format (Stacked16), the source checks of both
+static void check_lsb_source(const VideoInfo& vi, bool out16, const char* name, IScriptEnvironment* env)
+{
+  if (out16)
+    env->ThrowError("%s : cannot specify both lsb and out16 flag", name);
+  if (!vi.IsY8() && !vi.IsYV12() && !vi.IsYV16() && !vi.IsYV24())
+    env->ThrowError("%s : lsb=true needs an 8 bit Y8, YV12, YV16 or YV24 source (or use out16=true)", name);
 }
 
 AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnvironment* env)
@@ -390,8 +419,16 @@ AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnviro
 
   // change limit. 2.7.25-: use 255 as default for all bit depth. v42: float
   const float limit = args[limit_param_index + param_index_shift].AsFloatf(255.f);
-  return new MVDegrainX(
-    args[0].AsClip(),       // source
+  const bool lsb = args[13 + param_index_shift].AsBool(false);
+  const bool out16 = args[15 + param_index_shift].AsBool(false);
+  if (lsb)
+    check_lsb_source(args[0].AsClip()->GetVideoInfo(), out16, "MDegrainX", env);
+  if (out16 && args[0].AsClip()->GetVideoInfo().IsYUY2())
+    env->ThrowError("MDegrainX : only Y8, YV12, YV16 or YV24 allowed for out16");
+  const bool planar = args[12 + param_index_shift].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
+  PClip degrain = new MVDegrainX(
+    source,                 // source
     args[1].AsClip(),       // super
     args[2].AsClip(),       // mvbw
     args[3].AsClip(),       // mvfw
@@ -413,15 +450,15 @@ AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnviro
     args[9 + param_index_shift].AsInt(MV_DEFAULT_SCD1), // thSCD1
     args[10 + param_index_shift].AsInt(MV_DEFAULT_SCD2), // thSCD2
     args[11 + param_index_shift].AsBool(true),  // isse
-    args[12 + param_index_shift].AsBool(false), // planar
-    args[13 + param_index_shift].AsBool(false), // lsb
     args[14 + param_index_shift].AsBool(true),  // mt
-    args[15 + param_index_shift].AsBool(false),  // out16
-    args[16 + param_index_shift].AsBool(false),  // out32
-    args[17 + param_index_shift].AsBool(false),  // gpu (MDegrain1 only)
+    out16 || lsb,           // out16
+    args[16 + param_index_shift].AsBool(false),  // gpu (ours)
     level,
     env
   );
+  if (lsb)
+    return new Stacked16(degrain, env);
+  return degrain; });
 }
 
 AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
@@ -456,6 +493,15 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
   const float limit = args[7].AsFloatf(255.f); // change limit. 2.7.25-: use 255 as default for all bit depth v42:float
   const int thSAD2 = args[14].AsInt(thSAD);  // thSAD2
   const int thSADC2 = args[15].AsInt(thSADC); // thSADC2
+  const bool lsb = args[13].AsBool(false);
+  const bool out16 = args[17].AsBool(false);
+  if (lsb)
+    check_lsb_source(args[0].AsClip()->GetVideoInfo(), out16, "MDegrainN", env);
+  if (out16 && args[0].AsClip()->GetVideoInfo().IsYUY2())
+    env->ThrowError("MDegrainN : only Y8, YV12, YV16 or YV24 allowed for out16");
+  const bool planar = args[12].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
+  PClip degrain;
 
   // Switch to MDegrain1/2/3/4/5/6 when possible (faster)
   if (thSAD2 == thSAD && thSADC == thSADC2)
@@ -463,8 +509,8 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
     if (tr <= MAX_DEGRAIN) // up to MDegrain5 160926, MDegrain6 170105
     {
 
-      return new MVDegrainX(
-        args[0].AsClip(),        // source
+      degrain = new MVDegrainX(
+        source,                  // source
         args[1].AsClip(),        // super clip
         args[2].AsClip(),        // mvbw
         ::PClip(),                // mvfw
@@ -486,20 +532,18 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
         args[9].AsInt(MV_DEFAULT_SCD1),  // thSCD1
         args[10].AsInt(MV_DEFAULT_SCD2), // thSCD2
         args[11].AsBool(true),   // isse
-        args[12].AsBool(false),  // planar
-        args[13].AsBool(false),  // lsb
         args[16].AsBool(true),   // mt
-        args[17].AsBool(false),  // out16
-        false, // args[18].AsBool(false),  // cannot pass: no out32 parameter for MDegrainN
-        false, // gpu
+        out16 || lsb,            // out16
+        false,                   // gpu: MDegrainN has no gpu parameter
         tr, // PF: level
         env
       );
     }
   }
   // Standard MDegrainN
-  return new MDegrainN(
-    args[0].AsClip(),        // source
+  if (!degrain)
+    degrain = new MDegrainN(
+    source,                  // source
     args[1].AsClip(),        // super clip
     args[2].AsClip(),        // mvmulti
     tr,                        // tr
@@ -511,15 +555,15 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
     args[9].AsInt(MV_DEFAULT_SCD1),  // thSCD1
     args[10].AsInt(MV_DEFAULT_SCD2), // thSCD2
     args[11].AsBool(true),   // isse
-    args[12].AsBool(false),  // planar
-    args[13].AsBool(false),  // lsb
     thSAD2,                    // thSAD2
     thSADC2,                   // thSADC2
     args[16].AsBool(true),   // mt
-    args[17].AsBool(false),   // out16
-    // fixme: out32
+    out16 || lsb,            // out16
     env
   );
+  if (lsb)
+    return new Stacked16(degrain, env);
+  return degrain; });
 }
 
 AVSValue __cdecl Create_MVRecalculate(AVSValue args, void*, IScriptEnvironment* env)
@@ -573,8 +617,10 @@ AVSValue __cdecl Create_MVRecalculate(AVSValue args, void*, IScriptEnvironment* 
 
 AVSValue __cdecl Create_MVBlockFps(AVSValue args, void*, IScriptEnvironment* env)
 {
+  const bool planar = args[12].AsBool(false);
+  return yuy2_wrapped(args[0].AsClip(), planar, env, [&](const PClip& source) -> PClip {
   return new MVBlockFps(
-    args[0].AsClip(),       // src
+    source,       // src
     args[1].AsClip(),       // super
     args[2].AsClip(),       // bw
     args[3].AsClip(),       // fw
@@ -586,16 +632,17 @@ AVSValue __cdecl Create_MVBlockFps(AVSValue args, void*, IScriptEnvironment* env
     args[9].AsInt(MV_DEFAULT_SCD1),
     args[10].AsInt(MV_DEFAULT_SCD2),
     args[11].AsBool(true),  // isse2
-    args[12].AsBool(false), // planar
     args[13].AsBool(true),  // mt
     env
-  );
+  ); });
 }
 
 AVSValue __cdecl Create_MVSuper(AVSValue args, void*, IScriptEnvironment* env)
 {
+  // YUY2: the super clip is made from YV16 (Yuy2Planar.h) and stays YV16, flagged for MShow
+  const bool planar = args[10].AsBool(false);
   return new MVSuper(
-    args[0].AsClip(),      // source
+    yuy2_to_yv16(args[0].AsClip(), planar, env), // source
     args[1].AsInt(8),      // hpad
     args[2].AsInt(8),      // vpad
     args[3].AsInt(2),      // pel
@@ -603,10 +650,10 @@ AVSValue __cdecl Create_MVSuper(AVSValue args, void*, IScriptEnvironment* env)
     args[5].AsBool(true),  // chroma
     args[6].AsInt(2),      // sharp
     args[7].AsInt(2),      // rfilter
-    (args[8].Defined() ? args[8].AsClip() : 0), // pelclip
+    (args[8].Defined() ? yuy2_to_yv16(args[8].AsClip(), planar, env) : 0), // pelclip
     args[9].AsBool(true),   // isse2
-    args[10].AsBool(false), // planar
     args[11].AsBool(true), // mt
+    args[0].AsClip()->GetVideoInfo().IsYUY2(), // yuy2_source
     args[12].AsBool(false), // gpu
     env
   );
@@ -685,7 +732,7 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
 #endif
   env->AddFunction("MShow", "cc[scale]i[sil]i[tol]i[showsad]b[number]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVShow, 0);
-  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[gpu]b", Create_MVAnalyse, 0);
+  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[gpu]b", Create_MVAnalyse, 0);
   env->AddFunction("MMask", "cc[ml]f[gamma]f[kind]i[time]f[Ysc]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVMask, 0);
   env->AddFunction("MCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i[gpu]b", Create_MVCompensate, 0);
   env->AddFunction("MSCDetection", "cc[Ysc]i[thSCD1]i[thSCD2]i[isse]b", Create_MVSCDetection, 0);
@@ -694,12 +741,12 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   env->AddFunction("MFlowInter", "cccc[time]f[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[tclip]c", Create_MVFlowInter, 0);
   env->AddFunction("MFlowFps", "cccc[num]i[den]i[mask]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[optDebug]i[mt]b[gpu]b", Create_MVFlowFps, 0);
   env->AddFunction("MFlowBlur", "cccc[blur]f[prec]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVFlowBlur, 0);
-  env->AddFunction("MDegrain1", "cccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)1);
-  env->AddFunction("MDegrain2", "cccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)2);
-  env->AddFunction("MDegrain3", "cccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)3);
-  env->AddFunction("MDegrain4", "cccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)4);
-  env->AddFunction("MDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)5);
-  env->AddFunction("MDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[out32]b[gpu]b", Create_MVDegrainX, (void *)6);
+  env->AddFunction("MDegrain1", "cccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)1);
+  env->AddFunction("MDegrain2", "cccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)2);
+  env->AddFunction("MDegrain3", "cccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)3);
+  env->AddFunction("MDegrain4", "cccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)4);
+  env->AddFunction("MDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)5);
+  env->AddFunction("MDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)6);
   env->AddFunction("MDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b", Create_MDegrainN, 0);
   env->AddFunction("MRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i[gpu]b", Create_MVRecalculate, 0);
   env->AddFunction("MBlockFps", "cccc[num]i[den]i[mode]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b", Create_MVBlockFps, 0);

@@ -43,8 +43,6 @@ class GroupOfPlanes
   int            divideExtra;
   bool           _mt_flag;
 
-  conc::ObjPool <DCTClass> *
-                 _dct_pool_ptr;
   PlaneOfBlocks **
                  planes;
 
@@ -61,7 +59,7 @@ public :
     SearchType searchType, int nSearchParam, int _PelSearch, int _nLambda,
     sad_t _lsad, int _pnew, int _plevel, bool _global, int flags, int *out,
     short * outfilebuf, int fieldShift, int _pzero, int _pglobal, sad_t badSAD,
-    int badrange, bool meander, int *vecPrev, bool tryMany);
+    int badrange, bool meander, int *vecPrev, bool tryMany, SearchType searchTypeCoarse, bool tryManyAll);
   void           WriteDefaultToArray (int *array);
   int            GetArraySize ();
   void           ExtraDivide (int *out, int flags);

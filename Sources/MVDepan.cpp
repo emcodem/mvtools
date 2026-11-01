@@ -16,6 +16,7 @@
 // Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
 // http://www.gnu.org/copyleft/gpl.html .
 
+#include "ClipFnc.h"
 #include "info.h"
 #include "MVDepan.h"
 
@@ -32,13 +33,19 @@
 MVDepan::MVDepan(PClip _child, PClip mvs, PClip _mask, bool _zoom, bool _rot, float _pixaspect,
   float _error, bool _info, const char * _logfilename, float _wrong, float _zerow, int _range, sad_t nSCD1, int nSCD2, bool isse, bool _planar, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
-  mvclip(mvs, nSCD1, nSCD2, env, 1, 0),
   MVFilter(mvs, "MDepan", env, 1, 0),
-  mask(_mask),
-  planar(_planar),
+  mvclip(mvs, nSCD1, nSCD2, env, 1, 0),
+  ifZoom(_zoom),
+  ifRot(_rot),
+  pixaspect(_pixaspect),
+  error(_error),
+  info(_info),
+  logfilename(_logfilename),
   wrongDif(_wrong),
-  zeroWeight(_zerow), range(_range),
-  ifZoom(_zoom), ifRot(_rot), pixaspect(_pixaspect), error(_error), info(_info), logfilename(_logfilename)
+  zeroWeight(_zerow),
+  range(_range),
+  mask(_mask),
+  planar(_planar)
 {
   has_at_least_v8 = true;
   try { env->CheckVersion(8); }
@@ -124,6 +131,7 @@ void MVDepan::write_depan_data1(unsigned char *dstp, int frame, float motionx, f
     header.signature[i] = signaturegood[i];
   }
 
+  header.reserved = 0;
   header.nframes = 1;// framelast - framefirst +1; // number of frames to write motion info about
 
   int sizeheader = sizeof(header);
@@ -157,6 +165,7 @@ void MVDepan::write_depan_data(unsigned char *dstp, int framefirst, int framelas
     header.signature[i] = signaturegood[i];
   }
 
+  header.reserved = 0;
   header.nframes = framelast - framefirst + 1; // number of frames to write motion info about
 
   int sizeheader = sizeof(header);
@@ -461,29 +470,31 @@ PVideoFrame __stdcall MVDepan::GetFrame(int ndest, IScriptEnvironment* env)
   int src_pitch;
   int dst_pitch;
   const BYTE * maskp;
-  int mask_width;
-  int mask_height;
   int mask_pitch;
 
-  if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsYUY2())
+  if (ClipFnc::is_yuv_any(vi) && !vi.IsYUY2())
   {
-  // copy U
-    srcp = src->GetReadPtr(PLANAR_U);
-    src_width = src->GetRowSize(PLANAR_U);
-    src_height = src->GetHeight(PLANAR_U);
-    src_pitch = src->GetPitch(PLANAR_U);
-    dstp = dst->GetWritePtr(PLANAR_U);
-    dst_pitch = dst->GetPitch(PLANAR_U);
-    env->BitBlt(dstp, dst_pitch, srcp, src_pitch, src_width, src_height);
+    if (!ClipFnc::is_grey(vi)) // Y, YA: no U/V planes
+    {
+      // copy U
+      srcp = src->GetReadPtr(PLANAR_U);
+      src_width = src->GetRowSize(PLANAR_U);
+      src_height = src->GetHeight(PLANAR_U);
+      src_pitch = src->GetPitch(PLANAR_U);
+      dstp = dst->GetWritePtr(PLANAR_U);
+      dst_pitch = dst->GetPitch(PLANAR_U);
+      env->BitBlt(dstp, dst_pitch, srcp, src_pitch, src_width, src_height);
 
-    // copy V
-    srcp = src->GetReadPtr(PLANAR_V);
-    src_width = src->GetRowSize(PLANAR_V);
-    src_height = src->GetHeight(PLANAR_V);
-    src_pitch = src->GetPitch(PLANAR_V);
-    dstp = dst->GetWritePtr(PLANAR_V);
-    dst_pitch = dst->GetPitch(PLANAR_V);
-    env->BitBlt(dstp, dst_pitch, srcp, src_pitch, src_width, src_height);
+      // copy V
+      srcp = src->GetReadPtr(PLANAR_V);
+      src_width = src->GetRowSize(PLANAR_V);
+      src_height = src->GetHeight(PLANAR_V);
+      src_pitch = src->GetPitch(PLANAR_V);
+      dstp = dst->GetWritePtr(PLANAR_V);
+      dst_pitch = dst->GetPitch(PLANAR_V);
+      env->BitBlt(dstp, dst_pitch, srcp, src_pitch, src_width, src_height);
+    }
+    ClipFnc::copy_alpha(dst, src, vi, env);
 
     // copy Y and prepare for output data
     srcp = src->GetReadPtr(PLANAR_Y);
@@ -496,8 +507,6 @@ PVideoFrame __stdcall MVDepan::GetFrame(int ndest, IScriptEnvironment* env)
     if (mask)
     {
       maskp = maskf->GetReadPtr(PLANAR_Y);
-      mask_width = maskf->GetRowSize(PLANAR_Y);
-      mask_height = maskf->GetHeight(PLANAR_Y);
       mask_pitch = maskf->GetPitch(PLANAR_Y);
     }
   }
@@ -513,8 +522,6 @@ PVideoFrame __stdcall MVDepan::GetFrame(int ndest, IScriptEnvironment* env)
     if (mask)
     {
       maskp = maskf->GetReadPtr();
-      mask_width = maskf->GetRowSize();
-      mask_height = maskf->GetHeight();
       mask_pitch = maskf->GetPitch();
     }
   }

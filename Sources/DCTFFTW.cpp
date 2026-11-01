@@ -19,13 +19,21 @@
 
 
 #ifdef _WIN32
+// The Windows SDK's minwindef.h defines STRICT as 1, avs/win.h (external) defines
+// it as empty: drop the previous definition to avoid a redefinition warning.
+#ifdef STRICT
+#undef STRICT
+#endif
 #include "avs/win.h"
 #endif
 
 #include "DCTFFTW.h"
 
 //#define __INTEL_COMPILER_USE_INTRINSIC_PROTOTYPES 1
+#include "types.h"
+#ifdef INTEL_INTRINSICS
 #include <emmintrin.h>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <tuple>
@@ -33,9 +41,12 @@
 #include "types.h"
 #include <avisynth.h>
 #include "def.h"
+#ifdef INTEL_INTRINSICS
 #include <emmintrin.h>
 #include <smmintrin.h>
+#endif
 #include <mutex>
+#include <cmath>
 #include <cassert>
 
 // FFTW is not thread-safe for plan creation/destruction.
@@ -122,6 +133,11 @@ DCTFFTW::DCTFFTW(int _sizex, int _sizey, FFTFunctionPointers &fftfp_preloaded, i
 
   bool isse_flag = true;
   arch_t arch;
+#ifdef NEON_INTRINSICS
+  if ((((cpu & CPUF_ARM_NEON) != 0) & isse_flag))
+    arch = USE_NEON;
+  else
+#endif
   if ((((cpu & CPUF_AVX2) != 0) & isse_flag))
     arch = USE_AVX2;
   else if ((((cpu & CPUF_AVX) != 0) & isse_flag))
@@ -203,6 +219,7 @@ void DCTFFTW::Bytes2Float_C(const unsigned char * srcp, int src_pitch, float * r
   }
 }
 
+#ifdef INTEL_INTRINSICS
 template<typename pixel_t, int nBlkSizeX>
 void DCTFFTW::Bytes2Float_SSE2(const unsigned char * srcp8, int src_pitch, float * realdata)
 {
@@ -296,7 +313,9 @@ void DCTFFTW::Bytes2Float_SSE2(const unsigned char * srcp8, int src_pitch, float
     realdata += floatpitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
+#ifdef INTEL_INTRINSICS
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4309)
@@ -504,6 +523,7 @@ void DCTFFTW::Float2Bytes_uint16_t_SSE4(unsigned char* dstp0, int dst_pitch, flo
   // overwrite very first
   dstp_save[0] = (pixel_t)first_integ;
 }
+#endif // INTEL_INTRINSICS
 
 
 template <typename pixel_t>
@@ -518,12 +538,15 @@ void DCTFFTW::Float2Bytes_C(unsigned char * dstp0, int dst_pitch, float * realda
   const int middlePixelValue = 1 << (bits_per_pixel - 1);   // 128..32768 
 
   // normalization: to be compatible with integer DCTINT8
+  // AC: rounded to nearest. The coefficients are only compared by SAD (src vs ref block): nearest (and floor) give
+  // an unbiased |q(a) - q(b)|, truncation toward zero has a dead zone around 0 that lowers it (about -0.25 per coefficient).
+  // DC: never negative (REDFT10 of raw pixels), there truncation is a floor: also unbiased.
   dstp[0] = (pixel_t)std::min(maxPixelValue, std::max(0, int(realdata[0] * dctNormalize_DC) + middlePixelValue)); // DC;
 
   for (int i = 1; i < sizex; i += 1)
   {
     const float f = realdata[i] * dctNormalize_AC; // to be compatible with integer DCTINT8
-    dstp[i] = (pixel_t)std::min(maxPixelValue, std::max(0, int(f) + middlePixelValue));
+    dstp[i] = (pixel_t)std::min(maxPixelValue, std::max(0, int(std::lrint(f)) + middlePixelValue));
   }
 
   dstp += dst_pitch;
@@ -534,7 +557,7 @@ void DCTFFTW::Float2Bytes_C(unsigned char * dstp0, int dst_pitch, float * realda
     for (int i = 0; i < sizex; i += 1)
     {
       const float f = realdata[i] * dctNormalize_AC; // to be compatible with integer DCTINT8
-      dstp[i] = (pixel_t)std::min(maxPixelValue, std::max(0, int(f) + middlePixelValue));
+      dstp[i] = (pixel_t)std::min(maxPixelValue, std::max(0, int(std::lrint(f)) + middlePixelValue));
     }
     dstp += dst_pitch;
     realdata += floatpitch;
@@ -547,6 +570,7 @@ DCTFFTW::Float2BytesFunction DCTFFTW::get_floatToBytesPROC_function(int BlockX, 
   std::map<std::tuple<int, int, arch_t>, DCTFFTW::Float2BytesFunction> func;
   using std::make_tuple;
 
+#ifdef INTEL_INTRINSICS
   // SSE4
   
   // uint8_t
@@ -576,9 +600,15 @@ DCTFFTW::Float2BytesFunction DCTFFTW::get_floatToBytesPROC_function(int BlockX, 
   func[make_tuple(16, 1, USE_SSE2)] = &DCTFFTW::Float2Bytes_SSE2<16>;
   func[make_tuple(12, 1, USE_SSE2)] = &DCTFFTW::Float2Bytes_SSE2<12>; // mod4 allowed
   func[make_tuple(8, 1, USE_SSE2)] = &DCTFFTW::Float2Bytes_SSE2<8>;
+#endif // INTEL_INTRINSICS
+#ifdef NEON_INTRINSICS
+  // any width
+  func[make_tuple(BlockX, 1, USE_NEON)] = &DCTFFTW::Float2Bytes_neon<uint8_t>;
+  func[make_tuple(BlockX, 2, USE_NEON)] = &DCTFFTW::Float2Bytes_neon<uint16_t>;
+#endif
   
   DCTFFTW::Float2BytesFunction result = nullptr;
-  arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+  arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
   int index = 0;
   while (result == nullptr) {
     arch_t current_arch_try = archlist[index++];
@@ -598,6 +628,7 @@ DCTFFTW::Bytes2FloatFunction DCTFFTW::get_bytesToFloatPROC_function(int BlockX, 
   std::map<std::tuple<int, int, arch_t>, DCTFFTW::Bytes2FloatFunction> func;
   using std::make_tuple;
 
+#ifdef INTEL_INTRINSICS
   // SSE2
   
   // uint8_t
@@ -618,9 +649,15 @@ DCTFFTW::Bytes2FloatFunction DCTFFTW::get_bytesToFloatPROC_function(int BlockX, 
   func[make_tuple(12, 2, USE_SSE2)] = &DCTFFTW::Bytes2Float_SSE2<uint16_t, 12>; // 12 ok, mod4 handled
   func[make_tuple(8, 2, USE_SSE2)] = &DCTFFTW::Bytes2Float_SSE2<uint16_t, 8>;
   func[make_tuple(4, 2, USE_SSE2)] = &DCTFFTW::Bytes2Float_SSE2<uint16_t, 4>;
+#endif // INTEL_INTRINSICS
   
+#ifdef NEON_INTRINSICS
+  // any width
+  func[make_tuple(BlockX, 1, USE_NEON)] = &DCTFFTW::Bytes2Float_neon<uint8_t>;
+  func[make_tuple(BlockX, 2, USE_NEON)] = &DCTFFTW::Bytes2Float_neon<uint16_t>;
+#endif
   DCTFFTW::Bytes2FloatFunction result = nullptr;
-  arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+  arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
   int index = 0;
   while (result == nullptr) {
     arch_t current_arch_try = archlist[index++];

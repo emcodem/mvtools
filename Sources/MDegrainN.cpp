@@ -12,8 +12,10 @@
 #include "ProfSkip.h"
 #include "SuperParams64Bits.h"
 
+#ifdef INTEL_INTRINSICS
 #include	<emmintrin.h>
 #include	<mmintrin.h>
+#endif
 
 #include	<cassert>
 #include	<cmath>
@@ -21,14 +23,17 @@
 #include <tuple>
 #include <stdint.h>
 #include "commonfunctions.h"
+#include "BlockSizes.h"
+#ifdef NEON_INTRINSICS
+#include "MDegrainN_neon.h"
+#endif
 
 // out16_type: 
 //   0: native 8 or 16
-//   1: 8bit in, lsb
 //   2: 8bit in, native16 out
 template <typename pixel_t, int blockWidth, int blockHeight, int out16_type>
 void DegrainN_C(
-  BYTE* pDst, BYTE* pDstLsb, int nDstPitch,
+  BYTE* pDst, int nDstPitch,
   const BYTE* pSrc, int nSrcPitch,
   const BYTE* pRef[], int Pitch[],
   int Wall[], int trad
@@ -36,10 +41,9 @@ void DegrainN_C(
 {
   // for less template, see solution in Degrain1to6_C
 
-  constexpr bool lsb_flag = (out16_type == 1);
   constexpr bool out16 = (out16_type == 2);
 
-  if constexpr (lsb_flag || out16)
+  if constexpr (out16)
   {
     // 8 bit base only
     for (int h = 0; h < blockHeight; ++h)
@@ -52,18 +56,10 @@ void DegrainN_C(
           val += pRef[k * 2][x] * Wall[k * 2 + 1]
             + pRef[k * 2 + 1][x] * Wall[k * 2 + 2];
         }
-        if constexpr (lsb_flag) {
-          pDst[x] = (uint8_t)(val >> 8);
-          pDstLsb[x] = (uint8_t)(val & 255);
-        }
-        else { // out16
-          reinterpret_cast<uint16_t*>(pDst)[x] = (uint16_t)val;
-        }
+        reinterpret_cast<uint16_t*>(pDst)[x] = (uint16_t)val;
       }
 
       pDst += nDstPitch;
-      if constexpr (lsb_flag)
-        pDstLsb += nDstPitch;
       pSrc += nSrcPitch;
       for (int k = 0; k < trad; ++k)
       {
@@ -110,13 +106,13 @@ void DegrainN_C(
 // Debug note: DegrainN filter is calling Degrain1-6 instead if ThSAD(C) == ThSAD(C)2.
 // To reach DegrainN_ functions, set the above parameters to different values
 
+#ifdef INTEL_INTRINSICS
 // out16_type: 
 //   0: native 8 or 16
-//   1: 8bit in, lsb
 //   2: 8bit in, native16 out
 template <int blockWidth, int blockHeight, int out16_type>
 void DegrainN_sse2(
-  BYTE *pDst, BYTE *pDstLsb, int nDstPitch,
+  BYTE *pDst, int nDstPitch,
   const BYTE *pSrc, int nSrcPitch,
   const BYTE *pRef[], int Pitch[],
   int Wall[], int trad
@@ -125,7 +121,6 @@ void DegrainN_sse2(
   assert(blockWidth % 4 == 0);
   // only mod4 supported
 
-  constexpr bool lsb_flag = (out16_type == 1);
   constexpr bool out16 = (out16_type == 2);
 
   const __m128i z = _mm_setzero_si128();
@@ -133,10 +128,9 @@ void DegrainN_sse2(
   constexpr bool is_mod8 = blockWidth % 8 == 0;
   constexpr int pixels_at_a_time = is_mod8 ? 8 : 4; // 4 for 4 and 12; 8 for all others 8, 16, 24, 32...
 
-  if constexpr(lsb_flag || out16)
+  if constexpr (out16)
   {
     // no rounding
-    const __m128i m = _mm_set1_epi16(255);
 
     for (int h = 0; h < blockHeight; ++h)
     {
@@ -165,28 +159,12 @@ void DegrainN_sse2(
           val = _mm_add_epi16(val, s1);
           val = _mm_add_epi16(val, s2);
         }
-        if constexpr(is_mod8) {
-          if constexpr(lsb_flag) {
-            _mm_storel_epi64((__m128i*)(pDst + x), _mm_packus_epi16(_mm_srli_epi16(val, 8), z));
-            _mm_storel_epi64((__m128i*)(pDstLsb + x), _mm_packus_epi16(_mm_and_si128(val, m), z));
-          }
-          else {
-            _mm_storeu_si128((__m128i*)(pDst + x * 2), val);
-          }
-        }
-        else {
-          if constexpr(lsb_flag) {
-            *(uint32_t*)(pDst + x) = _mm_cvtsi128_si32(_mm_packus_epi16(_mm_srli_epi16(val, 8), z));
-            *(uint32_t*)(pDstLsb + x) = _mm_cvtsi128_si32(_mm_packus_epi16(_mm_and_si128(val, m), z));
-          }
-          else {
-            _mm_storel_epi64((__m128i*)(pDst + x * 2), val);
-          }
-        }
+        if constexpr(is_mod8)
+          _mm_storeu_si128((__m128i*)(pDst + x * 2), val);
+        else
+          _mm_storel_epi64((__m128i*)(pDst + x * 2), val);
       }
       pDst += nDstPitch;
-      if constexpr(lsb_flag)
-        pDstLsb += nDstPitch;
       pSrc += nSrcPitch;
       for (int k = 0; k < trad; ++k)
       {
@@ -250,8 +228,11 @@ void DegrainN_sse2(
 }
 
 template<int blockWidth, int blockHeight, bool lessThan16bits>
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
 void DegrainN_16_sse41(
-  BYTE* pDst, BYTE* pDstLsb, int nDstPitch,
+  BYTE* pDst, int nDstPitch,
   const BYTE* pSrc, int nSrcPitch,
   const BYTE* pRef[], int Pitch[],
   int Wall[], int trad
@@ -358,12 +339,12 @@ void DegrainN_16_sse41(
   }
 
 }
+#endif // INTEL_INTRINSICS
 
-MDegrainN::DenoiseNFunction* MDegrainN::get_denoiseN_function(int BlockX, int BlockY, int _bits_per_pixel, bool _lsb_flag, bool _out16_flag, arch_t arch)
+MDegrainN::DenoiseNFunction* MDegrainN::get_denoiseN_function(int BlockX, int BlockY, int _bits_per_pixel, bool _out16_flag, arch_t arch)
 {
   //---------- DENOISE/DEGRAIN
   const int DEGRAIN_TYPE_8BIT = 1;
-  const int DEGRAIN_TYPE_8BIT_STACKED = 2;
   const int DEGRAIN_TYPE_8BIT_OUT16 = 4;
   const int DEGRAIN_TYPE_10to14BIT = 8;
   const int DEGRAIN_TYPE_16BIT = 16;
@@ -376,8 +357,6 @@ MDegrainN::DenoiseNFunction* MDegrainN::get_denoiseN_function(int BlockX, int Bl
   if (_bits_per_pixel == 8) {
     if (_out16_flag)
       type_to_search = DEGRAIN_TYPE_8BIT_OUT16;
-    else if (_lsb_flag)
-      type_to_search = DEGRAIN_TYPE_8BIT_STACKED;
     else
       type_to_search = DEGRAIN_TYPE_8BIT;
   }
@@ -391,72 +370,32 @@ MDegrainN::DenoiseNFunction* MDegrainN::get_denoiseN_function(int BlockX, int Bl
     return nullptr;
 
 
-  // 8bit C, 8bit lsb C, 8bit out16 C, 10-16 bit C, float C (same for all, no blocksize templates)
+  // 8bit C, 8bit out16 C, 10-16 bit C, float C (same for all, no blocksize templates)
 #define MAKE_FN(x, y) \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT, NO_SIMD)] = DegrainN_C<uint8_t, x, y, 0>; \
-func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT_STACKED, NO_SIMD)] = DegrainN_C<uint8_t, x, y, 1>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT_OUT16, NO_SIMD)] = DegrainN_C<uint8_t, x, y, 2>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_10to14BIT, NO_SIMD)] = DegrainN_C<uint16_t, x, y, 0>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, NO_SIMD)] = DegrainN_C<uint16_t, x, y, 0>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_32BIT, NO_SIMD)] = DegrainN_C<float, x, y, 0>;
-    MAKE_FN(64, 64)
-    MAKE_FN(64, 48)
-    MAKE_FN(64, 32)
-    MAKE_FN(64, 16)
-    MAKE_FN(48, 64)
-    MAKE_FN(48, 48)
-    MAKE_FN(48, 24)
-    MAKE_FN(48, 12)
-    MAKE_FN(32, 64)
-    MAKE_FN(32, 32)
-    MAKE_FN(32, 24)
-    MAKE_FN(32, 16)
-    MAKE_FN(32, 8)
-    MAKE_FN(24, 48)
-    MAKE_FN(24, 32)
-    MAKE_FN(24, 24)
-    MAKE_FN(24, 12)
-    MAKE_FN(24, 6)
-    MAKE_FN(16, 64)
-    MAKE_FN(16, 32)
-    MAKE_FN(16, 16)
-    MAKE_FN(16, 12)
-    MAKE_FN(16, 8)
-    MAKE_FN(16, 4)
-    MAKE_FN(16, 2)
-    MAKE_FN(16, 1)
-    MAKE_FN(12, 48)
-    MAKE_FN(12, 24)
-    MAKE_FN(12, 16)
-    MAKE_FN(12, 12)
-    MAKE_FN(12, 6)
-    MAKE_FN(12, 3)
-    MAKE_FN(8, 32)
-    MAKE_FN(8, 16)
-    MAKE_FN(8, 8)
-    MAKE_FN(8, 4)
-    MAKE_FN(8, 2)
-    MAKE_FN(8, 1)
-    MAKE_FN(6, 24)
-    MAKE_FN(6, 12)
-    MAKE_FN(6, 6)
-    MAKE_FN(6, 3)
-    MAKE_FN(4, 8)
-    MAKE_FN(4, 4)
-    MAKE_FN(4, 2)
-    MAKE_FN(4, 1)
-    MAKE_FN(3, 6)
-    MAKE_FN(3, 3)
-    MAKE_FN(2, 4)
-    MAKE_FN(2, 2)
-    MAKE_FN(2, 1)
+    MVTOOLS_BLOCKSIZES(MAKE_FN) // BlockSizes.h: the same list for all C tables
 #undef MAKE_FN
 #undef MAKE_FN_LEVEL
 
+#ifdef NEON_INTRINSICS
+#define MAKE_FN(x, y) \
+func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT, USE_NEON)] = DegrainN_neon<uint8_t, x, y, 0>; \
+func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT_OUT16, USE_NEON)] = DegrainN_neon<uint8_t, x, y, 2>; \
+func_degrain[make_tuple(x, y, DEGRAIN_TYPE_10to14BIT, USE_NEON)] = DegrainN_neon<uint16_t, x, y, 0>; \
+func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, USE_NEON)] = DegrainN_neon<uint16_t, x, y, 0>; \
+func_degrain[make_tuple(x, y, DEGRAIN_TYPE_32BIT, USE_NEON)] = DegrainN_float_neon<x, y>;
+    MVTOOLS_BLOCKSIZES(MAKE_FN)
+#undef MAKE_FN
+#endif
+
+#ifdef INTEL_INTRINSICS
       // and the SSE2 versions for 8 bit
 #define MAKE_FN(x, y) \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT, USE_SSE2)] = DegrainN_sse2<x, y, 0>; \
-func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT_STACKED, USE_SSE2)] = DegrainN_sse2<x, y, 1>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_8BIT_OUT16, USE_SSE2)] = DegrainN_sse2<x, y, 2>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_10to14BIT, USE_SSE41)] = DegrainN_16_sse41<x, y, true>; \
 func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, USE_SSE41)] = DegrainN_16_sse41<x, y, false>;
@@ -503,6 +442,7 @@ func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, USE_SSE41)] = DegrainN_16_sse4
     //MAKE_FN(6, 12)
     //MAKE_FN(6, 6)
     //MAKE_FN(6, 3)
+    MAKE_FN(4, 16)
     MAKE_FN(4, 8)
     MAKE_FN(4, 4)
     MAKE_FN(4, 2)
@@ -513,10 +453,11 @@ func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, USE_SSE41)] = DegrainN_16_sse4
     //MAKE_FN(2, 2) // no 2 byte width, only C
     //MAKE_FN(2, 1) // no 2 byte width, only C
 #undef MAKE_FN
+#endif // INTEL_INTRINSICS
 #undef MAKE_FN_LEVEL
 
   DenoiseNFunction* result = nullptr;
-  arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+  arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
   int index = 0;
   while (result == nullptr) {
     arch_t current_arch_try = archlist[index++];
@@ -533,7 +474,7 @@ func_degrain[make_tuple(x, y, DEGRAIN_TYPE_16BIT, USE_SSE41)] = DegrainN_16_sse4
 MDegrainN::MDegrainN(
   PClip child, PClip super, PClip mvmulti, int trad,
   sad_t thsad, sad_t thsadc, int yuvplanes, float nlimit, float nlimitc,
-  sad_t nscd1, int nscd2, bool isse_flag, bool planar_flag, bool lsb_flag,
+  sad_t nscd1, int nscd2, bool isse_flag,
   sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, IScriptEnvironment* env_ptr
 )
   : GenericVideoFilter(child)
@@ -544,14 +485,9 @@ MDegrainN::MDegrainN(
   , _nlimit(nlimit)
   , _nlimitc(nlimitc)
   , _super(super)
-  , _planar_flag(planar_flag)
-  , _lsb_flag(lsb_flag)
-  , _mt_flag(mt_flag)
   , _out16_flag(out16_flag)
-  , _height_lsb_or_out16_mul((lsb_flag || out16_flag) ? 2 : 1)
+  , _mt_flag(mt_flag)
   , _nsupermodeyuv(-1)
-  , _dst_planes(nullptr)
-  , _src_planes(nullptr)
   , _overwins()
   , _overwins_uv()
   , _oversluma_ptr(0)
@@ -560,8 +496,6 @@ MDegrainN::MDegrainN(
   , _overschroma16_ptr(0)
   , _oversluma32_ptr(0)
   , _overschroma32_ptr(0)
-  , _oversluma_lsb_ptr(0)
-  , _overschroma_lsb_ptr(0)
   , _degrainluma_ptr(0)
   , _degrainchroma_ptr(0)
   , _dst_short()
@@ -574,7 +508,6 @@ MDegrainN::MDegrainN(
   //,	_src_ptr_arr ()
   //,	_dst_pitch_arr ()
   //,	_src_pitch_arr ()
-  //,	_lsb_offset_arr ()
   , _covered_width(0)
   , _covered_height(0)
   , _boundary_cnt_arr()
@@ -604,7 +537,7 @@ MDegrainN::MDegrainN(
 
     static const char *name_0[2] = { "mvbw", "mvfw" };
     char txt_0[127 + 1];
-    sprintf(txt_0, "%s%d", name_0[k & 1], 1 + k / 2);
+    snprintf(txt_0, sizeof(txt_0), "%s%d", name_0[k & 1], 1 + k / 2);
     CheckSimilarity(*(_mv_clip_arr[k]._clip_sptr), txt_0, env_ptr);
   }
 
@@ -623,9 +556,9 @@ MDegrainN::MDegrainN(
   // because xRatioUV and yRatioUV: in MVFilter, property of motion vectors
   xRatioUV_super = 1;
   yRatioUV_super = 1;
-  if (!vi.IsY() && !vi.IsRGB()) {
-    xRatioUV_super = vi.IsYUY2() ? 2 : (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
-    yRatioUV_super = vi.IsYUY2() ? 1 : (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
+  if (!ClipFnc::is_grey(vi) && !vi.IsRGB()) {
+    xRatioUV_super = (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
+    yRatioUV_super = (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
   }
   nLogxRatioUV_super = ilog2(xRatioUV_super);
   nLogyRatioUV_super = ilog2(yRatioUV_super);
@@ -695,18 +628,12 @@ MDegrainN::MDegrainN(
     env_ptr->ThrowError("MDegrainN : wrong source or super frame size");
   }
 
-  if(lsb_flag && (pixelsize != 1 || pixelsize_super != 1))
-    env_ptr->ThrowError("MDegrainN : lsb_flag only for 8 bit sources");
-
   if (out16_flag) {
     if (pixelsize != 1 || pixelsize_super != 1)
       env_ptr->ThrowError("MDegrainN : out16 flag only for 8 bit sources");
     if (!vi.IsY8() && !vi.IsYV12() && !vi.IsYV16() && !vi.IsYV24())
       env_ptr->ThrowError("MDegrainN : only YV8, YV12, YV16 or YV24 allowed for out16");
   }
-
-  if (lsb_flag && out16_flag)
-    env_ptr->ThrowError("MDegrainN : cannot specify both lsb and out16 flag");
 
   // output can be different bit depth from input
   pixelsize_output = pixelsize_super;
@@ -718,15 +645,6 @@ MDegrainN::MDegrainN(
     pixelsize_output_shift = ilog2(pixelsize_output);
   }
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !_planar_flag)
-  {
-    _dst_planes = std::unique_ptr <YUY2Planes>(
-      new YUY2Planes(nWidth, nHeight * _height_lsb_or_out16_mul)
-      );
-    _src_planes = std::unique_ptr <YUY2Planes>(
-      new YUY2Planes(nWidth, nHeight)
-      );
-  }
   _dst_short_pitch = ((nWidth + 15) / 16) * 16;
   _dst_int_pitch = _dst_short_pitch;
   if (nOverlapX > 0 || nOverlapY > 0)
@@ -738,7 +656,7 @@ MDegrainN::MDegrainN(
       nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super,
       nOverlapX >> nLogxRatioUV_super, nOverlapY >> nLogyRatioUV_super
     ));
-    if (_lsb_flag || pixelsize_output > 1)
+    if (pixelsize_output > 1)
     {
       _dst_int.resize(_dst_int_pitch * nHeight);
     }
@@ -753,10 +671,14 @@ MDegrainN::MDegrainN(
   }
 
     // in overlaps.h
-    // OverlapsLsbFunction
     // OverlapsFunction
     // in M(V)DegrainX: DenoiseXFunction
   arch_t arch;
+#ifdef NEON_INTRINSICS
+  if ((_cpuFlags & CPUF_ARM_NEON) != 0)
+    arch = USE_NEON;
+  else
+#endif
   if ((_cpuFlags & CPUF_AVX2) != 0)
     arch = USE_AVX2;
   else if ((_cpuFlags & CPUF_AVX) != 0)
@@ -769,51 +691,45 @@ MDegrainN::MDegrainN(
     arch = NO_SIMD;
 
 // C only -> NO_SIMD
-  _oversluma_lsb_ptr = get_overlaps_lsb_function(nBlkSizeX, nBlkSizeY, sizeof(uint8_t), NO_SIMD);
-  _overschroma_lsb_ptr = get_overlaps_lsb_function(nBlkSizeX / xRatioUV_super, nBlkSizeY / yRatioUV_super, sizeof(uint8_t), NO_SIMD);
+  _oversluma_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint8_t), arch);
+  _overschroma_ptr = get_overlaps_function(nBlkSizeX / xRatioUV_super, nBlkSizeY / yRatioUV_super, sizeof(uint8_t), arch);
 
-  _oversluma_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint8_t), false, arch);
-  _overschroma_ptr = get_overlaps_function(nBlkSizeX / xRatioUV_super, nBlkSizeY / yRatioUV_super, sizeof(uint8_t), false, arch);
+  _oversluma16_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint16_t), arch);
+  _overschroma16_ptr = get_overlaps_function(nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super, sizeof(uint16_t), arch);
 
-  _oversluma16_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint16_t), false, arch);
-  _overschroma16_ptr = get_overlaps_function(nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super, sizeof(uint16_t), false, arch);
+  _oversluma32_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(float), arch);
+  _overschroma32_ptr = get_overlaps_function(nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super, sizeof(float), arch);
 
-  _oversluma32_ptr = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(float), false, arch);
-  _overschroma32_ptr = get_overlaps_function(nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super, sizeof(float), false, arch);
+  _degrainluma_ptr = get_denoiseN_function(nBlkSizeX, nBlkSizeY, bits_per_pixel_super, out16_flag, arch);
+  _degrainchroma_ptr = get_denoiseN_function(nBlkSizeX / xRatioUV_super, nBlkSizeY / yRatioUV_super, bits_per_pixel_super, out16_flag, arch);
 
-  _degrainluma_ptr = get_denoiseN_function(nBlkSizeX, nBlkSizeY, bits_per_pixel_super, lsb_flag, out16_flag, arch);
-  _degrainchroma_ptr = get_denoiseN_function(nBlkSizeX / xRatioUV_super, nBlkSizeY / yRatioUV_super, bits_per_pixel_super, lsb_flag, out16_flag, arch);
-
-  if (!_oversluma_lsb_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _oversluma_lsb_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
-  if (!_overschroma_lsb_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _overschroma_lsb_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
+  if (nBlkSizeX % xRatioUV_super || nBlkSizeY % yRatioUV_super)
+    env_ptr->ThrowError("MDegrainN : block size %dx%d is not a multiple of the chroma subsampling (%dx%d)", nBlkSizeX, nBlkSizeY, xRatioUV_super, yRatioUV_super);
   if (!_oversluma_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _oversluma_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
+    env_ptr->ThrowError("MDegrainN : no valid _oversluma_ptr function for %dx%d, pixelsize=%d, out16=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)out16_flag);
   if (!_overschroma_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _overschroma_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
+    env_ptr->ThrowError("MDegrainN : no valid _overschroma_ptr function for %dx%d, pixelsize=%d, out16=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)out16_flag);
   if (!_degrainluma_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _degrainluma_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
+    env_ptr->ThrowError("MDegrainN : no valid _degrainluma_ptr function for %dx%d, pixelsize=%d, out16=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)out16_flag);
   if (!_degrainchroma_ptr)
-    env_ptr->ThrowError("MDegrainN : no valid _degrainchroma_ptr function for %dx%d, pixelsize=%d, lsb_flag=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)lsb_flag);
+    env_ptr->ThrowError("MDegrainN : no valid _degrainchroma_ptr function for %dx%d, pixelsize=%d, out16=%d", nBlkSizeX, nBlkSizeY, pixelsize_super, (int)out16_flag);
 
+#ifdef INTEL_INTRINSICS
   if ((_cpuFlags & CPUF_SSE2) != 0)
   {
     if(out16_flag)
       LimitFunction = LimitChanges_src8_target16_c; // todo SSE2
     else if (pixelsize_super == 1)
-      LimitFunction = LimitChanges_sse2_new<uint8_t, 0>;
+      LimitFunction = LimitChanges_sse2_new<uint8_t>;
     else if (pixelsize_super == 2) { // pixelsize_super == 2
-      if ((_cpuFlags & CPUF_SSE4_1) != 0)
-        LimitFunction = LimitChanges_sse2_new<uint16_t, 1>;
-      else
-        LimitFunction = LimitChanges_sse2_new<uint16_t, 0>;
+      LimitFunction = LimitChanges_sse2_new<uint16_t>;
     }
     else {
       LimitFunction = LimitChanges_float_c; // no SSE2
     }
   }
   else
+#endif // INTEL_INTRINSICS
   {
     if (out16_flag)
       LimitFunction = LimitChanges_src8_target16_c; // todo SSE2
@@ -826,12 +742,6 @@ MDegrainN::MDegrainN(
   }
 
   //---------- end of functions
-
-  // 16 bit output hack
-  if (_lsb_flag)
-  {
-    vi.height <<= 1;
-  }
 
   if (out16_flag) {
     if (vi.IsY8())
@@ -871,10 +781,6 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 
   const BYTE * pRef[MAX_TEMP_RAD * 2][3];
   int nRefPitches[MAX_TEMP_RAD * 2][3];
-  unsigned char *pDstYUY2;
-  const unsigned char *pSrcYUY2;
-  int nDstPitchYUY2;
-  int nSrcPitchYUY2;
 
   for (int k2 = 0; k2 < _trad * 2; ++k2)
   {
@@ -892,80 +798,18 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
   PVideoFrame src = child->GetFrame(n, env_ptr);
   PVideoFrame dst = has_at_least_v8 ? env_ptr->NewVideoFrameP(vi, &src) : env_ptr->NewVideoFrame(vi); // frame property support
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
-  {
-    if (!_planar_flag)
-    {
-      pDstYUY2 = dst->GetWritePtr();
-      nDstPitchYUY2 = dst->GetPitch();
-      _dst_ptr_arr[0] = _dst_planes->GetPtr();
-      _dst_ptr_arr[1] = _dst_planes->GetPtrU();
-      _dst_ptr_arr[2] = _dst_planes->GetPtrV();
-      _dst_pitch_arr[0] = _dst_planes->GetPitch();
-      _dst_pitch_arr[1] = _dst_planes->GetPitchUV();
-      _dst_pitch_arr[2] = _dst_planes->GetPitchUV();
-
-      pSrcYUY2 = src->GetReadPtr();
-      nSrcPitchYUY2 = src->GetPitch();
-      _src_ptr_arr[0] = _src_planes->GetPtr();
-      _src_ptr_arr[1] = _src_planes->GetPtrU();
-      _src_ptr_arr[2] = _src_planes->GetPtrV();
-      _src_pitch_arr[0] = _src_planes->GetPitch();
-      _src_pitch_arr[1] = _src_planes->GetPitchUV();
-      _src_pitch_arr[2] = _src_planes->GetPitchUV();
-
-      YUY2ToPlanes(
-        pSrcYUY2, nSrcPitchYUY2, nWidth, nHeight,
-        _src_ptr_arr[0], _src_pitch_arr[0],
-        _src_ptr_arr[1], _src_ptr_arr[2], _src_pitch_arr[1],
-        _cpuFlags
-      );
-    }
-    else
-    {
-      _dst_ptr_arr[0] = dst->GetWritePtr();
-      _dst_ptr_arr[1] = _dst_ptr_arr[0] + nWidth;
-      _dst_ptr_arr[2] = _dst_ptr_arr[1] + nWidth / 2; //yuy2 xratio
-      _dst_pitch_arr[0] = dst->GetPitch();
-      _dst_pitch_arr[1] = _dst_pitch_arr[0];
-      _dst_pitch_arr[2] = _dst_pitch_arr[0];
-      _src_ptr_arr[0] = src->GetReadPtr();
-      _src_ptr_arr[1] = _src_ptr_arr[0] + nWidth;
-      _src_ptr_arr[2] = _src_ptr_arr[1] + nWidth / 2;
-      _src_pitch_arr[0] = src->GetPitch();
-      _src_pitch_arr[1] = _src_pitch_arr[0];
-      _src_pitch_arr[2] = _src_pitch_arr[0];
-    }
-  }
-  else
-  {
-    _dst_ptr_arr[0] = YWPLAN(dst);
-    _dst_ptr_arr[1] = UWPLAN(dst);
-    _dst_ptr_arr[2] = VWPLAN(dst);
-    _dst_pitch_arr[0] = YPITCH(dst);
-    _dst_pitch_arr[1] = UPITCH(dst);
-    _dst_pitch_arr[2] = VPITCH(dst);
-    _src_ptr_arr[0] = YRPLAN(src);
-    _src_ptr_arr[1] = URPLAN(src);
-    _src_ptr_arr[2] = VRPLAN(src);
-    _src_pitch_arr[0] = YPITCH(src);
-    _src_pitch_arr[1] = UPITCH(src);
-    _src_pitch_arr[2] = VPITCH(src);
-  }
-
-  _lsb_offset_arr[0] = _dst_pitch_arr[0] * nHeight;
-  _lsb_offset_arr[1] = _dst_pitch_arr[1] * (nHeight >> nLogyRatioUV_super);
-  _lsb_offset_arr[2] = _dst_pitch_arr[2] * (nHeight >> nLogyRatioUV_super);
-
-  if (_lsb_flag)
-  {
-    memset(_dst_ptr_arr[0] + _lsb_offset_arr[0], 0, _lsb_offset_arr[0]);
-    if (!_planar_flag)
-    {
-      memset(_dst_ptr_arr[1] + _lsb_offset_arr[1], 0, _lsb_offset_arr[1]);
-      memset(_dst_ptr_arr[2] + _lsb_offset_arr[2], 0, _lsb_offset_arr[2]);
-    }
-  }
+  _dst_ptr_arr[0] = YWPLAN(dst);
+  _dst_ptr_arr[1] = UWPLAN(dst);
+  _dst_ptr_arr[2] = VWPLAN(dst);
+  _dst_pitch_arr[0] = YPITCH(dst);
+  _dst_pitch_arr[1] = UPITCH(dst);
+  _dst_pitch_arr[2] = VPITCH(dst);
+  _src_ptr_arr[0] = YRPLAN(src);
+  _src_ptr_arr[1] = URPLAN(src);
+  _src_ptr_arr[2] = VRPLAN(src);
+  _src_pitch_arr[0] = YPITCH(src);
+  _src_pitch_arr[1] = UPITCH(src);
+  _src_pitch_arr[2] = VPITCH(src);
 
   ::PVideoFrame ref[MAX_TEMP_RAD * 2];
 
@@ -980,36 +824,17 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
   if (mv_prof_skip("degrain"))
     return src;
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
+  for (int k2 = 0; k2 < _trad * 2; ++k2)
   {
-    for (int k2 = 0; k2 < _trad * 2; ++k2)
+    const int k = reorder_ref(k2);
+    if (_usable_flag_arr[k])
     {
-      const int k = reorder_ref(k2);
-      if (_usable_flag_arr[k])
-      {
-        pRef[k][0] = ref[k]->GetReadPtr();
-        pRef[k][1] = pRef[k][0] + ref[k]->GetRowSize() / 2;
-        pRef[k][2] = pRef[k][1] + ref[k]->GetRowSize() / 4;
-        nRefPitches[k][0] = ref[k]->GetPitch();
-        nRefPitches[k][1] = nRefPitches[k][0];
-        nRefPitches[k][2] = nRefPitches[k][0];
-      }
-    }
-  }
-  else
-  {
-    for (int k2 = 0; k2 < _trad * 2; ++k2)
-    {
-      const int k = reorder_ref(k2);
-      if (_usable_flag_arr[k])
-      {
-        pRef[k][0] = YRPLAN(ref[k]);
-        pRef[k][1] = URPLAN(ref[k]);
-        pRef[k][2] = VRPLAN(ref[k]);
-        nRefPitches[k][0] = YPITCH(ref[k]);
-        nRefPitches[k][1] = UPITCH(ref[k]);
-        nRefPitches[k][2] = VPITCH(ref[k]);
-      }
+      pRef[k][0] = YRPLAN(ref[k]);
+      pRef[k][1] = URPLAN(ref[k]);
+      pRef[k][2] = VRPLAN(ref[k]);
+      nRefPitches[k][0] = YPITCH(ref[k]);
+      nRefPitches[k][1] = UPITCH(ref[k]);
+      nRefPitches[k][2] = VPITCH(ref[k]);
     }
   }
 
@@ -1080,7 +905,7 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
       uint16_t *pDstShort = (_dst_short.empty()) ? 0 : &_dst_short[0];
       int *pDstInt = (_dst_int.empty()) ? 0 : &_dst_int[0];
 
-      if (_lsb_flag || pixelsize_output>1)
+      if (pixelsize_output > 1)
       {
         MemZoneSet(
           reinterpret_cast <unsigned char *> (pDstInt), 0,
@@ -1097,11 +922,11 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 
       if (nOverlapY > 0)
       {
-        memset(
-          &_boundary_cnt_arr[0],
-          0,
-          _boundary_cnt_arr.size() * sizeof(_boundary_cnt_arr[0])
-        );
+        // Do not memset the atomic counters: they are not trivially copyable.
+        for (conc::AtomicInt <int> &cnt : _boundary_cnt_arr)
+        {
+          cnt = 0;
+        }
       }
 
       slicer.start(
@@ -1112,17 +937,7 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
       );
       slicer.wait();
       // fixme: SSE versions from ShortToBytes family like in MDegrain3
-      if (_lsb_flag)
-      {
-        Short2BytesLsb(
-          _dst_ptr_arr[0],
-          _dst_ptr_arr[0] + _lsb_offset_arr[0],
-          _dst_pitch_arr[0],
-          &_dst_int[0], _dst_int_pitch,
-          _covered_width, _covered_height
-        );
-      }
-      else if (_out16_flag)
+      if (_out16_flag)
       {
         Short2Bytes_Int32toWord16(
           (uint16_t *)_dst_ptr_arr[0], _dst_pitch_arr[0],
@@ -1211,25 +1026,22 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
   //-------------------------------------------------------------------------
   // CHROMA planes
 
-  process_chroma <1>(UPLANE & _nsupermodeyuv);
-  process_chroma <2>(VPLANE & _nsupermodeyuv);
+  if (!ClipFnc::is_grey(vi)) // Y, YA: no U/V planes (for YA the U/V pointers are not valid)
+  {
+    process_chroma <1>(UPLANE & _nsupermodeyuv);
+    process_chroma <2>(VPLANE & _nsupermodeyuv);
+  }
 
   //-------------------------------------------------------------------------
 
-#ifndef _M_X64 
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty(); // (we may use double-float somewhere) Fizick
 #endif
 
   PROFILE_STOP(MOTION_PROFILE_COMPENSATION);
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !_planar_flag)
-  {
-    YUY2FromPlanes(
-      pDstYUY2, nDstPitchYUY2, nWidth, nHeight * _height_lsb_or_out16_mul,
-      _dst_ptr_arr[0], _dst_pitch_arr[0],
-      _dst_ptr_arr[1], _dst_ptr_arr[2], _dst_pitch_arr[1], _cpuFlags);
-  }
 
+  ClipFnc::copy_alpha(dst, src, vi, env_ptr);
   return (dst);
 }
 
@@ -1291,7 +1103,7 @@ void	MDegrainN::process_chroma(int plane_mask)
       uint16_t * pDstShort = (_dst_short.empty()) ? 0 : &_dst_short[0];
       int * pDstInt = (_dst_int.empty()) ? 0 : &_dst_int[0];
 
-      if (_lsb_flag || pixelsize_output > 1)
+      if (pixelsize_output > 1)
       {
         MemZoneSet(
           reinterpret_cast <unsigned char *> (pDstInt), 0,
@@ -1310,11 +1122,11 @@ void	MDegrainN::process_chroma(int plane_mask)
 
       if (nOverlapY > 0)
       {
-        memset(
-          &_boundary_cnt_arr[0],
-          0,
-          _boundary_cnt_arr.size() * sizeof(_boundary_cnt_arr[0])
-        );
+        // Do not memset the atomic counters: they are not trivially copyable.
+        for (conc::AtomicInt <int> &cnt : _boundary_cnt_arr)
+        {
+          cnt = 0;
+        }
       }
 
       slicer.start(
@@ -1325,17 +1137,7 @@ void	MDegrainN::process_chroma(int plane_mask)
       );
       slicer.wait();
       
-      if (_lsb_flag)
-      {
-        Short2BytesLsb(
-          _dst_ptr_arr[P],
-          _dst_ptr_arr[P] + _lsb_offset_arr[P], // 8 bit only
-          _dst_pitch_arr[P],
-          &_dst_int[0], _dst_int_pitch,
-          _covered_width >> nLogxRatioUV_super, _covered_height >> nLogyRatioUV_super
-        );
-      }
-      else if (_out16_flag)
+      if (_out16_flag)
       {
         Short2Bytes_Int32toWord16(
           (uint16_t *)_dst_ptr_arr[P], _dst_pitch_arr[P],
@@ -1391,15 +1193,15 @@ void	MDegrainN::process_chroma(int plane_mask)
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
-          plane_copy_8_to_16_c(_dst_ptr_arr[P] + ((_dst_pitch_arr[P] * _covered_height) >> nLogyRatioUV_super), _dst_pitch_arr[P],
-            _src_ptr_arr[P] + ((_src_pitch_arr[P] * _covered_height) >> nLogyRatioUV_super), _src_pitch_arr[P],
+          plane_copy_8_to_16_c(_dst_ptr_arr[P] + (_dst_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _dst_pitch_arr[P],
+            _src_ptr_arr[P] + (_src_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _src_pitch_arr[P],
             nWidth >> nLogxRatioUV_super, ((nHeight - _covered_height) >> nLogyRatioUV_super)
           );
         }
         else {
           BitBlt(
-            _dst_ptr_arr[P] + ((_dst_pitch_arr[P] * _covered_height) >> nLogyRatioUV_super), _dst_pitch_arr[P],
-            _src_ptr_arr[P] + ((_src_pitch_arr[P] * _covered_height) >> nLogyRatioUV_super), _src_pitch_arr[P],
+            _dst_ptr_arr[P] + (_dst_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _dst_pitch_arr[P],
+            _src_ptr_arr[P] + (_src_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _src_pitch_arr[P],
             (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, ((nHeight - _covered_height) >> nLogyRatioUV_super)
           );
         }
@@ -1463,7 +1265,7 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
 
       // luma
       _degrainluma_ptr(
-        pDstCur + (xx << pixelsize_output_shift), pDstCur + _lsb_offset_arr[0] + (xx << pixelsize_super_shift), _dst_pitch_arr[0],
+        pDstCur + (xx << pixelsize_output_shift), _dst_pitch_arr[0],
         pSrcCur + (xx << pixelsize_super_shift), _src_pitch_arr[0],
         ref_data_ptr_arr, pitch_arr, weight_arr, _trad
       );
@@ -1616,19 +1418,11 @@ void	MDegrainN::process_luma_overlap_slice(int y_beg, int y_end)
 
       // luma
       _degrainluma_ptr(
-        &tmp_block._d[0], tmp_block._lsb_ptr, tmpPitch << pixelsize_output_shift,
+        &tmp_block._d[0], tmpPitch << pixelsize_output_shift,
         pSrcCur + (xx << pixelsize_super_shift), _src_pitch_arr[0],
         ref_data_ptr_arr, pitch_arr, weight_arr, _trad
       );
-      if (_lsb_flag)
-      {
-        _oversluma_lsb_ptr(
-          pDstInt + xx, _dst_int_pitch,
-          &tmp_block._d[0], tmp_block._lsb_ptr, tmpPitch,
-          winOver, nBlkSizeX
-        );
-      }
-      else if (_out16_flag)
+      if (_out16_flag)
       {
         // cast to match the prototype
         _oversluma16_ptr((uint16_t *)(pDstInt + xx), _dst_int_pitch, &tmp_block._d[0], tmpPitch << pixelsize_output_shift, winOver, nBlkSizeX);
@@ -1702,8 +1496,7 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
 
       // chroma
       _degrainchroma_ptr(
-        pDstCur + (xx << pixelsize_output_shift),
-        pDstCur + (xx << pixelsize_super_shift) + _lsb_offset_arr[P], _dst_pitch_arr[P],
+        pDstCur + (xx << pixelsize_output_shift), _dst_pitch_arr[P],
         pSrcCur + (xx << pixelsize_super_shift), _src_pitch_arr[P],
         ref_data_ptr_arr, pitch_arr, weight_arr, _trad
       );
@@ -1867,19 +1660,11 @@ void	MDegrainN::process_chroma_overlap_slice(int y_beg, int y_end)
       // here we don't pass pixelsize, because _degrainchroma_ptr points already to the uint16_t version
       // if the clip was 16 bit one
       _degrainchroma_ptr(
-        &tmp_block._d[0], tmp_block._lsb_ptr, tmpPitch << pixelsize_output_shift,
+        &tmp_block._d[0], tmpPitch << pixelsize_output_shift,
         pSrcCur + (xx << pixelsize_super_shift), _src_pitch_arr[P],
         ref_data_ptr_arr, pitch_arr, weight_arr, _trad
       );
-      if (_lsb_flag)
-      {
-        _overschroma_lsb_ptr(
-          pDstInt + xx, _dst_int_pitch,
-          &tmp_block._d[0], tmp_block._lsb_ptr, tmpPitch,
-          winOverUV, nBlkSizeX >> nLogxRatioUV_super
-        );
-      }
-      else if (_out16_flag)
+      if (_out16_flag)
       {
         // cast to match the prototype
         _overschroma16_ptr(
@@ -1953,9 +1738,9 @@ void	MDegrainN::use_block_uv(
   if (usable_flag)
   {
     const FakeBlockData &block = c_info._clip_sptr->GetBlock(0, i);
-    const int blx = block.GetX() * nPel + block.GetMV().x;
-    const int bly = block.GetY() * nPel + block.GetMV().y;
-    p = plane_ptr->GetPointer(blx >> nLogxRatioUV_super, bly >> nLogyRatioUV_super);
+    const int blx = pos_to_chroma(block.GetX() * nPel, block.GetMV().x, nLogxRatioUV_super);
+    const int bly = pos_to_chroma(block.GetY() * nPel, block.GetMV().y, nLogyRatioUV_super);
+    p = plane_ptr->GetPointer(blx, bly);
     np = plane_ptr->GetPitch();
     const sad_t block_sad = block.GetSAD(); // SAD of MV Block. Scaled to MVClip's bits_per_pixel;
     wref = DegrainWeight(c_info._thsadc, c_info._thsadc_sq, block_sad);

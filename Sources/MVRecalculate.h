@@ -20,16 +20,11 @@
 #ifndef __MV_RECALCULATE__
 #define __MV_RECALCULATE__
 
-#define	NOGDI
-#define	NOMINMAX
-#define	WIN32_LEAN_AND_MEAN
-
 #include	"conc/ObjPool.h"
 #include "commonfunctions.h"
 #include "DCTFactory.h"
 #include "GroupOfPlanes.h"
 #include "MVAnalysisData.h"
-#include "yuy2planes.h"
 #include	"SharedPtr.h"
 
 #include	<memory>
@@ -92,10 +87,6 @@ protected:
   FILE *         outfile;
   short *        outfilebuf;
 
-  YUY2Planes *   SrcPlanes;
-  YUY2Planes *   RefPlanes;
-  YUY2Planes *   Src2xPlanes;
-  YUY2Planes *   Ref2xPlanes;
 
   std::unique_ptr <DCTFactory>
                  _dct_factory_ptr;	// Not instantiated if not needed

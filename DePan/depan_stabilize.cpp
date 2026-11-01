@@ -75,6 +75,7 @@
 #include "info.h"
 #include "depanio.h"
 #include "depan.h"
+#include "yuy2planes.h"
 
 #include <chrono>
 #include <cassert>
@@ -116,6 +117,7 @@ class DePanStabilize : public GenericVideoFilter {
   const char *vrot; // global parameter rot name
   int method; // stabllization method
   const char *debuglog;  // filename of debug log P.F.
+  int alphainvert;  // YUVA, YA, RGBA: alpha of the new empty borders is max instead of 0
 
   // internal parameters
 //	int matchfields;
@@ -195,7 +197,7 @@ public:
     float _initzoom, bool _addzoom, int _fillprev, int _fillnext, int _mirror, int _blur, float _dxmax,
     float _dymax, float _zoommax, float _rotmax, int _subpixel, float _pixaspect,
     int _fitlast, float _tzoom, int _info, const char * _inputlog,
-    const char * _vdx, const char * _vdy, const char * _vzoom, const char * _vrot, int _method, const char * _debuglog, IScriptEnvironment* env);
+    const char * _vdx, const char * _vdy, const char * _vzoom, const char * _vrot, int _method, const char * _debuglog, int _alphainvert, IScriptEnvironment* env);
   // This is the constructor. It does not return any value, and is always used,
   //  when an instance of the class is created.
   // Since there is no code in this, this is the definition.
@@ -221,13 +223,13 @@ DePanStabilize::DePanStabilize(PClip _child, PClip _DePanData, float _cutoff,
   int _mirror, int _blur, float _dxmax, float _dymax, float _zoommax,
   float _rotmax, int _subpixel, float _pixaspect,
   int _fitlast, float _tzoom, int _info, const char * _inputlog,
-  const char * _vdx, const char * _vdy, const char * _vzoom, const char * _vrot, int _method, const char * _debuglog, IScriptEnvironment* env) :
+  const char * _vdx, const char * _vdy, const char * _vzoom, const char * _vrot, int _method, const char * _debuglog, int _alphainvert, IScriptEnvironment* env) :
 
   GenericVideoFilter(_child), DePanData(_DePanData), cutoff(_cutoff), damping(_damping),
   initzoom(_initzoom), addzoom(_addzoom), fillprev(_fillprev), fillnext(_fillnext), mirror(_mirror), blur(_blur),
   dxmax(_dxmax), dymax(_dymax), zoommax(_zoommax), rotmax(_rotmax), subpixel(_subpixel),
   pixaspect(_pixaspect), fitlast(_fitlast), tzoom(_tzoom), info(_info), inputlog(_inputlog),
-  vdx(_vdx), vdy(_vdy), vzoom(_vzoom), vrot(_vrot), method(_method), debuglog(_debuglog) {
+  vdx(_vdx), vdy(_vdy), vzoom(_vzoom), vrot(_vrot), method(_method), debuglog(_debuglog), alphainvert(_alphainvert) {
   // This is the implementation of the constructor.
   // The child clip (source clip) is inherited by the GenericVideoFilter,
   //  where the following variables gets defined:
@@ -266,13 +268,19 @@ DePanStabilize::DePanStabilize(PClip _child, PClip _DePanData, float _cutoff,
   bits_per_pixel = vi.BitsPerComponent();
 
   if (!vi.IsYUY2() && !vi.IsYUV() && !vi.IsYUVA() && !vi.IsPlanarRGB() && !vi.IsPlanarRGBA())
-    env->ThrowError("DePanStabilize: input must be Y or planar YUV(A)/RGB(A)!");
+    env->ThrowError("DePanStabilize: input must be Y(A), YUY2 or planar YUV(A)/RGB(A)!");
+  if (vi.BitsPerComponent() == 32)
+    env->ThrowError("DePanStabilize: 32 bit float input is not supported!");
 
   if (method < -1 || method > 2)
     env->ThrowError("DePanStabilize: wrong method");//v1.13
 
-  if ((DePanData->GetVideoInfo().num_frames) != vi.num_frames)
-    env->ThrowError("DePanStabilize: The length of input clip must be same as motion data clip !");
+  if (lstrlen(inputlog) == 0) { // with inputlog the motion data clip is not used
+    if (!DePanData)
+      env->ThrowError("DePanStabilize: motion data clip or inputlog is required!");
+    if ((DePanData->GetVideoInfo().num_frames) != vi.num_frames)
+      env->ThrowError("DePanStabilize: The length of input clip must be same as motion data clip !");
+  }
 
   motionx = new float[vi.num_frames]; // was: (float *)malloc(vi.num_frames*sizeof(float));
   motiony = new float[vi.num_frames];
@@ -309,7 +317,7 @@ DePanStabilize::DePanStabilize(PClip _child, PClip _DePanData, float _cutoff,
 
 #ifdef _DEBUG
     _RPT1(0, "Num of frames= %d \n", DePanData->GetVideoInfo().num_frames);
-    sprintf(debugbuf, "Num of frames= %d \n", DePanData->GetVideoInfo().num_frames);
+    snprintf(debugbuf, sizeof(debugbuf), "Num of frames= %d \n", DePanData->GetVideoInfo().num_frames);
     LogToFile(debugbuf);
 #endif
     //	if (debuglogfile != NULL) { fprintf(debuglogfile, "Num of frames= %d \n", DePanData->GetVideoInfo().num_frames); } // PF debug
@@ -424,6 +432,8 @@ DePanStabilize::DePanStabilize(PClip _child, PClip _DePanData, float _cutoff,
   for (int i = winfzsize; i <= wintsize; i++)
     winfz[i] = 0;
 
+  width = vi.width; // frame edges for the adaptive zoom limits
+  height = vi.height;
   xcenter = vi.width / 2.0f;  // center of frame
   ycenter = vi.height / 2.0f;
 
@@ -494,14 +504,14 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
   // recurrent calculation of smoothed cumulative transforms from base+2 to ndest frames
 #ifdef DEBUG
   _RPT2(0, "  >> Inertial: %d->%d recurrent calculation of smoothed cumulative transforms from base+2 to ndest frames\n", nbase + 2, ndest);
-  sprintf(debugbuf, "  >> Inertial: %d->%d recurrent calculation of smoothed cumulative transforms from base+2 to ndest frames\n", nbase + 2, ndest);
+  snprintf(debugbuf, sizeof(debugbuf), "  >> Inertial: %d->%d recurrent calculation of smoothed cumulative transforms from base+2 to ndest frames\n", nbase + 2, ndest);
   LogToFile(debugbuf);
 #endif
 
   for (n = nbase + 2; n <= ndest; n++) {
 #ifdef DEBUG
     _RPT1(0, "  >>> n=%d\n", n);
-    sprintf(debugbuf, "  >>> n=%d\n", n);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>> n=%d\n", n);
     LogToFile(debugbuf);
 #endif
     float sm1;
@@ -521,7 +531,7 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
     nonlin = nonlinfactor.dxc;
 #ifdef _DEBUG
     _RPT3(0, "  >>>> trcumul[n-2].dxc = %f, [n-1].dxc = %f, [n].dxc = %f\n", cu2, cu1, cu0);
-    sprintf(debugbuf, "  >>>> trcumul[n-2].dxc = %f, [n-1].dxc = %f, [n].dxc = %f\n", cu2, cu1, cu0);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>>> trcumul[n-2].dxc = %f, [n-1].dxc = %f, [n].dxc = %f\n", cu2, cu1, cu0);
     LogToFile(debugbuf);
 #endif
     //----------------------------------------
@@ -539,7 +549,7 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
       (1 + nonlin*fabsf(sm1 - cu1));
 #ifdef _DEBUG
     _RPT2(0, "  >>>> trsmoothed[n].dxc %f, %f\n", firstpass, secondpass);
-    sprintf(debugbuf, "  >>>> trsmoothed[n].dxc %f, %f\n", firstpass, secondpass);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>>> trsmoothed[n].dxc %f, %f\n", firstpass, secondpass);
     LogToFile(debugbuf);
 #endif
     trsmoothed[n].dxc = secondpass;
@@ -574,7 +584,7 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
 
 #ifdef _DEBUG
     _RPT3(0, "  >>>> trcumul[n-2].dyc = %f, [n-1].dyc = %f, [n].dyc = %f\n", cu2, cu1, cu0);
-    sprintf(debugbuf, "  >>>> trcumul[n-2].dyc = %f, [n-1].dyc = %f, [n].dyc = %f\n", cu2, cu1, cu0);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>>> trcumul[n-2].dyc = %f, [n-1].dyc = %f, [n].dyc = %f\n", cu2, cu1, cu0);
     LogToFile(debugbuf);
 #endif
     //----------------------------------------
@@ -592,7 +602,7 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
       (1 + nonlin*fabsf(sm1 - cu1));
 #ifdef _DEBUG
     _RPT2(0, "  >>>> trsmoothed[n].dyc %f, %f\n", firstpass, secondpass);
-    sprintf(debugbuf, "  >>>> trsmoothed[n].dyc %f, %f\n", firstpass, secondpass);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>>> trsmoothed[n].dyc %f, %f\n", firstpass, secondpass);
     LogToFile(debugbuf);
 #endif
     trsmoothed[n].dyc = secondpass;
@@ -609,7 +619,7 @@ void DePanStabilize::Inertial(int nbase, int ndest, transform * ptrdif)
       ( 1 + 0.5f*nonlinfactor.dyc/freqnative*0.5f*fabsf(trsmoothed[n].dyc - trsmoothed[n-2].dyc - trcumul[n].dyc + trcumul[n-2].dyc) ) - \
       cquad*freqnative*freqnative*(trsmoothed[n-1].dyc - trcumul[n-1].dyc)* \
       ( 1 + nonlinfactor.dyc*fabsf(trsmoothed[n-1].dyc - trcumul[n-1].dyc) );    // corrector, one iteration must be enough
-    sprintf(debugbuf, "  >>>> trsmoothed[n].dyc %f, %f\n", trsmoothed[n].dyc, secondpass);
+    snprintf(debugbuf, sizeof(debugbuf), "  >>>> trsmoothed[n].dyc %f, %f\n", trsmoothed[n].dyc, secondpass);
     LogToFile(debugbuf);
     */
     /* when nonlinfactor is small (dymax=8 -> 5/8, because nonlinfactor.dyc = 5/fabsf(dymax);// chanded in v1.7
@@ -1073,7 +1083,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
 
 #ifdef _DEBUG
   _RPT2(0, "DePanStabilize::GetFrame get motion info START: about frames in interval from begin source to dest in reverse order. nbase=%d->ndest=%d \n", nbase, ndest);
-  sprintf(debugbuf, "DePanStabilize::GetFrame get motion info START: about frames in interval from begin source to dest in reverse order. nbase=%d->ndest=%d \n", nbase, ndest);
+  snprintf(debugbuf, sizeof(debugbuf), "DePanStabilize::GetFrame get motion info START: about frames in interval from begin source to dest in reverse order. nbase=%d->ndest=%d \n", nbase, ndest);
   LogToFile(debugbuf);
 #endif
   //if (debuglogfile != NULL) { fprintf(debuglogfile, "DePanStabilize::GetFrame get motion info about frames in interval from begin source to dest in reverse order. nbase=%d->ndest=%d \n",nbase,ndest); }
@@ -1085,7 +1095,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
       // note: if inputlogfile has been read, all motion data is always known
 #ifdef _DEBUG
       _RPT1(0, "  DePanStabilize::GetFrame Request frame n from the DePanData clip. n=%d \n", n);
-      sprintf(debugbuf, "  DePanStabilize::GetFrame Request frame n from the DePanData clip. n=%d \n", n);
+      snprintf(debugbuf, sizeof(debugbuf), "  DePanStabilize::GetFrame Request frame n from the DePanData clip. n=%d \n", n);
       LogToFile(debugbuf);
 #endif
       //if (debuglogfile != NULL) { fprintf(debuglogfile, "DePanStabilize::GetFrame Request frame n from the DePanData clip. n=%d \n", n); } // PF debug
@@ -1102,7 +1112,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
       // log first. arrays are vi.num_frames long
 #ifdef _DEBUG
       _RPT5(0, "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, motionx[n], motiony[n], motionzoom[n], motionrot[n]);
-      sprintf(debugbuf, "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, motionx[n], motiony[n], motionzoom[n], motionrot[n]);
+      snprintf(debugbuf, sizeof(debugbuf), "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, motionx[n], motiony[n], motionzoom[n], motionrot[n]);
       LogToFile(debugbuf);
 #endif
 
@@ -1147,7 +1157,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
     nbase = n;  // set base frame to new scene start if found
 #ifdef _DEBUG
     _RPT1(0, "DePanStabilize::GetFrame New nbase. n=%d \n", nbase);
-    sprintf(debugbuf, "DePanStabilize::GetFrame New nbase. n=%d \n", nbase);
+    snprintf(debugbuf, sizeof(debugbuf), "DePanStabilize::GetFrame New nbase. n=%d \n", nbase);
     LogToFile(debugbuf);
 #endif
   }
@@ -1156,11 +1166,11 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
   //		OutputDebugString(debugbuf);
 #ifdef _DEBUG
   _RPT3(0, "DePanStabilize: nbase=%d ndest=%d nmax=%d\n", nbase, ndest, nmax);
-  sprintf(debugbuf, "DePanStabilize: nbase=%d ndest=%d nmax=%d\n", nbase, ndest, nmax);
+  snprintf(debugbuf, sizeof(debugbuf), "DePanStabilize: nbase=%d ndest=%d nmax=%d\n", nbase, ndest, nmax);
   LogToFile(debugbuf);
 
   _RPT2(0, "DePanStabilize::GetFrame get motion Part#1 info START: ndest+1=%d -> nmax=%d \n", ndest + 1, nmax);
-  sprintf(debugbuf, "DePanStabilize::GetFrame get motion Part#1 info START: ndest+1=%d -> nmax=%d \n", ndest + 1, nmax);
+  snprintf(debugbuf, sizeof(debugbuf), "DePanStabilize::GetFrame get motion Part#1 info START: ndest+1=%d -> nmax=%d \n", ndest + 1, nmax);
   LogToFile(debugbuf);
 #endif
   for (n = ndest + 1; n <= nmax; n++) {
@@ -1179,7 +1189,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
       if (error != 0) env->ThrowError("DePanStabilize: data clip is NOT good DePanEstimate clip !");
 #ifdef _DEBUG
       _RPT5(0, "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, *motionx, *motiony, *motionzoom, *motionrot);
-      sprintf(debugbuf, "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, *motionx, *motiony, *motionzoom, *motionrot);
+      snprintf(debugbuf, sizeof(debugbuf), "  DePanStabilize::GetFrame DePanData read. n=%d motionx=%f motiony=%f motionzoom=%f motionrot=%f \n", n, *motionx, *motiony, *motionzoom, *motionrot);
       LogToFile(debugbuf);
 #endif
     }
@@ -1228,7 +1238,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
     if (nbase == 4 && ndest == 6) // !! Specific clip debug!
     {
       _RPT2(0, "DePanStabilize. will be problem nbase=%d ndest=%d\n", nbase, ndest);
-      sprintf(debugbuf, "DePanStabilize. will be problem \n");
+      snprintf(debugbuf, sizeof(debugbuf), "DePanStabilize. will be problem \n");
       LogToFile(debugbuf);
       // if (debuglogfile != NULL) { fprintf(debuglogfile, "DePanStabilize. will be problem \n"); }
     }
@@ -1245,7 +1255,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
       sumtransform(trcumul[n - 1], trcur, &trcumul[n]);
 #ifdef _DEBUG
       _RPT5(0, "  cumul[%d].dxc,dyc=%f,%f  MotionX,Y=%f,%f\n", n, trcumul[n].dxc, trcumul[n].dyc, mx, my);
-      sprintf(debugbuf, "  cumul[%d].dxc,dyc=%f,%f  MotionX,Y=%f,%f\n", n, trcumul[n].dxc, trcumul[n].dyc, mx, my);
+      snprintf(debugbuf, sizeof(debugbuf), "  cumul[%d].dxc,dyc=%f,%f  MotionX,Y=%f,%f\n", n, trcumul[n].dxc, trcumul[n].dyc, mx, my);
       LogToFile(debugbuf);
 #endif
     }
@@ -1353,6 +1363,36 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
 
   VideoInfo vi_dst;
   dst = env->NewVideoFrame(vi);
+
+  // Alpha marks the new empty borders (#67): starts as all border (0, alphainvert: max), each used frame
+  // (fillprev, fillnext, current) writes its moved source alpha where it covers, without mirror and blur.
+  const bool has_alpha = vi.IsYUVA() || vi.IsPlanarRGBA(); // YUVA, YA, RGBA
+  if (has_alpha)
+    fill_plane(dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A), dst->GetRowSize(PLANAR_A), dst->GetHeight(PLANAR_A),
+      alphainvert ? (1 << bits_per_pixel) - 1 : 0, pixelsize);
+
+  // fillprev, fillnext: each phase writes only the area covered by its frame (border -1). The rest gets the same
+  // values as the empty border without fill: luma (RGB: all planes) 0, chroma neutral.
+  // Was: left uninitialized, the holes showed garbage (usually picture leftovers from earlier frames).
+  if (fillprev > 0 || fillnext > 0) {
+    if (vi.IsYUY2()) { // planar work buffers, converted back after the last phase
+      fill_plane(YUY2data.dstplaneY, YUY2data.planeYpitch, YUY2data.planeYwidth, vi.height, 0, 1);
+      fill_plane(YUY2data.dstplaneU, YUY2data.planeUVpitch, YUY2data.planeUVwidth, vi.height, 128, 1);
+      fill_plane(YUY2data.dstplaneV, YUY2data.planeUVpitch, YUY2data.planeUVwidth, vi.height, 128, 1);
+    }
+    else {
+      const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+      const int planes_r[3] = { PLANAR_G, PLANAR_B, PLANAR_R };
+      const int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+      const int planecount = (vi.IsY() || vi.IsYA()) ? 1 : 3;
+      for (int p = 0; p < planecount; p++) {
+        const int plane = planes[p];
+        const bool is_chroma = (plane == PLANAR_U) || (plane == PLANAR_V);
+        fill_plane(dst->GetWritePtr(plane), dst->GetPitch(plane), dst->GetRowSize(plane), dst->GetHeight(plane),
+          is_chroma ? 1 << (bits_per_pixel - 1) : 0, pixelsize);
+      }
+    }
+  }
   vi_dst = vi; // same
 
   // Ready to make motion stabilization,
@@ -1465,15 +1505,21 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
     const int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
     const int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
 
-    const int planecount = std::min(vi.NumComponents(), 3);
+    const int planecount = (vi.IsY() || vi.IsYA()) ? 1 : std::min(vi.NumComponents(), 3); // Y, YA: no U/V planes
+
+    // YUY2: work on planar copies, the destination planes are converted back after the last phase.
+    // DePan 2.13.1.0 - 2.15: the packed YUY2 row was processed as a single luma plane
+    const bool isYUY2 = vi.IsYUY2();
+    if (isYUY2)
+      YUY2ToPlanes(src->GetReadPtr(), src->GetPitch(), vi.width, vi.height, YUY2data.srcplaneY, YUY2data.planeYpitch, YUY2data.srcplaneU, YUY2data.srcplaneV, YUY2data.planeUVpitch, env->GetCPUFlags());
 
     for (int p = 0; p < planecount; p++)
     {
       const int plane = planes[p];
 
-      int width_sub = vi.GetPlaneWidthSubsampling(plane);
-      int height_sub = vi.GetPlaneHeightSubsampling(plane);
       bool is_chroma = (plane == PLANAR_U) || (plane == PLANAR_V);
+      int width_sub = isYUY2 ? (is_chroma ? 1 : 0) : vi.GetPlaneWidthSubsampling(plane);
+      int height_sub = isYUY2 ? 0 : vi.GetPlaneHeightSubsampling(plane);
       if (notfilled == 0)
         border = -1; // negative - borders is filled by prev, not by black!
       else {
@@ -1497,6 +1543,14 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
 
       const uint8_t *srcp = src->GetReadPtr(plane);
       int src_pitch = src->GetPitch(plane);
+
+      if (isYUY2) {
+        src_width = is_chroma ? YUY2data.planeUVwidth : YUY2data.planeYwidth;
+        src_height = vi.height;
+        src_pitch = dst_pitch_current = is_chroma ? YUY2data.planeUVpitch : YUY2data.planeYpitch;
+        srcp = plane == PLANAR_Y ? YUY2data.srcplaneY : plane == PLANAR_U ? YUY2data.srcplaneU : YUY2data.srcplaneV;
+        dstp_current = plane == PLANAR_Y ? YUY2data.dstplaneY : plane == PLANAR_U ? YUY2data.dstplaneU : YUY2data.dstplaneV;
+      }
 
       // memo: 
       // move: xc/yc 
@@ -1549,7 +1603,15 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
       _RPT2(0, "Compensate plane %d %f\r\n", p, elapsed_seconds);
 #endif
     } // for planes
+
+    if (has_alpha) // border -1: only the area covered by this frame is written
+      compensate_plane2((subpixel == 0 || fillprev0next1current2 != 2) ? 0 : subpixel, pixelsize,
+        dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A),
+        src->GetRowSize(PLANAR_A), src->GetHeight(PLANAR_A), trY, 0, -1, 0, bits_per_pixel);
   } // prev/next/current frame phase
+
+  if (vi.IsYUY2())
+    YUY2FromPlanes(dst->GetWritePtr(), dst->GetPitch(), vi.width, vi.height, YUY2data.dstplaneY, YUY2data.planeYpitch, YUY2data.dstplaneU, YUY2data.dstplaneV, YUY2data.planeUVpitch, env->GetCPUFlags());
 
   if (debuglogfile != NULL) {
     fflush(debuglogfile);
@@ -1586,7 +1648,7 @@ PVideoFrame __stdcall DePanStabilize::GetFrame(int ndest, IScriptEnvironment* en
 
 AVSValue __cdecl Create_DePanStabilize(AVSValue args, void* user_data, IScriptEnvironment* env) {
   return new DePanStabilize(args[0].AsClip(), // the 0th parameter is the source clip
-    args[1].AsClip(),	// parameter  - motion data clip.
+    args[1].Defined() ? args[1].AsClip() : nullptr, // parameter  - motion data clip (optional with inputlog)
     (float)args[2].AsFloat(1.0f),	// parameter  - cutoff
     (float)args[3].AsFloat(0.9f),	// parameter  - damping  - default changed to 0.9 in v.1.1.4 (was really fixed =0.9 in all prev versions)
     (float)args[4].AsFloat(1.0f),	// parameter  - initial zoom
@@ -1611,6 +1673,7 @@ AVSValue __cdecl Create_DePanStabilize(AVSValue args, void* user_data, IScriptEn
     args[23].AsString(""),  // rot global param
     args[24].AsInt(0),	// parameter  - method
     args[25].AsString(""), // debuglog file name - PF
+    args[26].AsBool(false), // alphainvert
     env);
     // Calls the constructor with the arguments provided.
 }

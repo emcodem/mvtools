@@ -15,6 +15,8 @@
 // Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA, or visit
 // http://www.gnu.org/copyleft/gpl.html .
 
+#include "types.h"
+#ifdef INTEL_INTRINSICS
 #if defined (__GNUC__) && ! defined (__INTEL_COMPILER)
 #include <x86intrin.h>
 // x86intrin.h includes header files for whatever instruction
@@ -22,6 +24,7 @@
 #else
 #include <immintrin.h> // MS version of immintrin.h covers AVX, AVX2 and FMA3
 #endif // __GNUC__
+#endif // INTEL_INTRINSICS
 
 #ifndef __POBLOCKS__
 #define __POBLOCKS__
@@ -31,6 +34,7 @@
 #include "MTSlicer.h"
 #include	"MVInterface.h"	// Required for ALIGN_SOURCEBLOCK
 #include "SADFunctions.h"
+#include "commonfunctions.h"
 #include "SearchType.h"
 #include "Variance.h"
 
@@ -128,6 +132,8 @@ private:
   const int      nLogxRatioUV;     // log of xRatioUV (0 for 1 and 1 for 2)
   const int      yRatioUV;
   const int      nLogyRatioUV;     // log of yRatioUV (0 for 1 and 1 for 2)
+  // luma vector to chroma vector, rounded half away from zero (#59), see mv_to_chroma; precalculated for speed
+  const int      nChromaHalfX, nChromaNegFlagX, nChromaHalfY, nChromaNegFlagY; // NegFlag: 1 if subsampled, else 0
   const int      pixelsize; // PF
   const int      pixelsize_shift; // log of pixelsize (0,1,2) for shift instead of mul or div
   const int      bits_per_pixel;
@@ -370,20 +376,42 @@ private:
       pRefFrame->GetPlane(YPLANE)->GetAbsolutePointerPel <2>((workarea.x[0] << 2) + nVx, (workarea.y[0] << 2) + nVy);
   }
 
-  MV_FORCEINLINE const uint8_t* GetRefBlockU(WorkingArea& workarea, int nVx, int nVy)
+  // Speed-optimized version of mv_to_chroma,
+  // They must give the same result as mv_to_chroma(v, nLogxRatioUV) used by the consumers
+  // (MDegrain, MCompensate, ...)
+  // Cheaper than mv_to_chroma due to precalculated constants: called for every search candidate.
+  // Sign: unsigned 0/1 flag (asm tested with actual ClangCL) on purpose.
+  MV_FORCEINLINE int MvToChromaX(int v) const { return (v + nChromaHalfX - (int)(((unsigned)v >> 31) & (unsigned)nChromaNegFlagX)) >> nLogxRatioUV; }
+  MV_FORCEINLINE int MvToChromaY(int v) const { return (v + nChromaHalfY - (int)(((unsigned)v >> 31) & (unsigned)nChromaNegFlagY)) >> nLogyRatioUV; }
+
+  // nCVx, nCVy: vector already converted to the chroma plane (MvToChromaX/Y)
+  MV_FORCEINLINE const uint8_t* GetRefBlockU(WorkingArea& workarea, int nCVx, int nCVy)
   {
     return
-      (nPel == 2) ? pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <1>((workarea.x[1] << 1) + (nVx >> nLogxRatioUV), (workarea.y[1] << 1) + (nVy >> nLogyRatioUV)) :
-      (nPel == 1) ? pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <0>((workarea.x[1]) + (nVx >> nLogxRatioUV), (workarea.y[1]) + (nVy >> nLogyRatioUV)) :
-      pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <2>((workarea.x[1] << 2) + (nVx >> nLogxRatioUV), (workarea.y[1] << 2) + (nVy >> nLogyRatioUV));
+      (nPel == 2) ? pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <1>((workarea.x[1] << 1) + nCVx, (workarea.y[1] << 1) + nCVy) :
+      (nPel == 1) ? pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <0>((workarea.x[1]) + nCVx, (workarea.y[1]) + nCVy) :
+      pRefFrame->GetPlane(UPLANE)->GetAbsolutePointerPel <2>((workarea.x[1] << 2) + nCVx, (workarea.y[1] << 2) + nCVy);
   }
 
-  MV_FORCEINLINE const uint8_t* GetRefBlockV(WorkingArea& workarea, int nVx, int nVy)
+  MV_FORCEINLINE const uint8_t* GetRefBlockV(WorkingArea& workarea, int nCVx, int nCVy)
   {
     return
-      (nPel == 2) ? pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <1>((workarea.x[2] << 1) + (nVx >> nLogxRatioUV), (workarea.y[2] << 1) + (nVy >> nLogyRatioUV)) :
-      (nPel == 1) ? pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <0>((workarea.x[2]) + (nVx >> nLogxRatioUV), (workarea.y[2]) + (nVy >> nLogyRatioUV)) :
-      pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <2>((workarea.x[2] << 2) + (nVx >> nLogxRatioUV), (workarea.y[2] << 2) + (nVy >> nLogyRatioUV));
+      (nPel == 2) ? pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <1>((workarea.x[2] << 1) + nCVx, (workarea.y[2] << 1) + nCVy) :
+      (nPel == 1) ? pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <0>((workarea.x[2]) + nCVx, (workarea.y[2]) + nCVy) :
+      pRefFrame->GetPlane(VPLANE)->GetAbsolutePointerPel <2>((workarea.x[2] << 2) + nCVx, (workarea.y[2] << 2) + nCVy);
+  }
+
+  // Extracted here to be able to use a common UV path.
+  // To keep the speed after 4.7.48's chroma shift correctness fix.
+  // U+V SAD of the block pointed by luma vector (vx, vy).
+  // U/V share the same chroma vector, convert it once.
+  MV_FORCEINLINE sad_t ChromaSAD(WorkingArea& workarea, int vx, int vy)
+  {
+    const int cvx = MvToChromaX(vx);
+    const int cvy = MvToChromaY(vy);
+    return ScaleSadChroma(
+      SADCHROMA(workarea.pSrc[1], nSrcPitch[1], GetRefBlockU(workarea, cvx, cvy), nRefPitch[1])
+      + SADCHROMA(workarea.pSrc[2], nSrcPitch[2], GetRefBlockV(workarea, cvx, cvy), nRefPitch[2]), effective_chromaSADscale);
   }
 
   MV_FORCEINLINE const uint8_t* GetSrcBlock(int nX, int nY)

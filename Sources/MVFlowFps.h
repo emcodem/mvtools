@@ -5,7 +5,6 @@
 #include "MVFilter.h"
 #include "MTSlicer.h"
 #include "SimpleResize.h"
-#include "yuy2planes.h"
 #include "GpuBackend.h"
 #include <atomic>
 #include <mutex>
@@ -27,7 +26,6 @@ private:
   double ml;
   //bool isse;
   int cpuFlags;
-  bool planar;
   bool blend;
 
   PClip finest; // v2.0
@@ -104,7 +102,6 @@ private:
   SimpleResize *upsizer;
   SimpleResize *upsizerUV;
 
-  YUY2Planes * DstPlanes;
 
   bool is444;
   bool isGrey;
@@ -156,7 +153,7 @@ private:
 
 public:
   MVFlowFps(PClip _child, PClip _super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
-    bool _blend, sad_t nSCD1, int nSCD2, bool isse, bool _planar, int _optDebug, bool mt_flag, bool gpu_flag, IScriptEnvironment* env);
+    bool _blend, sad_t nSCD1, int nSCD2, bool isse, int _optDebug, bool mt_flag, bool gpu_flag, IScriptEnvironment* env);
   ~MVFlowFps();
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

@@ -5,7 +5,13 @@
 #include <tuple>
 #include <stdint.h>
 #include "def.h"
+#ifdef INTEL_INTRINSICS
 #include <immintrin.h>
+#endif
+#include "BlockSizes.h"
+#ifdef NEON_INTRINSICS
+#include "SADFunctions_neon.h"
+#endif
 
 MV_FORCEINLINE unsigned int SADABS(int x) {	return ( x < 0 ) ? -x : x; }
 //inline unsigned int SADABS(int x) {	return ( x < -16 ) ? 16 : ( x < 0 ) ? -x : ( x > 16) ? 16 : x; }
@@ -25,6 +31,7 @@ static unsigned int Sad_C(const uint8_t *pSrc, int nSrcPitch,const uint8_t *pRef
   return sum;
 }
 
+#ifdef INTEL_INTRINSICS
 // -- Start of SATD16 intrinsics
 // https://github.com/xiph/daala/blob/master/src/x86/sse2mcenc.c
 MV_FORCEINLINE void butterfly_2x2_16x8(__m128i &t0, __m128i &t1, __m128i &t2, __m128i &t3) {
@@ -86,7 +93,6 @@ MV_FORCEINLINE __m128i load_4x16_make_4x32_subtract(const unsigned char *src_p, 
 
 // returns 4* of real value, have to divide it back
 // for compatibility with x264 versions, only >>1 needed
-template<bool hasSSSE3>
 uint32_t compute_satd16_4x4_sse2(const unsigned char *src, int systride, const unsigned char *ref, int rystride) {
   uint32_t satd;
   // 16 bit overflows -> load 8 byte 4*uint16_t -> 4x32-bit
@@ -102,19 +108,10 @@ uint32_t compute_satd16_4x4_sse2(const unsigned char *src, int systride, const u
   butterfly_2x2_32x4(a, b, c, d);
   butterfly_2x2_32x4(a, b, c, d);
   // Find the absolute values
-  if (!hasSSSE3) {
-    a = _MM_ABS_EPI32(a);
-    b = _MM_ABS_EPI32(b);
-    c = _MM_ABS_EPI32(c);
-    d = _MM_ABS_EPI32(d);
-  }
-  else {
-// SSSE3:
-    a = _mm_abs_epi32(a);
-    b = _mm_abs_epi32(b);
-    c = _mm_abs_epi32(c);
-    d = _mm_abs_epi32(d);
-  }
+  a = _MM_ABS_EPI32(a);
+  b = _MM_ABS_EPI32(b);
+  c = _MM_ABS_EPI32(c);
+  d = _MM_ABS_EPI32(d);
   // Take the sum of all the absolute values
   a = _mm_add_epi32(a, b);
   c = _mm_add_epi32(c, d);
@@ -328,12 +325,12 @@ MV_FORCEINLINE int32_t compute_sum_8x8_satd16(int ln,
 }
 #endif
 
-template<int w, int h, bool hasSSSE3>
+template<int w, int h>
 MV_FORCEINLINE int32_t calc_satd16_4x4_blocks(const unsigned char *src, int systride, const unsigned char *ref, int rystride) {
   int32_t satd = 0;
   for (int i = 0; i < h; i += 4) {
     for (int j = 0; j < w; j += 4) {
-      satd += compute_satd16_4x4_sse2<hasSSSE3>(
+      satd += compute_satd16_4x4_sse2(
         src + i*systride + j*sizeof(uint16_t), systride,
         ref + i*rystride + j*sizeof(uint16_t), rystride);
     }
@@ -344,9 +341,8 @@ MV_FORCEINLINE int32_t calc_satd16_4x4_blocks(const unsigned char *src, int syst
 
 // declaring templates for 16 bit satd
 #define MAKE_FN(w,h) \
-template<bool hasSSSE3> \
 static uint32_t satd16_##w##x##h##_sse2(const unsigned char *src, int systride, const unsigned char *ref, int rystride) { \
-  return calc_satd16_4x4_blocks<w, h, hasSSSE3>(src, systride, ref, rystride); \
+  return calc_satd16_4x4_blocks<w, h>(src, systride, ref, rystride); \
 } 
   MAKE_FN(64, 64)
   MAKE_FN(64, 48)
@@ -395,6 +391,7 @@ static int32_t compute_satd16_16x16_sse2(const unsigned char *src, int systride,
 */
 
 // -- End of SATD16 intrinsics
+#endif // INTEL_INTRINSICS
 
 /*
 void HADAMARD4_sse2(__m128i &d10, __m128i &d32, __m128i &s10, __m128i &s32) {
@@ -413,14 +410,8 @@ void HADAMARD4_sse2(__m128i &d10, __m128i &d32, __m128i &s10, __m128i &s32) {
 
 }
 */
-#define SUB(a,b) \
-(uint32_t)(((int)(a & 0xFFFFFFFF)) - ((int)(b & 0xFFFFFFFF))) | \
-((uint64_t)(((int)(((int64_t)a >> 32) & 0xFFFFFFFF)) - ((int)(((int64_t)b >> 32) & 0xFFFFFFFF))) << 32)
-#define ADD(a,b) \
-(uint32_t)(((int)(a & 0xFFFFFFFF)) + ((int)(b & 0xFFFFFFFF))) | \
-((uint64_t)(((int)(((int64_t)a >> 32) & 0xFFFFFFFF)) + ((int)(((int64_t)b >> 32) & 0xFFFFFFFF))) << 32)
-
-/*
+// x264 pseudo SIMD: two values in one sum2_t, lo + (hi << BITS_PER_SUM), plain + and -: the carries between the
+// halves are resolved by abs2 (exact for 8-16 bit, checked against a direct Hadamard SATD)
 #define HADAMARD4(d0, d1, d2, d3, s0, s1, s2, s3) {\
     sum2_t t0 = s0 + s1;\
     sum2_t t1 = s0 - s1;\
@@ -431,25 +422,10 @@ void HADAMARD4_sse2(__m128i &d10, __m128i &d32, __m128i &s10, __m128i &s32) {
     d1 = t1 + t3;\
     d3 = t1 - t3;\
 }
-todo why this differs from the ADD and SUB version?
-*/
-#define HADAMARD4(d0, d1, d2, d3, s0, s1, s2, s3) {\
-    sum2_t t0 = ADD(s0,s1);\
-    sum2_t t1 = SUB(s0,s1);\
-    sum2_t t2 = ADD(s2,s3);\
-    sum2_t t3 = SUB(s2,s3);\
-    d0 = ADD(t0,t2);\
-    d2 = SUB(t0,t2);\
-    d1 = ADD(t1,t3);\
-    d3 = SUB(t1,t3);\
-}
-
-// (a+b*256) - (c+d*256) = a-c + 256*(b-d) is it OK always?
 
 // in: a pseudo-simd number of the form x+(y<<16)
 // return: abs(x)+(abs(y)<<16)
 // or <<32 for 16 bit pixels
-// todo check is it OK?
 template<typename sum_t, typename sum2_t>
 static MV_FORCEINLINE sum2_t abs2( sum2_t a )
 {
@@ -728,60 +704,18 @@ SADFunction* get_sad_function(int BlockX, int BlockY, int bits_per_pixel, arch_t
     std::map<std::tuple<int, int, int, arch_t>, SADFunction*> func_sad;
 #define MAKE_SAD_FN(x, y) func_sad[make_tuple(x, y, 8, NO_SIMD)] = Sad_C<x, y, uint8_t>; \
 func_sad[make_tuple(x, y, 16, NO_SIMD)] = Sad_C<x, y, uint16_t>;
-// match with CopyCode.cpp and Overlap.cpp, and luma (variance.cpp) list
-MAKE_SAD_FN(64, 64)
-MAKE_SAD_FN(64, 48)
-MAKE_SAD_FN(64, 32)
-MAKE_SAD_FN(64, 16)
-MAKE_SAD_FN(48, 64)
-MAKE_SAD_FN(48, 48)
-MAKE_SAD_FN(48, 24)
-MAKE_SAD_FN(48, 12)
-MAKE_SAD_FN(32, 64)
-MAKE_SAD_FN(32, 32)
-MAKE_SAD_FN(32, 24)
-MAKE_SAD_FN(32, 16)
-MAKE_SAD_FN(32, 8)
-MAKE_SAD_FN(24, 48)
-MAKE_SAD_FN(24, 32)
-MAKE_SAD_FN(24, 24)
-MAKE_SAD_FN(24, 12)
-MAKE_SAD_FN(24, 6)
-MAKE_SAD_FN(16, 64)
-MAKE_SAD_FN(16, 32)
-MAKE_SAD_FN(16, 16)
-MAKE_SAD_FN(16, 12)
-MAKE_SAD_FN(16, 8)
-MAKE_SAD_FN(16, 4)
-MAKE_SAD_FN(16, 2)
-MAKE_SAD_FN(16, 1)
-MAKE_SAD_FN(12, 48)
-MAKE_SAD_FN(12, 24)
-MAKE_SAD_FN(12, 16)
-MAKE_SAD_FN(12, 12)
-MAKE_SAD_FN(12, 6)
-MAKE_SAD_FN(12, 3)
-MAKE_SAD_FN(8, 32)
-MAKE_SAD_FN(8, 16)
-MAKE_SAD_FN(8, 8)
-MAKE_SAD_FN(8, 4)
-MAKE_SAD_FN(8, 2)
-MAKE_SAD_FN(8, 1)
-MAKE_SAD_FN(6, 24)
-MAKE_SAD_FN(6, 12)
-MAKE_SAD_FN(6, 6)
-MAKE_SAD_FN(6, 3)
-MAKE_SAD_FN(4, 8)
-MAKE_SAD_FN(4, 4)
-MAKE_SAD_FN(4, 2)
-MAKE_SAD_FN(4, 1)
-MAKE_SAD_FN(3, 6)
-MAKE_SAD_FN(3, 3)
-MAKE_SAD_FN(2, 4)
-MAKE_SAD_FN(2, 2)
-MAKE_SAD_FN(2, 1)
+    MVTOOLS_BLOCKSIZES(MAKE_SAD_FN) // BlockSizes.h: the same list for all C tables
 #undef MAKE_SAD_FN
 
+#ifdef NEON_INTRINSICS
+    // 10-14 bit: found by the secondary (16 bit) search
+#define MAKE_SAD_FN(x, y) func_sad[make_tuple(x, y, 8, USE_NEON)] = Sad_neon<x, y, uint8_t>; \
+func_sad[make_tuple(x, y, 16, USE_NEON)] = Sad_neon<x, y, uint16_t>;
+    MVTOOLS_BLOCKSIZES(MAKE_SAD_FN)
+#undef MAKE_SAD_FN
+#endif
+
+#ifdef INTEL_INTRINSICS
 // PF SAD 10 SIMD intrinsic functions
 // only for >=8 bytes widths
 // really this is SSSE3, we make it use from SSE4.1 (until I make an USE_SSSE3 flag)
@@ -816,6 +750,7 @@ MAKE_SAD_FN(6, 24)
 MAKE_SAD_FN(6, 12)
 MAKE_SAD_FN(6, 6)
 MAKE_SAD_FN(6, 3)
+MAKE_SAD_FN(4, 16)
 MAKE_SAD_FN(4, 8)
 MAKE_SAD_FN(4, 4)
 MAKE_SAD_FN(4, 2)
@@ -877,6 +812,7 @@ func_sad[make_tuple(x, y, 8, USE_SSE2)] = Sad_sse2<x,y>;
       MAKE_SAD_FN(6, 12)
       MAKE_SAD_FN(6, 6)
       MAKE_SAD_FN(6, 3)
+      MAKE_SAD_FN(4, 16)
       MAKE_SAD_FN(4, 8)
       MAKE_SAD_FN(4, 4)
       MAKE_SAD_FN(4, 2)
@@ -1046,10 +982,11 @@ func_sad[make_tuple(x, y, 8, USE_SSE2)] = Sad_sse2<x,y>;
       //MAKE_SAD_FN(2, 2)
       //MAKE_SAD_FN(2, 1)
 #undef MAKE_SAD_FN
+#endif // INTEL_INTRINSICS
 
 
     SADFunction *result = nullptr;
-    arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+    arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
     int index = 0;
     while (result == nullptr) {
       arch_t current_arch_try = archlist[index++];
@@ -1376,22 +1313,26 @@ SADFunction* get_satd_function(int BlockX, int BlockY, int pixelsize, arch_t arc
     func_satd[make_tuple(4 , 8 , 1, USE_SSE2)] = x264_pixel_satd_4x8_sse2;
     func_satd[make_tuple(4 , 4 , 1, USE_SSE2)] = x264_pixel_satd_4x4_mmx2;
 #endif // USE_SATD_ASM
-    // 8 and 16 bit C; 16 bit SSE4/SSE2 SADT functions
-    // e.g.. satd16_64x64_sse2<false>;
+#ifdef INTEL_INTRINSICS
+#define MAKE_FN_SSE(w,h) \
+    func_satd[make_tuple(w, h, 2, USE_SSE2)] = satd16_##w##x##h##_sse2; \
+    func_satd[make_tuple(w, h, 2, USE_AVX2)] = Satd16_avx2<w, h>;
+#else
+#define MAKE_FN_SSE(w,h)
+#endif
+    // 8 and 16 bit C; 16 bit SSE2/AVX2 SATD functions
 #ifdef USE_SATD_ASM
 #define MAKE_FN(w,h) \
     func_satd[make_tuple(w, h, 2, NO_SIMD)] = mvtools_satd_##w##x##h##_c<uint16_t>; \
     func_satd[make_tuple(w, h, 1, NO_SIMD)] = mvtools_satd_##w##x##h##_c<uint8_t>; \
-    func_satd[make_tuple(w, h, 2, USE_SSE41)] = satd16_##w##x##h##_sse2<true>; \
-    func_satd[make_tuple(w, h, 2, USE_SSE2)] = satd16_##w##x##h##_sse2<false>;
+    MAKE_FN_SSE(w,h)
 #else
     // additional: 8 bit C from 2.7.46 (gcc)
     // FIXME: implement 8 bit sse2 in case of external asm-less compilation
 #define MAKE_FN(w,h) \
     func_satd[make_tuple(w, h, 2, NO_SIMD)] = mvtools_satd_##w##x##h##_c<uint16_t>; \
     func_satd[make_tuple(w, h, 1, NO_SIMD)] = mvtools_satd_##w##x##h##_c<uint8_t>; \
-    func_satd[make_tuple(w, h, 2, USE_SSE41)] = satd16_##w##x##h##_sse2<true>; \
-    func_satd[make_tuple(w, h, 2, USE_SSE2)] = satd16_##w##x##h##_sse2<false>;
+    MAKE_FN_SSE(w,h)
 #endif
       MAKE_FN(64, 64)
       MAKE_FN(64, 48)
@@ -1430,9 +1371,25 @@ SADFunction* get_satd_function(int BlockX, int BlockY, int pixelsize, arch_t arc
       MAKE_FN(4, 8)
       MAKE_FN(4, 4)
 #undef MAKE_FN
+#undef MAKE_FN_SSE
+
+#ifdef NEON_INTRINSICS
+#define MAKE_FN(w,h) \
+    func_satd[make_tuple(w, h, 1, USE_NEON)] = Satd_neon<w, h, uint8_t>; \
+    func_satd[make_tuple(w, h, 2, USE_NEON)] = Satd_neon<w, h, uint16_t>;
+    MAKE_FN(64, 64) MAKE_FN(64, 48) MAKE_FN(64, 32) MAKE_FN(64, 16)
+    MAKE_FN(48, 64) MAKE_FN(48, 48) MAKE_FN(48, 24) MAKE_FN(48, 12)
+    MAKE_FN(32, 64) MAKE_FN(32, 32) MAKE_FN(32, 24) MAKE_FN(32, 16) MAKE_FN(32, 8) MAKE_FN(32, 4)
+    MAKE_FN(24, 48) MAKE_FN(24, 32) MAKE_FN(24, 24) MAKE_FN(24, 12)
+    MAKE_FN(16, 64) MAKE_FN(16, 32) MAKE_FN(16, 16) MAKE_FN(16, 12) MAKE_FN(16, 8) MAKE_FN(16, 4)
+    MAKE_FN(12, 48) MAKE_FN(12, 24) MAKE_FN(12, 16) MAKE_FN(12, 12)
+    MAKE_FN(8, 32) MAKE_FN(8, 16) MAKE_FN(8, 8) MAKE_FN(8, 4)
+    MAKE_FN(4, 32) MAKE_FN(4, 16) MAKE_FN(4, 8) MAKE_FN(4, 4)
+#undef MAKE_FN
+#endif
 
     SADFunction *result = nullptr;
-    arch_t archlist[] = { USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
+    arch_t archlist[] = { USE_NEON, USE_AVX2, USE_AVX, USE_SSE41, USE_SSE2, NO_SIMD };
     int index = 0;
     while (result == nullptr) {
       arch_t current_arch_try = archlist[index++];

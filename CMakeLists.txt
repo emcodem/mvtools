@@ -6,6 +6,7 @@
 #     cmake --build build
 #   Linux (GCC / Clang): build_linux.sh, or cmake -G Ninja -S . -B build && cmake --build build
 #   Windows from Linux (MinGW-w64, CPU plugins + bridge + cudafilters): cmake/toolchain-mingw64.cmake
+#   Windows on ARM64 (llvm-mingw, NEON, CPU plugins): cmake/toolchains/llvm-mingw-aarch64.cmake
 #
 # Targets and outputs:
 #   mvtools2        mvtools2.dll / libmvtools2.so          (MSVC: with the NASM sources of the .vcxproj)
@@ -13,8 +14,9 @@
 #   depanestimate   DePanEstimate.dll / libdepanestimate.so
 #   mvtools_vsbridge  VapourSynth host for the plugins above (MVTOOLS_VAPOURSYNTH)
 #   mvtools_cuda, cudafilters   GPU part (MVTOOLS_GPU; mvtools_cuda needs CUDA 12, on Windows with MSVC 14.4x)
-# The Visual Studio solution (mvtools.sln) still works and builds the same AviSynth+ DLLs.
-cmake_minimum_required(VERSION 3.18)
+# This CMake build is the one we maintain and test. The Visual Studio solution (mvtools.sln / .slnx) is upstream's,
+# unchanged: it builds upstream's CPU plugins only (without the GPU and VapourSynth parts).
+cmake_minimum_required(VERSION 3.18...3.31)
 
 project("MvTools2" LANGUAGES C CXX)
 include(GNUInstallDirs)
@@ -40,26 +42,39 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 set(CMAKE_CXX_EXTENSIONS FALSE)
 
+# Detect Intel and AArch64 processors and turn Intel SIMD or NEON SIMD on automatically.
+message(STATUS "Target processor: ${CMAKE_SYSTEM_PROCESSOR}")
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCHID)
+set(INTEL_SIMD "OFF")
+set(NEON_SIMD "OFF")
+if( ("${ARCHID}" STREQUAL "x86") OR
+    ("${ARCHID}" STREQUAL "x64") OR
+    ("${ARCHID}" STREQUAL "i686") OR
+    ("${ARCHID}" STREQUAL "amd64") OR
+    ("${ARCHID}" STREQUAL "x86_64") )
+  set(INTEL_SIMD "ON")
+elseif( ("${ARCHID}" STREQUAL "aarch64") OR
+        ("${ARCHID}" STREQUAL "arm64") )
+  set(NEON_SIMD "ON")
+endif()
+
+option(ENABLE_INTEL_SIMD "Enable SIMD intrinsics for Intel processors" "${INTEL_SIMD}")
+option(ENABLE_NEON_SIMD "Enable SIMD intrinsics for AArch64 processors" "${NEON_SIMD}")
+if(ENABLE_INTEL_SIMD AND ENABLE_NEON_SIMD)
+  message(FATAL_ERROR "ENABLE_INTEL_SIMD and ENABLE_NEON_SIMD are mutually exclusive")
+endif()
+
 if(CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_CONFIGURATION_TYPES Debug Release RelWithDebInfo)
   set(CMAKE_CONFIGURATION_TYPES "${CMAKE_CONFIGURATION_TYPES}" CACHE STRING "Reset the configurations to what we need" FORCE)
 endif()
 
-message(STATUS "Target processor: ${CMAKE_SYSTEM_PROCESSOR}")
-string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ARCHID)
-if(ARCHID MATCHES "^(x86|x64|i686|amd64|x86_64)$")
-  set(INTEL_SIMD "ON")
-else()
-  set(INTEL_SIMD "OFF")
-endif()
-option(ENABLE_INTEL_SIMD "Enable SIMD intrinsics for Intel processors" "${INTEL_SIMD}")
-
 if(MSVC)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    message(FATAL_ERROR "clang-cl is not supported by this CMake build (the Visual Studio solution has LLVM configurations)")
+    message(FATAL_ERROR "clang-cl is not supported by this CMake build (MSVC cl, GCC or Clang)")
   endif()
   if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-    message(FATAL_ERROR "Only x64 is supported by the CMake build (use the Visual Studio solution for Win32)")
+    message(FATAL_ERROR "Only x64 is supported with MSVC by this CMake build")
   endif()
   # Static CRT for every DLL (no Visual C++ redistributable needed). Note: the .vcxproj of mvtools2 uses /MD.
   option(MVTOOLS_STATIC_CRT "MSVC: link the C runtime statically (/MT)" ON)
@@ -89,6 +104,14 @@ if(NOT MSVC)
   if(ENABLE_INTEL_SIMD)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-msse2>")
     add_compile_definitions(INTEL_INTRINSICS)
+  elseif(ENABLE_NEON_SIMD)
+    add_compile_definitions(NEON_INTRINSICS)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      # GCC (GNU mode) contracts a*b+c to fmadd also across inlined calls, Clang's default
+      # (-ffp-contract=on) only within one expression. The NEON float paths fuse like GCC's C;
+      # with this the C reference is the same under GCC and Clang.
+      add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=fast>")
+    endif()
   endif()
   if(WIN32)
     # MinGW: GCC does not align the stack to 32 bytes on Win64 (GCC bug 54412), so AVX spills with aligned moves crash;

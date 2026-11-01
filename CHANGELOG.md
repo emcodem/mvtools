@@ -1,11 +1,134 @@
 Change log
+- 2.7.48 (20261029)
+  - Feature request #68: adding search_coarse from SVP fork: MAnalyse: new parameters search_coarse.
+  - MAnalyse: Add parameter trymanyall, which allows trymany for the finest level as well (default false to not decrease speed)
+  - Fix (#69, #51): 32 bit float clips with overlap: garbage (black) output in MDegrain1-6, MDegrainN, MCompensate, MBlockFps.
+    Regression since 2.7.45, float overlap function read the integer overlap window table as float.
+  - Fix: MDegrain1-6 limitC was ineffective for 32 bit float clips.
+  - (internal cosmetics): MAnalyse, MRecalculate: clear the unused part of the vector clip header (was uninitialized garbage, 
+    harmless, but made the output non-deterministic).
+  - Fix (#59): chroma shift (up/left) in motion compensated output of subsampled formats (4:2:0, 4:2:2, 4:1:1).
+    Converting the luma vector to the chroma grid now rounds symmetrically, both on the vector generation side
+    (MAnalyse, MRecalculate chroma SAD) and on the consumer side (MDegrain1-6, MDegrainN, MCompensate, MBlockFps,
+    MFlow, MFlowInter, MFlowFps, MFlowBlur). Not subsampled directions (e.g. vertical in 4:2:2, 4:4:4) were not affected.
+    Chroma output (and vectors with chroma=true) of subsampled clips changes slightly.
+  - MDegrain1-6: remove the experimental out32 (float intermediate overlap buffer) code path. No speed or quality benefit
+    (output differed from the normal path only by +-1 rounding). The out32 parameter is removed as well: scripts passing out32 get an error.
+  - Update Avisynth headers to V13 interface (YA, 4:1:0, 4:1:1, 4:4:0 formats in all bit depths)
+  - Fix: MShow, MDepan text overlay (showsad=true, info=true):
+    - Y (greyscale) clips: "GetPlaneWidthSubsampling not available on Y or YA pixel type" error.
+    - 10-16 bits: possible crash (access violation), or text shading at the wrong place.
+      The chroma part of the text was drawn at double row offset, with 4:4:4 it could write past the frame buffer.
+    - Characters not fitting into the frame are skipped instead of being written outside of it.
+  - New chroma block sizes 2x8 and 4x16, e.g. 4:1:1 needs them with blksize=8 and 16 (also 4:2:2 with 4x8, 8x16 and 4:2:0 with 8x32).
+  - Support the formats added in Avisynth+ interface V13: YUV(A) 4:1:0 and 4:4:0, YUV(A) 4:1:1 in all bit depths, Y with alpha (YA).
+    Clips with alpha (YUVA, YA) are accepted now (YUVA was rejected).
+  - Fix: MDegrain1-6, MDegrainN on greyscale (Y) clips: part of the degrained luma was overwritten with source luma.
+  - Alpha plane: the output alpha is copied from the source (current frame; the nearest frame in MFlowInter, MFlowFps, MBlockFps;
+    MShow: fully opaque). Alpha is not processed. Earlier the output alpha of planar RGBA clips was left undefined.
+  - MDegrain1-6, MDegrainN: lsb=true is not allowed for clips with alpha.
+  - Fix: MFlowBlur: chroma used the horizontal padding of the super clip as vertical padding (wrong chroma when hpad != vpad).
+  - Fix: MSuper, MShow with 4:1:0 and odd vpad: the frame height was not a multiple of 4
+    (Avisynth error: "Attempted to request a planar frame that wasn't mod4").
+  - MSuper: odd hpad with 4:1:1 and 4:1:0 is rejected with a clear error message (width + 2 * hpad must be a multiple of 4).
+  - All block sizes work with subsampled formats when the block size is a multiple of the chroma subsampling, e.g.
+    16x12 in 4:2:0 (chroma 8x6), 32x24 in 4:2:2, 4x4 in 4:1:1 and 4:1:0 (chroma 1x4, 1x1), 64x48 in 4:4:0.
+    39 chroma-only block sizes were missing (C versions added): "no BLITCHROMA function" or similar errors,
+    in MCompensate a crash (access violation).
+  - Block sizes which are not a multiple of the chroma subsampling (e.g. 3x3, 6x3 in 4:2:0, 2x2 in 4:1:1) are rejected
+    with a clear error in MAnalyse, MRecalculate (chroma=true), MDegrain1-6, MDegrainN, MCompensate, MBlockFps.
+    Was: various missing function errors, or a truncated chroma block.
+  - Fix: blksize 6x24 and 12x3: crash (access violation) in MAnalyse, all formats (missing luma function).
+  - Fix: blksize 48x48 at 8 bit with the adaptive dct modes: the block luma was taken from the top 48x12 part only.
+  - MAnalyse, MRecalculate dct=5..10 (SATD): error for a block width or height not divisible by 4 (24x6, 16x2, 12x6, 12x3,
+    8x2, 8x1, 6x*, 4x2, 3x*, 2x*). Was: no SATD function for these sizes, the SATD part was silently 0
+    (dct=5: luma ignored in the search).
+  - Fix: overlap windows, further fix (after #69 above), MCompensate, MDegrain1-6, MDegrainN, MBlockFps with overlap: the weights of the overlapping
+    blocks summed to 2047..2049 instead of 2048, so a flat area changed by up to +-0.05%: at 16 bit up to +-32
+    (e.g. flat 30000 became 29985..30015), from 12 bits visible. 8 bit: rarely +-1. Now the sum is exact.
+    What users could see: a faint static grid on bright, smooth areas, following the block overlap layout
+    (pixels 0.05% too dark or too bright, larger on brighter areas), mostly after strong grading or contrast boost
+    of 12-16 bit material. Degrain strength was not affected, only this small level error in the overlap zones.
+
+  Fixes, all builds
+  - Fix: MSuper with an odd chroma width or height (e.g. 854x480 4:2:0): the first coarser level was reduced from
+    level 0 before level 0 was padded, so the coarser levels, and the vectors of MAnalyse/MRecalculate, depended on
+    uninitialized memory (non-deterministic output). Vectors of such clips change.
+  - Fix: MCompensate cclip was ignored (the parameter was read from the thSAD2 argument). With tr > 0 the center frames
+    come from cclip now, as documented.
+  - (internal cosmetics): MDepan: the reserved field of the motion data header was uninitialized (4 random bytes in the
+    data clip; DePan ignores it). Deterministic output now.
+
+  Fixes, C path (non-x86 builds, and x86 with SetMaxCPU("none"))
+  - Fix: MFlow, MFlowInter, MFlowFps, MFlowBlur, MBlockFps: heap corruption (crash) in the vector upsizer: rows were
+    written past the end of the buffer. Vector limiting is now done per pixel, giving the same vectors as SSE2.
+  - Fix: MAnalyse, MRecalculate dct modes, 8 bit: the block luma sum overflowed for bright blocks of 129..256 pixels
+    (16x16, 12x12, 8x32, ...).
+  - Fix: MAnalyse, MRecalculate dct=5..10, 10-16 bit: wrong SATD for most blocks.
+  - MAnalyse, MRecalculate dct=1..4: the DCT AC coefficients are rounded to nearest like the SIMD versions (were
+    truncated, biased towards zero). The C path gives the same vectors as the x86 SIMD path now.
+
+  Fixes, Intel SIMD
+  - Fix: MFlow, MFlowInter, MFlowFps, MFlowBlur: wrong (clamped) values for negative vectors in the last 1-3 columns of
+    the upsized vector field when its width is not a multiple of 4: MFlowBlur at any width not mod 4; the others when the
+    padded luma or chroma width is not mod 4 (e.g. blksize 4, 6, 12).
+  - Fix: MDegrain1-6 out16=true: crash with block width 12 (luma blksize 12, or 24 with 4:2:0 / 4:2:2 chroma).
+  - Fix: 8 bit SAD for block widths 6 and 12, and 24x24, 24x32, 24x48: only a part of the block was compared (the last
+    4 or 2 columns, or 4 of every 8 rows), MAnalyse gave bad vectors. Builds without the external asm only: Linux and
+    macOS on x86, MinGW (GCC, llvm-mingw). The MSVC and ClangCL builds were not affected.
+  - Fix: YUY2 with planar=true, limit and a width not a multiple of 16: crash in MDegrain1-6, MDegrainN.
+  - Fix: x64 MinGW builds: the 64 bit atomic compare-exchange used 32 bit address registers.
+  - Fix: MSuper rfilter=0, 10-16 bit, CPUs without SSE4.1: wrong output (the SSE2 path stored the unpacked result).
+  - Fix: MSuper sharp=1 and sharp=2, 10-16 bit, SSE2: the vertical interpolation wrote past the row end in the averaged
+    edge rows and read up to two rows past the plane. Output was not affected.
+
+  Optimizations
+  - New aarch64 (ARM64) NEON code paths, bit-identical to the C path:
+    - SAD (all block sizes, 8 and 10-16 bit), SATD for dct=5..10 (8 and 10-16 bit)
+    - DCT modes (dct=1..4): pixel <-> float conversion of the fftw DCT, 8 and 10-16 bit
+    - block luma sums (dct modes), 8 and 10-16 bit
+    - MSuper: all rfilter reducers, all sharp refines, the pel=4 averaging, 8-16 bit
+    - overlapped block output (8, 10-16 bit, float)
+    - MDegrain1-6, MDegrainN (8 bit, out16, 10-16 bit; MDegrainN also 32 bit float)
+  - MFlow, MFlowBlur, MFlowFps with pel=2 and pel=4: the subpixel plane merge is vectorized by the compilers
+    (all platforms).
+  - x86 AVX2, same output as SSE2 and C:
+    - MSuper sharp=1 (bicubic) and sharp=2 (Wiener) subpixel interpolation, 8 and 10-16 bit (MSuper pel=2 up to 1.5x faster)
+    - SATD for dct=5..10, 10-16 bit (MAnalyse dct=5 about 1.3x faster)
+
+  Code simplification (no change in output unless noted)
+  - MDegrain1-6, MDegrainN lsb=true: implemented as the out16=true result converted to the stacked format (MSB rows on
+    top of the LSB rows, 8 bit clip of double height). All stacked-output kernels and overlap functions are removed.
+    - Output is identical except with limit/limitC < 255: the stacked path limited the MSB half only, now the
+      16 bit value is limited (as with out16=true).
+    - lsb=true with a YUY2 source is an error now (as out16=true).
+  - YUY2: converted to YV16 at the filter boundary, the filters work on YV16 only. planar=false (normal YUY2):
+    ConvertToYV16 before, ConvertToYUY2 after; planar=true (the planar YUY2 layout of Interleaved2Planar): repacked the
+    same way. The internal YUY2 code of all filters is removed. Output is unchanged.
+    - The super clip of a YUY2 source is YV16 (was a planar-layout YUY2 clip); MShow converts its output back to YUY2.
+    - MDepan keeps its own YUY2 handling (its output is a data clip).
+
+  Build environment
+  - CMake: aarch64 targets are detected, NEON is enabled (ENABLE_NEON_SIMD), x86 SIMD flags and files are used on
+    Intel targets only. A C-only build compiles and runs on any target.
+  - x86 GCC, Clang, ClangCL builds: SSE2 base (no global -msse4.1), the SSE4.1/AVX/AVX2 code is chosen at runtime.
+    The Linux and MinGW builds run on SSE2-only CPUs as well.
+  - Windows on ARM64: build_arm64_mingw.bat, cross-compiled on x64 Windows with llvm-mingw (UCRT), CMake and Ninja;
+    libc++ is linked statically, the DLLs need only system DLLs. MvTools2, DePan and DePanEstimate.
+    The DCT modes and DePanEstimate need an ARM64 libfftw3f-3.dll.
+  - The sources compile with MSVC for ARM64 as well.
+  - CMake builds for Windows (MinGW, llvm-mingw) include the version resources of all three DLLs.
+  - Linux aarch64: the DCT modes and DePanEstimate need the fftw library (libfftw3-single3 / fftw), as on x86.
+  - Note: aarch64 vs x86 output differs slightly for 32 bit float clips (fused multiply-add) and in the DCT modes
+    (fftw), as between different compilers.
+
 - 2.7.47 (20260424)
   - Update Avisynth headers to V12 interface (AcquireGlobalLock/ReleaseGlobalLock support)
   - Thread-safe FFTW plan creation/destruction in DCTFFTW using GlobalLockGuard:
     On Avisynth+ V12+ uses the shared global named lock "fftw", coordinating with
     other plugins (e.g. dfttest, depanestimate) that use the same FFTW DLL.
     Falls back to a local static mutex on older Avisynth versions.
-  - Project solution: moved to VS2026 solution format (.slnx)
+  - Project MS solution: moved to VS2026 solution format (.slnx); add Intel C++ Compiler 2025 ICX; drop Intel C++ Compiler 2024.1 ICX and 19.2 ICL
 
 - 2.7.46 (20240503)
   - Recheck and fix build processes for various compilers 

@@ -1,4 +1,4 @@
-﻿gf<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+gf<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html lang='en' xml:lang='en' xmlns="http://www.w3.org/1999/xhtml">
 
 <head>
@@ -12,14 +12,16 @@
     <h2>Abstract</h2>
     <table class="n">
         <tr><td class="n"><b>Authors:      </b></td><td class="n">&nbsp;</td><td class="n">Manao, Tsp, TSchniede, SEt, Fizick (Alexander Balakhnin), Vit, Firesledge, pinterf</td></tr>
-        <tr><td class="n"><b>Version:      </b></td><td class="n">&nbsp;</td><td class="n">2.7.47</td></tr>
+        <tr><td class="n"><b>Version:      </b></td><td class="n">&nbsp;</td><td class="n">2.7.48</td></tr>
         <tr><td class="n"><b>git:          </b></td><td class="n">&nbsp;</td><td class="n"><a href="https://github.com/pinterf/mvtools/tree/mvtools-pfmod">https://github.com/pinterf/mvtools/tree/mvtools-pfmod</a></td></tr>
         <tr><td class="n"><b>Forum:        </b></td><td class="n">&nbsp;</td><td class="n"><a href="https://forum.doom9.org/showthread.php?t=173356">https://forum.doom9.org/showthread.php?t=173356</a></td></tr>
         <tr><td class="n"><b>Base versions:</b></td><td class="n">&nbsp;</td><td class="n">2.6.0.5 + 2.5.11.22</td></tr>
         <tr><td class="n"><b>Base download:</b></td><td class="n">&nbsp;</td><td class="n">Contained in the Dither package, <a href="http://ldesoras.free.fr/prod.html#src_ditheravsi">http://ldesoras.free.fr/prod.html</a></td></tr>
         <tr><td class="n"><b>Category:     </b></td><td class="n">&nbsp;</td><td class="n">Misc Plugins</td></tr>
-        <tr><td class="n"><b>Requirements: </b></td><td class="n">&nbsp;</td><td class="n">YV12, YV16, YV24 or YUY2, Y, YUV420P10-16, YUV422P10-16, YUV444P10-16 for finding vectors</td></tr>
-        <tr><td class="n"><b>              </b></td><td class="n">&nbsp;</td><td class="n">8-32 bit Y, YUV 420, 422, 444 and planar RGB for MSuper, MCompensate and MDegrains and MFlowXX family</td></tr>
+        <tr><td class="n"><b>Requirements: </b></td><td class="n">&nbsp;</td><td class="n">YV12, YV16, YV24 or YUY2, Y, YUV420P10-16, YUV422P10-16, YUV444P10-16 for finding vectors;
+            since 2.7.48 also YA, YUVA, 4:1:0, 4:1:1, 4:4:0 (8-16 bit)</td></tr>
+        <tr><td class="n"><b>              </b></td><td class="n">&nbsp;</td><td class="n">8-32 bit Y(A), YUV(A) 420, 422, 444, 410, 411, 440 and planar RGB(A) for MSuper, MCompensate and MDegrains and MFlowXX family</td></tr>
+        <tr><td class="n"><b>Platforms:    </b></td><td class="n">&nbsp;</td><td class="n">Windows x86, x64 and ARM64 (since 2.7.48); Linux x86-64 and aarch64 (NEON, since 2.7.48)</td></tr>
         <tr><td class="n"><b>License:      </b></td><td class="n">&nbsp;</td><td class="n">GPL</td></tr>
 
     </table>
@@ -112,6 +114,8 @@
         Versions from 2.7.5.22 support all 420, 422, 444 planar YUV formats, 8 and 10-16 bits
         with recent Avisynth Plus versions.
         Since 2.7.40 almost all 8-32 bit Y, YUV and planar RGB colorspaces are supported for many filters.
+        Since 2.7.48 the formats of Avisynth+ interface V13 (Y with alpha (YA), 4:1:0, 4:1:1, 4:4:0 in all bit depths)
+        and clips with alpha (YUVA) are supported as well. The alpha plane is copied from the source, it is not processed.
         Except that for motion vector search only 8-16 bit Y or YUV clips are supported.
 
         Use color format conversion and try using (smart) bob-deinterlace for
@@ -258,6 +262,14 @@
         YV16 format.
         This paramenter is ignored for YV12 clips. Note: super clip is always planar.
     </p>
+    <p>
+        Since 2.7.48 the filters convert a YUY2 source to YV16 internally and the result back to YUY2:
+        with planar=false by ConvertToYV16 and ConvertToYUY2, with planar=true by repacking the planar YUY2 layout.
+        Both kinds of YUY2 work as before and give the same output, but planar=true has no speed benefit any more;
+        use YV16 clips directly if you can. The super clip of a YUY2 source is a YV16 clip.
+        MDepan works on the YUY2 frames directly (its output is a data clip).
+    </p>
+
     <p class="var">gpu (bool, false)</p>
     <p>
         <code>MSuper</code>, <code>MAnalyse</code>, <code>MRecalculate</code>, <code>MCompensate</code>,
@@ -295,7 +307,7 @@
         That is one of reasons why we additionally use source clip with client
         functions.
         You may have a look to super clip yourself (it has normal format).
-        Supported formats: greyscale, YUV and planar RGB 8-32 bits, YUY2
+        Supported formats: greyscale (Y, YA), YUV(A) 4:2:0, 4:2:2, 4:4:4, 4:1:0, 4:1:1, 4:4:0 and planar RGB(A) 8-32 bits, YUY2
         You can use different Super clip for generation vectors with MAnalyze and a different
         super clip format for the actual action. Thus MFlowFPS can support native RGB (planar),
         and MDegrain can work with 32 bit float input clips.
@@ -309,6 +321,14 @@
     </p>
     <p class="var">vpad</p>
     <p>It is vertical padding added to source frame (both top and bottom).</p>
+    <p>
+        Note for subsampled formats: the chroma planes get <var>hpad</var> and <var>vpad</var> divided by the
+        chroma subsampling, rounded down (e.g. 4:2:0 with vpad=3: chroma vpad 1; 4:1:1 with hpad=2: chroma hpad 0).
+        Near the frame edges a vector may then point to a chroma area which is not padded.
+        Recommended: multiples of the subsampling, i.e. 4:2:0: both even, 4:2:2: hpad even,
+        4:1:1: hpad multiple of 4, 4:1:0: both multiples of 4, 4:4:0: vpad even. The default 8 is fine for all formats.
+        With 4:1:1 and 4:1:0 an odd hpad is rejected (width + 2 * hpad must be a multiple of 4).
+    </p>
     <p class="var">pel</p>
     <p>
         It is the accuracy of the motion estimation.
@@ -422,7 +442,9 @@
 	bool   multi (false),
 	bool   mt (true),
 	int    scaleCSAD (0),
-	bool gpu (false)
+	int    search_coarse (3),
+	bool   trymanyall (false),
+	bool   gpu (false)
 )</pre>
     <p>
         Get prepared multilevel super clip, estimate motion by block-matching
@@ -493,7 +515,10 @@
         4x8, 4x4, 4x2<br />
         3x6, 3x3<br />
         2x4, 2x2<br />
-        Note: some smaller block sizes can only be available in 4:4:4 formats, due to block size division (chroma subsampling)
+        With subsampled formats (and chroma processing) the block size must be a multiple of the chroma subsampling,
+        e.g. 4:2:0: both even, 4:2:2: width even, 4:1:1: width multiple of 4, 4:1:0: both multiples of 4, 4:4:0: height even.
+        E.g. 4x4 works with 4:1:1 and 4:1:0 (chroma block 1x4, 1x1), but 3x3 is 4:4:4 only.
+        Other sizes are rejected with an error message.
     </p>
     <p class="var">blksizeV</p>
     <p>
@@ -514,13 +539,16 @@
         (computer graphics, etc).
         Default = 0 since v.2.5 (all levels are used).
     </p>
-    <p class="var">search, searchparam, pelsearch</p>
+    <p class="var">search, searchparam, pelsearch, search_coarse</p>
     <p>
-        <var>search</var> decides the type of search at every level,
-        <var>searchparam</var> is an additional parameter (step, radius) for this
-        search, and <var>pelsearch</var> is the radius parameter at finest (pel)
-        level.
-        Below are the possible values for the <var>search</var> type:
+        <var>search</var> decides the type of search at the finest level,
+        <var>search_coarse</var> decides the type of search at the coarser levels (default 3: exhaustive, as before v2.7.48).
+        <var>searchparam</var> is an additional parameter (step, radius) for the coarse levels' search.
+        It is applied on every coarse level, so its effective range at full resolution is roughly
+        <var>searchparam</var> &times; 2^(levels&minus;1); the default 2 is not as small as it looks.
+        <var>pelsearch</var> is the radius parameter at finest (pel) level.
+        Exception: with <var>search</var>=6 or 7 (pure horizontal/vertical) or with a single level, <var>search</var> and <var>searchparam</var> are used at all levels.
+        Below are the possible values for the <var>search</var> and <var>search_coarse</var> type:
     </p>
     <table>
         <tr><td><b>0</b></td><td>'OneTimeSearch'. <var>searchparam</var> is the step between each vectors tried (if <var>searchparam</var> is superior to 1, step will be progressively refined).</td></tr>
@@ -532,6 +560,14 @@
         <tr><td><b>6</b></td><td>pure Horizontal exhaustive search, <var>searchparam</var> is the radius (width is 2*radius+1).</td></tr>
         <tr><td><b>7</b></td><td>pure Vertical exhaustive search, <var>searchparam</var> is the radius (height is 2*radius+1).</td></tr>
     </table>
+    <p>
+        Test note (v2.7.48): <var>search_coarse</var> is mainly a speed option (types 2 and 4 were about 5% faster
+        than the default 3). Quality differences were small (within about 1% on most clips); where a different
+        coarse type helped, raising <var>searchparam</var> (the coarse levels' range) gave the same improvement.
+        These are AI-driven numeric test results (luma mean absolute error of motion compensation and frame
+        interpolation, 60 frames each) on four real clips: a 720p camera clip, an 8mm film transfer, a 50 fps VHS
+        capture and a 1440x576 clip. No visual inspection was done.
+    </p>
     <p class="var">isb</p>
     <p>
         Allows to choose between a forward search (motion from the previous frame
@@ -686,7 +722,9 @@
         <tr><td><b>9</b></td><td>Similar to 2, use SATD and weight ranges from SAD only to equal SAD & SATD.</td></tr>
         <tr><td><b>10</b></td><td>Similar to 3/4,use SATD weight is on SAD, only on strong luma changes.</td></tr>
     </table>
-    <p>Modes 5 to 10 were added in v1.9.5.3.</p>
+    <p>Modes 5 to 10 were added in v1.9.5.3.
+        SATD is the sum of 4x4 Hadamard transforms: modes 5 to 10 need a block width and height divisible by 4
+        (error otherwise, since v2.7.48). Modes 1 to 4 work with all block sizes.</p>
     <p class="var">divide</p>
     <p>post-processing motion vectors by dividing every block into 4 subblocks.</p>
     <table>
@@ -723,8 +761,20 @@
         work correctly.
         Note: Since 2.7.32 the filter registers itself automatically MT_SERIALIZED instead of MT_MULTI_INSTANCE under Avisynth+ when temporal=true is given.
     </p>
-    <p class="var">trymany</p>
-    <p>Try to start searches around many predictors (besides finest level).</p>
+    <p class="var">trymany, trymanyall</p>
+    <p>
+        <var>trymany</var>: try to start searches around many predictors, at all levels except the finest one.
+        Default false.<br>
+        <var>trymanyall</var> (v2.7.48): used only when <var>trymany</var>=true. Then the finest level is searched
+        around many predictors as well, i.e. at all levels. Default false, since it is slow: MAnalyse takes
+        more than twice as long as with <var>trymany</var>=true alone.<br>
+        Similar to mvutensils (VapourSynth): <var>trymany</var>=true equals its trymany=1 (AllExceptFinest),
+        <var>trymany</var>=true with <var>trymanyall</var>=true equals its trymany=2 (All).<br>
+        Test note (v2.7.48): <var>trymanyall</var> gives slightly better block matching (about 0.4-1.6% lower compensation error
+        than <var>trymany</var> alone) at more than 2x MAnalyse time; frame interpolation (MFlowInter) did not improve.
+        These are AI-driven numeric test results (luma mean absolute error, 60 frames each) on four real clips:
+        a 720p camera clip, an 8mm film transfer, a 50 fps VHS capture and a 1440x576 clip. No visual inspection was done.
+    </p>
     <p class="var">multi</p>
     <p>
         When set to true, MAnalyse generates the motion vectors for all the
@@ -772,6 +822,22 @@
         0: 4:2 (default, same as the native ratio for YV12)<br />
         1: 4:4<br />
         2: 4:8<br />
+    </p>
+    <p>
+        The ratio is the same for all formats: the chroma SAD is normalized to the 4:2 ratio of 4:2:0
+        (4:4:4: chroma SAD divided by 4; 4:2:2, 4:4:0: by 2; 4:2:0, 4:1:1: unchanged; 4:1:0: multiplied by 4),
+        <var>scaleCSAD</var> changes it from there.
+    </p>
+    <p>
+        Note: only the SAD is weighted. The chroma part of the thresholds which are derived from <var>thSCD1</var>
+        (scene change detection) and <var>thSAD</var> (MDegrain1-6, MDegrainN <var>thSAD</var>, <var>thSADC</var>; MRecalculate <var>thSAD</var>)
+        is scaled in the <i>opposite</i> direction: with <var>scaleCSAD</var>=1 it is halved, with 2 it is quartered
+        (-1: doubled, -2: quadrupled). Relative to the luma part of the threshold, the whole threshold is
+        3.0 (-2), 2.0 (-1), 1.5 (0), 1.25 (1), 1.125 (2) times larger.<br />
+        So a positive <var>scaleCSAD</var> makes chroma differences count more and lowers the effective thresholds at the same time:
+        use larger <var>thSAD</var>, <var>thSCD1</var> values to keep the denoising strength and the scene change sensitivity.<br />
+        This behavior is kept for compatibility, scripts like SMDegrain and QTGMC+ use <var>scaleCSAD</var>=2 for HD sources
+        and their defaults are tuned to it.
     </p>
     <h4>Truemotion parameters</h4>
     <p>
@@ -890,7 +956,8 @@
     <p>
         This is multilevel super clip prepared by <code>MSuper</code> function.
         Mandatory.
-        From 2.7.37 may more bit depths and formats supported: 8-32 bits, YUV420-422-444, Planar RGB, and YUY2 planar
+        From 2.7.37 may more bit depths and formats supported: 8-32 bits, YUV420-422-444, Planar RGB, and YUY2 planar.
+        From 2.7.48 also Y with alpha (YA), YUV(A) 4:1:0, 4:1:1, 4:4:0 and clips with alpha (YUVA, planar RGBA).
         Super clip format must match with the source, but can be different from the base format of vector clip.
     </p>
     <p class="var">vectors</p>
@@ -1641,6 +1708,27 @@
         <code>MDeGrainN</code> has a temporal radius given by the <var>tr</var>
         parameter, and uses a special motion vector clip.
     </p>
+    <p>
+        Note: only whole blocks are processed. If the frame is not covered by whole blocks, the remaining
+        pixels at the right and bottom edges are not denoised, they are copied from the source.
+        The uncovered width is (<var>width</var>&nbsp;-&nbsp;<var>overlap</var>) modulo
+        (<var>blksize</var>&nbsp;-&nbsp;<var>overlap</var>), the uncovered height is the same with
+        <var>height</var>, <var>overlapV</var> and <var>blksizeV</var>.
+        E.g. at 1920x1080 with <var>blksize</var>=16, <var>overlap</var>=0 the last 8 rows,
+        with <var>blksize</var>=32 the last 24 rows are not denoised;
+        at 1280x720 with <var>blksize</var>=24, <var>overlap</var>=2 the last 2 columns and 14 rows.<br />
+        Workaround: pad the clip to a covered size before <code>MSuper</code>, crop the result:
+    </p>
+    <pre>bs = 16
+ov = 4
+step = bs - ov
+padx = (step - (Width() - ov) % step) % step
+pady = (step - (Height() - ov) % step) % step
+padded = AddBorders(0, 0, padx, pady)
+super = padded.MSuper()
+backward_vec = super.MAnalyse(isb = true, blksize = bs, overlap = ov)
+forward_vec = super.MAnalyse(isb = false, blksize = bs, overlap = ov)
+padded.MDegrain1(super, backward_vec, forward_vec, thSAD = 400).Crop(0, 0, -padx, -pady)</pre>
     <p class="var">super</p>
     <p>
         Multilevel super clip prepared by <code>MSuper</code> function.
@@ -1708,7 +1796,11 @@
         on the top of the least significant byte (LSB) block.
         Hence a twice taller resulting picture.
         You can extract the MSB or the LSB with a simple Crop() call.
-        This mode helps recovering the full bitdepth of temporally dithered data.
+        This mode helps recovering the full bitdepth of temporally dithered data.<br />
+        Since 2.7.48 lsb=true is the out16=true result converted to the stacked format (as ConvertToStacked does):
+        the same output as before, except with <var>limit</var> or <var>limitC</var> below 255, where the 16 bit value
+        is limited now (earlier only the MSB part). Only 8 bit Y8, YV12, YV16, YV24 sources are accepted; YUY2 is not
+        supported any more.
     </p>
     <p class="var">tr</p>
     <p>
@@ -1735,6 +1827,7 @@
         Generates 16-bit data from 8 bit inputs when set to true.
         It is like lsb=true but the output format is native 16bits.
         A bit faster than lsb=true. Cannot be mixed with lsb=true.
+        Y8, YV12, YV16 or YV24 sources only (not YUY2).
     </p>
 
     <h3>MRecalculate</h3>
@@ -2190,7 +2283,9 @@ forward = MAnalyse(superfilt, isb = false, blksize=16)
 forward_re = MRecalculate(super, forward, blksize=8, thSAD=100)
 backward_re = MRecalculate(super, backward, blksize=8, thSAD=100)
 MFlowFps(super, backward_re, forward_re, num=50, den=1)</pre>
-    <p>How to use planar option for faster processing of YUY2 (MDegrain3 example):</p>
+    <p>How to use planar option for faster processing of YUY2 (MDegrain3 example).
+       Since 2.7.48 this has no speed benefit (YUY2 is converted to YV16 inside the filters), the example is kept
+       for the old scripts:</p>
 <pre class="src">LoadPlugin("SSEToolsS.dll") # for conversion functions
 AVISource("c:\test.avi") # or MPEG2Source, DirectShowSource, some previous filter, etc
 Interleaved2Planar() # convert clip to planar
@@ -2233,34 +2328,197 @@ Planar2Interleaved() # convert back to normal interleave YUY2
 
     <h2><a name="revisions"></a>VI) Revisions</h2>
 
+    <p>2.7.48 (20261029)</p>
+    <ul>
+        <li>
+            Feature request #68: adding search_coarse from SVP fork: MAnalyse: new parameters search_coarse.
+            MAnalyse: Add parameter trymanyall, which allows trymany for the finest level as well (default false to not decrease speed)
+        </li>
+        <li>
+            Fix (#69, #51): 32 bit float clips with overlap: garbage (black) output in MDegrain1-6, MDegrainN, MCompensate, MBlockFps.<br />
+            Regression since 2.7.45, float overlap function read the integer overlap window table as float.
+        </li>
+        <li>Fix: MDegrain1-6 limitC was ineffective for 32 bit float clips.</li>
+        <li>MAnalyse, MRecalculate: clear the unused part of the vector clip header (was uninitialized garbage, harmless, but made the output non-deterministic).</li>
+        <li>
+            Fix (#59): chroma shift (up/left) in motion compensated output of subsampled formats (4:2:0, 4:2:2, 4:1:1).<br />
+            Converting the luma vector to the chroma grid now rounds symmetrically, both on the vector generation side
+            (MAnalyse, MRecalculate chroma SAD) and on the consumer side (MDegrain1-6, MDegrainN, MCompensate, MBlockFps,
+            MFlow, MFlowInter, MFlowFps, MFlowBlur). Not subsampled directions (e.g. vertical in 4:2:2, 4:4:4) were not affected.<br />
+            Chroma output (and vectors with chroma=true) of subsampled clips changes slightly.
+        </li>
+        <li>
+            MDegrain1-6: remove the experimental out32 (float intermediate overlap buffer) code path. No speed or quality benefit
+            (output differed from the normal path only by +-1 rounding). The out32 parameter is removed as well: scripts passing out32 get an error.
+        </li>
+        <li>Update Avisynth headers to V13 interface (YA, 4:1:0, 4:1:1, 4:4:0 formats in all bit depths)</li>
+        <li>
+            Fix: MShow, MDepan text overlay (showsad=true, info=true):<br />
+            - Y (greyscale) clips: "GetPlaneWidthSubsampling not available on Y or YA pixel type" error.<br />
+            - 10-16 bits: possible crash (access violation), or text shading at the wrong place.
+            The chroma part of the text was drawn at double row offset, with 4:4:4 it could write past the frame buffer.<br />
+            - Characters not fitting into the frame are skipped instead of being written outside of it.
+        </li>
+        <li>New chroma block sizes 2x8 and 4x16, e.g. 4:1:1 needs them with blksize=8 and 16 (also 4:2:2 with 4x8, 8x16 and 4:2:0 with 8x32).</li>
+        <li>
+            Support the formats added in Avisynth+ interface V13: YUV(A) 4:1:0 and 4:4:0, YUV(A) 4:1:1 in all bit depths, Y with alpha (YA).<br />
+            Clips with alpha (YUVA, YA) are accepted now (YUVA was rejected).
+        </li>
+        <li>Fix: MDegrain1-6, MDegrainN on greyscale (Y) clips: part of the degrained luma was overwritten with source luma.</li>
+        <li>
+            Alpha plane: the output alpha is copied from the source (current frame; the nearest frame in MFlowInter, MFlowFps, MBlockFps;
+            MShow: fully opaque). Alpha is not processed. Earlier the output alpha of planar RGBA clips was left undefined.
+        </li>
+        <li>MDegrain1-6, MDegrainN: lsb=true is not allowed for clips with alpha.</li>
+        <li>Fix: MFlowBlur: chroma used the horizontal padding of the super clip as vertical padding (wrong chroma when hpad != vpad).</li>
+        <li>
+            Fix: MSuper, MShow with 4:1:0 and odd vpad: the frame height was not a multiple of 4
+            (Avisynth error: "Attempted to request a planar frame that wasn't mod4").
+        </li>
+        <li>MSuper: odd hpad with 4:1:1 and 4:1:0 is rejected with a clear error message (width + 2 * hpad must be a multiple of 4).</li>
+        <li>All block sizes work with subsampled formats when the block size is a multiple of the chroma subsampling, e.g.
+            16x12 in 4:2:0 (chroma 8x6), 32x24 in 4:2:2, 4x4 in 4:1:1 and 4:1:0 (chroma 1x4, 1x1), 64x48 in 4:4:0.
+            39 chroma-only block sizes were missing (C versions added): "no BLITCHROMA function" or similar errors,
+            in MCompensate a crash (access violation).</li>
+        <li>Block sizes which are not a multiple of the chroma subsampling (e.g. 3x3, 6x3 in 4:2:0, 2x2 in 4:1:1) are rejected
+            with a clear error in MAnalyse, MRecalculate (chroma=true), MDegrain1-6, MDegrainN, MCompensate, MBlockFps.
+            Was: various missing function errors, or a truncated chroma block.</li>
+        <li>Fix: blksize 6x24 and 12x3: crash (access violation) in MAnalyse, all formats (missing luma function).</li>
+        <li>Fix: blksize 48x48 at 8 bit with the adaptive dct modes: the block luma was taken from the top 48x12 part only.</li>
+        <li>MAnalyse, MRecalculate dct=5..10 (SATD): error for a block width or height not divisible by 4 (24x6, 16x2, 12x6, 12x3,
+            8x2, 8x1, 6x*, 4x2, 3x*, 2x*). Was: no SATD function for these sizes, the SATD part was silently 0
+            (dct=5: luma ignored in the search).</li>
+        <li>Fix: overlap windows, further fix (after #69 above), MCompensate, MDegrain1-6, MDegrainN, MBlockFps with overlap: the weights of the overlapping
+            blocks summed to 2047..2049 instead of 2048, so a flat area changed by up to +-0.05%: at 16 bit up to +-32
+            (e.g. flat 30000 became 29985..30015), from 12 bits visible. 8 bit: rarely +-1. Now the sum is exact.
+            What users could see: a faint static grid on bright, smooth areas, following the block overlap layout
+            (pixels 0.05% too dark or too bright, larger on brighter areas), mostly after strong grading or contrast boost
+            of 12-16 bit material. Degrain strength was not affected, only this small level error in the overlap zones.</li>
+        <li>
+            Fixes, all builds:
+            <ul>
+                <li>Fix: MSuper with an odd chroma width or height (e.g. 854x480 4:2:0): the first coarser level was reduced from
+                    level 0 before level 0 was padded, so the coarser levels, and the vectors of MAnalyse/MRecalculate, depended on
+                    uninitialized memory (non-deterministic output). Vectors of such clips change.</li>
+                <li>Fix: MCompensate cclip was ignored (the parameter was read from the thSAD2 argument). With tr &gt; 0 the center frames
+                    come from cclip now, as documented.</li>
+                <li>(internal cosmetics): MDepan: the reserved field of the motion data header was uninitialized (4 random bytes in the
+                    data clip; DePan ignores it). Deterministic output now.</li>
+            </ul>
+        </li>
+        <li>
+            Fixes, C path (non-x86 builds, and x86 with SetMaxCPU("none")):
+            <ul>
+                <li>Fix: MFlow, MFlowInter, MFlowFps, MFlowBlur, MBlockFps: heap corruption (crash) in the vector upsizer: rows were
+                    written past the end of the buffer. Vector limiting is now done per pixel, giving the same vectors as SSE2.</li>
+                <li>Fix: MAnalyse, MRecalculate dct modes, 8 bit: the block luma sum overflowed for bright blocks of 129..256 pixels
+                    (16x16, 12x12, 8x32, ...).</li>
+                <li>Fix: MAnalyse, MRecalculate dct=5..10, 10-16 bit: wrong SATD for most blocks.</li>
+                <li>MAnalyse, MRecalculate dct=1..4: the DCT AC coefficients are rounded to nearest like the SIMD versions (were
+                    truncated, biased towards zero). The C path gives the same vectors as the x86 SIMD path now.</li>
+            </ul>
+        </li>
+        <li>
+            Fixes, Intel SIMD:
+            <ul>
+                <li>Fix: MFlow, MFlowInter, MFlowFps, MFlowBlur: wrong (clamped) values for negative vectors in the last 1-3 columns of
+                    the upsized vector field when its width is not a multiple of 4: MFlowBlur at any width not mod 4; the others when the
+                    padded luma or chroma width is not mod 4 (e.g. blksize 4, 6, 12).</li>
+                <li>Fix: MDegrain1-6 out16=true: crash with block width 12 (luma blksize 12, or 24 with 4:2:0 / 4:2:2 chroma).</li>
+                <li>Fix: 8 bit SAD for block widths 6 and 12, and 24x24, 24x32, 24x48: only a part of the block was compared (the last
+                    4 or 2 columns, or 4 of every 8 rows), MAnalyse gave bad vectors. Builds without the external asm only: Linux and
+                    macOS on x86, MinGW (GCC, llvm-mingw). The MSVC and ClangCL builds were not affected.</li>
+                <li>Fix: YUY2 with planar=true, limit and a width not a multiple of 16: crash in MDegrain1-6, MDegrainN.</li>
+                <li>Fix: x64 MinGW builds: the 64 bit atomic compare-exchange used 32 bit address registers.</li>
+                <li>Fix: MSuper rfilter=0, 10-16 bit, CPUs without SSE4.1: wrong output (the SSE2 path stored the unpacked result).</li>
+                <li>Fix: MSuper sharp=1 and sharp=2, 10-16 bit, SSE2: the vertical interpolation wrote past the row end in the averaged
+                    edge rows and read up to two rows past the plane. Output was not affected.</li>
+            </ul>
+        </li>
+        <li>
+            Optimizations:
+            <ul>
+                <li>New aarch64 (ARM64) NEON code paths, bit-identical to the C path:
+                    SAD (all block sizes, 8 and 10-16 bit), SATD for dct=5..10 (8 and 10-16 bit);
+                    DCT modes (dct=1..4): pixel &lt;-&gt; float conversion of the fftw DCT, 8 and 10-16 bit;
+                    block luma sums (dct modes), 8 and 10-16 bit;
+                    MSuper: all rfilter reducers, all sharp refines, the pel=4 averaging, 8-16 bit;
+                    overlapped block output (8, 10-16 bit, float);
+                    MDegrain1-6, MDegrainN (8 bit, out16, 10-16 bit; MDegrainN also 32 bit float).</li>
+                <li>MFlow, MFlowBlur, MFlowFps with pel=2 and pel=4: the subpixel plane merge is vectorized by the compilers
+                    (all platforms).</li>
+                <li>x86 AVX2, same output as SSE2 and C:
+                    MSuper sharp=1 (bicubic) and sharp=2 (Wiener) subpixel interpolation, 8 and 10-16 bit (MSuper pel=2 up to 1.5x faster);
+                    SATD for dct=5..10, 10-16 bit (MAnalyse dct=5 about 1.3x faster).</li>
+            </ul>
+        </li>
+        <li>
+            Code simplification (no change in output unless noted):
+            <ul>
+                <li>MDegrain1-6, MDegrainN lsb=true: implemented as the out16=true result converted to the stacked format (MSB rows on
+                    top of the LSB rows, 8 bit clip of double height). All stacked-output kernels and overlap functions are removed.<br />
+                    - Output is identical except with limit/limitC &lt; 255: the stacked path limited the MSB half only, now the
+                    16 bit value is limited (as with out16=true).<br />
+                    - lsb=true with a YUY2 source is an error now (as out16=true).</li>
+                <li>YUY2: converted to YV16 at the filter boundary, the filters work on YV16 only. planar=false (normal YUY2):
+                    ConvertToYV16 before, ConvertToYUY2 after; planar=true (the planar YUY2 layout of Interleaved2Planar): repacked the
+                    same way. The internal YUY2 code of all filters is removed. Output is unchanged.<br />
+                    - The super clip of a YUY2 source is YV16 (was a planar-layout YUY2 clip); MShow converts its output back to YUY2.<br />
+                    - MDepan keeps its own YUY2 handling (its output is a data clip).</li>
+            </ul>
+        </li>
+        <li>
+            Build environment:
+            <ul>
+                <li>CMake: aarch64 targets are detected, NEON is enabled (ENABLE_NEON_SIMD), x86 SIMD flags and files are used on
+                    Intel targets only. A C-only build compiles and runs on any target.</li>
+                <li>x86 GCC, Clang, ClangCL builds: SSE2 base (no global -msse4.1), the SSE4.1/AVX/AVX2 code is chosen at runtime.
+                    The Linux and MinGW builds run on SSE2-only CPUs as well.</li>
+                <li>Windows on ARM64: build_arm64_mingw.bat, cross-compiled on x64 Windows with llvm-mingw (UCRT), CMake and Ninja;
+                    libc++ is linked statically, the DLLs need only system DLLs. MvTools2, DePan and DePanEstimate.
+                    The DCT modes and DePanEstimate need an ARM64 libfftw3f-3.dll.</li>
+                <li>The sources compile with MSVC for ARM64 as well.</li>
+                <li>CMake builds for Windows (MinGW, llvm-mingw) include the version resources of all three DLLs.</li>
+                <li>Linux aarch64: the DCT modes and DePanEstimate need the fftw library (libfftw3-single3 / fftw), as on x86.</li>
+                <li>Note: aarch64 vs x86 output differs slightly for 32 bit float clips (fused multiply-add) and in the DCT modes
+                    (fftw), as between different compilers.</li>
+            </ul>
+        </li>
+    </ul>
+
     <p>2.7.47 (20260424)</p>
     <ul>
         <li>Update Avisynth headers to V12 interface (AcquireGlobalLock/ReleaseGlobalLock support)</li>
-        <li>Thread-safe FFTW plan creation/destruction in DCTFFTW using GlobalLockGuard:<br />
+        <li>
+            Thread-safe FFTW plan creation/destruction in DCTFFTW using GlobalLockGuard:<br />
             On Avisynth+ V12+ uses the shared global named lock &quot;fftw&quot;, coordinating with
             other plugins (e.g. dfttest, depanestimate) that use the same FFTW DLL.<br />
             Falls back to a local static mutex on older Avisynth versions.
         </li>
-        <li>Project solution: moved to VS2026 solution format (.slnx)</li>
+        <li>Project MS solution: moved to VS2026 solution format (.slnx); add Intel C++ Compiler 2025 ICX; drop Intel C++ Compiler 2024.1 ICX and 19.2 ICL</li>
     </ul>
 
     <p>2.7.46 (20240503)</p>
     <ul>
-        <li>Recheck and fix build processes for various compilers<br />
+        <li>
+            Recheck and fix build processes for various compilers<br />
             (Visual Studio MSVC v143, v141_xp; Intel C++ Compiler 2024.1 ICX, 19.2 ICL; ClangCL; gcc mingw64)
         </li>
         <li>Fix (#56): bug in Cross search</li>
         <li>(unreleased 2.7.46 (20230208) test build in https://github.com/pinterf/mvtools/issues/58)</li>
         <li>Fix (#58): MFlowFPS memory leak</li>
         <li>Fix (#49): lsad 0 caused division-by-zero crash</li>
-        <li>Optimization: MDegrain1-6 8 bit: Add avx2 code path (already was in code but disabled, now go live)
+        <li>
+            Optimization: MDegrain1-6 8 bit: Add avx2 code path (already was in code but disabled, now go live)
+        </li>
         <li>Optimization: MDegrainN 10-16 bits: SSE4.1 code path (was: C only)</li>
         <li>Optimization: VerticalBicubic interpolation SSE4.1 version besides SSE2</li>
         <li>Fix: MRestoreVect was trying to create unaligned frame (crash)</li>
         <li>(#48) Project files/solution: Intel C++ Compiler 2021 (icx) and 19.2 (icl classic) support on Windows</li>
         <li>Source internals: MDegrain: for block size of 4, read exactly 4 bytes instead of 8. (in extreme cases it would read past a valid memory area)</li>
         <li>MDegrain1-6 8 bit: Add avx2 code path (already was in code but disabled, now go live)</li>
-        <li>Possible LLVM-build speedup by not using _mm256_zeroupper in avx2,<br />
+        <li>
+            Possible LLVM-build speedup by not using _mm256_zeroupper in avx2,<br />
             compilers do that automatically. LLVM builds, because it unoptimizedly saved and restored _all_ ymm registers (slow!)
         </li>
     </ul>

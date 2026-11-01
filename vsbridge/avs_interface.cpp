@@ -402,6 +402,14 @@ bool VideoInfo::IsRGB64()   const { return ((pixel_type & CS_BGR32) == CS_BGR32)
 bool VideoInfo::IsYUVA() const { return !!(pixel_type&CS_YUVA ); }
 bool VideoInfo::IsPlanarRGB() const { return !!(pixel_type&CS_PLANAR) && !!(pixel_type&CS_BGR) && !!(pixel_type&CS_RGB_TYPE); }
 bool VideoInfo::IsPlanarRGBA() const { return !!(pixel_type&CS_PLANAR) && !!(pixel_type&CS_BGR) && !!(pixel_type&CS_RGBA_TYPE); }
+// V13 (avisynth.h 2.7.48): YUV(A) 4:4:0, 4:1:1, 4:1:0 and Y plus alpha
+bool VideoInfo::Is440() const { return ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUV440 & CS_PLANAR_FILTER)) ||
+                                       ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUVA440 & CS_PLANAR_FILTER)); }
+bool VideoInfo::IsYA() const { return (pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YA & CS_PLANAR_FILTER); }
+bool VideoInfo::Is410() const { return ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUV410 & CS_PLANAR_FILTER)) ||
+                                       ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUVA410 & CS_PLANAR_FILTER)); }
+bool VideoInfo::Is411() const { return ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUV411 & CS_PLANAR_FILTER)) ||
+                                       ((pixel_type & CS_PLANAR_MASK & ~CS_Sample_Bits_Mask) == (CS_GENERIC_YUVA411 & CS_PLANAR_FILTER)); }
 bool VideoInfo::IsChannelMaskKnown() const { return !!(image_type & IT_HAS_CHANNELMASK); }
 // Re-maps and stores channel mask into image_type, sets the 'has channel mask' flag as well
 void VideoInfo::SetChannelMask(bool isChannelMaskKnown, unsigned int dwChannelMask)
@@ -1337,8 +1345,17 @@ static const AVS_Linkage avs_linkage = {    // struct AVS_Linkage {
   &VideoInfo::SetChannelMask,               //   void    (VideoInfo::*SetChannelMask)();
   &VideoInfo::GetChannelMask,               //   int     (VideoInfo::*GetChannelMask)()  const;
 
+  // V13
+  &VideoInfo::Is440,                        //   bool    (VideoInfo::*Is440)() const;
+  &VideoInfo::IsYA,                         //   bool    (VideoInfo::*IsYA)() const;
+  &VideoInfo::Is410,                        //   bool    (VideoInfo::*Is410)() const;
+  &VideoInfo::Is411,                        //   bool    (VideoInfo::*Is411)() const;
+
+  // V14
+  &AVSValue::AsFunction,                    //   PFunction (AVSValue::*AVSValue_AsFunction)() const;
+
   // a single { nullptr } initializes the whole placeholder array
-  { nullptr },                              // void          (VideoInfo::* reserved2[64 - 31])(); // Reserve pointer space for Avisynth+
+  { nullptr },                              // void          (VideoInfo::* reserved2[64 - 36])(); // Reserve pointer space for Avisynth+
 
 /**********************************************************************/
   // AviSynth Neo additions

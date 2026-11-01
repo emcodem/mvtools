@@ -1,8 +1,10 @@
 # mvtools2: mvtools2.dll (MSVC, MinGW) / libmvtools2.so.
 #
-# MSVC reproduces Sources/mvtools.vcxproj, Release|x64: the same C++ sources (plus VapourSynthEntry.cpp), /arch:AVX2 for
-# the *_avx2.cpp files only, the NASM sources with the per-file defines and include paths of the project, the version
-# resource. Other compilers (GCC, Clang, MinGW) use the intrinsic code paths instead of the external assembler (def.h).
+# MSVC (x64) follows upstream's Sources/mvtools.vcxproj, Release|x64: the same C++ sources (plus VapourSynthEntry.cpp),
+# /arch:AVX2 for the *_avx2.cpp files only, the NASM sources with the per-file defines and include paths of the project,
+# the version resource. Other compilers (GCC, Clang, MinGW, llvm-mingw) use the intrinsic code paths instead of the
+# external assembler (def.h): x86 with an SSE2 base (the SSE4.1 kernels carry target attributes) and per-file ISA flags,
+# AArch64 with the *_neon.cpp files. Files.cmake (upstream's) drops the files of the other architecture.
 
 include("Files.cmake")
 
@@ -83,10 +85,13 @@ if(MSVC)
 
   target_link_libraries(mvtools2 PRIVATE winmm)
 else()
-  # GCC / Clang (Linux, MinGW): intrinsics, SSE4.1 baseline as before
-  target_compile_options(mvtools2 PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-msse4.1>")
-  target_compile_definitions(mvtools2 PRIVATE INTEL_INTRINSICS)
-  set_source_files_properties(${SRCS_AVX2} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  # GCC / Clang (Linux, MinGW, llvm-mingw): -msse2 + INTEL_INTRINSICS or NEON_INTRINSICS come from the top level
+  if(ENABLE_INTEL_SIMD)
+    set_source_files_properties(${SRCS_AVX2} PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  elseif(ENABLE_NEON_SIMD)
+    file(GLOB SRCS_NEON RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "*_neon.cpp")
+    set_source_files_properties(${SRCS_NEON} PROPERTIES COMPILE_OPTIONS "-march=armv8-a")
+  endif()
   if(WIN32)
     target_link_libraries(mvtools2 PRIVATE winmm)
   else()

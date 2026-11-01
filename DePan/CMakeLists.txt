@@ -16,11 +16,8 @@ target_include_directories(depan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_
 if(MSVC)
   target_compile_definitions(depan PRIVATE WIN32 _WINDOWS _USRDLL DePan_EXPORTS _MBCS)
   mv_msvc_release_flags(depan)
-else()
-  # GCC / Clang: SSE4.1 baseline as before
-  target_compile_options(depan PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-msse4.1>")
-  target_compile_definitions(depan PRIVATE INTEL_INTRINSICS)
 endif()
+# GCC / Clang: SSE2 base (upstream 2.7.48) with INTEL_INTRINSICS, or NEON_INTRINSICS, from the top level
 if(NOT WIN32)
   target_link_libraries(depan PRIVATE ${CMAKE_DL_LIBS})
 endif()

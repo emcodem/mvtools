@@ -42,13 +42,13 @@
 #include <algorithm>
 
 MVAnalyse::MVAnalyse(
-  PClip _child, int _blksizex, int _blksizey, int lv, int st, int stp,
+  PClip _child, int _blksizex, int _blksizey, int lv, int st /* searchtype */, int stp /* searchtype_param */,
   int _pelSearch, bool isb, int lambda, bool chroma, int df, sad_t _lsad,
   int _plevel, bool _global, int _pnew, int _pzero, int _pglobal,
   int _overlapx, int _overlapy, const char* _outfilename, int _dctmode,
   int _divide, int _sadx264, sad_t _badSAD, int _badrange, bool _isse,
   bool _meander, bool temporal_flag, bool _tryMany, bool multi_flag,
-  bool mt_flag, int _chromaSADScale, bool gpu_flag, IScriptEnvironment* env
+  bool mt_flag, int _chromaSADScale, int st_coarse, bool _tryManyAll, bool gpu_flag, IScriptEnvironment* env
 )
   : ::GenericVideoFilter(_child)
   , _srd_arr(1)
@@ -94,12 +94,12 @@ MVAnalyse::MVAnalyse(
     env->ThrowError("MAnalyse: Clip with float pixel type is not supported");
   }
 
-  if (!vi.IsYUV() && !vi.IsYUY2()) // YUY2 is also YUV but let's see what is supported
+  if (!ClipFnc::is_yuv_any(vi)) // YUY2 is also YUV but let's see what is supported
   {
-    env->ThrowError("MAnalyse: Clip must be YUV or YUY2");
+    env->ThrowError("MAnalyse: Clip must be Y(A), YUV(A) or YUY2");
   }
 
-  if (vi.IsY())
+  if (ClipFnc::is_grey(vi))
     chroma = false; // silent fallback
 
   // get parameters of super clip - v2.0
@@ -129,9 +129,9 @@ MVAnalyse::MVAnalyse(
   analysisData.nWidth = vi.width - nSuperHPad * 2;
   analysisData.nHeight = nHeight;
   analysisData.pixelType = vi.pixel_type;
-  if (!vi.IsY()) {
-    analysisData.yRatioUV = vi.IsYUY2() ? 1 : (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
-    analysisData.xRatioUV = vi.IsYUY2() ? 2 : (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
+  if (!ClipFnc::is_grey(vi)) {
+    analysisData.yRatioUV = (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
+    analysisData.xRatioUV = (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
   }
   else {
     analysisData.yRatioUV = 1; // n/a
@@ -187,6 +187,11 @@ MVAnalyse::MVAnalyse(
     env->ThrowError(
       "MAnalyse: Invalid block size: %d x %d", analysisData.nBlkSizeX, analysisData.nBlkSizeY);
   }
+  // SATD sums 4x4 Hadamard transforms
+  if (_dctmode >= 5 && (analysisData.nBlkSizeX % 4 != 0 || analysisData.nBlkSizeY % 4 != 0)) {
+    env->ThrowError(
+      "MAnalyse: dct=%d (SATD) needs a block size divisible by 4, not %d x %d", _dctmode, analysisData.nBlkSizeX, analysisData.nBlkSizeY);
+  }
 
   analysisData.nPel = nSuperPel;
   if (analysisData.nPel != 1
@@ -211,6 +216,13 @@ MVAnalyse::MVAnalyse(
   if (_overlapx % analysisData.xRatioUV || _overlapy % analysisData.yRatioUV)
   {
     env->ThrowError("MAnalyse: wrong overlap for the colorspace subsampling");
+  }
+
+  // chroma block = block size / subsampling, it must be exact (e.g. 3x3 in 4:2:0 would give a truncated 1x1 chroma block)
+  if (chroma && (analysisData.nBlkSizeX % analysisData.xRatioUV || analysisData.nBlkSizeY % analysisData.yRatioUV))
+  {
+    env->ThrowError("MAnalyse: block size %dx%d is not a multiple of the chroma subsampling (%dx%d), use chroma=false or another block size",
+      analysisData.nBlkSizeX, analysisData.nBlkSizeY, analysisData.xRatioUV, analysisData.yRatioUV);
   }
 
   if (_divide != 0 && (_blksizex < 8 || _blksizey < 8)) // || instead of && 2.5.11.22 green garbage issue
@@ -308,6 +320,7 @@ MVAnalyse::MVAnalyse(
   badrange = _badrange;
   meander = _meander;
   tryMany = _tryMany;
+  tryManyAll = _tryManyAll;
 
   if (_dctmode != 0)
   {
@@ -317,41 +330,48 @@ MVAnalyse::MVAnalyse(
     _dct_pool.set_factory(*_dct_factory_ptr);
   }
 
-  switch (st)
+  SearchType searchTypes[] = { ONETIME, NSTEP, LOGARITHMIC, EXHAUSTIVE, HEX2SEARCH, UMHSEARCH, HSEARCH, VSEARCH };
+  if (st < 0 || st > 7)
   {
-  case 0:
-    searchType = ONETIME;
+    st = 2; // LOGARITHMIC
+  }
+  searchType = searchTypes[st];
+  switch (searchType)
+  {
+  case ONETIME:
     nSearchParam = (stp < 1) ? 1 : stp;
     break;
-  case 1:
-    searchType = NSTEP;
+  case NSTEP:
     nSearchParam = (stp < 0) ? 0 : stp;
     break;
-  case 3:
-    searchType = EXHAUSTIVE;
+  case LOGARITHMIC:
     nSearchParam = (stp < 1) ? 1 : stp;
     break;
-  case 4:
-    searchType = HEX2SEARCH;
+  case EXHAUSTIVE:
     nSearchParam = (stp < 1) ? 1 : stp;
     break;
-  case 5:
-    searchType = UMHSEARCH;
+  case HEX2SEARCH:
+    nSearchParam = (stp < 1) ? 1 : stp;
+    break;
+  case UMHSEARCH:
     nSearchParam = (stp < 1) ? 1 : stp; // really min is 4
     break;
-  case 6:
-    searchType = HSEARCH;
+  case HSEARCH:
     nSearchParam = (stp < 1) ? 1 : stp;
     break;
-  case 7:
-    searchType = VSEARCH;
+  case VSEARCH:
     nSearchParam = (stp < 1) ? 1 : stp;
     break;
-  case 2:
-  default:
-    searchType = LOGARITHMIC;
-    nSearchParam = (stp < 1) ? 1 : stp;
   }
+
+  // default was 3 - EXHAUSTIVE
+  if (st_coarse < 0 || st_coarse > 7)
+  {
+    env->ThrowError(
+      "MAnalyse: search_coarse must be between 0 and 7"
+    );
+  }
+  searchTypeCoarse = searchTypes[st_coarse]; // coarse levels' radius is searchparam (nSearchParam)
 
   // not below value of 0 at finest level
   nPelSearch = (_pelSearch <= 0) ? analysisData.nPel : _pelSearch;
@@ -431,12 +451,15 @@ MVAnalyse::MVAnalyse(
   // stays on the CPU, silently
   if (gpu_flag)
   {
-    _gpu_rfilter = params.param & 7;
-    const bool super_ok = (params.param & 0x80) && (_gpu_rfilter == 4 || _gpu_rfilter == 2) /* rfilter */
-      && ((params.param >> 3) & 3) == 2 /* sharp */ && !(params.param & 0x20) /* no pelclip */;
+    // rfilter 2 / 4, sharp 2, no pelclip, written by our MSuper (SuperParams64Bits.h, D4)
+    const bool super_ok = super_param_gpu_rebuildable(params);
+    _gpu_rfilter = super_ok ? super_param_rfilter(params) : 0;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
       && !divideExtra && !_dctmode && !temporal_flag && !multi_flag
+      // upstream 2.7.48 options the CUDA search does not have (REBASE_PLAN.md issue 3): coarse levels exhaustive only
+      // (search_coarse 3, the behaviour before 2.7.48), no trymany at the finest level
+      && st_coarse == 3 && !tryManyAll
       && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount)
       && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && analysisData.nBlkSizeX <= 32
       && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)))
@@ -622,6 +645,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       sizeof(srd._analysis_data)
     );
   }
+  // avoid garbage (helps tests): zero the unused rest of the header
+  memset(pDst + sizeof(int) + sizeof(MVAnalysisData), 0, headerSize - sizeof(int) - sizeof(MVAnalysisData));
   pDst += headerSize;
 
   if (nsrc < minframe || nsrc >= maxframe)
@@ -668,7 +693,12 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
     }
 
     // temporal predictor dst if prev frame was really prev
-    int *			pVecPrevOrNull = 0;
+    int *pVecPrevOrNull = nullptr;
+    // FIXME: Why this check is needed: we have exactly one 'previous' data, so a
+    // RequestLinear-like access pattern is heavily expected.
+    // But in multithreading this is rare; even in single-threaded mode it is not guaranteed.
+    // Maybe we would consider using a circular buffer of previous vectors,
+    // to allow more freedom in access pattern and to increase the chance of temporal prediction.
     if (_temporal_flag && srd._vec_prev_frame == nsrc - 1)
     {
       pVecPrevOrNull = &srd._vec_prev[0];
@@ -713,7 +743,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       searchType, nSearchParam, nPelSearch, nLambda, lsad, pnew, plevel,
       global, srd._analysis_data.nFlags, reinterpret_cast<int*>(pDst),
       outfilebuf, fieldShift, pzero, pglobal, badSAD, badrange,
-      meander, pVecPrevOrNull, tryMany
+      meander, pVecPrevOrNull, tryMany, searchTypeCoarse, tryManyAll
     );
     }
 
@@ -843,31 +873,16 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
 
 void	MVAnalyse::load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data)
 {
-  PROFILE_START(MOTION_PROFILE_YUY2CONVERT);
   const unsigned char *	pSrcY;
   const unsigned char *	pSrcU;
   const unsigned char *	pSrcV;
   int				nSrcPitchY;
   int				nSrcPitchUV;
-  if ((ana_data.pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
-  {
-    // planar data packed to interleaved format (same as interleved2planar
-    // by kassandro) - v2.0.0.5
-    pSrcY = src->GetReadPtr();
-    pSrcU = pSrcY + src->GetRowSize() / 2;
-    pSrcV = pSrcU + src->GetRowSize() / 4;
-    nSrcPitchY = src->GetPitch();
-    nSrcPitchUV = nSrcPitchY;
-  }
-  else
-  {
-    pSrcY = src->GetReadPtr(PLANAR_Y);
-    pSrcU = src->GetReadPtr(PLANAR_U);
-    pSrcV = src->GetReadPtr(PLANAR_V);
-    nSrcPitchY = src->GetPitch(PLANAR_Y);
-    nSrcPitchUV = src->GetPitch(PLANAR_U);
-  }
-  PROFILE_STOP(MOTION_PROFILE_YUY2CONVERT);
+  pSrcY = src->GetReadPtr(PLANAR_Y);
+  pSrcU = src->GetReadPtr(PLANAR_U);
+  pSrcV = src->GetReadPtr(PLANAR_V);
+  nSrcPitchY = src->GetPitch(PLANAR_Y);
+  nSrcPitchUV = src->GetPitch(PLANAR_U);
 
   gof.Update(
     nModeYUV,

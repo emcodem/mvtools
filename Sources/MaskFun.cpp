@@ -20,7 +20,11 @@
 
 
 #include "MaskFun.h"
+#include "commonfunctions.h"
+#include "types.h"
+#ifdef INTEL_INTRINSICS
 #include <emmintrin.h>
+#endif
 #include <cassert>
 
 #if !defined(_M_X64)
@@ -125,7 +129,7 @@ void MakeVectorOcclusionMaskTime(MVClip &mvClip, int nBlkX, int nBlkY, double dM
   MemZoneSet(occMask, 0, nBlkX, nBlkY, 0, 0, occMaskPitch); 
   int time4096X = time256*16/blkSizeX;
   int time4096Y = time256*16/blkSizeY;
-#ifndef _M_X64 
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty ();
 #endif
   double occnorm = 10 / dMaskNormFactor/nPel;
@@ -174,7 +178,7 @@ void VectorMasksToOcclusionMaskTime(uint8_t *VXMask, uint8_t *VYMask, int nBlkX,
   MemZoneSet(occMask, 0, nBlkX, nBlkY, 0, 0, nBlkX);
   int time4096X = time256*16/blkSizeX;
   int time4096Y = time256*16/blkSizeY;
-#ifndef _M_X64 
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty ();
 #endif
   double occnorm = 10 / dMaskNormFactor/nPel;
@@ -217,7 +221,7 @@ void VectorMasksToOcclusionMaskTime(uint8_t *VXMask, uint8_t *VYMask, int nBlkX,
 // it is old pre 1.8 version
 void MakeVectorOcclusionMask(MVClip &mvClip, int nBlkX, int nBlkY, double dMaskNormFactor, double fGamma, int nPel, uint8_t * occMask, int occMaskPitch)
 {	// analyse vectors field to detect occlusion
-#ifndef _M_X64 
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty ();
 #endif
   double occnorm = 10 / dMaskNormFactor/nPel; // empirical
@@ -281,7 +285,7 @@ void MakeVectorOcclusionMask(MVClip &mvClip, int nBlkX, int nBlkY, double dMaskN
 void VectorMasksToOcclusionMask(uint8_t *VXMask, uint8_t *VYMask, int nBlkX, int nBlkY, double dMaskNormFactor, double fGamma, int nPel, uint8_t * occMask)
 {	// analyse vectors field to detect occlusion
   // note: dMaskNormFactor was = 1/ml, now is = ml
-#ifndef _M_X64 
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty ();
 #endif
   double occnorm = 10 / dMaskNormFactor/nPel; // empirical
@@ -396,33 +400,29 @@ void MakeVectorSmallMasks(MVClip &mvClip, int nBlkX, int nBlkY, short *VXSmallY,
 // it can be called with X and Y vectors, ratioUV can be xRatioUV or yRatioUV
 void VectorSmallMaskYToHalfUV(short * VSmallY, int nBlkX, int nBlkY, short *VSmallUV, int ratioUV)
 {
-  if (ratioUV == 2)
+  // ratioUV: 1 (e.g. height of YUY2), 2 (e.g. YV12) or 4 (YV411 width)
+  const int log = ilog2(ratioUV);
+  for (int by = 0; by<nBlkY; by++)
   {
-    // e.g. YV12 colorformat 
-    for (int by = 0; by<nBlkY; by++)
+    for (int bx = 0; bx<nBlkX; bx++)
     {
-      for (int bx = 0; bx<nBlkX; bx++)
-      {
-        VSmallUV[bx] = ((VSmallY[bx]) >> 1); // chroma
-      }
-      VSmallY += nBlkX;
-      VSmallUV += nBlkX;
+      VSmallUV[bx] = (short)mv_to_chroma(VSmallY[bx], log); // chroma, symmetric rounding (#59)
     }
+    VSmallY += nBlkX;
+    VSmallUV += nBlkX;
   }
-  else // ratioUV==1
-  {
-    // e.g. Height YUY2 colorformat
-    for (int by = 0; by<nBlkY; by++)
-    {
-      for (int bx = 0; bx<nBlkX; bx++)
-      {
-        VSmallUV[bx] = VSmallY[bx]; // chroma
-      }
-      VSmallY += nBlkX;
-      VSmallUV += nBlkX;
-    }
-  }
+}
 
+// one row of the pel=2 plane: p_a p_b p_a p_b ...
+// __restrict (GCC honors it on parameters only): no aliasing between the planes, the compilers can vectorize the interleaving
+template<typename pixel_t>
+static void Merge2RowsToRow_c(pixel_t* __restrict dst, const pixel_t* __restrict a, const pixel_t* __restrict b, int width)
+{
+  for (int w = 0; w < width; w++)
+  {
+    dst[2 * w] = a[w];
+    dst[2 * w + 1] = b[w];
+  }
 }
 
 template<typename pixel_t>
@@ -430,20 +430,11 @@ static void Merge4PlanesToBig_c(
   uint8_t *pel2Plane, int pel2Pitch, const uint8_t *pPlane0, const uint8_t *pPlane1,
   const uint8_t *pPlane2, const uint8_t * pPlane3, int width, int height, int pitch, int bits_per_pixel)
 {
-  
   for (int h=0; h<height; h++)
   {
-    for (int w=0; w<width; w++)
-    {
-      reinterpret_cast<pixel_t *>(pel2Plane)[w<<1] = reinterpret_cast<const pixel_t *>(pPlane0)[w];
-      reinterpret_cast<pixel_t *>(pel2Plane)[(w<<1) +1] = reinterpret_cast<const pixel_t *>(pPlane1)[w];
-    }
+    Merge2RowsToRow_c(reinterpret_cast<pixel_t *>(pel2Plane), reinterpret_cast<const pixel_t *>(pPlane0), reinterpret_cast<const pixel_t *>(pPlane1), width);
     pel2Plane += pel2Pitch;
-    for (int w=0; w<width; w++)
-    {
-      reinterpret_cast<pixel_t *>(pel2Plane)[w<<1] = reinterpret_cast<const pixel_t *>(pPlane2)[w];
-      reinterpret_cast<pixel_t *>(pel2Plane)[(w<<1) +1] = reinterpret_cast<const pixel_t *>(pPlane3)[w];
-    }
+    Merge2RowsToRow_c(reinterpret_cast<pixel_t *>(pel2Plane), reinterpret_cast<const pixel_t *>(pPlane2), reinterpret_cast<const pixel_t *>(pPlane3), width);
     pel2Plane += pel2Pitch;
     pPlane0 += pitch;
     pPlane1 += pitch;
@@ -452,6 +443,7 @@ static void Merge4PlanesToBig_c(
   }
 }
 
+#ifdef INTEL_INTRINSICS
 template<typename pixel_t>
 static void Merge4PlanesToBig_sse2(
   uint8_t *pel2Plane, int pel2Pitch, const uint8_t *pPlane0, const uint8_t *pPlane1,
@@ -508,6 +500,7 @@ static void Merge4PlanesToBig_sse2(
     pPlane3 += pitch;
   }
 }
+#endif // INTEL_INTRINSICS
 
 void Merge4PlanesToBig(
   uint8_t *pel2Plane, int pel2Pitch, const uint8_t *pPlane0, const uint8_t *pPlane1,
@@ -517,25 +510,22 @@ void Merge4PlanesToBig(
   // P =  p0 p1 p0 p1 p0 p1 p0 p1...
   //      p2 p3 p2 p3 p2 p3 p2 p3
   // 
-  bool isse = !!(cpuFlags & CPUF_SSE2);
-  if (!isse || pixelsize == 4)
+#ifdef INTEL_INTRINSICS
+  if (!!(cpuFlags & CPUF_SSE2) && pixelsize != 4)
   {
-    if(pixelsize==1)
-      Merge4PlanesToBig_c<uint8_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
-    else if(pixelsize==2)
-      Merge4PlanesToBig_c<uint16_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
-    else if(pixelsize==4)
-      Merge4PlanesToBig_c<float>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
-    return;
-  }
-  else {
     if (pixelsize == 1)
       Merge4PlanesToBig_sse2<uint8_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
     else if (pixelsize == 2)
       Merge4PlanesToBig_sse2<uint16_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
-    else
-      assert(0);
+    return;
   }
+#endif // INTEL_INTRINSICS
+  if(pixelsize==1)
+    Merge4PlanesToBig_c<uint8_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
+  else if(pixelsize==2)
+    Merge4PlanesToBig_c<uint16_t>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
+  else if(pixelsize==4)
+    Merge4PlanesToBig_c<float>(pel2Plane, pel2Pitch, pPlane0, pPlane1, pPlane2, pPlane3, width, height, pitch, pixelsize);
   return;
 #if 0
 #if !(defined(_M_X64) && defined(_MSC_VER))
@@ -633,6 +623,20 @@ loopw2:
 
 
 
+// one row of the pel=4 plane: p_a p_b p_c p_d p_a p_b ..., see Merge2RowsToRow_c
+template<typename pixel_t>
+static void Merge4RowsToRow_c(pixel_t* __restrict dst, const pixel_t* __restrict a, const pixel_t* __restrict b,
+  const pixel_t* __restrict c, const pixel_t* __restrict d, int width)
+{
+  for (int w = 0; w < width; w++)
+  {
+    dst[4 * w] = a[w];
+    dst[4 * w + 1] = b[w];
+    dst[4 * w + 2] = c[w];
+    dst[4 * w + 3] = d[w];
+  }
+}
+
 template<typename pixel_t>
 static void Merge16PlanesToBig_c(
   uint8_t *pel4Plane, int pel4Pitch,
@@ -647,37 +651,17 @@ static void Merge16PlanesToBig_c(
   {
     for (int h = 0; h < height; h++)
     {
-      for (int w = 0; w < width; w++)
-      {
-        reinterpret_cast<pixel_t *>(pel4Plane)[w << 2] = reinterpret_cast<const pixel_t *>(pPlane0)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 1] = reinterpret_cast<const pixel_t *>(pPlane1)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 2] = reinterpret_cast<const pixel_t *>(pPlane2)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 3] = reinterpret_cast<const pixel_t *>(pPlane3)[w];
-      }
+      Merge4RowsToRow_c(reinterpret_cast<pixel_t *>(pel4Plane), reinterpret_cast<const pixel_t *>(pPlane0), reinterpret_cast<const pixel_t *>(pPlane1),
+        reinterpret_cast<const pixel_t *>(pPlane2), reinterpret_cast<const pixel_t *>(pPlane3), width);
       pel4Plane += pel4Pitch;
-      for (int w = 0; w < width; w++)
-      {
-        reinterpret_cast<pixel_t *>(pel4Plane)[w << 2] = reinterpret_cast<const pixel_t *>(pPlane4)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 1] = reinterpret_cast<const pixel_t *>(pPlane5)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 2] = reinterpret_cast<const pixel_t *>(pPlane6)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 3] = reinterpret_cast<const pixel_t *>(pPlane7)[w];
-      }
+      Merge4RowsToRow_c(reinterpret_cast<pixel_t *>(pel4Plane), reinterpret_cast<const pixel_t *>(pPlane4), reinterpret_cast<const pixel_t *>(pPlane5),
+        reinterpret_cast<const pixel_t *>(pPlane6), reinterpret_cast<const pixel_t *>(pPlane7), width);
       pel4Plane += pel4Pitch;
-      for (int w = 0; w < width; w++)
-      {
-        reinterpret_cast<pixel_t *>(pel4Plane)[w << 2] = reinterpret_cast<const pixel_t *>(pPlane8)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 1] = reinterpret_cast<const pixel_t *>(pPlane9)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 2] = reinterpret_cast<const pixel_t *>(pPlane10)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 3] = reinterpret_cast<const pixel_t *>(pPlane11)[w];
-      }
+      Merge4RowsToRow_c(reinterpret_cast<pixel_t *>(pel4Plane), reinterpret_cast<const pixel_t *>(pPlane8), reinterpret_cast<const pixel_t *>(pPlane9),
+        reinterpret_cast<const pixel_t *>(pPlane10), reinterpret_cast<const pixel_t *>(pPlane11), width);
       pel4Plane += pel4Pitch;
-      for (int w = 0; w < width; w++)
-      {
-        reinterpret_cast<pixel_t *>(pel4Plane)[w << 2] = reinterpret_cast<const pixel_t *>(pPlane12)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 1] = reinterpret_cast<const pixel_t *>(pPlane13)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 2] = reinterpret_cast<const pixel_t *>(pPlane14)[w];
-        reinterpret_cast<pixel_t *>(pel4Plane)[(w << 2) + 3] = reinterpret_cast<const pixel_t *>(pPlane15)[w];
-      }
+      Merge4RowsToRow_c(reinterpret_cast<pixel_t *>(pel4Plane), reinterpret_cast<const pixel_t *>(pPlane12), reinterpret_cast<const pixel_t *>(pPlane13),
+        reinterpret_cast<const pixel_t *>(pPlane14), reinterpret_cast<const pixel_t *>(pPlane15), width);
       pel4Plane += pel4Pitch;
       pPlane0 += pitch;
       pPlane1 += pitch;

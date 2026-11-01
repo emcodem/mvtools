@@ -90,9 +90,9 @@ MVRecalculate::MVRecalculate(
     env->ThrowError("MRecalculate: Clip with float pixel type is not supported");
   }
 
-  if (!vi.IsYUV() && !vi.IsYUY2()) // YUY2 is also YUV but let's see what is supported
+  if (!ClipFnc::is_yuv_any(vi)) // YUY2 is also YUV but let's see what is supported
   {
-    env->ThrowError("MRecalculate: Clip must be YUV or YUY2");
+    env->ThrowError("MRecalculate: Clip must be Y(A), YUV(A) or YUY2");
   }
 
   vi.num_frames *= _nbr_srd;
@@ -110,7 +110,7 @@ MVRecalculate::MVRecalculate(
   const int nSuperLevels = params.nLevels;
   _super_lite = MV_SUPER_IS_LITE(params);
 
-  if (vi.IsY())
+  if (ClipFnc::is_grey(vi))
     chroma = false; // silent fallback
 
   nModeYUV = chroma ? YUVPLANES : YPLANE;
@@ -133,7 +133,7 @@ MVRecalculate::MVRecalculate(
   analysisData.nWidth = pAnalyseFilter->GetWidth();
   analysisData.nHeight = pAnalyseFilter->GetHeight();
   analysisData.pixelType = pAnalyseFilter->GetPixelType();
-  if (!vi.IsY()) {
+  if (!ClipFnc::is_grey(vi)) {
     analysisData.yRatioUV = 1 << vi.GetPlaneHeightSubsampling(PLANAR_U);
     analysisData.xRatioUV = 1 << vi.GetPlaneWidthSubsampling(PLANAR_U);
   }
@@ -202,6 +202,11 @@ MVRecalculate::MVRecalculate(
     env->ThrowError(
       "MRecalculate: Invalid block size: %d x %d", analysisData.nBlkSizeX, analysisData.nBlkSizeY);
   }
+  // SATD sums 4x4 Hadamard transforms
+  if (_dctmode >= 5 && (analysisData.nBlkSizeX % 4 != 0 || analysisData.nBlkSizeY % 4 != 0)) {
+    env->ThrowError(
+      "MRecalculate: dct=%d (SATD) needs a block size divisible by 4, not %d x %d", _dctmode, analysisData.nBlkSizeX, analysisData.nBlkSizeY);
+  }
 
   analysisData.nPel = nSuperPel;
   analysisData.nDeltaFrame = pAnalyseFilter->GetDeltaFrame();
@@ -216,6 +221,13 @@ MVRecalculate::MVRecalculate(
   if (_overlapx % analysisData.xRatioUV || _overlapy % analysisData.yRatioUV)
   {
     env->ThrowError("MRecalculate: wrong overlap for the colorspace subsampling");
+  }
+
+  // chroma block = block size / subsampling, it must be exact (e.g. 3x3 in 4:2:0 would give a truncated 1x1 chroma block)
+  if (chroma && (analysisData.nBlkSizeX % analysisData.xRatioUV || analysisData.nBlkSizeY % analysisData.yRatioUV))
+  {
+    env->ThrowError("MRecalculate: block size %dx%d is not a multiple of the chroma subsampling (%dx%d), use chroma=false or another block size",
+      analysisData.nBlkSizeX, analysisData.nBlkSizeY, analysisData.xRatioUV, analysisData.yRatioUV);
   }
 
   if (_divide != 0 && (_blksizex < 8 || _blksizey < 8)) // 2.5.11.22 || instead of &&
@@ -417,9 +429,8 @@ MVRecalculate::MVRecalculate(
   // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
   if (gpu_flag)
   {
-    _gpu_rfilter = params.param & 7;
-    const bool super_ok = (params.param & 0x80) && (_gpu_rfilter == 4 || _gpu_rfilter == 2) && ((params.param >> 3) & 3) == 2
-      && !(params.param & 0x20);
+    const bool super_ok = super_param_gpu_rebuildable(params); // SuperParams64Bits.h, D4
+    _gpu_rfilter = super_ok ? super_param_rfilter(params) : 0;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
       && !divideExtra && !_dctmode && _nbr_srd == 1
@@ -570,6 +581,8 @@ PVideoFrame __stdcall MVRecalculate::GetFrame(int n, IScriptEnvironment* env)
       sizeof(srd._analysis_data)
     );
   }
+  // avoid garbage (helps tests): zero the unused rest of the header
+  memset(pDst + sizeof(int) + sizeof(MVAnalysisData), 0, headerSize - sizeof(int) - sizeof(MVAnalysisData));
   pDst += headerSize;
 
   if (!srd._clip_sptr->IsUsable() || nsrc < minframe || nsrc >= maxframe)
@@ -790,31 +803,16 @@ bool MVRecalculate::gpu_recalc(SrcRefData &srd, const PVideoFrame &src, const PV
 
 void	MVRecalculate::load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data)
 {
-  PROFILE_START(MOTION_PROFILE_YUY2CONVERT);
   const unsigned char *	pSrcY;
   const unsigned char *	pSrcU;
   const unsigned char *	pSrcV;
   int				nSrcPitchY;
   int				nSrcPitchUV;
-  if ((ana_data.pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
-  {
-    // planar data packed to interleaved format (same as interleved2planar
-    // by kassandro) - v2.0.0.5
-    pSrcY = src->GetReadPtr();
-    pSrcU = pSrcY + src->GetRowSize() / 2;
-    pSrcV = pSrcU + src->GetRowSize() / 4;
-    nSrcPitchY = src->GetPitch();
-    nSrcPitchUV = nSrcPitchY;
-  }
-  else
-  {
-    pSrcY = src->GetReadPtr(PLANAR_Y);
-    pSrcU = src->GetReadPtr(PLANAR_U);
-    pSrcV = src->GetReadPtr(PLANAR_V);
-    nSrcPitchY = src->GetPitch(PLANAR_Y);
-    nSrcPitchUV = src->GetPitch(PLANAR_U);
-  }
-  PROFILE_STOP(MOTION_PROFILE_YUY2CONVERT);
+  pSrcY = src->GetReadPtr(PLANAR_Y);
+  pSrcU = src->GetReadPtr(PLANAR_U);
+  pSrcV = src->GetReadPtr(PLANAR_V);
+  nSrcPitchY = src->GetPitch(PLANAR_Y);
+  nSrcPitchUV = src->GetPitch(PLANAR_U);
 
   gof.Update(
     nModeYUV,

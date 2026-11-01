@@ -23,7 +23,9 @@
 #include "CopyCode.h"
 #include <cstdio>
 #include "def.h"
+#ifdef INTEL_INTRINSICS
 #include "emmintrin.h"
+#endif
 
 // top, middle, bottom and left, middle, right windows
 #define OW_TL 0
@@ -45,14 +47,7 @@ class OverlapWindows
   int size; // full window size= nx*ny
 
   short * Overlap9Windows;
-  float * Overlap9WindowsF;
 
-  float *fWin1UVx;
-  float *fWin1UVxfirst;
-  float *fWin1UVxlast;
-  float *fWin1UVy;
-  float *fWin1UVyfirst;
-  float *fWin1UVylast;
 public :
 
   OverlapWindows(int _nx, int _ny, int _ox, int _oy);
@@ -62,16 +57,13 @@ public :
    MV_FORCEINLINE int Getny() const { return ny; }
    MV_FORCEINLINE int GetSize() const { return size; }
    MV_FORCEINLINE short *GetWindow(int i) const { return Overlap9Windows + size*i; }
-   MV_FORCEINLINE float* GetWindowF(int i) const { return Overlap9WindowsF + size * i; }
 };
 
 typedef void (OverlapsFunction)(uint16_t *pDst, int nDstPitch,
                             const unsigned char *pSrc, int nSrcPitch,
               short *pWin, int nWinPitch);
-typedef void (OverlapsLsbFunction)(int *pDst, int nDstPitch, const unsigned char *pSrc, const unsigned char *pSrcLsb, int nSrcPitch, short *pWin, int nWinPitch);
 
-OverlapsFunction* get_overlaps_function(int BlockX, int BlockY, int pixelsize, bool out32, arch_t arch);
-OverlapsLsbFunction* get_overlaps_lsb_function(int BlockX, int BlockY, int pixelsize, arch_t arch);
+OverlapsFunction* get_overlaps_function(int BlockX, int BlockY, int pixelsize, arch_t arch);
 
 //=============================================================
 // short
@@ -143,41 +135,12 @@ void Overlaps_C(uint16_t *pDst0, int nDstPitch, const unsigned char *pSrc, int n
   }
 }
 
-/* 8 bit source, 32 bit temporary target */
 template <int blockWidth, int blockHeight>
 // pDst is short* for 8 bit, int * for 16 bit sources, float * from 32 bit sources
-// out32: internally everything is float
-void Overlaps_float_new_C(uint16_t* pDst0, int nDstPitch, const unsigned char* pSrc, int nSrcPitch, short* _pWin, int nWinPitch)
+void Overlaps_float_C(uint16_t *pDst0, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, short *pWin, int nWinPitch)
 {
-  // src is tmpBlock, for this new method it is always float
-  auto pWin = reinterpret_cast<float*>(_pWin); // overlap windows constants are now float
-
-  // in integer 8-16 bit format originally pWin from 0 to 2048 total shift 11
-  // for float internal working formats no scaling occurs in overlaps constants
-
-  float* pDst = reinterpret_cast<float*>(pDst0);
-
-  for (int j = 0; j < blockHeight; j++)
-  {
-    for (int i = 0; i < blockWidth; i++)
-    {
-      float val = reinterpret_cast<const float*>(pSrc)[i];
-      float win = pWin[i] /** (1.0f / 2048.0f)*/;
-      pDst[i] = pDst[i] + val * win;
-    }
-    pDst += nDstPitch;
-    pSrc += nSrcPitch;
-    pWin += nWinPitch;
-  }
-}
-
-template <int blockWidth, int blockHeight>
-// pDst is short* for 8 bit, int * for 16 bit sources, float * from 32 bit sources
-void Overlaps_float_C(uint16_t *pDst0, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, short *_pWin, int nWinPitch)
-{
-  auto pWin = reinterpret_cast<float*>(_pWin);
-  // in integer 8-16 bit format originally pWin from 0 to 2048 total shift 11
-  // for float internal working formats no scaling occurs in overlaps constants
+  // pWin from 0 to 2048 total shift 11
+  // 32 bit float is using the same int16 (short) windows as the 8/16 bit versions
 
   // when pixel_t == uint16_t, dst should be int*
   float *pDst = reinterpret_cast<float *>(pDst0);
@@ -196,27 +159,6 @@ void Overlaps_float_C(uint16_t *pDst0, int nDstPitch, const unsigned char *pSrc,
   }
 }
 
-
-template <int blockWidth, int blockHeight>
-void OverlapsLsb_C(int *pDst, int nDstPitch, const unsigned char *pSrc, const unsigned char *pSrcLsb, int nSrcPitch, short *pWin, int nWinPitch)
-{
-  // pWin from 0 to 2048: total shift 11
-  for (int j=0; j<blockHeight; j++)
-  {
-    for (int i=0; i<blockWidth; i++)
-    {
-      const int		val = (pSrc [i] << 8) + pSrcLsb [i];
-      short win = pWin[i];
-      // 16 bits data + 11 bits window = 27 bits max (safe)
-      // shift 11 in Short2Bytes_lsb
-      pDst [i] += val * win;
-    }
-    pDst += nDstPitch;
-    pSrc += nSrcPitch;
-    pSrcLsb += nSrcPitch;
-    pWin += nWinPitch;
-  }
-}
 
 
 #ifdef USE_OVERLAPS_ASM
@@ -267,15 +209,14 @@ extern "C" void __cdecl  Overlaps2x2_sse2(uint16_t *pDst, int nDstPitch, const u
 
 void Short2Bytes_sse2(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, int dstShortPitch, int nWidth, int nHeight);
 void Short2Bytes(unsigned char *pDst, int nDstPitch, uint16_t *pDstShort, int dstShortPitch, int nWidth, int nHeight);
-void Short2BytesLsb(unsigned char *pDst, unsigned char *pDstLsb, int nDstPitch, int *pDstInt, int dstIntPitch, int nWidth, int nHeight);
 void Short2Bytes_Int32toWord16(uint16_t *pDst, int nDstPitch, int *pDstInt, int dstIntPitch, int nWidth, int nHeight, int bits_per_pixel);
+#ifdef INTEL_INTRINSICS
+#if defined(GCC) || defined(CLANG)
+__attribute__((__target__("sse4.1")))
+#endif
 void Short2Bytes_Int32toWord16_sse4(uint16_t *pDst, int nDstPitch, int *pDstInt, int dstIntPitch, int nWidth, int nHeight, int bits_per_pixel);
+#endif
 void Short2Bytes_FloatInInt32ArrayToFloat(float *pDst, int nDstPitch, float *pDstInt, int dstIntPitch, int nWidth, int nHeight);
-
-template<typename pixel_t>
-void OverlapsBuf_Float2Bytes_sse4(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
-template<typename pixel_t>
-void OverlapsBuf_Float2Bytes(unsigned char* pDst0, int nDstPitch, float* pTmpFloat, int tmpPitch, int nWidth, int nHeight, int bits_per_pixel);
 
 template<typename pixel_t>
 void LimitChanges_c(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit_f);
@@ -283,7 +224,7 @@ void LimitChanges_float_c(unsigned char *pDst, int nDstPitch, const unsigned cha
 
 typedef void(LimitFunction_t)(unsigned char *pDst8, int nDstPitch, const unsigned char *pSrc8, int nSrcPitch, const int nWidth, int nHeight, float nLimit_f);
 
-template<typename pixel_t, bool hasSSE41>
+template<typename pixel_t>
 void LimitChanges_sse2_new(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit_f);
 
 void LimitChanges_src8_target16_c(unsigned char *pDst, int nDstPitch, const unsigned char *pSrc, int nSrcPitch, int nWidth, int nHeight, float nLimit_f);

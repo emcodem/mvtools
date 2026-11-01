@@ -21,7 +21,18 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 /*\\\ INCLUDE FILES \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\*/
 #include "avs/config.h" // WIN/POSIX/ETC defines
 
+// INTEL_INTRINSICS: the x86 SIMD code is compiled. CMake defines it (ENABLE_INTEL_SIMD),
+// the MSVC solution does not: derive it from the target there.
+#if defined(_MSC_VER) && !defined(INTEL_INTRINSICS) && !defined(NEON_INTRINSICS) && (defined(_M_IX86) || defined(_M_X64))
+#define INTEL_INTRINSICS
+#endif
+
 #ifdef _WIN32
+// The Windows SDK's minwindef.h defines STRICT as 1, avs/win.h (external) defines
+// it as empty: drop the previous definition to avoid a redefinition warning.
+#ifdef STRICT
+#undef STRICT
+#endif
 #include "avs/win.h"
 #endif
 

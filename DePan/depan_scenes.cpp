@@ -40,9 +40,15 @@
 */
 
 #ifdef _WIN32
-#define	NOGDI
-#define	NOMINMAX
-#define	WIN32_LEAN_AND_MEAN
+#ifndef NOGDI
+#define NOGDI
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include "windows.h"
 #endif
 #include <avisynth.h>
@@ -132,8 +138,10 @@ DePanScenes::DePanScenes(PClip _child, int _plane, const char * _inputlog, IScri
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
 
-	if (!vi.IsYUV() && !vi.IsYUY2())
-		env->ThrowError("DePanScenes: input to filter must be in YUV or YUY2!");
+	if (!vi.IsYUV() && !vi.IsYUVA() && !vi.IsYUY2())
+		env->ThrowError("DePanScenes: input to filter must be in Y(A), YUV(A) or YUY2!");
+  if (vi.BitsPerComponent() == 32)
+    env->ThrowError("DePanScenes: 32 bit float input is not supported!");
 
 	if (plane <1 || plane > 7)
 		env->ThrowError("DePanScenes: Plane parameter must be from 1 to 7!");
@@ -229,7 +237,7 @@ PVideoFrame __stdcall DePanScenes::GetFrame(int ndest, IScriptEnvironment* env) 
 	if (!vi.IsYUY2())
   {
     int planes[] = { PLANAR_Y, PLANAR_U, PLANAR_V };
-    int plane_count = vi.IsY() ? 1 : 3;
+    int plane_count = (vi.IsY() || vi.IsYA()) ? 1 : 3; // Y, YA: no U/V planes
 
     for (int p = 0; p < plane_count; p++)
     {
@@ -237,8 +245,10 @@ PVideoFrame __stdcall DePanScenes::GetFrame(int ndest, IScriptEnvironment* env) 
 
       srcp = src->GetReadPtr(workplane);
 
-      src_width = vi.width >> (1 << vi.GetPlaneWidthSubsampling(workplane));    // src->GetRowSize(workplane);
-      src_height = vi.height >> (1 << vi.GetPlaneHeightSubsampling(workplane)); //  src->GetHeight(workplane);
+      // was: vi.width >> (1 << subsampling): only the top-left part of each plane was written
+      // (half width and height; a quarter of the width for 4:1:1, 4:1:0 chroma)
+      src_width = src->GetRowSize(workplane) / pixelsize;
+      src_height = src->GetHeight(workplane);
       src_pitch = src->GetPitch(workplane);
 
       dstp = dst->GetWritePtr(workplane);
@@ -280,6 +290,8 @@ PVideoFrame __stdcall DePanScenes::GetFrame(int ndest, IScriptEnvironment* env) 
         }
       }
     } // for
+    if (vi.IsYUVA()) // YUVA and YA: copy alpha
+      env->BitBlt(dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A), src->GetRowSize(PLANAR_A), src->GetHeight(PLANAR_A));
 	}
   else
   { // YUY2

@@ -147,6 +147,7 @@ class DePan : public GenericVideoFilter {
   int blur; // blur mirror length
   int info;         // show motion info on frame
   const char *inputlog;  // filename of input log file in Deshaker format
+  int alphainvert;  // YUVA, YA: alpha of the new empty borders is max instead of 0
 
 // internal parameters
   int fieldbased;
@@ -186,7 +187,7 @@ public:
   // Otherwise they can only be called from functions within the class itself.
 
   DePan(PClip _child, PClip _DePanData, float _offset, int _subpixel, float _pixaspect, int _matchfields,
-    int _mirror, int _blur, int _info, const char * _inputlog, IScriptEnvironment* env);
+    int _mirror, int _blur, int _info, const char * _inputlog, int _alphainvert, IScriptEnvironment* env);
   // This is the constructor. It does not return any value, and is always used, 
   //  when an instance of the class is created.
   // Since there is no code in this, this is the definition.
@@ -209,9 +210,9 @@ public:
 
 //Here is the actual constructor code used
 DePan::DePan(PClip _child, PClip _DePanData, float _offset, int _subpixel, float _pixaspect, int _matchfields,
-  int _mirror, int _blur, int _info, const char * _inputlog, IScriptEnvironment* env) :
+  int _mirror, int _blur, int _info, const char * _inputlog, int _alphainvert, IScriptEnvironment* env) :
   GenericVideoFilter(_child), DePanData(_DePanData), offset(_offset), subpixel(_subpixel), pixaspect(_pixaspect), matchfields(_matchfields),
-  mirror(_mirror), blur(_blur), info(_info), inputlog(_inputlog) {
+  mirror(_mirror), blur(_blur), info(_info), inputlog(_inputlog), alphainvert(_alphainvert) {
   // This is the implementation of the constructor.
   // The child clip (source clip) is inherited by the GenericVideoFilter,
   //  where the following variables gets defined:
@@ -232,7 +233,9 @@ DePan::DePan(PClip _child, PClip _DePanData, float _offset, int _subpixel, float
   TFF = (vi.IsTFF()) ? 1 : 0;
 
   if (!vi.IsYUY2() && !vi.IsYUV() && !vi.IsYUVA())
-    env->ThrowError("DePan: input must be YUV planar or YUY2!"); // PF: all planar, inlcuding native 16 bits
+    env->ThrowError("DePan: input must be Y(A), YUV(A) planar or YUY2!"); // PF: all planar, inlcuding native 16 bits
+  if (vi.BitsPerComponent() == 32)
+    env->ThrowError("DePan: 32 bit float input is not supported!");
 
   motionx = new float[vi.num_frames];
   motiony = new float[vi.num_frames];
@@ -263,6 +266,8 @@ DePan::DePan(PClip _child, PClip _DePanData, float _offset, int _subpixel, float
     //		if(vi.IsFieldBased  && loginterlaced==0)	env->ThrowError("DePan: Input log must be in interlaced for fieldbased!");
   }
   else { // motion data will be requesred from DepanEstimate
+    if (!DePanData)
+      env->ThrowError("DePan: motion data clip or inputlog is required!");
     if ((DePanData->GetVideoInfo().num_frames) != child->GetVideoInfo().num_frames)
       env->ThrowError("DePan: The length of input clip must be same as motion data clip  !");
 
@@ -615,8 +620,8 @@ PVideoFrame __stdcall DePan::GetFrame(int ndest, IScriptEnvironment* env) {
     // from now on
 
     int planes[] = { PLANAR_Y, PLANAR_U, PLANAR_V };
-    int plane_count = vi.IsY() ? 1 : 3;
-    // alpha plane undefined
+    int plane_count = (vi.IsY() || vi.IsYA()) ? 1 : 3; // Y, YA: no U/V planes
+    // alpha plane: after the color planes
 
     for (int p = 0; p < plane_count; p++)
     {
@@ -696,6 +701,15 @@ PVideoFrame __stdcall DePan::GetFrame(int ndest, IScriptEnvironment* env) {
       _RPT2(0, "Compensate plane %d %f\r\n", p, elapsed_seconds);
 #endif
     } // for planes
+
+    if (vi.IsYUVA()) { // YUVA, YA
+      // Alpha marks the new empty borders (#67): moved like luma, without mirror and blur,
+      // the borders get 0 (alphainvert: max), the rest is the moved source alpha.
+      const int alpha_border = alphainvert ? (1 << bits_per_pixel) - 1 : 0;
+      compensate_plane2(subpixel, pixelsize, dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A),
+        src->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A), src->GetRowSize(PLANAR_A), src->GetHeight(PLANAR_A),
+        trY, 0, alpha_border, 0, bits_per_pixel);
+    }
 
     int xmsg = (fieldbased != 0) ? (ndest % 2) * 15 : 0; // x-position of odd fields message
     if (info) { // show text info on frame image
@@ -913,7 +927,7 @@ PVideoFrame __stdcall DePan::GetFrame(int ndest, IScriptEnvironment* env) {
 
 AVSValue __cdecl Create_DePan(AVSValue args, void* user_data, IScriptEnvironment* env) {
   return new DePan(args[0].AsClip(), // the 0th parameter is the source clip
-    args[1].AsClip(),		// parameter  - motion data clip.
+    args[1].Defined() ? args[1].AsClip() : nullptr, // parameter  - motion data clip (optional with inputlog)
     (float)args[2].AsFloat(0),	// parameter  - offset
     args[3].AsInt(2),		// parameter  - subpixel 
     (float)args[4].AsFloat(1.),	// parameter  - pixaspect
@@ -922,6 +936,7 @@ AVSValue __cdecl Create_DePan(AVSValue args, void* user_data, IScriptEnvironment
     args[7].AsInt(0),		// parameter  - blur mirror length
     args[8].AsBool(false),	// parameter  - info
     args[9].AsString(""),  // inputlog
+    args[10].AsBool(false),  // alphainvert
     env);
   // Calls the constructor with the arguments provided.
 }
@@ -965,6 +980,7 @@ class DePanInterleave : public GenericVideoFilter {
   int blur; // blur mirror length
   int info;   // show motion info on frame
   const char * inputlog;
+  int alphainvert; // YUVA, YA: alpha of the new empty borders is max instead of 0
 
   PClip interleaved; // interleaved clip
   AVSValue * allclips; //array of all motion compensated clips
@@ -978,7 +994,7 @@ public:
   // Otherwise they can only be called from functions within the class itself.
 
   DePanInterleave(PClip _child, PClip _DePanData, int _prev, int _next, int _subpixel, float _pixaspect, int _matchfields,
-    int _mirror, int _blur, int _info, const char * _inputlog, IScriptEnvironment* env);
+    int _mirror, int _blur, int _info, const char * _inputlog, int _alphainvert, IScriptEnvironment* env);
   // This is the constructor. It does not return any value, and is always used, 
   //  when an instance of the class is created.
   // Since there is no code in this, this is the definition.
@@ -999,9 +1015,9 @@ public:
 
 //Here is the actual constructor code used
 DePanInterleave::DePanInterleave(PClip _child, PClip _DePanData, int _prev, int _next, int _subpixel, float _pixaspect, int _matchfields,
-  int _mirror, int _blur, int _info, const char * _inputlog, IScriptEnvironment* env) :
+  int _mirror, int _blur, int _info, const char * _inputlog, int _alphainvert, IScriptEnvironment* env) :
   GenericVideoFilter(_child), DePanData(_DePanData), prev(_prev), next(_next), subpixel(_subpixel), pixaspect(_pixaspect), matchfields(_matchfields),
-  mirror(_mirror), blur(_blur), info(_info), inputlog(_inputlog) {
+  mirror(_mirror), blur(_blur), info(_info), inputlog(_inputlog), alphainvert(_alphainvert) {
   // This is the implementation of the constructor.
   // The child clip (source clip) is inherited by the GenericVideoFilter,
   //  where the following variables gets defined:
@@ -1014,10 +1030,16 @@ DePanInterleave::DePanInterleave(PClip _child, PClip _DePanData, int _prev, int 
   int num = prev + next + 1;
 
   if (!vi.IsYUY2() && !vi.IsYUV() && !vi.IsYUVA())
-    env->ThrowError("DePanInterleave: input must be planar YUV or YUY2 !"); //v1.6
+    env->ThrowError("DePanInterleave: input must be Y(A), YUV(A) planar or YUY2 !"); //v1.6
+  if (vi.BitsPerComponent() == 32)
+    env->ThrowError("DePanInterleave: 32 bit float input is not supported!");
 
-  if ((DePanData->GetVideoInfo().num_frames) != vi.num_frames)
-    env->ThrowError("DePanInterleave: The length of input clip must be same as motion data clip !");
+  if (!*inputlog) { // with inputlog the motion data clip is not used
+    if (!DePanData)
+      env->ThrowError("DePanInterleave: motion data clip or inputlog is required!");
+    if ((DePanData->GetVideoInfo().num_frames) != vi.num_frames)
+      env->ThrowError("DePanInterleave: The length of input clip must be same as motion data clip !");
+  }
   if (prev < 0 || next < 0 || num <= 0)
     env->ThrowError("DePanInterleave: The number of clips must be positive !");
 
@@ -1034,7 +1056,7 @@ DePanInterleave::DePanInterleave(PClip _child, PClip _DePanData, int _prev, int 
     // integer offset values for compensated clips
     offset = float(prev - i);
     // create forwarded motion compensated clip from prev
-    allclips[i] = new DePan(child, DePanData, offset, subpixel, pixaspect, matchfields, mirror, blur, info, inputlog, env);
+    allclips[i] = new DePan(child, DePanData, offset, subpixel, pixaspect, matchfields, mirror, blur, info, inputlog, alphainvert, env);
   }
 
   allclips[prev] = child;  // central clip is input source
@@ -1043,7 +1065,7 @@ DePanInterleave::DePanInterleave(PClip _child, PClip _DePanData, int _prev, int 
     // integer offset values for compensated clips
     offset = float(-i - 1);
     // create backwarded clip (from motion conpensated next frames)
-    allclips[i + prev + 1] = new DePan(child, DePanData, offset, subpixel, pixaspect, matchfields, mirror, blur, info, inputlog, env);
+    allclips[i + prev + 1] = new DePan(child, DePanData, offset, subpixel, pixaspect, matchfields, mirror, blur, info, inputlog, alphainvert, env);
   }
 
 
@@ -1100,7 +1122,7 @@ PVideoFrame __stdcall DePanInterleave::GetFrame(int ndest, IScriptEnvironment* e
 
 AVSValue __cdecl Create_DePanInterleave(AVSValue args, void* user_data, IScriptEnvironment* env) {
   return new DePanInterleave(args[0].AsClip(), // the 0th parameter is the source clip
-    args[1].AsClip(),	// parameter  - motion data clip.
+    args[1].Defined() ? args[1].AsClip() : nullptr, // parameter  - motion data clip (optional with inputlog)
     args[2].AsInt(1),	// parameter  - prev
     args[3].AsInt(1),	// parameter  - next
     args[4].AsInt(1),	// parameter  - subpixel - changed default to 1 in v1.6
@@ -1110,6 +1132,7 @@ AVSValue __cdecl Create_DePanInterleave(AVSValue args, void* user_data, IScriptE
     args[8].AsInt(0),	// parameter  - blur mirror length
     args[9].AsBool(false),	// parameter  - info
     args[10].AsString(""),  // inputlog filename
+    args[11].AsBool(false),  // alphainvert
     env);
   // Calls the constructor with the arguments provided.
 }

@@ -30,6 +30,11 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 #include "types.h"
 
 #ifdef _WIN32
+// The Windows SDK's minwindef.h defines STRICT as 1, avs/win.h (external) defines
+// it as empty: drop the previous definition to avoid a redefinition warning.
+#ifdef STRICT
+#undef STRICT
+#endif
 #include "avs/win.h"
 #endif
 
@@ -60,7 +65,7 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 // Name is a string containing only alpha+num+underscore, free of double quotes.
 // Requires a ";" at the end.
 #define  CHECK_COMPILE_TIME(name, cond)	\
-  typedef int CHECK_COMPILE_TIME_##name##_##__LINE__ [(cond) ? 1 : -1]
+  static_assert (cond, #name)
 
 const long double	PI  = 3.1415926535897932384626433832795L;
 const long double	LN2 = 0.69314718055994530941723212145818L;
@@ -117,9 +122,9 @@ const long double	LN2 = 0.69314718055994530941723212145818L;
 
 #define MAX_BLOCK_SIZE 64
 
-// external asm related defines, disable them for non-windows
-#if defined(_WIN32) && !defined(__GNUC__)
-#define USE_COPYCODE_ASM
+// external asm related defines (x86 NASM/MASM): MSVC x86/x64 only, not for non-windows or ARM64
+#if defined(_WIN32) && !defined(__GNUC__) && (defined(_M_IX86) || defined(_M_X64))
+//#define USE_COPYCODE_ASM // not needed: the C block copies (memcpy with constant size) compile to register moves
 #define USE_OVERLAPS_ASM
 #define USE_SAD_ASM
 #define USE_SATD_ASM

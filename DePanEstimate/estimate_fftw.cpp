@@ -59,6 +59,11 @@
 
 #include <avisynth.h>
 #ifdef _WIN32
+// The Windows SDK's minwindef.h defines STRICT as 1, avs/win.h (external) defines
+// it as empty: drop the previous definition to avoid a redefinition warning.
+#ifdef STRICT
+#undef STRICT
+#endif
 #include "avs/win.h"
 #endif
 #include "def.h"
@@ -148,7 +153,7 @@ DePanEstimate_fftw::DePanEstimate_fftw(PClip _child, int _range, float _trust, i
   int avisynth_if_ver = 6;
   try {
     env->CheckVersion(9); // GetEnvProperty with AEP_INTERFACE_VERSION is only safe since V9
-    avisynth_if_ver = env->GetEnvProperty(AEP_INTERFACE_VERSION);
+    avisynth_if_ver = (int)env->GetEnvProperty(AEP_INTERFACE_VERSION);
   }
   catch (const AvisynthError&) {
     try { env->CheckVersion(8); avisynth_if_ver = 8; }
@@ -157,8 +162,10 @@ DePanEstimate_fftw::DePanEstimate_fftw(PClip _child, int _range, float _trust, i
   has_at_least_v8 = avisynth_if_ver >= 8;
   has_at_least_v12 = avisynth_if_ver >= 12; // global locks
 
-  if (!vi.IsYUY2() && !vi.IsYUV())
-    env->ThrowError("DePanEstimate: input must be YUV or YUY2!");
+  if (!vi.IsYUY2() && !vi.IsYUV() && !vi.IsYUVA())
+    env->ThrowError("DePanEstimate: input must be Y(A), YUV(A) or YUY2!");
+  if (vi.BitsPerComponent() == 32)
+    env->ThrowError("DePanEstimate: 32 bit float input is not supported!");
   // if (!vi.IsYV12() && !vi.IsYUY2())	env->ThrowError("DePanEstimate: input to filter must be in YV12 or YUY2!");
 
   pixelsize = vi.ComponentSize();
@@ -172,6 +179,7 @@ DePanEstimate_fftw::DePanEstimate_fftw(PClip _child, int _range, float _trust, i
 
   int wleft0 = wleft; // save
   if (wleft < 0) wleft = 0; // auto
+  const bool winx_auto = (winx == 0);
 
   // check and set fft window x size
   if (winx > vi.width - wleft)	env->ThrowError("DePanEstimate: WINX must not be greater than WIDTH-WLeft !");
@@ -202,6 +210,16 @@ DePanEstimate_fftw::DePanEstimate_fftw(PClip _child, int _range, float _trust, i
   }
   else
     if (wleft0 < 0) wleft = (vi.width - winx) / 2;
+
+  // zoom: the right fft window starts at wleft + width/2, it must fit into the frame as well
+  if (zoommax != 1.0 && wleft0 >= 0) {
+    if (winx_auto) {
+      while (winx > 1 && wleft + vi.width / 2 + winx > vi.width)
+        winx /= 2; // keep it a power of 2
+    }
+    if (wleft + vi.width / 2 + winx > vi.width)
+      env->ThrowError("DePanEstimate: with zoommax, WLeft + WINX/2 must not be greater than WIDTH/2 !");
+  }
 
 
   int wtop0 = wtop; // save
@@ -340,6 +358,7 @@ DePanEstimate_fftw::DePanEstimate_fftw(PClip _child, int _range, float _trust, i
   motionx[0] = 0;
   motiony[0] = 0;
   motionzoom[0] = 1.0;
+  trust[0] = 0; // no previous frame; read by the scene change check of frame 1 and written to extlog
   for (i = 1; i < vi.num_frames; i++) {
     motionx[i] = MOTIONUNKNOWN;  //set motion as unknown for all frames beside 0
   }
@@ -909,6 +928,44 @@ int __stdcall DePanEstimate_fftw::SetCacheHints(int cachehints, int frame_range)
   return 0;
 }
 
+// Fills the whole frame: luma 0, chroma neutral, alpha opaque.
+// For the motion data clip, where only the data area is written (deterministic output).
+// 8-16 bit only: 32 bit float input is rejected in the constructor
+static void clear_frame(PVideoFrame &dst, const VideoInfo &vi)
+{
+  if (vi.IsYUY2()) {
+    uint8_t *p = dst->GetWritePtr();
+    for (int y = 0; y < dst->GetHeight(); y++) {
+      for (int x = 0; x < dst->GetRowSize(); x += 2) {
+        p[x] = 0;       // Y
+        p[x + 1] = 128; // U or V
+      }
+      p += dst->GetPitch();
+    }
+    return;
+  }
+  const int bits = vi.BitsPerComponent(); // 8-16
+  const bool has_uv = !vi.IsY() && !vi.IsYA();
+  const bool has_alpha = vi.IsYUVA(); // YUVA and YA
+  const int planes[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+  for (int i = 0; i < 4; i++) {
+    const int plane = planes[i];
+    if ((plane == PLANAR_U || plane == PLANAR_V) && !has_uv) continue;
+    if (plane == PLANAR_A && !has_alpha) continue;
+    const int value = plane == PLANAR_Y ? 0 : plane == PLANAR_A ? (1 << bits) - 1 : 1 << (bits - 1);
+    uint8_t *p = dst->GetWritePtr(plane);
+    const int pitch = dst->GetPitch(plane);
+    const int rowsize = dst->GetRowSize(plane);
+    for (int y = 0; y < dst->GetHeight(plane); y++) {
+      if (bits == 8)
+        std::fill_n(p, rowsize, (uint8_t)value);
+      else
+        std::fill_n(reinterpret_cast<uint16_t *>(p), rowsize / 2, (uint16_t)value);
+      p += pitch;
+    }
+  }
+}
+
 //
 PVideoFrame __stdcall DePanEstimate_fftw::GetFrame(int ndest, IScriptEnvironment* env) {
   fftwf_complex *fftcur, *fftprev; // chanded in v.1.0
@@ -962,10 +1019,14 @@ PVideoFrame __stdcall DePanEstimate_fftw::GetFrame(int ndest, IScriptEnvironment
 
  // create output frame with crypted motion data info
   PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src) : env->NewVideoFrame(vi); // frame property support
+  // (internal cosmetics) motion data clip: only the data area is written below, the rest was uninitialized
+  if (info == 0 && show == 0)
+    clear_frame(dst, vi);
 
   // ---------------------------------------------------------------------------
   // isYUY2 = vi.IsYUY2(); // v.1.1 move to init
-  int width = (isYUY2) ? src_width / 2 : src_width; //vi.width; // v 1.1, bug fixed in v.1.1.5 (we change vi.width !)
+  // in pixels. Was: row size in bytes for planar, wrong right zoom window and info position for 10-16 bits
+  int width = (isYUY2) ? src_width / 2 : src_width / pixelsize; //vi.width; // v 1.1, bug fixed in v.1.1.5 (we change vi.width !)
 
   // Process Y Luma Plane
   const BYTE * srcp = src->GetReadPtr();
@@ -1225,8 +1286,10 @@ PVideoFrame __stdcall DePanEstimate_fftw::GetFrame(int ndest, IScriptEnvironment
 
   // So, now we got all needed global motion info
 
-  int xmsg = (fieldbased != 0) ? (width / 4 - 15 + (ndest % 2) * 15) : width / 4 - 8; // x-position of odd fields message //v1.6
-  int ymsg = dst_height / 40 - 4;  // y position
+  // x and y in character units (10x20 pixels), around the frame center.
+  // Was width / 4 - 8: outside the right edge, text wrapped into lower lines
+  int xmsg = std::max(0, (fieldbased != 0) ? (width / 20 - 15 + (ndest % 2) * 15) : width / 20 - 8); // x-position of odd fields message //v1.6
+  int ymsg = std::max(0, dst_height / 40 - 4);  // y position
   if (info) { // show text info on frame
     if (show == 0) {  // luma plane was not copied by show, then copy it now
       env->BitBlt(dstp, dst_pitch, srcp, src_pitch, dst_rowsize, dst_height);
@@ -1272,7 +1335,7 @@ PVideoFrame __stdcall DePanEstimate_fftw::GetFrame(int ndest, IScriptEnvironment
 
 // ---------------------------------------------------------------------------
 
-  if (!vi.IsY() && !isYUY2)
+  if (!vi.IsY() && !vi.IsYA() && !isYUY2)
   { // all planar which is not grey
     // Process U plane
     srcp = src->GetReadPtr(PLANAR_U);
@@ -1296,6 +1359,9 @@ PVideoFrame __stdcall DePanEstimate_fftw::GetFrame(int ndest, IScriptEnvironment
 
     // end of V plane code
   }
+
+  if (vi.IsYUVA() && (info != 0 || show != 0)) // YUVA and YA: copy alpha
+    env->BitBlt(dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A), dst->GetRowSize(PLANAR_A), dst->GetHeight(PLANAR_A));
 
   return dst;
 }

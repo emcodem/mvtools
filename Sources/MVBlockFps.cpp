@@ -37,7 +37,7 @@
 MVBlockFps::MVBlockFps(
   PClip _child, PClip _super, PClip mvbw, PClip mvfw,
   unsigned int _num, unsigned int _den, int _mode, double _ml, bool _blend,
-  sad_t nSCD1, int nSCD2, bool _isse2, bool _planar, bool mt_flag,
+  sad_t nSCD1, int nSCD2, bool _isse2, bool mt_flag,
   IScriptEnvironment* env
 )
   : GenericVideoFilter(_child)
@@ -89,7 +89,6 @@ MVBlockFps::MVBlockFps(
   if (mode < 0 || mode >8)
     env->ThrowError("MBlockFps: mode from 0 to 8");
   ml = _ml;
-  planar = _planar;
   blend = _blend;
 
   if (mvClipB.GetDeltaFrame() <= 0 || mvClipF.GetDeltaFrame() <= 0)
@@ -111,23 +110,23 @@ MVBlockFps::MVBlockFps(
   bits_per_pixel_super = super->GetVideoInfo().BitsPerComponent();
   pixelsize_super_shift = ilog2(pixelsize_super);
 
-  planecount = vi.IsYUY2() ? 3 : std::min(vi.NumComponents(), 3);
+  planecount = ClipFnc::nbr_planes_processed(vi);
 
   xRatioUVs[0] = xRatioUVs[1] = xRatioUVs[2] = 1;
   yRatioUVs[0] = yRatioUVs[1] = yRatioUVs[2] = 1;
 
-  if (!vi.IsY() && !vi.IsRGB()) {
-    xRatioUVs[1] = xRatioUVs[2] = vi.IsYUY2() ? 2 : (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
-    yRatioUVs[1] = yRatioUVs[2] = vi.IsYUY2() ? 1 : (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
+  if (!ClipFnc::is_grey(vi) && !vi.IsRGB()) {
+    xRatioUVs[1] = xRatioUVs[2] = (1 << vi.GetPlaneWidthSubsampling(PLANAR_U));
+    yRatioUVs[1] = yRatioUVs[2] = (1 << vi.GetPlaneHeightSubsampling(PLANAR_U));
   }
 
-  for (int i = 0; i < planecount; i++) {
+  for (int i = 0; i < 3; i++) { // all planes, also for Y-only clips (ratio 1), the chroma function lookups use [1]
     nLogxRatioUVs[i] = ilog2(xRatioUVs[i]);
     nLogyRatioUVs[i] = ilog2(yRatioUVs[i]);
   }
 
   is444 = vi.Is444();
-  isGrey = vi.IsY();
+  isGrey = ClipFnc::is_grey(vi);
   isRGB = vi.IsPlanarRGB() || vi.IsPlanarRGBA(); // planar only
   //needDistinctChroma = !is444 && !isGrey && !isRGB;
 
@@ -149,10 +148,14 @@ MVBlockFps::MVBlockFps(
   }
 
   // in overlaps.h
-  // OverlapsLsbFunction
   // OverlapsFunction
   // in M(V)DegrainX: DenoiseXFunction
   arch_t arch;
+#ifdef NEON_INTRINSICS
+  if ((cpuFlags & CPUF_ARM_NEON) != 0)
+    arch = USE_NEON;
+  else
+#endif
   if ((cpuFlags & CPUF_AVX2) != 0)
     arch = USE_AVX2;
   else if ((cpuFlags & CPUF_AVX) != 0)
@@ -166,16 +169,25 @@ MVBlockFps::MVBlockFps(
   else
     arch = NO_SIMD;
 
-  OVERSLUMA = get_overlaps_function(nBlkSizeX, nBlkSizeY, pixelsize_super, false, arch);
-  OVERSCHROMA = get_overlaps_function(nBlkSizeX / xRatioUVs[1], nBlkSizeY / yRatioUVs[1], pixelsize_super, false, arch);
+  OVERSLUMA = get_overlaps_function(nBlkSizeX, nBlkSizeY, pixelsize_super, arch);
+  OVERSCHROMA = get_overlaps_function(nBlkSizeX / xRatioUVs[1], nBlkSizeY / yRatioUVs[1], pixelsize_super, arch);
   BLITLUMA = get_copy_function(nBlkSizeX, nBlkSizeY, pixelsize_super, arch);
   BLITCHROMA = get_copy_function(nBlkSizeX / xRatioUVs[1], nBlkSizeY / yRatioUVs[1], pixelsize_super, arch);
   // 161115
-  OVERSLUMA16 = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint16_t), false, arch);
-  OVERSCHROMA16 = get_overlaps_function(nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1], sizeof(uint16_t), false, arch);
+  OVERSLUMA16 = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(uint16_t), arch);
+  OVERSCHROMA16 = get_overlaps_function(nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1], sizeof(uint16_t), arch);
 
-  OVERSLUMA32 = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(float), false, arch);
-  OVERSCHROMA32 = get_overlaps_function(nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1], sizeof(float), false, arch);
+  OVERSLUMA32 = get_overlaps_function(nBlkSizeX, nBlkSizeY, sizeof(float), arch);
+  OVERSCHROMA32 = get_overlaps_function(nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1], sizeof(float), arch);
+
+  if (nBlkSizeX % xRatioUVs[1] || nBlkSizeY % yRatioUVs[1])
+    env->ThrowError("MBlockFps: block size %dx%d is not a multiple of the chroma subsampling (%dx%d)", nBlkSizeX, nBlkSizeY, xRatioUVs[1], yRatioUVs[1]);
+  // only the overlap path uses these; a missing size would be a null call
+  if (nOverlapX > 0 || nOverlapY > 0) {
+    const bool ovr_ok = pixelsize_super == 1 ? OVERSLUMA && OVERSCHROMA : pixelsize_super == 2 ? OVERSLUMA16 && OVERSCHROMA16 : OVERSLUMA32 && OVERSCHROMA32;
+    if (!ovr_ok)
+      env->ThrowError("MBlockFps: no valid overlap function for block size %dx%d (chroma %dx%d)", nBlkSizeX, nBlkSizeY, nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1]);
+  }
 
   // may be padded for full frame cover
   /*
@@ -227,10 +239,6 @@ MVBlockFps::MVBlockFps(
   if (!isGrey)
     upsizerUV = new SimpleResize(nWidthPUV, nHeightPUV, nBlkXP, nBlkYP, cpuFlags);
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
-  {
-    DstPlanes = new YUY2Planes(nWidth, nHeight);
-  }
 
   const int tmpDstAlign = 16;
   dstShortPitch = AlignNumber(nWidth, tmpDstAlign); // 2.5.11.22
@@ -278,10 +286,6 @@ MVBlockFps::~MVBlockFps()
   delete[] smallMaskO;
 
 
-  if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
-  {
-    delete DstPlanes;
-  }
   delete pRefBGOF;
   delete pRefFGOF;
   if (nOverlapX > 0 || nOverlapY > 0)
@@ -669,9 +673,9 @@ void MVBlockFps::compensate_overlap_slice(int y_beg, int y_end)
 
           if (pixelsize_super == 1) {
             ResultBlock<uint8_t>(myTmpBlock, nBlkPitch*pixelsize_super,
-              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesB[p]->GetPitch(),
-              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesF[p]->GetPitch(),
               pRefP, _cpNRefPitches[p],
               pSrcP, _cpNSrcPitches[p],
@@ -689,9 +693,9 @@ void MVBlockFps::compensate_overlap_slice(int y_beg, int y_end)
           }
           else if (pixelsize_super == 2) {
             ResultBlock<uint16_t>(myTmpBlock, nBlkPitch*pixelsize_super,
-              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesB[p]->GetPitch(),
-              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesF[p]->GetPitch(),
               pRefP, _cpNRefPitches[p],
               pSrcP, _cpNSrcPitches[p],
@@ -709,9 +713,9 @@ void MVBlockFps::compensate_overlap_slice(int y_beg, int y_end)
           }
           else if (pixelsize_super == 4) {
             ResultBlock<float>(myTmpBlock, nBlkPitch*pixelsize_super,
-              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+              _cpPPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesB[p]->GetPitch(),
-              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+              _cpPPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
               _cpPPlanesF[p]->GetPitch(),
               pRefP, _cpNRefPitches[p],
               pSrcP, _cpNSrcPitches[p],
@@ -742,7 +746,7 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
   int nHeightUV = nHeight / yRatioUVs[1];
   int nWidthUV = nWidth / xRatioUVs[1];
 
-#ifndef _M_X64
+#if defined(INTEL_INTRINSICS) && !defined(_M_X64)
   _mm_empty();  // paranoya
 #endif
   // intermediate product may be very large! Now I know how to multiply int64
@@ -753,8 +757,6 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
   BYTE *pDst[3];
   const BYTE *pRef[3], *pSrc[3];
   int nDstPitches[3], nRefPitches[3], nSrcPitches[3];
-  unsigned char *pDstYUY2;
-  int nDstPitchYUY2;
 
   int off = mvClipB.GetDeltaFrame(); // integer offset of reference frame
   if (off <= 0)
@@ -797,64 +799,22 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
   if (mvClipB.IsUsable() && mvClipF.IsUsable())
   {
 
-    PROFILE_START(MOTION_PROFILE_YUY2CONVERT);
 
-    if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
-    {
-      pSrc[0] = src->GetReadPtr();
-      pSrc[1] = pSrc[0] + src->GetRowSize() / 2;
-      pSrc[2] = pSrc[1] + src->GetRowSize() / 4;
-      nSrcPitches[0] = src->GetPitch();
-      nSrcPitches[1] = nSrcPitches[0];
-      nSrcPitches[2] = nSrcPitches[0];
+    int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+    int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+    int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+    planecount = ClipFnc::nbr_planes_processed(vi);
+    for (int p = 0; p < planecount; ++p) {
+      const int plane = planes[p];
+      pSrc[p] = src->GetReadPtr(plane);
+      nSrcPitches[p] = src->GetPitch(plane);
 
-      pRef[0] = ref->GetReadPtr();
-      pRef[1] = pRef[0] + ref->GetRowSize() / 2;
-      pRef[2] = pRef[1] + ref->GetRowSize() / 4;
-      nRefPitches[0] = ref->GetPitch();
-      nRefPitches[1] = nRefPitches[0];
-      nRefPitches[2] = nRefPitches[0];
+      pRef[p] = ref->GetReadPtr(plane);
+      nRefPitches[p] = ref->GetPitch(plane);
 
-      if (!planar)
-      {
-        pDstYUY2 = dst->GetWritePtr();
-        nDstPitchYUY2 = dst->GetPitch();
-        pDst[0] = DstPlanes->GetPtr();
-        pDst[1] = DstPlanes->GetPtrU();
-        pDst[2] = DstPlanes->GetPtrV();
-        nDstPitches[0] = DstPlanes->GetPitch();
-        nDstPitches[1] = DstPlanes->GetPitchUV();
-        nDstPitches[2] = DstPlanes->GetPitchUV();
-      }
-      else
-      {
-        pDst[0] = dst->GetWritePtr();
-        pDst[1] = pDst[0] + nWidth;
-        pDst[2] = pDst[1] + nWidth / 2;
-        nDstPitches[0] = dst->GetPitch();
-        nDstPitches[1] = nDstPitches[0];
-        nDstPitches[2] = nDstPitches[0];
-      }
+      pDst[p] = dst->GetWritePtr(plane);
+      nDstPitches[p] = dst->GetPitch(plane);
     }
-    else
-    {
-      int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-      int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-      int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
-      planecount = std::min(vi.NumComponents(), 3);
-      for (int p = 0; p < planecount; ++p) {
-        const int plane = planes[p];
-        pSrc[p] = src->GetReadPtr(plane);
-        nSrcPitches[p] = src->GetPitch(plane);
-
-        pRef[p] = ref->GetReadPtr(plane);
-        nRefPitches[p] = ref->GetPitch(plane);
-
-        pDst[p] = dst->GetWritePtr(plane);
-        nDstPitches[p] = dst->GetPitch(plane);
-      }
-    }
-    PROFILE_STOP(MOTION_PROFILE_YUY2CONVERT);
 
     BYTE *pDstSave[3];
     pDstSave[0] = pDst[0];
@@ -973,9 +933,9 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
           if (needProcessPlanes[p]) {
             if (pixelsize_super == 1) {
               ResultBlock<uint8_t>(pDst[p], nDstPitches[p],
-                pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+                pPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesB[p]->GetPitch(),
-                pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+                pPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesF[p]->GetPitch(),
                 pRef[p], nRefPitches[p],
                 pSrc[p], nSrcPitches[p],
@@ -991,9 +951,9 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
             else if (pixelsize_super == 2)
             {
               ResultBlock<uint16_t>(pDst[p], nDstPitches[p],
-                pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+                pPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesB[p]->GetPitch(),
-                pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+                pPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesF[p]->GetPitch(),
                 pRef[p], nRefPitches[p],
                 pSrc[p], nSrcPitches[p],
@@ -1009,9 +969,9 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
             else if (pixelsize_super == 4)
             {
               ResultBlock<float>(pDst[p], nDstPitches[p],
-                pPlanesB[p]->GetPointer(p == 0 ? refxB : refxB >> nLogxRatioUVs[1], p == 0 ? refyB : refyB >> nLogyRatioUVs[1]),
+                pPlanesB[p]->GetPointer(p == 0 ? refxB : pos_to_chroma(blockB.GetX() * nPel, refxB - blockB.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyB : pos_to_chroma(blockB.GetY() * nPel, refyB - blockB.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesB[p]->GetPitch(),
-                pPlanesF[p]->GetPointer(p == 0 ? refxF : refxF >> nLogxRatioUVs[1], p == 0 ? refyF : refyF >> nLogyRatioUVs[1]),
+                pPlanesF[p]->GetPointer(p == 0 ? refxF : pos_to_chroma(blockF.GetX() * nPel, refxF - blockF.GetX() * nPel, nLogxRatioUVs[1]), p == 0 ? refyF : pos_to_chroma(blockF.GetY() * nPel, refyF - blockF.GetY() * nPel, nLogyRatioUVs[1])),
                 pPlanesF[p]->GetPitch(),
                 pRef[p], nRefPitches[p],
                 pSrc[p], nSrcPitches[p],
@@ -1246,14 +1206,8 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
     }
     PROFILE_STOP(MOTION_PROFILE_COMPENSATION);
 
-    PROFILE_START(MOTION_PROFILE_YUY2CONVERT);
-    if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2 && !planar)
-    {
-      YUY2FromPlanes(pDstYUY2, nDstPitchYUY2, nWidth, nHeight,
-        pDstSave[0], nDstPitches[0], pDstSave[1], pDstSave[2], nDstPitches[1], cpuFlags);
-    }
-    PROFILE_STOP(MOTION_PROFILE_YUY2CONVERT);
 
+    ClipFnc::copy_alpha_from(dst, child, time256 < 128 ? nleft : nright, vi, env); // alpha of the nearest frame
     return dst;
   }
 
@@ -1266,61 +1220,49 @@ PVideoFrame __stdcall MVBlockFps::GetFrame(int n, IScriptEnvironment* env)
     {
       PVideoFrame ref = child->GetFrame(nright, env);
       PROFILE_START(MOTION_PROFILE_FLOWINTER);
-      if ((pixelType & VideoInfo::CS_YUY2) == VideoInfo::CS_YUY2)
-      {
-        pSrc[0] = src->GetReadPtr(); // we can blend YUY2
-        nSrcPitches[0] = src->GetPitch();
-        pRef[0] = ref->GetReadPtr();
-        nRefPitches[0] = ref->GetPitch();
-        pDstYUY2 = dst->GetWritePtr();
-        nDstPitchYUY2 = dst->GetPitch();
-        Blend<uint8_t>(pDstYUY2, pSrc[0], pRef[0], nHeight, nWidth * 2, nDstPitchYUY2, nSrcPitches[0], nRefPitches[0], time256, cpuFlags);
+      int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+      int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+      int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+      planecount = ClipFnc::nbr_planes_processed(vi);
+      for (int p = 0; p < planecount; ++p) {
+        const int plane = planes[p];
+        pSrc[p] = src->GetReadPtr(plane);
+        nSrcPitches[p] = src->GetPitch(plane);
+
+        pRef[p] = ref->GetReadPtr(plane);
+        nRefPitches[p] = ref->GetPitch(plane);
+
+        pDst[p] = dst->GetWritePtr(plane);
+        nDstPitches[p] = dst->GetPitch(plane);
       }
-      else
+      // blend with time weight
+
+      for (int p = 0; p < 3; p++)
       {
-        int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-        int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-        int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
-        planecount = std::min(vi.NumComponents(), 3);
-        for (int p = 0; p < planecount; ++p) {
-          const int plane = planes[p];
-          pSrc[p] = src->GetReadPtr(plane);
-          nSrcPitches[p] = src->GetPitch(plane);
-
-          pRef[p] = ref->GetReadPtr(plane);
-          nRefPitches[p] = ref->GetPitch(plane);
-
-          pDst[p] = dst->GetWritePtr(plane);
-          nDstPitches[p] = dst->GetPitch(plane);
-        }
-        // blend with time weight
-
-        for (int p = 0; p < 3; p++)
-        {
-          if (needProcessPlanes[p]) {
-            if (pixelsize_super == 1) {
-              Blend<uint8_t>(pDst[p], pSrc[p], pRef[p],
-                p == 0 ? nHeight : nHeightUV,
-                p == 0 ? nWidth : nWidthUV,
-                nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
-            }
-            else if (pixelsize_super == 2) {
-              Blend<uint16_t>(pDst[p], pSrc[p], pRef[p],
-                p == 0 ? nHeight : nHeightUV,
-                p == 0 ? nWidth : nWidthUV,
-                nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
-            }
-            else if (pixelsize_super == 4) {
-              Blend<float>(pDst[p], pSrc[p], pRef[p],
-                p == 0 ? nHeight : nHeightUV,
-                p == 0 ? nWidth : nWidthUV,
-                nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
-            }
+        if (needProcessPlanes[p]) {
+          if (pixelsize_super == 1) {
+            Blend<uint8_t>(pDst[p], pSrc[p], pRef[p],
+              p == 0 ? nHeight : nHeightUV,
+              p == 0 ? nWidth : nWidthUV,
+              nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
+          }
+          else if (pixelsize_super == 2) {
+            Blend<uint16_t>(pDst[p], pSrc[p], pRef[p],
+              p == 0 ? nHeight : nHeightUV,
+              p == 0 ? nWidth : nWidthUV,
+              nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
+          }
+          else if (pixelsize_super == 4) {
+            Blend<float>(pDst[p], pSrc[p], pRef[p],
+              p == 0 ? nHeight : nHeightUV,
+              p == 0 ? nWidth : nWidthUV,
+              nDstPitches[p], nSrcPitches[p], nRefPitches[p], time256, cpuFlags);
           }
         }
       }
       PROFILE_STOP(MOTION_PROFILE_FLOWINTER);
 
+      ClipFnc::copy_alpha_from(dst, child, time256 < 128 ? nleft : nright, vi, env); // alpha of the nearest frame
       return dst;
     }
     else
