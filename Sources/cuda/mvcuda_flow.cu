@@ -159,8 +159,8 @@ namespace
     vy[i] = (short)y;
     if (a.distinct)
     {
-      vxuv[i] = (short)(a.lx ? (short)x >> 1 : x);
-      vyuv[i] = (short)(a.ly ? (short)y >> 1 : y);
+      vxuv[i] = (short)mvc::mv_to_chroma((short)x, a.lx); // VectorSmallMaskYToHalfUV (symmetric rounding, #59)
+      vyuv[i] = (short)mvc::mv_to_chroma((short)y, a.ly);
     }
   }
 

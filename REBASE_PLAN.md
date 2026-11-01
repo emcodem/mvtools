@@ -174,3 +174,22 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   chains (`baseline\merge_wip1`); AviSynth+ = VapourSynth in all 44 compare.py chains; GPU = CPU only for the 4:4:4
   chains (`gpu_vectors_normalsuper`, `gpu_compensate`), the 4:2:0 / 4:2:2 ones differ as predicted (issue 8).
   Not done yet: Linux build and tests. Next: step 5, port #59 to the CUDA kernels.
+- 2026-11-02, step 5 (issue 8): upstream's #59 rounding ported to the CUDA kernels: `mvc::mv_to_chroma` /
+  `pos_to_chroma` (`mvcuda_internal.h`, same formula as `commonfunctions.h`) in the search's chroma SAD
+  (`mvcuda_analyse.cu`, every candidate path and the exhaustive window bounds), `mvcuda_recalc.cu`, the NVOF vector
+  refinement (`mvcuda_nvof_vec.cu`), MCompensate / MDegrain1-6 (`mvcuda_comp.cu`) and MFlowFps's chroma vectors
+  (`mvcuda_flow.cu`, as `VectorSmallMaskYToHalfUV`). One trap: `exh_runs` (exhaustive search, radius > 3) evaluates
+  8 candidates `pel << log_x_uv` apart and took candidate k's chroma k samples after candidate 0's, which the new
+  rounding breaks for a run of odd vectors crossing x = 0 (-1 -> -1, +1 -> +1); such runs now take the sums of
+  their cx > 0 candidates from a second pass at cxa + 1. Without it every exhaustive 4:2:0 / 4:2:2 chain differed,
+  so compare.py got `gpu_vectors_exh` (hd420p8, pel 2, searchparam 8; all old chains use radius 2).
+  The other 2.7.48 fixes need nothing on the GPU: the overlap windows are the CPU's `OverlapWindows` uploaded as they
+  are (the 2048 sum came with the merge); the GPU MSuper builds level 0 with its padding before reducing (= the odd
+  chroma fix); the GPU vector upsizer uses signed weights (= the C path, which was right); the GPU has no float,
+  dct != 0, MFlowBlur or MBlockFps paths (#69, limitC float, dct rounding, MFlowBlur vpad).
+  Tests (build `build_merge\bin` + avstp, `baseline\merge_step5`): CPU = upstream a74dcb6 in all 25 chains; GPU = CPU
+  in all 7 GPU chains and lin_gpu = lin_cpu; AviSynth+ = VapourSynth in all 45 compare.py chains. Ad hoc: exhaustive
+  search radius 4 / 8 / 16, pel 1 / 2, hd420p8 and uhd422p10: GPU = CPU in all 12 (all 12 differ with the second
+  pass disabled). The cf_* chains with vectors changed against `merge_wip1`, as expected.
+  Not done yet: missing-library fallback test, Linux build and tests, step 6 docs (`Documentation/gpu.md`
+  search_coarse / trymanyall fallback, `VAPOURSYNTH_PLAN.md` todo list).

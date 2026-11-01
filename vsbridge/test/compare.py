@@ -157,6 +157,9 @@ GPU_CHAINS = {
     'gpu_vectors': ('hd420p8', GPU_ANA + 'out = bv\n'),
     'gpu_vectors_normalsuper': ('hd444p10', 'sup = MSuper(c, pel=2)\n'
                                 'out = MAnalyse(sup, isb=false, blksize=16, overlap=8, gpu=true)\n'),
+    # exhaustive search with radius > 3 (exh_runs) and 4:2:0 chroma: runs of odd vectors across x = 0 (#59 rounding)
+    'gpu_vectors_exh': ('hd420p8', 'sup = MSuper(c, pel=2, gpu=true)\n'
+                        'out = MAnalyse(sup, isb=true, blksize=16, overlap=8, search=3, searchparam=8, gpu=true)\n'),
     'gpu_compensate': ('hd444p10', GPU_ANA + 'out = MCompensate(c, sup, fv, gpu=true)\n'),
     'gpu_degrain2': ('hd420p8',
                      'sup = MSuper(c, pel=2, gpu=true)\n'

@@ -171,7 +171,7 @@ namespace
       {
         int s = 0;
         for (int p = 1; p < 3; p++)
-          s += block_sad(*a, p, x0[p], y0[p], cw, ch, x0[p] * a->pel + (cx >> a->log_x_uv), y0[p] * a->pel + (cy >> a->log_y_uv));
+          s += block_sad(*a, p, x0[p], y0[p], cw, ch, x0[p] * a->pel + mvc::mv_to_chroma(cx, a->log_x_uv), y0[p] * a->pel + mvc::mv_to_chroma(cy, a->log_y_uv));
         return scale_chroma(s, a->chroma_scale);
       }
       // CheckMV cost chain. The partial sums only grow, so "full cost < minimum" accepts exactly the CPU's candidates.

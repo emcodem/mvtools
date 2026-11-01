@@ -37,7 +37,7 @@ namespace
     int maxv;                         // max pixel value (255 for 8 bit)
     int width[3], height[3];
     int bw[3], bh[3], step_x[3], step_y[3], log_x[3], log_y[3];
-    int lstep_x, lstep_y;             // luma block step: block origins are (luma origin * pel + vector) >> chroma shift
+    int lstep_x, lstep_y;             // luma block step: block origins are pos_to_chroma(luma origin * pel, vector, chroma shift)
     int wb[3], hb[3];                 // width / height of the block grid in this plane
     int ew[3], eh[3], hp[3], vp[3];   // pel 2: padded sub-pel plane geometry
     const short *win[3];              // overlap windows of this plane (luma or chroma set), nullptr without overlap
@@ -122,13 +122,13 @@ namespace
         if (i < 0 || i >= bw || j < 0 || j >= bh)
           continue;
         const int *b = blocks + stride * (by * nbx + bx);
-        // block origin in the plane: (luma origin * pel + vector) >> chroma shift, as GetPointer(blx >> log, bly >> log)
+        // block origin in the plane: pos_to_chroma(luma origin * pel, vector, chroma shift), as the CPU since 2.7.48 (#59)
         const int lx = bx * pl.lstep_x * PEL, ly = by * pl.lstep_y * PEL;
         int v;
         if (MODE == 0)
         {
           if (b[2])
-            v = ref_at<T, PEL>(pl, 0, p, (lx + b[0]) >> pl.log_x[p], (ly + b[1]) >> pl.log_y[p], i, j);
+            v = ref_at<T, PEL>(pl, 0, p, mvc::pos_to_chroma(lx, b[0], pl.log_x[p]), mvc::pos_to_chroma(ly, b[1], pl.log_y[p]), i, j);
           else
             v = at<T>(pl.src[p], pl.pitch[p], x, y);
         }
@@ -139,8 +139,8 @@ namespace
           for (int k = 0; k < L; k++)
           {
             const int *mv = b + 4 * k;
-            const int rb = ref_at<T, PEL>(pl, 2 * k, p, (lx + mv[0]) >> pl.log_x[p], (ly + mv[1]) >> pl.log_y[p], i, j);
-            const int rf = ref_at<T, PEL>(pl, 2 * k + 1, p, (lx + mv[2]) >> pl.log_x[p], (ly + mv[3]) >> pl.log_y[p], i, j);
+            const int rb = ref_at<T, PEL>(pl, 2 * k, p, mvc::pos_to_chroma(lx, mv[0], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[1], pl.log_y[p]), i, j);
+            const int rf = ref_at<T, PEL>(pl, 2 * k + 1, p, mvc::pos_to_chroma(lx, mv[2], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[3], pl.log_y[p]), i, j);
             s += rf * w[1 + L + k] + rb * w[1 + k];
           }
           v = (s + 128) >> 8;

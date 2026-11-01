@@ -94,6 +94,20 @@ namespace mvc
     ~DevSuper();
   };
 
+  // luma vector (or offset) to chroma, rounded half away from zero: commonfunctions.h mv_to_chroma (upstream 2.7.48
+  // #59), used by the CPU search's chroma SAD and by every consumer. log: 0 (not subsampled) or 1. Monotonic, but not
+  // shift-invariant across 0: mv_to_chroma(v + 2, 1) != mv_to_chroma(v, 1) + 1 for v == -1.
+  __host__ __device__ __forceinline__ int mv_to_chroma(int v, int log)
+  {
+    return (v + ((1 << log) >> 1) - ((v < 0) & (log != 0))) >> log;
+  }
+
+  // block position (pel units, divisible by the subsampling) plus a vector to chroma: commonfunctions.h pos_to_chroma
+  __host__ __device__ __forceinline__ int pos_to_chroma(int blockpos, int v, int log)
+  {
+    return (blockpos >> log) + mv_to_chroma(v, log);
+  }
+
   // geometry of one plane of one level (same formulas as MVSuper.h PlaneWidthLuma / PlaneHeightLuma)
   inline int level_size(int size, int level, int ratio, int pad)
   {

@@ -432,6 +432,16 @@ namespace
       }
     }
   }
+  // A run of exh_runs (candidates cxa + k * step, step = pel << log_x_uv, k < 8) takes candidate k's chroma k samples
+  // after candidate 0's. With the symmetric luma -> chroma rounding (mvc::mv_to_chroma, upstream #59) that holds only on
+  // one side of x = 0: an odd vector rounds down below 0 and up above it. A run with odd cxa < 0 that reaches cx > 0
+  // takes the chroma sums of its cx > 0 candidates from a second pass based at cxa + 1 ((cxa + 1) >> 1: even, exact).
+  // Its reads stay inside the window: the second base is at most one sample right of the first (EXH_XC spare columns).
+  __device__ __forceinline__ bool exh_run_crosses_zero(int cxa, int step, int log_x_uv)
+  {
+    return log_x_uv != 0 && (cxa & 1) != 0 && cxa < 0 && cxa + 7 * step > 0;
+  }
+
   // dispatch on the start offset in the first word (0 .. samples per word - 1) and on NARROW (bits <= 12, 16 bit)
   template <int NCOL, int SL>
   __device__ __forceinline__ void sad_rows_pk_o(int o, bool narrow, const unsigned *wrow, int wpitch, const unsigned *srow, int row0, int rstep, int rows, unsigned (&acc)[8])
@@ -525,7 +535,7 @@ namespace
     const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
     int sum_l = 0, sum_c = 0;
     const int rows_l = BSY ? BSY : a.bs_y, rows_c = CHH ? CHH : a.ch;
-    const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+    const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx, a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy, a.log_y_uv);
     const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
     const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
     if constexpr (CHH > 0)
@@ -659,7 +669,7 @@ namespace
     int shc = 0, pl = 1, ccg = 0, crg = 0;
     if constexpr (CHH > 0)
     {
-      const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+      const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx, a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy, a.log_y_uv);
       const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
       const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
       pl = lane < 16 ? 1 : 2;
@@ -924,11 +934,26 @@ namespace
               (const unsigned *)s_y, j, TPR, A.bs_y, al);
             if constexpr (CW > 0)
             {
-              const int xpc = x1 * A.pel + (cxa >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
-              const int cc = (xpc >> lp) - cx0, cc0 = cc % SPWD;
-              const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + cc;
-              sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu - cc0), WC / SPWD, (const unsigned *)s_u, j, TPR, A.ch, ac);
-              sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu + nsub * nc - cc0), WC / SPWD, (const unsigned *)s_v, j, TPR, A.ch, ac);
+              const int ypc = y1 * A.pel + mvc::mv_to_chroma(cy, A.log_y_uv);
+              auto chroma_run = [&](int xpc, unsigned (&acc)[K]) {
+                const int cc = (xpc >> lp) - cx0, cc0 = cc % SPWD;
+                const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + cc;
+                sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu - cc0), WC / SPWD, (const unsigned *)s_u, j, TPR, A.ch, acc);
+                sad_rows_pk_o<CW, 1>(cc0, A.bits <= 12, (const unsigned *)(bu + nsub * nc - cc0), WC / SPWD, (const unsigned *)s_v, j, TPR, A.ch, acc);
+              };
+              chroma_run(x1 * A.pel + mvc::mv_to_chroma(cxa, A.log_x_uv), ac);
+              if (exh_run_crosses_zero(cxa, step, A.log_x_uv))
+              {
+                unsigned ac2[K];
+                #pragma unroll
+                for (int k = 0; k < K; k++)
+                  ac2[k] = 0;
+                chroma_run(x1 * A.pel + ((cxa + 1) >> 1), ac2);
+                #pragma unroll
+                for (int k = 0; k < K; k++)
+                  if (cxa + k * step > 0)
+                    ac[k] = ac2[k];
+              }
             }
           }
           for (int o = 1; o < TPR; o <<= 1)
@@ -968,26 +993,41 @@ namespace
           }
           if constexpr (CW > 0)
           {
-            const int xpc = x1 * A.pel + (cxa >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
-            const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + ((xpc >> lp) - cx0);
-            const pix *bv = bu + nsub * nc;
-            for (int row = 0; row < A.ch; row++)
-            {
-              int wu[NWC], wv[NWC];
-              #pragma unroll
-              for (int i = 0; i < NWC; i++)
+            const int ypc = y1 * A.pel + mvc::mv_to_chroma(cy, A.log_y_uv);
+            auto chroma_run = [&](int xpc, int (&acc)[K]) {
+              const pix *bu = win + nsub * nl + ((xpc & pm) | ((ypc & pm) << lp)) * nc + ((ypc >> lp) - cy0) * WC + ((xpc >> lp) - cx0);
+              const pix *bv = bu + nsub * nc;
+              for (int row = 0; row < A.ch; row++)
               {
-                wu[i] = bu[row * WC + i];
-                wv[i] = bv[row * WC + i];
-              }
-              #pragma unroll
-              for (int col = 0; col < CW; col++)
-              {
-                const int su = s_u[row * CW + col], sv = s_v[row * CW + col];
+                int wu[NWC], wv[NWC];
                 #pragma unroll
-                for (int k = 0; k < K; k++)
-                  sc[k] += abs(su - wu[col + k]) + abs(sv - wv[col + k]);
+                for (int i = 0; i < NWC; i++)
+                {
+                  wu[i] = bu[row * WC + i];
+                  wv[i] = bv[row * WC + i];
+                }
+                #pragma unroll
+                for (int col = 0; col < CW; col++)
+                {
+                  const int su = s_u[row * CW + col], sv = s_v[row * CW + col];
+                  #pragma unroll
+                  for (int k = 0; k < K; k++)
+                    acc[k] += abs(su - wu[col + k]) + abs(sv - wv[col + k]);
+                }
               }
+            };
+            chroma_run(x1 * A.pel + mvc::mv_to_chroma(cxa, A.log_x_uv), sc);
+            if (exh_run_crosses_zero(cxa, step, A.log_x_uv))
+            {
+              int sc2[K];
+              #pragma unroll
+              for (int k = 0; k < K; k++)
+                sc2[k] = 0;
+              chroma_run(x1 * A.pel + ((cxa + 1) >> 1), sc2);
+              #pragma unroll
+              for (int k = 0; k < K; k++)
+                if (cxa + k * step > 0)
+                  sc[k] = sc2[k];
             }
           }
         }
@@ -1038,10 +1078,10 @@ namespace
       int cx0 = 0, cy0 = 0, WC = 0, HC = 0;
       if (chr)
       {
-        cx0 = (x1 * A.pel + ((mvx - r) >> A.log_x_uv)) >> lp;
-        cy0 = (y1 * A.pel + ((mvy - r) >> A.log_y_uv)) >> lp;
-        WC = (((x1 * A.pel + ((mvx + r) >> A.log_x_uv)) >> lp) - cx0 + A.cw + EXH_XC + 3) & ~3;
-        HC = ((y1 * A.pel + ((mvy + r) >> A.log_y_uv)) >> lp) - cy0 + A.ch;
+        cx0 = (x1 * A.pel + mvc::mv_to_chroma(mvx - r, A.log_x_uv)) >> lp;
+        cy0 = (y1 * A.pel + mvc::mv_to_chroma(mvy - r, A.log_y_uv)) >> lp;
+        WC = (((x1 * A.pel + mvc::mv_to_chroma(mvx + r, A.log_x_uv)) >> lp) - cx0 + A.cw + EXH_XC + 3) & ~3;
+        HC = ((y1 * A.pel + mvc::mv_to_chroma(mvy + r, A.log_y_uv)) >> lp) - cy0 + A.ch;
       }
       const int nl = WL * HL, nc = WC * HC;
       const bool use_win = nsub * (nl + 2 * nc) <= win_cap;
@@ -1168,7 +1208,7 @@ namespace
           ru[k] = rv[k] = nullptr;
           if (chr)
           {
-            const int xpc = x1 * A.pel + (cx >> A.log_x_uv), ypc = y1 * A.pel + (cy >> A.log_y_uv);
+            const int xpc = x1 * A.pel + mvc::mv_to_chroma(cx, A.log_x_uv), ypc = y1 * A.pel + mvc::mv_to_chroma(cy, A.log_y_uv);
             const int subc = (xpc & pm) | ((ypc & pm) << lp);
             if (use_win)
             {
@@ -1903,7 +1943,7 @@ namespace
       }
       if (a.cw)
       {
-        const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+        const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx, a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy, a.log_y_uv);
         const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
         const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
         if (2 * a.cw <= GW)
@@ -2025,7 +2065,7 @@ namespace
     {
       if (col < 2 * a.cw)
       {
-        const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+        const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx, a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy, a.log_y_uv);
         const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
         const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
         const int pl = col < a.cw ? 1 : 2, cc = col < a.cw ? col : col - a.cw;
@@ -2133,7 +2173,7 @@ namespace
     }
     if constexpr (CHH > 0)
     {
-      const int xpc = x1 * a.pel + (cx >> a.log_x_uv), ypc = y1 * a.pel + (cy >> a.log_y_uv);
+      const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx, a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy, a.log_y_uv);
       const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
       const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
       const int pl = col < GW / 2 ? 1 : 2, cc = col % (GW / 2), cg = cc % (GW / 8), rg = cc / (GW / 8);

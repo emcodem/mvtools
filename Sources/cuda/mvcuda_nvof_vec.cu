@@ -139,7 +139,7 @@ namespace
       for (int p = 1; p < 3; p++)
       {
         const int cx0 = a.hpad[p] + (xi >> a.log_x_uv), cy0 = a.vpad[p] + (yi >> a.log_y_uv);
-        sc += sad_block(a, p, cx0, cy0, a.cw, a.ch, cx0 * a.pel + (vx >> a.log_x_uv), cy0 * a.pel + (vy >> a.log_y_uv), lane);
+        sc += sad_block(a, p, cx0, cy0, a.cw, a.ch, cx0 * a.pel + mvc::mv_to_chroma(vx, a.log_x_uv), cy0 * a.pel + mvc::mv_to_chroma(vy, a.log_y_uv), lane);
       }
       sad += scale_chroma(sc, a.chroma_scale);
     }
