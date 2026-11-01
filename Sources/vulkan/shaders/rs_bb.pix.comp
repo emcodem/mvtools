@@ -1,0 +1,98 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "rs_common.glsl"
+// QTGMC's back blend (Sbb) of Sources/cuda/mvcuda_resample.cu, three stages selected by the specialization constant STAGE:
+//   0 k_bb_diff:  mt_makediff(thin, lossed) (luma), then RemoveGrain 12 (borders copied) -> diff
+//   1 k_bb_pass1: first resize pass, diff -> mid
+//   2 k_bb_final: second pass (luma) and mt_makediff(thin, G); chroma is thin's; then the optional clamp (z = plane)
+// diff / mid: luma-sized scratch planes, pitch w[0]. Workgroups (ceil(w / 128), h[, planes]).
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int STAGE = 0;
+
+struct Args
+{
+  uint64_t thin[3], ref[5][3], dst[3];
+  uint64_t lossed, diff, mid, off1, off2, c1, c2;
+  int pitch[3], w[3], h[3];
+  int taps1, taps2, h_first, nref, sovs, bits, maxv, half_;
+};
+ARGS(Args)
+
+int bb_d(int x, int y)
+{
+  const uint o = uint(y) * uint(A.pitch[0]) + uint(x);
+  return clamp(ldpix(A.thin[0], o) - ldpix(A.lossed, o) + A.half_, 0, A.maxv);
+}
+
+int bb_avg(int a, int c) { return (a + c + 1) >> 1; }
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+  if (STAGE == 0)
+  {
+    const int w = A.w[0], h = A.h[0];
+    if (x >= w || y >= h)
+      return;
+    int r;
+    if (x == 0 || y == 0 || x == w - 1 || y == h - 1)
+      r = bb_d(x, y);
+    else
+    {
+      const int a123 = bb_avg(bb_d(x, y - 1), bb_avg(bb_d(x - 1, y - 1), bb_d(x + 1, y - 1)));
+      const int a678 = bb_avg(bb_d(x, y + 1), bb_avg(bb_d(x - 1, y + 1), bb_d(x + 1, y + 1)));
+      const int a4c5 = bb_avg(bb_d(x, y), bb_avg(bb_d(x - 1, y), bb_d(x + 1, y)));
+      int a123678 = bb_avg(a123, a678);
+      a123678 = a123678 > 0 ? a123678 - 1 : 0;
+      r = bb_avg(a4c5, a123678);
+    }
+    stpix(A.diff, uint(y) * uint(w) + uint(x), r);
+  }
+  else if (STAGE == 1)
+  {
+    const int w = A.w[0], h = A.h[0];
+    if (x >= w || y >= h)
+      return;
+    int r;
+    if (A.h_first != 0)
+      r = rs_sum(A.diff, uint(y) * uint(w) + uint(PI32(A.off1).v[x]), 1u, A.c1, uint(x) * uint(A.taps1), A.taps1, A.bits);
+    else
+      r = rs_sum(A.diff, uint(PI32(A.off1).v[y]) * uint(w) + uint(x), uint(w), A.c1, uint(y) * uint(A.taps1), A.taps1, A.bits);
+    stpix(A.mid, uint(y) * uint(w) + uint(x), r);
+  }
+  else
+  {
+    const int p = int(gl_WorkGroupID.z);
+    if (x >= A.w[p] || y >= A.h[p])
+      return;
+    const uint o = uint(y) * uint(A.pitch[p]) + uint(x);
+    int v = ldpix(A.thin[p], o);
+    if (p == 0)
+    {
+      const int w = A.w[0];
+      int g;
+      if (A.h_first != 0)
+        g = rs_sum(A.mid, uint(PI32(A.off2).v[y]) * uint(w) + uint(x), uint(w), A.c2, uint(y) * uint(A.taps2), A.taps2, A.bits);
+      else
+        g = rs_sum(A.mid, uint(y) * uint(w) + uint(PI32(A.off2).v[x]), 1u, A.c2, uint(x) * uint(A.taps2), A.taps2, A.bits);
+      v = clamp(v - g + A.half_, 0, A.maxv);
+    }
+    if (A.nref != 0)
+    {
+      int up = 0, lo = A.maxv;
+      for (int j = 0; j < A.nref; j++)
+      {
+        const int r = ldpix(A.ref[j][p], o);
+        up = max(up, r);
+        lo = min(lo, r);
+      }
+      up = min(up + A.sovs, A.maxv);
+      lo = max(lo - A.sovs, 0);
+      v = min(v, up);
+      v = max(v, lo);
+    }
+    stpix(A.dst[p], o, v);
+  }
+}

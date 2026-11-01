@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "rs_common.glsl"
+// k_resample_v / k_resample_h of Sources/cuda/mvcuda_resample.cu: one output sample per invocation, workgroups
+// (ceil(max_w / 128), max_h, planes). horizontal = 0: the program runs over the rows (source row row_start + i * row_step),
+// 1: over the columns.
+
+layout(local_size_x = 128) in;
+
+struct Args
+{
+  uint64_t src[3], dst[3], off[3], coeff[3];
+  int src_pitch[3], dst_pitch[3], width[3], height[3], taps[3], row_start[3], row_step[3]; // pitches in samples
+  int bits, horizontal, pad0, pad1;
+};
+ARGS(Args)
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y), p = int(gl_WorkGroupID.z);
+  if (x >= A.width[p] || y >= A.height[p])
+    return;
+  const int taps = A.taps[p];
+  int r;
+  if (A.horizontal != 0)
+  {
+    const uint i0 = uint(y) * uint(A.src_pitch[p]) + uint(PI32(A.off[p]).v[x]);
+    r = rs_sum(A.src[p], i0, 1u, A.coeff[p], uint(x) * uint(taps), taps, A.bits);
+  }
+  else
+  {
+    const uint step = uint(A.row_step[p]) * uint(A.src_pitch[p]);
+    const uint i0 = uint(A.row_start[p] + PI32(A.off[p]).v[y] * A.row_step[p]) * uint(A.src_pitch[p]) + uint(x);
+    r = rs_sum(A.src[p], i0, step, A.coeff[p], uint(y) * uint(taps), taps, A.bits);
+  }
+  stpix(A.dst[p], uint(y) * uint(A.dst_pitch[p]) + uint(x), r);
+}

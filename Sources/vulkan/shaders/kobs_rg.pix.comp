@@ -1,0 +1,73 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "kobs_common.glsl"
+// k_rg of Sources/cuda/mvcuda_kobs.cu: RemoveGrain 12 / 20 (11 = 12), borders copied, other modes copy; z = plane.
+// Tiles of 128 x RG_ROWS samples with a one-sample halo in shared memory (one global load per sample instead of nine).
+// Workgroups (ceil(max_w / 128), ceil(max_h / RG_ROWS), planes).
+
+layout(local_size_x = 128) in;
+
+const int RG_ROWS = 8;        // vk_kobs.cpp: same value
+const int TW = 128 + 2;
+
+struct Args
+{
+  uint64_t s[3], d[3];
+  int sp[3], dp[3], w[3], h[3], mode[3], pad0;
+};
+ARGS(Args)
+
+shared uint tile[(RG_ROWS + 2) * TW];
+
+void main()
+{
+  const int p = int(gl_WorkGroupID.z), tx = int(gl_LocalInvocationID.x);
+  const int w = A.w[p], h = A.h[p];
+  const int x0 = int(gl_WorkGroupID.x) * 128, y0 = int(gl_WorkGroupID.y) * RG_ROWS;
+  if (x0 >= w || y0 >= h)
+    return; // uniform per workgroup
+  const int mode = A.mode[p] == 11 ? 12 : A.mode[p];
+  const uint64_t s = A.s[p];
+  const int sp = A.sp[p];
+  const bool filt = mode == 12 || mode == 20;
+  if (filt)
+  {
+    // halo samples outside the plane are clamped (only border samples, which are copied, would read them)
+    for (int i = tx; i < (RG_ROWS + 2) * TW; i += 128)
+    {
+      const int gy = clamp(y0 - 1 + i / TW, 0, h - 1), gx = clamp(x0 - 1 + i % TW, 0, w - 1);
+      tile[i] = uint(ldq(s, sp, gx, gy));
+    }
+  }
+  memoryBarrierShared();
+  barrier();
+  const int x = x0 + tx;
+  if (x >= w)
+    return;
+  for (int r = 0; r < RG_ROWS; r++)
+  {
+    const int y = y0 + r;
+    if (y >= h)
+      break;
+    int v;
+    if (!filt)
+      v = ldq(s, sp, x, y);
+    else
+    {
+      const int o = (r + 1) * TW + tx + 1;
+      v = int(tile[o]);
+      if (x > 0 && y > 0 && x < w - 1 && y < h - 1)
+      {
+        const int a1 = int(tile[o - TW - 1]), a2 = int(tile[o - TW]), a3 = int(tile[o - TW + 1]);
+        const int a4 = int(tile[o - 1]), a5 = int(tile[o + 1]);
+        const int a6 = int(tile[o + TW - 1]), a7 = int(tile[o + TW]), a8 = int(tile[o + TW + 1]);
+        if (mode == 12)
+          v = rg12(a1, a2, a3, a4, v, a5, a6, a7, a8);
+        else
+          v = rg20(uint(a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + v + 4));
+      }
+    }
+    stq(A.d[p], A.dp[p], x, y, v);
+  }
+}

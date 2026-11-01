@@ -1,0 +1,113 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "kobs_common.glsl"
+// k_qtgmc_sharp of Sources/cuda/mvcuda_kobs.cu: QTGMC's binomial smooth, resharp and temporal sharpness limit fused (all
+// planes). Workgroups (ceil(max_w / SL_X), ceil(max_h / SL_Y), planes), 256 invocations. Shared samples as uint.
+
+layout(local_size_x = 256) in;
+
+const int SL_X = 64, SL_Y = 16;   // output tile (vk_kobs.cpp: same values)
+const int NT = 256;
+const int BW = SL_X + 2;
+
+struct Args
+{
+  uint64_t edi[3], d1[3], d2[3], ref[5][3], d[3];
+  uint64_t lut[2], lutp[2];       // resharp tables; Precise: vresharp limit tables (0 = none)
+  int pe[3], p1[3], p2[3], pr[5][3], pd[3]; // pitches in samples
+  int w[3], h[3];
+  int tr1, w1, inv1, w2, inv2;
+  int smode, nref, sovs, maxv, pad0;
+};
+ARGS(Args)
+
+// binomial on rows y0 - 2 .. y0 + SL_Y + 1, columns x0 - 1 .. x0 + SL_X; vresharp on rows y0 - 1 .. y0 + SL_Y
+shared uint bin[(SL_Y + 4) * BW];
+shared uint vr[(SL_Y + 2) * BW];
+
+void main()
+{
+  const int p = int(gl_WorkGroupID.z), tid = int(gl_LocalInvocationID.x);
+  const int w = A.w[p], h = A.h[p], x0 = int(gl_WorkGroupID.x) * SL_X, y0 = int(gl_WorkGroupID.y) * SL_Y, n = A.maxv + 1;
+  if (x0 >= w || y0 >= h)
+    return; // uniform per workgroup
+  // the samples are those of the clamped coordinates: the vertical morphology replicates the edge rows; clamped columns
+  // are read only for border samples, which RemoveGrain copies
+  for (int i = tid; i < (SL_Y + 4) * BW; i += NT)
+  {
+    const int r = i / BW, c = i % BW;
+    const int gy = min(max(y0 - 2 + r, 0), h - 1), gx = min(max(x0 - 1 + c, 0), w - 1);
+    int b = ldq(A.edi[p], A.pe[p], gx, gy);
+    if (A.tr1 > 0)
+    {
+      int m = ldq(A.d1[p], A.p1[p], gx, gy);
+      if (A.tr1 > 1)
+        m = (m * A.inv1 + ldq(A.d2[p], A.p2[p], gx, gy) * A.w1 + 16384) >> 15; // Merge(degrain1, degrain2, 0.2)
+      b = (m * A.inv2 + b * A.w2 + 16384) >> 15;                                // Merge(.., edi, 0.25 / 0.0625)
+    }
+    bin[i] = uint(b);
+  }
+  memoryBarrierShared();
+  barrier();
+  if (A.smode == 2)
+  {
+    const uint64_t lp = A.lutp[p != 0 ? 1 : 0];
+    for (int i = tid; i < (SL_Y + 2) * BW; i += NT)
+    {
+      const int u = int(bin[i]), m = int(bin[i + BW]), dn = int(bin[i + 2 * BW]);
+      int v = avg2(max(m, max(u, dn)), min(m, min(u, dn)));
+      if (A.lutp[0] != 0)
+        v = lut_at(lp, n, v, m); // Precise: mt_lutxy(vresharp, binomial)
+      vr[i] = uint(v);
+    }
+    memoryBarrierShared();
+    barrier();
+  }
+  const uint64_t lt = A.lut[p != 0 ? 1 : 0];
+  for (int i = tid; i < SL_X * SL_Y; i += NT)
+  {
+    const int x = x0 + i % SL_X, y = y0 + i / SL_X;
+    if (x >= w || y >= h)
+      continue;
+    const int r = 1 + i / SL_X, c = 1 + i % SL_X; // (x, y) in vr; bin row r + 1
+    int res = int(bin[(r + 1) * BW + c]);
+    if (A.smode != 0)
+    {
+      // RemoveGrain 12 of vresharp (SMode 2) or of the binomial (SMode 1)
+      int rg;
+      const bool inner = x > 0 && y > 0 && x < w - 1 && y < h - 1;
+      if (A.smode == 2)
+      {
+        const int o = r * BW + c;
+        rg = int(vr[o]);
+        if (inner)
+          rg = rg12(int(vr[o - BW - 1]), int(vr[o - BW]), int(vr[o - BW + 1]), int(vr[o - 1]), int(vr[o]), int(vr[o + 1]),
+            int(vr[o + BW - 1]), int(vr[o + BW]), int(vr[o + BW + 1]));
+      }
+      else
+      {
+        const int o = (r + 1) * BW + c;
+        rg = int(bin[o]);
+        if (inner)
+          rg = rg12(int(bin[o - BW - 1]), int(bin[o - BW]), int(bin[o - BW + 1]), int(bin[o - 1]), int(bin[o]), int(bin[o + 1]),
+            int(bin[o + BW - 1]), int(bin[o + BW]), int(bin[o + BW + 1]));
+      }
+      res = lut_at(lt, n, res, rg);
+    }
+    if (A.nref != 0)
+    {
+      int up = 0, lo = A.maxv;
+      for (int j = 0; j < A.nref; j++)
+      {
+        const int v = ldq(A.ref[j][p], A.pr[j][p], x, y);
+        up = max(up, v);
+        lo = min(lo, v);
+      }
+      up = min(up + A.sovs, A.maxv);
+      lo = max(lo - A.sovs, 0);
+      res = max(min(res, up), lo);
+    }
+    stq(A.d[p], A.pd[p], x, y, res);
+  }
+}

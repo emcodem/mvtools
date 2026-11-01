@@ -1,0 +1,56 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "kobs_common.glsl"
+// k_mt of Sources/cuda/mvcuda_kobs.cu: one masktools-style operation per plane (op: MVCUDA_MT_* of mvcuda.h); z = plane.
+// Workgroups (ceil(max_w / 128), max_h, planes).
+
+layout(local_size_x = 128) in;
+
+const int MT_COPY_A = 0, MT_MIN = 1, MT_MAX = 2, MT_CLAMP = 3, MT_VEXPAND = 4, MT_VINPAND = 5, MT_LUT = 6, MT_COPY_B = 7;
+
+struct Args
+{
+  uint64_t a[3], b[3], c[3], d[3];
+  uint64_t lut[2];               // [0] luma, [1] chroma
+  int pa[3], pb[3], pc[3], pd[3]; // pitches in samples
+  int w[3], h[3], op[3];
+  int p1, p2, maxv;
+};
+ARGS(Args)
+
+void main()
+{
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y), p = int(gl_WorkGroupID.z);
+  if (x >= A.w[p] || y >= A.h[p])
+    return;
+  const uint64_t a = A.a[p];
+  const int pa = A.pa[p];
+  const int op = A.op[p];
+  int r;
+  if (op == MT_MIN)
+    r = min(ldq(a, pa, x, y), ldq(A.b[p], A.pb[p], x, y));
+  else if (op == MT_MAX)
+    r = max(ldq(a, pa, x, y), ldq(A.b[p], A.pb[p], x, y));
+  else if (op == MT_CLAMP)
+  {
+    // clamp_sse2 / clamp16_core_simd: min with (bright +sat overshoot, at most max), then max with (dark -sat undershoot)
+    int up = ldq(A.b[p], A.pb[p], x, y) + A.p1, lo = ldq(A.c[p], A.pc[p], x, y) - A.p2;
+    up = min(up, A.maxv);
+    lo = max(lo, 0);
+    r = max(min(ldq(a, pa, x, y), up), lo);
+  }
+  else if (op == MT_VEXPAND || op == MT_VINPAND)
+  {
+    const int h = A.h[p];
+    const int up = ldq(a, pa, x, y > 0 ? y - 1 : y), c = ldq(a, pa, x, y), dn = ldq(a, pa, x, y < h - 1 ? y + 1 : y);
+    r = op == MT_VEXPAND ? max(c, max(up, dn)) : min(c, min(up, dn));
+  }
+  else if (op == MT_LUT)
+    r = lut_at(A.lut[p != 0 ? 1 : 0], A.maxv + 1, ldq(a, pa, x, y), ldq(A.b[p], A.pb[p], x, y));
+  else if (op == MT_COPY_B)
+    r = ldq(A.b[p], A.pb[p], x, y);
+  else
+    r = ldq(a, pa, x, y);
+  stq(A.d[p], A.pd[p], x, y, r);
+}

@@ -1,0 +1,47 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_sad of Sources/cuda/mvcuda_temporal.cu (TemporalSoften scene-change SADs): one workgroup per (row, neighbour, plane slot),
+// the row's SAD in int as the CPU. Instead of a 64-bit atomic add, each row's SAD goes to rowsad[(slot * n_neigh + j) * max_h + y]
+// and tmp_decide sums the rows in 64 bit (same total).
+
+layout(local_size_x = 256) in;
+
+struct Args
+{
+  uint64_t planes[45];   // [frame * 3 + plane], the centre is frame radius
+  uint64_t rowsad;
+  int pitch[3], width[3], height[3], plane_ids[3];
+  int n_neigh, max_h, pad0, pad1;
+};
+ARGS(Args)
+
+shared int red[256];
+
+void main()
+{
+  const int y = int(gl_WorkGroupID.x), j = int(gl_WorkGroupID.y), slot = int(gl_WorkGroupID.z);
+  const int tid = int(gl_LocalInvocationID.x);
+  const int p = A.plane_ids[slot];
+  if (y >= A.height[p])
+    return; // uniform per workgroup
+  const int radius = A.n_neigh / 2;
+  const int k = j < radius ? j : j + 1;
+  const uint64_t c = A.planes[radius * 3 + p], o = A.planes[k * 3 + p];
+  const uint row = uint(y) * uint(A.pitch[p]);
+  int s = 0;
+  for (int x = tid; x < A.width[p]; x += 256)
+    s += abs(ldpix(c, row + uint(x)) - ldpix(o, row + uint(x)));
+  red[tid] = s;
+  memoryBarrierShared();
+  barrier();
+  for (int o2 = 128; o2 > 0; o2 >>= 1)
+  {
+    if (tid < o2)
+      red[tid] += red[tid + o2];
+    memoryBarrierShared();
+    barrier();
+  }
+  if (tid == 0)
+    PI32(A.rowsad).v[uint(slot * A.n_neigh + j) * uint(A.max_h) + uint(y)] = red[0];
+}

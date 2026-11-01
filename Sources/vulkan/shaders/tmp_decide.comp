@@ -1,0 +1,134 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_decide / k_decide_pair of Sources/cuda/mvcuda_temporal.cu: one workgroup. First the SAD of every (slot, neighbour) as
+// the 64-bit sum of the row SADs of tmp_sad (when do_sad), then the decisions of TemporalSoften::GetFrame.
+// Output (int): soften: mask[3], count[3]; pair (binomial): mask[3], count[3] (radius 2), mask1[3], count1[3] (radius 1).
+
+layout(local_size_x = 256) in;
+
+const int MAX_NEIGH = 32;
+
+struct Args
+{
+  uint64_t rowsad, outp;
+  int height_of_slot[3];
+  int n_slots, n_neigh, scenechange, sad_shift, max_h, do_sad, pair;
+};
+ARGS(Args)
+
+shared uint64_t red[256];
+shared uint64_t sad[3 * MAX_NEIGH];
+
+// decide over n neighbours; sad index of (c, j) = c * MAX_NEIGH + map(j); writes mask / count at outp[base ..]
+void decide(int n_neigh, bool r1, int base)
+{
+  const int radius = n_neigh / 2;
+  bool disabled[MAX_NEIGH];
+  for (int i = 0; i < n_neigh; i++)
+    disabled[i] = false;
+  bool stopped = false;
+  for (int c = 0; c < A.n_slots; c++)
+  {
+    int m = 0, d = n_neigh;
+    if (stopped)
+    {
+      PI32(A.outp).v[base + c] = 0;
+      PI32(A.outp).v[base + 3 + c] = -1;
+      continue;
+    }
+    if (A.scenechange > 0)
+    {
+      d = 0;
+      bool skiprest = false;
+      for (int i = radius - 1; i >= 0; i--)
+      {
+        if (!skiprest && !disabled[i])
+        {
+          const int jj = r1 ? (i == 0 ? 1 : 2) : i;
+          const int s = int(int64_t(sad[c * MAX_NEIGH + jj] >> A.sad_shift));
+          if (s < A.scenechange)
+          {
+            m |= 1 << i;
+            d++;
+          }
+          else
+            skiprest = true;
+          disabled[i] = skiprest;
+        }
+        else
+          disabled[i] = true;
+      }
+      skiprest = false;
+      for (int i = radius; i < 2 * radius; i++)
+      {
+        if (!skiprest && !disabled[i])
+        {
+          const int jj = r1 ? (i == 0 ? 1 : 2) : i;
+          const int s = int(int64_t(sad[c * MAX_NEIGH + jj] >> A.sad_shift));
+          if (s < A.scenechange)
+          {
+            m |= 1 << i;
+            d++;
+          }
+          else
+            skiprest = true;
+          disabled[i] = skiprest;
+        }
+        else
+          disabled[i] = true;
+      }
+    }
+    else
+      m = (1 << n_neigh) - 1;
+    if (d < 1)
+    {
+      stopped = true;
+      PI32(A.outp).v[base + c] = 0;
+      PI32(A.outp).v[base + 3 + c] = -1;
+      continue;
+    }
+    PI32(A.outp).v[base + c] = m;
+    PI32(A.outp).v[base + 3 + c] = d;
+  }
+}
+
+void main()
+{
+  const int tid = int(gl_LocalInvocationID.x);
+  if (A.do_sad != 0)
+  {
+    const int pairs = A.n_slots * A.n_neigh;
+    for (int q = 0; q < pairs; q++)
+    {
+      const int c = q / A.n_neigh, j = q % A.n_neigh;
+      const uint base = uint(q) * uint(A.max_h);
+      uint64_t s = 0;
+      for (int y = tid; y < A.height_of_slot[c]; y += 256)
+        s += uint64_t(uint(PI32(A.rowsad).v[base + uint(y)]));
+      red[tid] = s;
+      memoryBarrierShared();
+      barrier();
+      for (int o = 128; o > 0; o >>= 1)
+      {
+        if (tid < o)
+          red[tid] += red[tid + o];
+        memoryBarrierShared();
+        barrier();
+      }
+      if (tid == 0)
+        sad[c * MAX_NEIGH + j] = red[0];
+      memoryBarrierShared();
+      barrier();
+    }
+  }
+  if (tid != 0)
+    return;
+  if (A.pair != 0)
+  {
+    decide(4, false, 0);
+    decide(2, true, 6);
+  }
+  else
+    decide(A.n_neigh, false, 0);
+}

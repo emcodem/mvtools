@@ -1,0 +1,109 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_accumulate (BINOMIAL = 0, TemporalSoften) and k_binomial (BINOMIAL = 1, QTGMC's search-clip binomial: TemporalSoften
+// radius 1 and 2 merged) of Sources/cuda/mvcuda_temporal.cu. Workgroups (ceil(w0 / 128), h0, planes). dec: the decisions of
+// tmp_decide.
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int BINOMIAL = 0;
+
+struct Args
+{
+  uint64_t planes[45];   // [frame * 3 + plane]
+  uint64_t dst[3];
+  uint64_t dec;
+  float rcp[16];         // 1.0f / (d + 1), computed on the host (IEEE division, as __fdiv_rn)
+  int pitch[3], width[3], height[3], slot_of_plane[3];
+  int n_neigh, thr_y, thr_c, bits;
+  int w1, inv1, w2, inv2, tail_y, merge_chroma, tail_c, pad0;
+};
+ARGS(Args)
+
+int px(int k, int p, uint at) { return ldpix(A.planes[k * 3 + p], at); }
+
+// one sample of accumulate_line: cur and the averaged neighbours (bit j of m, d of them) of an n-neighbour window whose
+// first frame is frame off
+int ts_value(int cur, int n_neigh, int off, int m, int d, int threshold, int p, uint at)
+{
+  const bool max_thr = threshold == 255;
+  int thr = threshold;
+#ifndef MVC_PIX8
+  thr = threshold * (1 << (A.bits - 8));
+#endif
+  const int radius = n_neigh / 2;
+  int sum = cur;
+  for (int j = 0; j < n_neigh; j++)
+  {
+    if ((m & (1 << j)) == 0)
+      continue;
+    const int v = px((j < radius ? j : j + 1) + off, p, at);
+    if (max_thr)
+      sum += v;
+    else
+      sum += abs(cur - v) <= thr ? v : cur;
+  }
+#ifdef MVC_PIX8
+  const int div = 32768 / (d + 1);
+  return (sum * div + 16384) >> 15;
+#else
+  // accumulate_line_16_sse41: float multiply by 1 / (d + 1), round to nearest even, unsigned saturation, bit-depth limit
+  precise float r = float(sum) * A.rcp[d];
+  int v = int(roundEven(r));
+  v = clamp(v, 0, 65535);
+  if (A.bits < 16)
+    v = min(v, (1 << A.bits) - 1);
+  return v;
+#endif
+}
+
+int merge_w(int a, int b, int w, int inv, bool simd)
+{
+#ifndef MVC_PIX8
+  if (A.bits == 16 && simd)
+  {
+    int s = ((a - 32768) * inv + (b - 32768) * w + 16384) >> 15;
+    s = clamp(s, -32768, 32767);
+    return (s + 32768) & 0xffff;
+  }
+#endif
+  return (a * inv + b * w + 16384) >> 15;
+}
+
+void main()
+{
+  const int p = int(gl_WorkGroupID.z);
+  const int x = int(gl_GlobalInvocationID.x), y = int(gl_WorkGroupID.y);
+  if (x >= A.width[p] || y >= A.height[p])
+    return;
+  const int threshold = p == 0 ? A.thr_y : A.thr_c;
+  const uint at = uint(y) * uint(A.pitch[p]) + uint(x);
+  const int slot = A.slot_of_plane[p];
+  PI32 dec = PI32(A.dec);
+  int out_v;
+  if (BINOMIAL == 0)
+  {
+    const int radius = A.n_neigh / 2;
+    const int cur = px(radius, p, at);
+    out_v = cur;
+    if (slot >= 0 && dec.v[3 + slot] >= 0)
+      out_v = ts_value(cur, A.n_neigh, 0, dec.v[slot], dec.v[3 + slot], threshold, p, at);
+  }
+  else
+  {
+    // frames 0..4 = n - 2 .. n + 2; dec: mask[3], count[3] (radius 2), mask1[3], count1[3] (radius 1)
+    const int cur = px(2, p, at);
+    int ts1 = cur, ts2 = cur;
+    if (slot >= 0 && dec.v[9 + slot] >= 0)
+      ts1 = ts_value(cur, 2, 1, dec.v[6 + slot], dec.v[9 + slot], threshold, p, at);
+    out_v = ts1;
+    if (p == 0 || A.merge_chroma != 0)
+    {
+      if (slot >= 0 && dec.v[3 + slot] >= 0)
+        ts2 = ts_value(cur, 4, 0, dec.v[slot], dec.v[3 + slot], threshold, p, at);
+      const bool simd = x < (p == 0 ? A.tail_y : A.tail_c);
+      out_v = merge_w(merge_w(ts1, ts2, A.w1, A.inv1, simd), cur, A.w2, A.inv2, simd);
+    }
+  }
+  stpix(A.dst[p], at, out_v);
+}

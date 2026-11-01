@@ -1,0 +1,157 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "kobs_common.glsl"
+// k_kobs of Sources/cuda/mvcuda_kobs.cu: QTGMC_KeepOnlyBobShimmerFixes fused into one kernel (all planes), on a tile with a
+// halo as large as the chain's reach; plane borders follow the rules of the single filters, evaluated in plane coordinates
+// (so the tile size does not change the result). Shared buffers hold samples as uint (no 8/16-bit shared types needed);
+// the tile is 32 x 32 here (64 x 32 in CUDA) to stay within 32 KB of shared memory. Workgroups
+// (ceil(max_w / KT_X), ceil(max_h / KT_Y), planes), 256 invocations.
+
+layout(local_size_x = 256) in;
+
+const int KT_X = 32, KT_Y = 32;     // output tile (vk_kobs.cpp: same values)
+const int KR_MAX = 9, KC_MAX = 3;   // largest reach
+const int KB_W = KT_X + 2 * KC_MAX, KB_H = KT_Y + 2 * KR_MAX;
+const int NT = 256;
+
+struct Args
+{
+  uint64_t in_[3], rf[3], d[3];
+  uint64_t lut1[2], lut2[2];         // [0] luma, [1] chroma
+  int pin[3], prf[3], pd[3];         // pitches in samples
+  int w[3], h[3], act_[3];
+  int n1, n2, rg_first, od;          // first-direction vertical steps, second-direction steps, deflate step, over-dilation
+  int R, C;                          // vertical / horizontal reach of one chain
+  int maxv, half_;
+};
+ARGS(Args)
+
+shared uint sb[3][KB_H * KB_W];      // 0: diff, 1 / 2: ping-pong
+shared uint c1[KT_Y * KT_X];         // result of chain 0 on the tile
+
+// one step of a chain over the buffer region still valid (halo vr / vc around the tile): kind 0 vertical morph, 1 the
+// RemoveGrain 20 + min / max step
+void kobs_step(int si, int di, int kind, bool is_max, int vr, int vc, int gx0, int gy0, int w, int h, int tid)
+{
+  const int r0 = A.R - vr + 1, r1 = A.R + KT_Y + vr - 1;
+  const int c0 = A.C - vc + (kind != 0 ? 1 : 0), c1e = A.C + KT_X + vc - (kind != 0 ? 1 : 0);
+  const int cols = c1e - c0, n = (r1 - r0) * cols;
+  for (int i = tid; i < n; i += NT)
+  {
+    const int r = r0 + i / cols, c = c0 + i % cols;
+    const int gy = gy0 + r, gx = gx0 + c;
+    if (gy < 0 || gy >= h || gx < 0 || gx >= w)
+      continue;
+    const int o = r * KB_W + c;
+    const int v = int(sb[si][o]);
+    int outv;
+    if (kind == 0)
+    {
+      const int up = gy > 0 ? int(sb[si][o - KB_W]) : v, dn = gy < h - 1 ? int(sb[si][o + KB_W]) : v;
+      outv = is_max ? max(v, max(up, dn)) : min(v, min(up, dn));
+    }
+    else
+    {
+      int rg = v; // QTGMC_deflate / inflate: mt_logic(c, c.RemoveGrain(20), "min" / "max"), RemoveGrain borders copied
+      if (gx > 0 && gy > 0 && gx < w - 1 && gy < h - 1)
+        rg = rg20(sb[si][o - KB_W - 1] + sb[si][o - KB_W] + sb[si][o - KB_W + 1] + sb[si][o - 1] + uint(v) + sb[si][o + 1]
+          + sb[si][o + KB_W - 1] + sb[si][o + KB_W] + sb[si][o + KB_W + 1] + 4u);
+      outv = is_max ? max(v, rg) : min(v, rg);
+    }
+    sb[di][o] = uint(outv);
+  }
+}
+
+void main()
+{
+  const int p = int(gl_WorkGroupID.z), tid = int(gl_LocalInvocationID.x);
+  const int w = A.w[p], h = A.h[p], tx0 = int(gl_WorkGroupID.x) * KT_X, ty0 = int(gl_WorkGroupID.y) * KT_Y;
+  const int maxv = A.maxv, half_ = A.half_, n = maxv + 1;
+  if (tx0 >= w || ty0 >= h)
+    return; // uniform per workgroup
+  const uint64_t inp = A.in_[p];
+  const int pin = A.pin[p];
+  if (A.act_[p] == 0)
+  {
+    for (int i = tid; i < KT_X * KT_Y; i += NT)
+    {
+      const int x = tx0 + i % KT_X, y = ty0 + i / KT_X;
+      if (x < w && y < h)
+        stq(A.d[p], A.pd[p], x, y, ldq(inp, pin, x, y));
+    }
+    return;
+  }
+  const int R = A.R, C = A.C;
+  const int gx0 = tx0 - C, gy0 = ty0 - R; // plane coordinates of buffer [0][0]
+  const int rows = KT_Y + 2 * R, cols = KT_X + 2 * C;
+  for (int i = tid; i < rows * cols; i += NT)
+  {
+    const int r = i / cols, c = i % cols, gy = gy0 + r, gx = gx0 + c;
+    if (gy >= 0 && gy < h && gx >= 0 && gx < w)
+      sb[0][r * KB_W + c] = uint(clipv(ldq(A.rf[p], A.prf[p], gx, gy) - ldq(inp, pin, gx, gy) + half_, maxv)); // mt_makediff(Ref, Input)
+  }
+  memoryBarrierShared();
+  barrier();
+  for (int chain = 0; chain < 2; chain++)
+  {
+    // chain 0: positive differences (inpand first) into c1; chain 1: negative (expand first), result left in cur
+    const bool first_max = chain == 1;
+    int cur = 0, vr = R, vc = C;
+    for (int s = 0; s < A.n1 + A.rg_first + A.n2 + A.od; s++)
+    {
+      int kind;
+      bool is_max;
+      if (s < A.n1)
+      {
+        kind = 0;
+        is_max = first_max;
+      }
+      else if (s < A.n1 + A.rg_first)
+      {
+        kind = 1;
+        is_max = first_max;
+      }
+      else if (s < A.n1 + A.rg_first + A.n2)
+      {
+        kind = 0;
+        is_max = !first_max;
+      }
+      else
+      {
+        kind = 1;
+        is_max = !first_max;
+      }
+      const int outb = cur == 1 ? 2 : 1;
+      kobs_step(cur, outb, kind, is_max, vr, vc, gx0, gy0, w, h, tid);
+      memoryBarrierShared();
+      barrier();
+      cur = outb;
+      vr--;
+      if (kind != 0)
+        vc--;
+    }
+    if (chain == 0)
+    {
+      for (int i = tid; i < KT_X * KT_Y; i += NT)
+        c1[i] = sb[cur][(R + i / KT_X) * KB_W + C + i % KT_X];
+      memoryBarrierShared();
+      barrier();
+    }
+    else
+    {
+      // restore = diff.mt_lutxy(choke1, expr1).mt_lutxy(choke2, expr2); Input.mt_adddiff(restore)
+      const uint64_t l1 = A.lut1[p != 0 ? 1 : 0], l2 = A.lut2[p != 0 ? 1 : 0];
+      for (int i = tid; i < KT_X * KT_Y; i += NT)
+      {
+        const int x = tx0 + i % KT_X, y = ty0 + i / KT_X;
+        if (x >= w || y >= h)
+          continue;
+        const int o = (R + i / KT_X) * KB_W + C + i % KT_X;
+        const int t1 = lut_at(l1, n, int(sb[0][o]), int(c1[i]));
+        const int t2 = lut_at(l2, n, t1, int(sb[cur][o]));
+        stq(A.d[p], A.pd[p], x, y, clipv(ldq(inp, pin, x, y) + t2 - half_, maxv));
+      }
+    }
+  }
+}
