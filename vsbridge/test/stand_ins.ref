@@ -1,0 +1,24 @@
+# AviSynth+ 3.7.5 (Windows) with masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by stand_ins.py ref
+# case width height pixel_type fps_numerator fps_denominator num_frames image_type | ERROR message
+bob 1920 1080 -1610612728 60000 1001 20 0
+bob_args 1920 720 -1610612728 60000 1001 20 0
+bob_444p10 1280 1440 -1610284277 50 1 20 0
+bob_err420 ERROR SeparateFields: YUV420 height must be multiple of 4
+bob_errheight ERROR Resize: Planar destination height must be a multiple of 2.
+temporalsoften 1920 1080 -1610612728 30000 1001 10 0
+gauss 1280 720 -1610612728 30000 1001 10 0
+gauss_10 1921 1081 -1610284277 25 1 10 0
+gauss_err ERROR Resize: Planar destination height must be a multiple of 2.
+bilinear 960 540 -1610612728 30000 1001 10 0
+removegrain 1920 1080 -1610612728 30000 1001 10 0
+removegrain_10 1280 720 -1610284277 25 1 10 0
+nnedi3_m2 1920 1080 -1610612728 60000 1001 20 0
+nnedi3_dh 1920 2160 -1610612728 30000 1001 10 0
+nnedi3_1 1280 720 -1610284277 25 1 10 0
+nnedi3_3 1280 720 -1610284277 50 1 20 0
+nnedi3_err ERROR nnedi3: field must be set to -1, 0, or 1 when dh=true!
+mt_logic 1920 1080 -1610612728 30000 1001 10 0
+mt_clamp 1280 720 -1610284277 25 1 10 0
+mt_expand 1920 1080 -1610612728 30000 1001 10 0
+mt_inpand 1280 720 -1610284277 25 1 10 0
+kobs 1920 1080 -1610612728 30000 1001 10 0

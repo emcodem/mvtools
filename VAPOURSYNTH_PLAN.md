@@ -147,8 +147,8 @@ clips. Our registry does not (decision 2); the frame-property carrier stays the 
 
 1. **`Invoke`.** Done for mvtools2: `InternalCache` (MFlowBlur / MFlowFps / MFlowInter) is a pass-through; `Invoke`
    of a function registered through the bridge calls it directly (positional and named arguments). `MSuper` /
-   `MAnalyse` from CudaNVOFAnalyse will go that way. The CPU fallbacks of cudafilters: stand-ins (findings of step 4);
-   so far `Merge` / `MergeLuma` / `MergeChroma`, the others follow (VapourSynth todo list).
+   `MAnalyse` from CudaNVOFAnalyse will go that way. The CPU fallbacks of cudafilters: stand-ins for every name they
+   Invoke, and an exact port for `mt_lut` / `mt_lutxy` / `mt_adddiff` (findings of step 4).
 2. **Threading / MT modes.** Done: `MT_NICE_FILTER` → `fmParallel` with one instance; `MT_MULTI_INSTANCE` (almost
    every mvtools filter) → `fmParallel` with an instance pool: an idle instance per call, a new one created on demand
    (one at a time per filter), as AviSynth+ creates one per prefetch thread; `MT_SERIALIZED` (MAnalyse with
@@ -183,7 +183,10 @@ Test tools (`vsbridge/test/`): `vsmd5.py` (framemd5 like `avsmd5`; planar RGB ha
 from the UHD source), `compare.py` (each chain in both hosts with the same libmvtools2.so, framemd5 diff),
 `lin_cpu.vpy` / `lin_gpu.vpy` (the stored Linux reference chains; `MVPF_LOOP` for longer clips). `compare.py cpu` /
 `compare.py gpu` run one group; the GPU chains need `libmvtools_cuda.so` in `MVPF_PLUGIN_DIR` (without it they test the
-fallback).
+fallback). Step 4 added tests whose references come from AviSynth+ on Windows (where masktools, RgTools, nnedi3 and
+QTGMC.avsi exist; `python <test> ref` there writes the reference file next to the script, the VS run compares with
+it): `mt_tables.py` (masktools port), `stand_ins.py` (stand-in VideoInfo, via `avs_info.py`: AviSynth+'s C API from
+Python), `cf_chains.py` (cudafilters chains on a synthetic input).
 
 Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, CPU): 17 chains (vectors, MStoreVect / MRestoreVect, MCompensate,
 MDegrain2, MDegrainN, MFlow, MFlowInter, MFlowBlur, MFlowFps, MBlockFps, MMask, MSCDetection, MShow, MScaleVect,
@@ -263,6 +266,29 @@ chains still identical, 3 rounds.
   formats above 16 bit are refused. Tables up to 10 bit are built once per expression; above that the expression is
   evaluated per pixel (CPU fallback only, the GPU tables stop at 10 bit). The float32 code is compiled with
   `-ffp-contract=off` (Expr does not fuse multiply-add).
+- **Stand-ins for every fallback name (2026-11-01).** One table in `bridge.cpp` (`stand_in_specs`): AviSynth parameter
+  names, a VideoInfo rule, an optional nearest mapping. The rules repeat the VideoInfo calls of the AviSynth+
+  constructors (Bob: SeparateFields when frame-based, FilteredResizeV to `height`, Fieldwise `SetFieldBased(false)`;
+  Gauss / BilinearResize: target size with their size checks) or were measured where no source is at hand (nnedi3 of
+  plugins_JPSDR: `field` -2 / 2 / 3 double frames and rate, `dh` doubles the height and needs `field` -1 / 0 / 1, the
+  result is frame-based; RemoveGrain, TemporalSoften, the masktools filters, QTGMC_KeepOnlyBobShimmerFixes: the first
+  clip's VideoInfo). Errors the filters raise at creation are raised with the same text. `MVBRIDGE_DEBUG=1` logs each
+  stand-in's VideoInfo. Measured through AviSynth+'s C API (`avs_info.py`, ctypes) on Windows, where all the original
+  plugins exist. The stand-in's `GetParity` is never observable (a cudafilter inherits `GetParity` from its child, as
+  under AviSynth+), its `image_type` is (copied into the cudafilter's VideoInfo, read by mvtools as `IsFieldBased`).
+- **Nearest mappings** (VS core only has `std`, `resize`, `text`): Merge* `std.Merge`; Bob `std.SeparateFields` +
+  `resize.Bicubic` (b, c; top fields +0.25, bottom fields -0.25 lines, as Fieldwise picks them) + `std.Interleave`;
+  BilinearResize `resize.Bilinear` (AviSynth's src_width / src_height <= 0 converted); mt_logic min / max, mt_clamp
+  (masktools' order: upper limit first, then lower), mt_makediff `std.Expr`; mt_expand / mt_inpand `std.Maximum` /
+  `Minimum` with the mode's neighbours (default thresholds only). None for TemporalSoften, GaussResize, RemoveGrain,
+  nnedi3, QTGMC_KeepOnlyBobShimmerFixes (error in both modes). The nearest node's size and length are checked against the
+  stand-in's VideoInfo.
+- **CudaNNEDI3 needs the nnedi3 weights.** Windows reads them from the loaded plugins_JPSDR.dll (resource 101); elsewhere
+  `nnedi3_weights.bin` (the standard 13574928-byte file) must sit next to `libcudafilters.so`, under VS as under Linux
+  AviSynth+; without it CudaNNEDI3 takes its CPU path (under VS strict: the nnedi3 error). The standard file gives the
+  same output as the JPSDR resource (`cf_chains.py` nnedi3 cases).
+- **Test tool:** avsmd5's RawSource has no parity; Bob in Linux AviSynth+ then crashes in `C_VideoFilter::GetParity`. The
+  Bob chains of `compare.py` put `AssumeBFF` on the AviSynth side (BFF is also what the bridge reports for VS clips).
 
 Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, RTX 5090): `compare.py cf`, 7 chains (CudaUpload / CudaDownload round
 trip; CudaMerge 0.3, 0.5, CudaMergeLuma 0.7, CudaMergeChroma 0.6 on three formats; CudaUpload -> MSuper / MAnalyse /
@@ -280,15 +306,29 @@ coverage for both evaluators, AddNoise chains, plane modes 1 / 2 / 3 / 4 on 4:2:
 identical without `libmvtools_cuda.so` (port as CPU fallback, 94 cases) and with it (70 cases on the GPU from the port's
 tables, the rest on the port). `compare.py cf` (7), `gpu` (7), `cpu` (17) still identical.
 
+Result 2026-11-01 (stand-ins): `stand_ins.py`, 22 cases (Bob with defaults / b, c, height / 4:4:4 10-bit and its two
+errors, TemporalSoften, GaussResize incl. odd sizes and the error, BilinearResize, RemoveGrain, nnedi3 field -2 / -1 dh
+/ 1 / 3 and the dh error, mt_logic / clamp / expand / inpand, QTGMC_KeepOnlyBobShimmerFixes): VideoInfo (size, rate,
+frames, pixel type, image_type) and errors identical with AviSynth+ 3.7.5 on Windows (`stand_ins.ref`). `cf_chains.py`,
+19 chains on a synthetic input both hosts generate (CudaRemoveGrain 12 / 20, CudaNNEDI3 -2 / 1, CudaLogic max / min,
+CudaClamp, CudaExpand / Inpand, CudaKeepOnlyBobShimmerFixes rep 4 / 1, CudaQtgmcSharpLimit smode 2 precise / smode 1
+tr1 2, CudaQtgmcBackBlend, CudaQtgmcAddNoise, CudaLutxy, CudaQtgmcBinomial0, CudaBob, CudaGaussResize): VS on Linux
+(GPU path, strict stand-ins) identical with AviSynth+ on Windows (release bundle 2026-11-01b, the real plugins,
+`cf_chains.md5`), also at `MVCUDA_CACHE_MB=16` (567 evictions, 34 regenerations). `compare.py cf` now 13 chains (+ Bob x2,
+TemporalSoften, GaussResize, BilinearResize, Binomial0) identical at 24 and 1 threads; `gpu` (7), `cpu` (17) identical.
+Without `libmvtools_cuda.so` or with a truncated one: strict stops with the stand-in's error (except CudaLutxy /
+CudaQtgmcAddNoise: exact masktools port, still identical); nearest runs the mapped filters (logic, expand, inpand, clamp
+matched AviSynth+ on this input, Bob and BilinearResize differ in every frame, Merge as before) and stops on the unmapped
+ones; python and vspipe exit cleanly.
+
 ## VapourSynth todo list
 
 - Measure `MVBRIDGE_FALLBACK=nearest` per mapping against AviSynth+ (runs without `libmvtools_cuda.so` send every frame
   through the fallback): differing frames, share of differing pixels, largest difference; document per filter.
-- Stand-ins for the other fallback names (Bob, TemporalSoften, Gauss/BilinearResize, RemoveGrain, nnedi3, mt_logic /
-  mt_clamp / mt_expand / mt_inpand / mt_makediff, QTGMC_KeepOnlyBobShimmerFixes, CudaQtgmc* chains): VideoInfo rule
-  each, nearest mapping where one exists (std.AverageFrames, resize.*, rgvs / zsmooth, znedi3, std.Maximum / Minimum /
-  Expr).
+  (Postponed by the user, 2026-10-31.)
 - CudaNVOFAnalyse through the bridge (Invoke of MSuper / MAnalyse), planar RGB test.
+- Optional: nearest mappings to VS plugins when loaded (zsmooth TemporalSoften / RemoveGrain, znedi3); QTGMC_gpu.avsi
+  as a whole under VS (needs the script's non-GPU parts in VS form).
 
 ## Files
 
@@ -310,7 +350,7 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
    Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
 4. cudafilters through the same shim; CudaNVOFAnalyse. In progress: entry point, token frames end to end, Merge*
    stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31, masktools port (`mt_lut` / `mt_lutxy` / `mt_adddiff`, D10)
-   2026-11-01 (findings above); the rest is on the todo list.
+   and stand-ins for every other fallback name 2026-11-01 (findings above); CudaNVOFAnalyse is on the todo list.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.
 

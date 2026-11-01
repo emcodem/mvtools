@@ -1,0 +1,21 @@
+# AviSynth+ 3.7.5 (Windows), release bundle 2026-11-01b (cudafilters.dll 530b06a, mvtools_cuda.dll 15811aa), masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by cf_chains.py ref
+# case frames md5(concatenated per-frame md5s)
+removegrain12 10 f554a2d8978b7077b32b4439c91c816a
+removegrain20 10 ef970a22547e37d3b94f304a9f8c00ff
+nnedi3_m2 20 5afc4e313f08db82914de4fc11e90b40
+nnedi3_1 10 78fdd1d1a9d381f08e272972fbaf349a
+logic_max 10 19e9b3786da780331c0daef036129170
+logic_min 10 391c2d8ac7dda36b6bb23ae8f5f5d9fc
+clamp 10 eb2ff9d3884dcbebfe1f08389bf3d12b
+expand 10 0336a16e0cf2e6818566c155b70e74f1
+inpand 10 466107cc87500f0ba2af99dc27a7bd9c
+kobs4 10 cd26cd2cf4d442736431ec6dde4c46b1
+kobs1_10 10 bdf02fe05060c3f5b96cb9181c5a5f95
+sharplimit 10 78747707f053229aa14125355a055ad1
+sharplimit_s1 10 d2e8401e40f6be94836d2a196bfcec9a
+backblend 10 f5f7edeabab6ff66390ccc8ba2e9c57f
+addnoise 10 5ef3a160abae51f679b475329bd19b21
+lutxy 10 2e782ea7788adf999333269df5a3876b
+binomial0 10 4193461cb8b2663efe85744332d7db42
+bob 20 260f4b24de8982b4af94f9e61c3b650e
+gauss 10 1a2da32acf12f758ac80b6d6c35ed9cc

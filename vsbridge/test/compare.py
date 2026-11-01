@@ -159,16 +159,25 @@ CF_CHAINS = {
                          'MAnalyse(MSuper(c, pel=2, hpad=16, vpad=16), isb=true, blksize=32, overlap=16), '
                          'MAnalyse(MSuper(c, pel=2, hpad=16, vpad=16), isb=false, blksize=32, overlap=16), '
                          'num=60000, den=1001))), weight=0.4))\n'),
+    # cudafilters whose CPU fallback exists in Linux AviSynth+ (VS: the bridge's stand-ins; the others: cf_chains.py)
+    # BFF(x): AssumeBFF in AviSynth+ (avsmd5's RawSource has no parity: Bob crashes in C_VideoFilter::GetParity),
+    # nothing in VS (the bridge reports BFF for VS clips)
+    'cf_bob': ('hd420p8', 'out = CudaDownload(CudaBob(CudaUpload(BFF(c)), 0.0, 0.5))\n'),
+    'cf_bob_h': ('uhd422p10', 'out = CudaDownload(CudaBob(CudaUpload(BFF(c)), height=1080))\n'),
+    'cf_tsoften': ('hd444p10', 'out = CudaDownload(CudaTemporalSoften(CudaUpload(c), 2, 4, 8, scenechange=15, mode=2))\n'),
+    'cf_gauss': ('hd420p8', 'out = CudaDownload(CudaGaussResize(CudaUpload(c), 1280, 720, p=5.0))\n'),
+    'cf_bilinear': ('hd444p10', 'out = CudaDownload(CudaBilinearResize(CudaUpload(c), 960, 540, src_left=2.5))\n'),
+    'cf_binomial0': ('hd420p8', 'out = CudaDownload(CudaQtgmcBinomial0(CudaUpload(c)))\n'),
 }
 
 
 def cf_vs_body(avs):
-    vs = re.sub(r'\bREV\(', 'core.std.Reverse(', vs_body(avs))
+    vs = re.sub(r'\bBFF\(', '(', re.sub(r'\bREV\(', 'core.std.Reverse(', vs_body(avs)))
     return re.sub(r'\b(Cuda\w*)\(', r'cf.\1(', vs)
 
 
 for _name, (_src, _body) in CF_CHAINS.items():
-    CHAINS[_name] = (_src, _body.replace('REV(', 'Reverse('), cf_vs_body(_body))
+    CHAINS[_name] = (_src, _body.replace('REV(', 'Reverse(').replace('BFF(', 'AssumeBFF('), cf_vs_body(_body))
 
 
 def write(path, text):

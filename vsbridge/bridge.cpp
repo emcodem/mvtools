@@ -1377,10 +1377,32 @@ std::vector<AVSValue> invoke_args(const AVSValue &args, const char *const *arg_n
   return out;
 }
 
-// nearest for Merge / MergeLuma / MergeChroma: std.Merge with per-plane weights (AviSynth+: Merge weights all planes,
-// MergeLuma only Y, MergeChroma only U and V; default weight 0.5 / 1.0 / 1.0)
-bool nearest_merge(const std::string &l, const PClip &a, const PClip &b, const AVSValue &weight, StandInClip &s,
-                   std::string &err)
+// A filter of a VapourSynth core plugin (com.vapoursynth.std / .resize) on `in` (freed here): its node, or null and err.
+VSNode *vs_call(const char *plugin_id, const char *func, VSMap *in, std::string &err)
+{
+  VSCore *core = current_core();
+  VSPlugin *p = core ? g_vsapi->getPluginByID(plugin_id, core) : nullptr;
+  if (!p)
+  {
+    g_vsapi->freeMap(in);
+    err = std::string("VapourSynth plugin ") + plugin_id + " not found";
+    return nullptr;
+  }
+  VSMap *out = g_vsapi->invoke(p, func, in);
+  g_vsapi->freeMap(in);
+  if (const char *e = g_vsapi->mapGetError(out))
+  {
+    err = std::string(func) + ": " + e;
+    g_vsapi->freeMap(out);
+    return nullptr;
+  }
+  VSNode *node = g_vsapi->mapGetNode(out, "clip", 0, nullptr);
+  g_vsapi->freeMap(out);
+  return node;
+}
+
+// the input clips of a nearest mapping as VS nodes appended to `key` of `in`; false and err on failure
+bool append_clips(VSMap *in, const char *key, const std::vector<PClip> &clips, const char *name, std::string &err)
 {
   VSCore *core = current_core();
   if (!core)
@@ -1388,20 +1410,175 @@ bool nearest_merge(const std::string &l, const PClip &a, const PClip &b, const A
     err = "no VapourSynth core";
     return false;
   }
-  const double w = weight.Defined() ? weight.AsFloat() : (l == "merge" ? 0.5 : 1.0);
-  VSNode *na = clip_node(a, "MergeFallbackInput", core, err);
-  if (!na)
-    return false;
-  VSNode *nb = clip_node(b, "MergeFallbackInput", core, err);
-  if (!nb)
+  for (const PClip &c : clips)
   {
-    g_vsapi->freeNode(na);
-    return false;
+    VSNode *n = clip_node(c, std::string(name) + "FallbackInput", core, err);
+    if (!n)
+      return false;
+    g_vsapi->mapConsumeNode(in, key, n, maAppend);
+  }
+  return true;
+}
+
+// masktools plane mode (Y / U / V: 3 process, 2 copy, 1 none, 4 copy second) -> the std.Expr expression of the plane;
+// "" for modes without one (memset values)
+std::string mt_plane_expr(const AVSValue &v, int def, const std::string &process, int nclips)
+{
+  const int m = v.Defined() ? (int)v.AsFloat((float)def) : def;
+  return m == 3 ? process : (m == 2 || m == 1) ? "x" : (m == 4 && nclips > 1) ? "y" : "";
+}
+
+// std.Expr over clips with one expression per plane (masktools Y / U / V modes at a[iy], a[iy + 1], a[iy + 2]); null
+// and err when a plane mode has no expression
+VSNode *nearest_mt_expr(const std::vector<PClip> &clips, const std::vector<AVSValue> &a, size_t iy,
+                        const std::string &process, const char *name, std::string &err)
+{
+  const int np = clips[0]->GetVideoInfo().NumComponents();
+  std::string ex[3];
+  for (int p = 0; p < np; ++p)
+  {
+    ex[p] = mt_plane_expr(a[iy + p], p == 0 ? 3 : 1, process, (int)clips.size());
+    if (ex[p].empty())
+    {
+      err = "this plane mode has no VapourSynth equivalent";
+      return nullptr;
+    }
   }
   VSMap *in = g_vsapi->createMap();
-  g_vsapi->mapConsumeNode(in, "clipa", na, maAppend);
-  g_vsapi->mapConsumeNode(in, "clipb", nb, maAppend);
-  const bool gray = a->GetVideoInfo().NumComponents() == 1;
+  if (!append_clips(in, "clips", clips, name, err))
+  {
+    g_vsapi->freeMap(in);
+    return nullptr;
+  }
+  for (int p = 0; p < np; ++p)
+    g_vsapi->mapSetData(in, "expr", ex[p].c_str(), (int)ex[p].size(), dtUtf8, maAppend);
+  return vs_call("com.vapoursynth.std", "Expr", in, err);
+}
+
+// The stand-in for AviSynth core / plugin filter `l` (lower case) that cudafilters Invoke as their CPU fallback:
+// AviSynth parameter names (positional ones first, in order), the VideoInfo rule (the same VideoInfo calls as the
+// filter's constructor; checked against AviSynth+ by vsbridge/test/stand_ins.py) and the nearest VS mapping, if any.
+struct StandInSpec
+{
+  const char *name;
+  std::vector<std::string> params;
+  bool (*video_info)(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err);
+  // nearest: the VS node computing an approximation, or null and err (null pointer: no mapping)
+  VSNode *(*nearest)(const std::string &l, const std::vector<AVSValue> &a, std::string &err);
+  const char *vs_name; // the VS filter(s) behind nearest, for the log
+};
+
+bool vi_first(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &)
+{
+  vi = a[0].AsClip()->GetVideoInfo();
+  return true;
+}
+
+// same format and size as the first clip (masktools' and Merge's requirement), for clips at the given positions
+bool vi_first_same(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err, size_t nclips)
+{
+  vi = a[0].AsClip()->GetVideoInfo();
+  for (size_t k = 1; k < nclips; ++k)
+  {
+    if (!a[k].IsClip())
+      continue;
+    const VideoInfo &v = a[k].AsClip()->GetVideoInfo();
+    if (v.pixel_type != vi.pixel_type || v.width != vi.width || v.height != vi.height)
+    {
+      err = "the clips must have the same format and size";
+      return false;
+    }
+  }
+  return true;
+}
+bool vi_first2(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err) { return vi_first_same(a, vi, err, 2); }
+bool vi_first3(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err) { return vi_first_same(a, vi, err, 3); }
+
+// AviSynth+ Bob (field.cpp, Create_Bob): SeparateFields when frame-based, FilteredResizeV to `height`, Fieldwise
+bool vi_bob(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err)
+{
+  vi = a[0].AsClip()->GetVideoInfo();
+  if (!vi.IsFieldBased())
+  {
+    if (vi.height & 1)
+      return err = "SeparateFields: height must be even", false;
+    if (vi.Is420() && vi.height & 3)
+      return err = "SeparateFields: YUV420 height must be multiple of 4", false;
+    vi.height >>= 1;
+    vi.MulDivFPS(2, 1);
+    vi.num_frames *= 2;
+    if (vi.num_frames < 0)
+      return err = "SeparateFields: Maximum number of frames exceeded.", false;
+    vi.SetFieldBased(true);
+  }
+  const int h = a[3].AsInt(vi.height * 2);
+  if (h <= 0)
+    return err = "Resize: Height must be greater than 0.", false;
+  if (vi.IsPlanar() && !vi.IsY() && !vi.IsRGB() && (h & ((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1)))
+    return err = "Resize: Planar destination height must be a multiple of " +
+                 std::to_string(1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) + ".",
+           false;
+  vi.height = h;
+  vi.SetFieldBased(false); // Fieldwise: frame-based, IT_BFF / IT_TFF kept
+  return true;
+}
+
+// AviSynth+ resizers (resample.cpp, FilteredResizeH / V): the target size, with their size checks
+bool vi_resize(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err)
+{
+  vi = a[0].AsClip()->GetVideoInfo();
+  const int w = a[1].AsInt(0), h = a[2].AsInt(0);
+  if (w <= 0)
+    return err = "Resize: Width must be greater than 0.", false;
+  if (h <= 0)
+    return err = "Resize: Height must be greater than 0.", false;
+  if (vi.IsPlanar() && !vi.IsY() && !vi.IsRGB())
+  {
+    const int mw = (1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1, mh = (1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1;
+    if ((w & mw) && w != vi.width)
+      return err = "Resize: Planar destination height must be a multiple of " + std::to_string(mw + 1) + ".", false;
+    if ((h & mh) && h != vi.height)
+      return err = "Resize: Planar destination height must be a multiple of " + std::to_string(mh + 1) + ".", false;
+  }
+  vi.width = w;
+  vi.height = h;
+  return true;
+}
+
+// nnedi3 (plugins_JPSDR; measured on AviSynth+ 3.7.5, vsbridge/test/stand_ins.py): field -2 / 2 / 3 double the rate,
+// dh doubles the height (field -1 / 0 / 1 only), the result is frame-based (IT_BFF / IT_TFF kept)
+bool vi_nnedi3(const std::vector<AVSValue> &a, VideoInfo &vi, std::string &err)
+{
+  vi = a[0].AsClip()->GetVideoInfo();
+  const int field = a[1].AsInt(-1);
+  const bool dh = a[2].AsBool(false);
+  if (field < -2 || field > 3)
+    return err = "nnedi3: field must be set to -2, -1, 0, 1, 2, or 3!", false;
+  if (dh && (field < -1 || field > 1))
+    return err = "nnedi3: field must be set to -1, 0, or 1 when dh=true!", false;
+  if (field > 1 || field == -2)
+  {
+    vi.num_frames *= 2;
+    vi.MulDivFPS(2, 1);
+  }
+  if (dh)
+    vi.height *= 2;
+  vi.SetFieldBased(false);
+  return true;
+}
+
+// nearest for Merge / MergeLuma / MergeChroma: std.Merge with per-plane weights (AviSynth+: Merge weights all planes,
+// MergeLuma only Y, MergeChroma only U and V; default weight 0.5 / 1.0 / 1.0)
+VSNode *nearest_merge(const std::string &l, const std::vector<AVSValue> &a, std::string &err)
+{
+  const double w = a[2].Defined() ? a[2].AsFloat() : (l == "merge" ? 0.5 : 1.0);
+  VSMap *in = g_vsapi->createMap();
+  if (!append_clips(in, "clipa", {a[0].AsClip()}, "Merge", err) || !append_clips(in, "clipb", {a[1].AsClip()}, "Merge", err))
+  {
+    g_vsapi->freeMap(in);
+    return nullptr;
+  }
+  const bool gray = a[0].AsClip()->GetVideoInfo().NumComponents() == 1;
   if (l == "merge" || gray)
     g_vsapi->mapSetFloat(in, "weight", l == "mergechroma" ? 0.0 : w, maAppend);
   else
@@ -1409,43 +1586,239 @@ bool nearest_merge(const std::string &l, const PClip &a, const PClip &b, const A
     g_vsapi->mapSetFloat(in, "weight", l == "mergeluma" ? w : 0.0, maAppend);
     g_vsapi->mapSetFloat(in, "weight", l == "mergeluma" ? 0.0 : w, maAppend);
   }
-  VSMap *out = g_vsapi->invoke(g_vsapi->getPluginByID("com.vapoursynth.std", core), "Merge", in);
-  g_vsapi->freeMap(in);
-  if (const char *e = g_vsapi->mapGetError(out))
+  return vs_call("com.vapoursynth.std", "Merge", in, err);
+}
+
+// nearest for Bob: std.SeparateFields, each field resized with resize.Bicubic (b, c) and shifted by -/+0.25 lines as
+// AviSynth+ does (Fieldwise: top fields +0.25, bottom fields -0.25), frame-based input only
+VSNode *nearest_bob(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+{
+  const PClip c = a[0].AsClip();
+  const VideoInfo &vi = c->GetVideoInfo();
+  if (vi.IsFieldBased())
   {
-    err = std::string("std.Merge: ") + e;
-    g_vsapi->freeMap(out);
-    return false;
+    err = "field-based input has no VapourSynth equivalent";
+    return nullptr;
   }
-  VSNode *node = g_vsapi->mapGetNode(out, "clip", 0, nullptr);
-  g_vsapi->freeMap(out);
-  VSClip *c = node_clip(node, err);
-  if (!c)
-    return false;
-  s.set_nearest(c, "std.Merge");
-  return true;
+  const bool tff = c->GetParity(0);
+  VSMap *in = g_vsapi->createMap();
+  if (!append_clips(in, "clip", {c}, "Bob", err))
+  {
+    g_vsapi->freeMap(in);
+    return nullptr;
+  }
+  g_vsapi->mapSetInt(in, "tff", tff ? 1 : 0, maAppend);
+  VSNode *sep = vs_call("com.vapoursynth.std", "SeparateFields", in, err);
+  if (!sep)
+    return nullptr;
+  const int fh = vi.height / 2, h = a[3].AsInt(vi.height);
+  VSNode *shifted[2] = {}; // [0]: -0.25 (bottom fields), [1]: +0.25 (top fields)
+  for (int k = 0; k < 2 && !err.size(); ++k)
+  {
+    VSMap *r = g_vsapi->createMap();
+    g_vsapi->mapSetNode(r, "clip", sep, maAppend);
+    g_vsapi->mapSetInt(r, "width", vi.width, maAppend);
+    g_vsapi->mapSetInt(r, "height", h, maAppend);
+    g_vsapi->mapSetFloat(r, "src_top", k ? 0.25 : -0.25, maAppend);
+    g_vsapi->mapSetFloat(r, "src_height", fh, maAppend);
+    g_vsapi->mapSetFloat(r, "filter_param_a", a[1].AsDblDef(1. / 3.), maAppend);
+    g_vsapi->mapSetFloat(r, "filter_param_b", a[2].AsDblDef(1. / 3.), maAppend);
+    shifted[k] = vs_call("com.vapoursynth.resize", "Bicubic", r, err);
+  }
+  g_vsapi->freeNode(sep);
+  if (!shifted[0] || !shifted[1])
+  {
+    for (VSNode *n : shifted)
+      if (n)
+        g_vsapi->freeNode(n);
+    return nullptr;
+  }
+  // field 2k is the top field when tff: take it from the +0.25 clip, field 2k + 1 from the -0.25 clip
+  VSNode *sel[2];
+  for (int k = 0; k < 2; ++k)
+  {
+    VSMap *s = g_vsapi->createMap();
+    g_vsapi->mapSetNode(s, "clip", shifted[k == 0 ? (tff ? 1 : 0) : (tff ? 0 : 1)], maAppend);
+    g_vsapi->mapSetInt(s, "cycle", 2, maAppend);
+    g_vsapi->mapSetInt(s, "offsets", k, maAppend);
+    sel[k] = vs_call("com.vapoursynth.std", "SelectEvery", s, err);
+  }
+  g_vsapi->freeNode(shifted[0]);
+  g_vsapi->freeNode(shifted[1]);
+  if (!sel[0] || !sel[1])
+  {
+    for (VSNode *n : sel)
+      if (n)
+        g_vsapi->freeNode(n);
+    return nullptr;
+  }
+  VSMap *il = g_vsapi->createMap();
+  g_vsapi->mapConsumeNode(il, "clips", sel[0], maAppend);
+  g_vsapi->mapConsumeNode(il, "clips", sel[1], maAppend);
+  return vs_call("com.vapoursynth.std", "Interleave", il, err);
+}
+
+// nearest for BilinearResize: resize.Bilinear with the same source window (AviSynth's src_width / src_height <= 0 count
+// from the right / bottom edge)
+VSNode *nearest_bilinear(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+{
+  const PClip c = a[0].AsClip();
+  const VideoInfo &vi = c->GetVideoInfo();
+  const double left = a[3].AsDblDef(0), top = a[4].AsDblDef(0);
+  double sw = a[5].AsDblDef(vi.width), sh = a[6].AsDblDef(vi.height);
+  if (sw <= 0)
+    sw = vi.width - left + sw;
+  if (sh <= 0)
+    sh = vi.height - top + sh;
+  VSMap *in = g_vsapi->createMap();
+  if (!append_clips(in, "clip", {c}, "BilinearResize", err))
+  {
+    g_vsapi->freeMap(in);
+    return nullptr;
+  }
+  g_vsapi->mapSetInt(in, "width", a[1].AsInt(), maAppend);
+  g_vsapi->mapSetInt(in, "height", a[2].AsInt(), maAppend);
+  g_vsapi->mapSetFloat(in, "src_left", left, maAppend);
+  g_vsapi->mapSetFloat(in, "src_top", top, maAppend);
+  g_vsapi->mapSetFloat(in, "src_width", sw, maAppend);
+  g_vsapi->mapSetFloat(in, "src_height", sh, maAppend);
+  return vs_call("com.vapoursynth.resize", "Bilinear", in, err);
+}
+
+// nearest for mt_logic "min" / "max" (others have none): std.Expr
+VSNode *nearest_mt_logic(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+{
+  const std::string mode = lower(a[2].AsString("and"));
+  if (mode != "min" && mode != "max")
+  {
+    err = "mode \"" + mode + "\" has no VapourSynth equivalent";
+    return nullptr;
+  }
+  return nearest_mt_expr({a[0].AsClip(), a[1].AsClip()}, a, 5, "x y " + mode, "mt_logic", err);
+}
+
+// nearest for mt_clamp: std.Expr, max(min(x, bright + overshoot), dark - undershoot) in masktools' order (clamp.cpp:
+// the upper limit first), the limits scaled as masktools scales them (paramscale "i8")
+VSNode *nearest_mt_clamp(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+{
+  const int bits = a[0].AsClip()->GetVideoInfo().BitsPerComponent();
+  auto scale = [&](int v) { return v >= 255 ? (1 << bits) - 1 : v << (bits - 8); };
+  const std::string e = "x y " + std::to_string(scale(a[3].AsInt(0))) + " + min z " +
+                        std::to_string(scale(a[4].AsInt(0))) + " - max";
+  return nearest_mt_expr({a[0].AsClip(), a[1].AsClip(), a[2].AsClip()}, a, 5, e, "mt_clamp", err);
+}
+
+// nearest for mt_makediff: std.Expr x - y + half
+VSNode *nearest_mt_makediff(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+{
+  const int bits = a[0].AsClip()->GetVideoInfo().BitsPerComponent();
+  return nearest_mt_expr({a[0].AsClip(), a[1].AsClip()}, a, 2, "x y - " + std::to_string(128 << (bits - 8)) + " +",
+                         "mt_makediff", err);
+}
+
+// nearest for mt_expand / mt_inpand: std.Maximum / Minimum over the mode's neighbours (thresholds left at their default)
+VSNode *nearest_mt_morph(const std::string &l, const std::vector<AVSValue> &a, std::string &err)
+{
+  const std::string mode = lower(a[3].AsString("square"));
+  static const std::map<std::string, std::vector<int>> coords = {{"square", {1, 1, 1, 1, 1, 1, 1, 1}},
+                                                                 {"vertical", {0, 1, 0, 0, 0, 0, 1, 0}},
+                                                                 {"horizontal", {0, 0, 0, 1, 1, 0, 0, 0}},
+                                                                 {"both", {0, 1, 0, 1, 1, 0, 1, 0}}};
+  const auto it = coords.find(mode);
+  if (it == coords.end() || (a[1].Defined() && a[1].AsInt(255) != 255) || (a[2].Defined() && a[2].AsInt(255) != 255))
+  {
+    err = "mode \"" + mode + "\" or the thresholds have no VapourSynth equivalent";
+    return nullptr;
+  }
+  const PClip c = a[0].AsClip();
+  const int np = c->GetVideoInfo().NumComponents();
+  VSMap *in = g_vsapi->createMap();
+  if (!append_clips(in, "clip", {c}, l.c_str(), err))
+  {
+    g_vsapi->freeMap(in);
+    return nullptr;
+  }
+  for (int p = 0; p < np; ++p)
+  {
+    const AVSValue &m = a[4 + p];
+    const int v = m.Defined() ? (int)m.AsFloat(3) : (p == 0 ? 3 : 1);
+    if (v == 3)
+      g_vsapi->mapSetInt(in, "planes", p, maAppend);
+    else if (v != 1 && v != 2)
+    {
+      g_vsapi->freeMap(in);
+      err = "this plane mode has no VapourSynth equivalent";
+      return nullptr;
+    }
+  }
+  for (int k : it->second)
+    g_vsapi->mapSetInt(in, "coordinates", k, maAppend);
+  return vs_call("com.vapoursynth.std", l == "mt_expand" ? "Maximum" : "Minimum", in, err);
+}
+
+const std::vector<StandInSpec> &stand_in_specs()
+{
+  static const std::vector<StandInSpec> specs = {
+      {"merge", {"clip", "clip2", "weight"}, vi_first2, nearest_merge, "std.Merge"},
+      {"mergeluma", {"clip", "clip2", "weight"}, vi_first2, nearest_merge, "std.Merge"},
+      {"mergechroma", {"clip", "clip2", "weight"}, vi_first2, nearest_merge, "std.Merge"},
+      {"bob", {"clip", "b", "c", "height"}, vi_bob, nearest_bob, "std.SeparateFields + resize.Bicubic"},
+      {"temporalsoften", {"clip", "radius", "luma_threshold", "chroma_threshold", "scenechange", "mode"}, vi_first, nullptr, ""},
+      {"gaussresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "p", "b", "s", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
+      {"bilinearresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_bilinear, "resize.Bilinear"},
+      {"removegrain", {"clip", "mode", "modeu", "modev", "planar"}, vi_first, nullptr, ""},
+      {"nnedi3",
+       {"clip", "field", "dh", "y", "u", "v", "nsize", "nns", "qual", "etype", "pscrn", "threads", "opt", "fapprox"},
+       vi_nnedi3, nullptr, ""},
+      {"mt_logic", {"clip", "clip2", "mode", "th1", "th2", "y", "u", "v"}, vi_first2, nearest_mt_logic, "std.Expr"},
+      {"mt_clamp", {"clip", "bright_limit", "dark_limit", "overshoot", "undershoot", "y", "u", "v"}, vi_first3,
+       nearest_mt_clamp, "std.Expr"},
+      {"mt_makediff", {"clip", "clip2", "y", "u", "v"}, vi_first2, nearest_mt_makediff, "std.Expr"},
+      {"mt_expand", {"clip", "thy", "thc", "mode", "y", "u", "v"}, vi_first, nearest_mt_morph, "std.Maximum"},
+      {"mt_inpand", {"clip", "thy", "thc", "mode", "y", "u", "v"}, vi_first, nearest_mt_morph, "std.Minimum"},
+      {"qtgmc_keeponlybobshimmerfixes", {"input", "ref", "rep", "chroma"}, vi_first2, nullptr, ""},
+  };
+  return specs;
 }
 
 // the stand-in for name, or null when name has none; args / arg_names as given to Invoke
 PClip stand_in(const std::string &l, const char *name, const AVSValue &args, const char *const *arg_names)
 {
-  if (l == "merge" || l == "mergeluma" || l == "mergechroma")
+  const auto &specs = stand_in_specs();
+  const auto spec = std::find_if(specs.begin(), specs.end(), [&](const StandInSpec &s) { return l == s.name; });
+  if (spec == specs.end())
+    return PClip();
+  const std::vector<AVSValue> a = invoke_args(args, arg_names, spec->params);
+  if (!a[0].IsClip())
+    return PClip();
+  VideoInfo vi;
+  std::string err;
+  if (!spec->video_info(a, vi, err))
+    g_env.ThrowError("%s", err.c_str());
+  if (debug_log())
+    fprintf(stderr, "mvtools_vsbridge: stand-in %s: %dx%d pixel_type %d fps %u/%u frames %d image_type %d\n", name,
+            vi.width, vi.height, vi.pixel_type, vi.fps_numerator, vi.fps_denominator, vi.num_frames, vi.image_type);
+  StandInClip *s = new StandInClip(name, a[0].AsClip(), vi, spec->nearest != nullptr);
+  PClip keep(s);
+  if (spec->nearest && fallback_mode() == FallbackMode::nearest)
   {
-    const std::vector<AVSValue> a = invoke_args(args, arg_names, {"clip", "clip2", "weight"});
-    if (!a[0].IsClip() || !a[1].IsClip())
-      return PClip();
-    PClip c = a[0].AsClip();
-    StandInClip *s = new StandInClip(name, c, c->GetVideoInfo(), true); // AviSynth+ Merge*: the first clip's VideoInfo
-    PClip keep(s);
-    if (fallback_mode() == FallbackMode::nearest)
-    {
-      std::string err;
-      if (!nearest_merge(l, c, a[1].AsClip(), a[2], *s, err))
-        g_env.ThrowError("%s: MVBRIDGE_FALLBACK=nearest: %s", name, err.c_str());
-    }
-    return keep;
+    VSNode *node = spec->nearest(l, a, err);
+    VSClip *c = node ? node_clip(node, err) : nullptr;
+    if (!c)
+      g_env.ThrowError("%s: MVBRIDGE_FALLBACK=nearest: %s", name, err.c_str());
+    s->set_nearest(c, spec->vs_name); // the stand-in owns c from here
+    const VideoInfo &nv = c->GetVideoInfo();
+    if (nv.width != vi.width || nv.height != vi.height || nv.num_frames != vi.num_frames || nv.pixel_type != vi.pixel_type)
+      g_env.ThrowError("%s: MVBRIDGE_FALLBACK=nearest: %s gives %dx%d, %d frames instead of %dx%d, %d frames", name,
+                       spec->vs_name, nv.width, nv.height, nv.num_frames, vi.width, vi.height, vi.num_frames);
   }
-  return PClip();
+  return keep;
 }
 
 AVSValue __stdcall BridgeEnv::Invoke(const char *name, const AVSValue args, const char *const *arg_names)
