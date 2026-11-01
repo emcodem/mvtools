@@ -151,6 +151,7 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   - base cdf04a5 (MSVC 19.44) = gpu_work in all 25 CPU / gpucpu chains: our 55 commits do not change CPU output.
   - upstream a74dcb6 (MSVC 19.51, toolset not pinned by `-NoCuda`) differs in every 4:2:0 chain and in
     `gpu_flowfps@cpu` (4:2:2), equal in the 4:4:4 `flowfps`, `gpu_vectors_normalsuper@cpu`, `scdetection`: matches
-    CHANGELOG 2.7.48 #59 + overlap window sum (issue 8). To do: rebuild upstream with `-VcvarsVer 14.44` to rule out
-    the compiler, then this folder is the reference for the merged CPU code.
+    CHANGELOG 2.7.48 #59 + overlap window sum (issue 8). Rebuilt with `-VcvarsVer 14.44` (MSVC 19.44, as ours):
+    identical to the 19.51 build in every chain, so the compiler plays no part. Reference for the merged CPU code:
+    `C:\dev\mvtools\profile\baseline\upstream_a74dcb6_msvc1944`.
   - `lin_cpu` does not run on base / upstream (`mt=` in MFlowFps is ours); expected.
