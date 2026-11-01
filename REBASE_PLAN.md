@@ -193,3 +193,14 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   pass disabled). The cf_* chains with vectors changed against `merge_wip1`, as expected.
   Not done yet: missing-library fallback test, Linux build and tests, step 6 docs (`Documentation/gpu.md`
   search_coarse / trymanyall fallback, `VAPOURSYNTH_PLAN.md` todo list).
+- 2026-11-02, step 5 (missing-library fallbacks): plugin folder `build_merge\bin_nocuda` = `bin` without
+  `mvtools_cuda.dll` (avstp kept). `baseline.py run` (`baseline\merge_nocuda`): all 52 chains run, GPU = CPU in all 7
+  GPU chains and lin_gpu = lin_cpu, and every chain equals `merge_step5` except `cf_nvof` / `cf_nvof_degrain`
+  (CudaNVOFAnalyse falls back to MSuper / MAnalyse, as documented). `MVTOOLS_GPU_LOG=1` shows "mvtools_cuda.dll not
+  loaded from the plugin folder (error 126), using the CPU". compare.py cpu gpu cf without the library: AviSynth+ =
+  VapourSynth in all 28 MVTools chains and in cf_roundtrip / degrain2 / nvof / nvof_degrain / rgb_*; the 11 cf chains
+  whose CPU fallback is an AviSynth+ core filter (Merge*, Bob, resizers, TemporalSoften) stop under VapourSynth with
+  the bridge's error (`MVBRIDGE_FALLBACK=strict`, the default, README), no hang or crash. NVOFA (System32, so tested
+  with a stand-in `nvofapi64.dll` in the host's application folder, which Windows searches first): a damaged file
+  (error 193) and a DLL without `NvOFAPICreateInstanceCuda` both log once and give exactly the no-`mvtools_cuda`
+  output in cf_nvof / cf_nvof_degrain, AviSynth+ = VapourSynth with the damaged file.
