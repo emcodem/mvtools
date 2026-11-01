@@ -3,7 +3,10 @@
 #   .\build_dev.ps1 -Out C:\dev\mvtools\profile\build_w [-Flags '-DMVC_PHASE_PROF']
 param(
   [Parameter(Mandatory = $true)][string]$Out,
-  [string]$Flags = ''
+  [string]$Flags = '',
+  # other targets, e.g. '-gencode arch=compute_61,code=compute_61' (PTX 6.1 only: the Pascal code paths, JIT-compiled for
+  # the local GPU); the toolkit comes from CUDA_PATH (CUDA 12.x for anything below 7.5)
+  [string]$Arch = '-gencode arch=compute_120,code=sm_120'
 )
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
@@ -12,7 +15,7 @@ New-Item -ItemType Directory -Force $obj | Out-Null
 $vcvars = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
 $cuda = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4' }
 $nvcc = Join-Path $cuda 'bin\nvcc.exe'
-$common = "-DMVCUDA_EXPORTS -O3 --std=c++17 $Flags -gencode arch=compute_120,code=sm_120 -Xcompiler `"/MT /O2`""
+$common = "-DMVCUDA_EXPORTS -O3 --std=c++17 $Flags $Arch -Xcompiler `"/MT /O2`""
 $hdr = @('mvcuda.h', 'mvcuda_internal.h')
 # unit -> extra sources it includes
 $units = [ordered]@{
@@ -57,7 +60,7 @@ Set-Content $bat -Encoding ascii -Value @(
   '@echo off',
   'set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"',
   "call `"$vcvars`" >nul || exit /b 1",
-  "`"$nvcc`" -shared -o `"$dll`" $objs -gencode arch=compute_120,code=sm_120 -Xcompiler `"/MT /O2`"")
+  "`"$nvcc`" -shared -o `"$dll`" $objs $Arch -Xcompiler `"/MT /O2`"")
 cmd /c "`"$bat`"" 2>&1 | Select-String 'error' | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { exit 1 }
 Write-Host "built $dll"
