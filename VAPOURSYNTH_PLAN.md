@@ -244,9 +244,25 @@ chains still identical, 3 rounds.
   weights), writes one line per stand-in to stderr at its first frame, and is not bit-identical in general. Names without
   a nearest mapping stay an error in both modes. For `nearest` the bridge turns AviSynth clips back into VS nodes
   (`clip_node`: one instance, no declared inputs, its fetches take the synchronous path).
-- **Lookup tables from masktools.** CudaKobs, CudaLutxy and CudaQtgmcSharpLimit read their device tables from a real
-  `mt_lutxy` frame at creation (`lut_from_cpu`, `CudaKobs.cpp:103`), so a stand-in cannot help there: whatever builds
-  that table under VS decides the GPU output. Open (todo list). Linux AviSynth+ has no masktools either.
+- **Lookup tables from masktools (decided 2026-11-01, `DECISIONS.md` D10).** CudaKobs, CudaLutxy, CudaQtgmcSharpLimit
+  (smode 1 / 2) and CudaQtgmcAddNoise read their device tables from a real `mt_lutxy` (AddNoise: `mt_adddiff(x,
+  mt_lut(y))`) frame on an n x n pattern at creation (`lut_from_cpu`, `CudaKobs.cpp:103`), so a stand-in cannot help:
+  whatever builds that table decides the GPU output. Findings that decided it:
+  - masktools' `use_expr` chooses who computes: 0, 1 at 8 bit and 2 without realtime (8 / 10 / 12 bit lutxy, any
+    lut) use masktools' own evaluator (double, comparisons 1 / -1, `==` within 1e-6, `scalef` = x * max / 255 with the
+    luma rule on every plane, store clamp + round half up); 1 above 8 bit, 2 with realtime (lutxy from 14 bit) and 3
+    call AviSynth+ Expr (float32, comparisons 1 / 0, `scalef` with the chroma rule (x - 128) * 511.5 / 127.5 + 512 on
+    U / V, the JIT's `round` = half to even, store trunc(clamp + 0.5f)). So chroma tables differ from luma tables only
+    on the Expr path.
+  - VS `std.Expr` is not a substitute: half-to-even store and no `scalef` (sharp 0.75 at 10 bit: 74898 of 1M entries
+    off by one; kobs1 at 10 bit off by up to 507 with a naive `scalef`).
+  - masktools quirk: `dupN` with N >= 1 drops the old top of stack (`[a, b] dup1` -> `[a, a, a]`; Expr: `[a, b, a]`).
+  - AviSynth+ crashes (not an error) on an unbalanced expression handed over by masktools; the port refuses it.
+  Done: `vsbridge/mt_port.cpp` serves `mt_lut`, `mt_lutxy`, `mt_adddiff` from `Invoke` (before the stand-ins, in both
+  `MVBRIDGE_FALLBACK` modes, because it is exact). Plane modes 1 / 2 / 3 (/ 4); memset, offsets, `scale_inputs` and
+  formats above 16 bit are refused. Tables up to 10 bit are built once per expression; above that the expression is
+  evaluated per pixel (CPU fallback only, the GPU tables stop at 10 bit). The float32 code is compiled with
+  `-ffp-contract=off` (Expr does not fuse multiply-add).
 
 Result 2026-10-31 (WSL, VS R81, AviSynth+ 3.7.5, RTX 5090): `compare.py cf`, 7 chains (CudaUpload / CudaDownload round
 trip; CudaMerge 0.3, 0.5, CudaMergeLuma 0.7, CudaMergeChroma 0.6 on three formats; CudaUpload -> MSuper / MAnalyse /
@@ -258,21 +274,26 @@ runs its CPU Merge; VS strict stops with the error; VS nearest runs (cf_merge 0.
 AviSynth+ in every frame, 0.5, MergeChroma 0.6 and the 10-bit 0.4 merge happened to match; not measured further, todo);
 python and vspipe exit cleanly. `compare.py cpu` (17) and `gpu` (7) still identical after the `create_filter` refactor.
 
+Result 2026-11-01 (masktools port): `vsbridge/test/mt_tables.py`, 94 cases (the 8 QTGMC_gpu table expressions, operator
+coverage for both evaluators, AddNoise chains, plane modes 1 / 2 / 3 / 4 on 4:2:0; full tables at 8 / 10 bit, 1024 x
+1024 spreads at 12 / 16 bit), references from masktools2 2.2.30 + AviSynth+ 3.7.5 on Windows (`mt_tables.md5`):
+identical without `libmvtools_cuda.so` (port as CPU fallback, 94 cases) and with it (70 cases on the GPU from the port's
+tables, the rest on the port). `compare.py cf` (7), `gpu` (7), `cpu` (17) still identical.
+
 ## VapourSynth todo list
 
 - Measure `MVBRIDGE_FALLBACK=nearest` per mapping against AviSynth+ (runs without `libmvtools_cuda.so` send every frame
   through the fallback): differing frames, share of differing pixels, largest difference; document per filter.
 - Stand-ins for the other fallback names (Bob, TemporalSoften, Gauss/BilinearResize, RemoveGrain, nnedi3, mt_logic /
-  mt_clamp / mt_expand / mt_inpand, QTGMC_KeepOnlyBobShimmerFixes, CudaQtgmc* chains): VideoInfo rule each, nearest
-  mapping where one exists (std.AverageFrames, resize.*, rgvs / zsmooth, znedi3, std.Maximum / Minimum / Expr).
-- masktools tables (CudaKobs, CudaLutxy, CudaQtgmcSharpLimit): error under VS, or a port of masktools' table builder
-  (RPN with scalef / range_half / use_expr) checked against masktools on Windows.
+  mt_clamp / mt_expand / mt_inpand / mt_makediff, QTGMC_KeepOnlyBobShimmerFixes, CudaQtgmc* chains): VideoInfo rule
+  each, nearest mapping where one exists (std.AverageFrames, resize.*, rgvs / zsmooth, znedi3, std.Maximum / Minimum /
+  Expr).
 - CudaNVOFAnalyse through the bridge (Invoke of MSuper / MAnalyse), planar RGB test.
 
 ## Files
 
 `vsbridge/` (decision 5: `avs_interface.cpp` and `avs_cpuid.cpp` from AviSynth+, `bridge.cpp`, `bridge_core.h`,
-`exports.map`, `CMakeLists.txt`, `test/`),
+`mt_port.cpp` / `mt_port.h` (masktools port, D10), `exports.map`, `CMakeLists.txt`, `test/`),
 `Sources/VapourSynthEntry.cpp` (and one in cudafilters): `VapourSynthPluginInit2` next to `AvisynthPluginInit3` (one library
 per plugin, each host ignores the other entry point), `cmake/plugin_exports.map` exports both, `VapourSynth4.h`
 (+ `VSHelper4.h` if used) vendored under `Sources/include/` (no build dependency on an installed VapourSynth). Option
@@ -288,7 +309,8 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
    `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path; GPU path (`gpu=true`) done 2026-10-31 (findings above).
    Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
 4. cudafilters through the same shim; CudaNVOFAnalyse. In progress: entry point, token frames end to end, Merge*
-   stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31 (findings above); the rest is on the todo list.
+   stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31, masktools port (`mt_lut` / `mt_lutxy` / `mt_adddiff`, D10)
+   2026-11-01 (findings above); the rest is on the todo list.
 5. DePan / DePanEstimate (optional, same shim).
 6. Docs: README (VS usage, namespace, formats), `Documentation/`.
 

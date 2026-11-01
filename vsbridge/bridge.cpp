@@ -10,6 +10,7 @@
 //   entry       mvbridge_register_functions, called from each plugin's VapourSynthPluginInit2
 
 #include "bridge_core.h"
+#include "mt_port.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1455,6 +1456,9 @@ AVSValue __stdcall BridgeEnv::Invoke(const char *name, const AVSValue args, cons
   const FuncDef *def = find_func(name);
   if (!def)
   {
+    // masktools filters the bridge computes itself, exactly (mt_port.h); then the stand-ins
+    if (PClip p = mt_port_invoke(l, args, arg_names, this))
+      return p;
     if (PClip s = stand_in(l, name, args, arg_names))
       return s;
     throw NotFound();

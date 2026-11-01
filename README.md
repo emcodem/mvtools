@@ -190,6 +190,9 @@ it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOUR
   bit-identical with AviSynth+. A cudafilter's CPU fallback (AviSynth core filters such as `Merge`) does not exist under
   VapourSynth; it runs only when the GPU is unusable or fails for a frame. `MVBRIDGE_FALLBACK=strict` (default) makes such
   a frame an error, so the output is AviSynth+'s or an error; `MVBRIDGE_FALLBACK=nearest` uses the closest VapourSynth
-  filter (`std.Merge`), which is not bit-identical. Other cudafilters are not available under VapourSynth yet.
+  filter (`std.Merge`), which is not bit-identical. CudaLutxy and CudaQtgmcAddNoise work too: the bridge computes
+  `mt_lutxy` / `mt_lut` / `mt_adddiff` itself, bit-identical with masktools2 2.2.30 under AviSynth+ 3.7.5, for their GPU
+  tables and as their CPU fallback (expressions with pow, %, exp, log or trigonometric functions are refused). Other
+  cudafilters are not available under VapourSynth yet.
 * Debugging: `MVBRIDGE_DEBUG=1` prints frame-request misses, instance counts and a backtrace on a crash;
   `MVBRIDGE_SERIAL=MAnalyse,MFlowFps` (or `all`) runs the named filters single-threaded.

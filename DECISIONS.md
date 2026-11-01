@@ -5,6 +5,26 @@ plans (`GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`) describe how 
 list of choices that later work must respect or consciously revisit. Status: **decided**, **open** (needs a decision),
 **superseded** (with a pointer).
 
+## D10. masktools tables under VapourSynth: the bridge ports masktools' arithmetic (2026-11-01, decided)
+
+**Decision.** CudaKeepOnlyBobShimmerFixes, CudaLutxy, CudaQtgmcSharpLimit (smode 1 / 2) and CudaQtgmcAddNoise build
+their GPU lookup table by running `mt_lutxy` / `mt_lut` + `mt_adddiff` on a test pattern. Under VapourSynth the bridge
+computes these three masktools filters itself (`vsbridge/mt_port.cpp`), exactly as masktools2 2.2.30 under AviSynth+
+3.7.5 does: masktools' own double-precision evaluator, or AviSynth+ Expr's float32 rules where masktools hands the
+expression to Expr (`use_expr`). Only a subset of the expression language: pow, %, exp, log and trigonometric
+functions are refused with an error.
+
+**Why.** Tried before deciding: a translation to VapourSynth's `std.Expr` was not exact (half-to-even rounding, no
+`scalef`: up to 74898 of 1M table entries off by one); a Python prototype of the two evaluators matched all 24 QTGMC
+tables exactly. The alternative, an error under VapourSynth, would leave QTGMC_gpu's output side unusable there.
+
+**Consequences.**
+- VapourSynth output equals AviSynth+ with masktools2 2.2.30 / AviSynth+ 3.7.5; another masktools or AviSynth+ version
+  that changes rounding or `scalef` would differ (AviSynth+ changed both in 3.7.1 / 3.7.2). `vsbridge/test/mt_tables.py`
+  (94 cases, references made on Windows) is the check.
+- The ported filters are also the exact CPU fallback of these cudafilters under VapourSynth.
+- Excluded functions stay excluded: AviSynth+'s results for them depend on the SSE / AVX2 code path or the C library.
+
 ## D9. VapourSynth through an AviSynth+ host, not a port (2026-10-31, decided)
 
 **Decision.** mvtools2 (and later cudafilters) run under VapourSynth unchanged, through `mvtools_vsbridge`: a small

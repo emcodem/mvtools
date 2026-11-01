@@ -6,7 +6,13 @@ add_library(mvtools_vsbridge SHARED
   avs_interface.cpp
   avs_cpuid.cpp
   bridge.cpp
-  bridge_core.h)
+  bridge_core.h
+  mt_port.cpp
+  mt_port.h)
+# mt_port.cpp emulates AviSynth+ Expr's float32 arithmetic: no fused multiply-add
+if(NOT MSVC)
+  set_source_files_properties(mt_port.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 target_include_directories(mvtools_vsbridge PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/../Sources/include")
