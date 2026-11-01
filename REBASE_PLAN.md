@@ -65,6 +65,20 @@ all in the conflicting files, so resolving the conflicts takes care of them.
    where the GPU copied a SIMD bug, it has to be fixed too. AVX2 interpolation / SATD are meant to equal the C code.
 7. **DePan reserved field.** Upstream zeroes the reserved field of the motion data header; relevant for MDepan under
    VapourSynth (still open in `VAPOURSYNTH_PLAN.md`).
+8. **Upstream changed CPU output on purpose; our CUDA kernels copy the old behaviour.** Found in step 0 (below). Two
+   2.7.48 fixes change results with default settings: **#59 chroma shift** (luma vector → chroma grid rounds
+   symmetrically now, in MAnalyse / MRecalculate chroma SAD and in every consumer: MDegrain1-6, MDegrainN,
+   MCompensate, MBlockFps, MFlow, MFlowInter, MFlowFps, MFlowBlur; 4:2:0 / 4:2:2 / 4:1:1 only, `chroma=true` is
+   MAnalyse's default) and **overlap windows summing to exactly 2048** (MCompensate, MDegrain, MBlockFps with
+   overlap). After the merge, GPU = CPU fails for subsampled clips and for overlapped compensation until both are
+   ported to the CUDA kernels (`Sources/cuda/`: the chroma vector conversion in the search's chroma SAD and in the
+   compensation / degrain / flow kernels; the window table). Also check the rest of CHANGELOG 2.7.48 for kernels we
+   mirror: float overlap (#69), MDegrain limitC for float, MFlowBlur chroma vpad, the vector upsizer (negative
+   vectors in the last columns), dct=1..4 rounding, MSuper with odd chroma size.
+9. **avstp changes MAnalyse output.** With `avstp.dll` next to mvtools2, MAnalyse / MRecalculate search in slices
+   (`min(threads, 64, blkY / 4)`), and the vectors at slice borders differ from the one-slice search. Builds may only
+   be compared with the same libraries in the plugin folder; `baseline.py` writes `plugins.txt` and `diff` warns.
+   (Also a GPU = CPU question: which slicing does the GPU path match? Our baseline shows GPU = CPU with avstp.)
 
 ## Decisions
 
@@ -112,7 +126,7 @@ all in the conflicting files, so resolving the conflicts takes care of them.
 4. Build Windows (`build_windows.ps1`, MSVC + Ninja, CUDA 12.9) and Linux (`build_linux.sh`); fix what the clean
    merges broke (auto-merged files that both sides changed: `MVFinest`, `MVFlow`, `MVFlowBlur`, `MVFlowInter`,
    `MVRecalculate`, `MVShow`, `PlaneOfBlocks`, `MVBlockFps.h`, `conc/Interlocked.hpp`).
-5. Tests: CPU = upstream a74dcb6 (step 0); GPU = CPU; VapourSynth = AviSynth+ (`vsbridge/test/compare.py`,
+5. Port upstream's output changes to the CUDA kernels (issue 8), then tests: CPU = upstream a74dcb6 (step 0); GPU = CPU; VapourSynth = AviSynth+ (`vsbridge/test/compare.py`,
    `cf_chains.py`, `stand_ins.py`, `mt_tables.py`); missing-library fallbacks (no `mvtools_cuda`, no NVOFA) still load
    and run on the CPU. Investigate every differing chain against issue 6 before accepting new references.
 6. Docs: README (7 hunks) and `mvtools2.html` merged section by section; `Documentation/gpu.md` for the new fallback rules
@@ -129,4 +143,14 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   f9553c5 (build `C:\dev\mvtools\profile\build_rel20\bin`, Windows, RTX 5090) in
   `C:\dev\mvtools\profile\baseline\gpu_work_f9553c5`: 50 chains (20 CPU, 6 GPU CPU twins, 7 GPU, 17 cudafilters),
   all run; GPU = CPU for all 6 GPU chains and lin_gpu = lin_cpu; a second run (`..._run2`) is identical in every
-  chain. Still to do: the same CPU groups (`cpu gpucpu`) with a plain upstream a74dcb6 build.
+  chain.
+- 2026-11-01, step 0 (references): upstream's CMake refuses MSVC ("use the sln"), and the solution needs NASM
+  integration per toolset, so upstream a74dcb6 and the merge base cdf04a5 were built with **our** CMake files copied
+  into worktrees (`C:\dev\mvtools\wt_upstream`, `wt_base`; `-DMVTOOLS_GPU=OFF`): same flags, only the sources differ.
+  Results (all with `avstp.dll` in the plugin folder, issue 9):
+  - base cdf04a5 (MSVC 19.44) = gpu_work in all 25 CPU / gpucpu chains: our 55 commits do not change CPU output.
+  - upstream a74dcb6 (MSVC 19.51, toolset not pinned by `-NoCuda`) differs in every 4:2:0 chain and in
+    `gpu_flowfps@cpu` (4:2:2), equal in the 4:4:4 `flowfps`, `gpu_vectors_normalsuper@cpu`, `scdetection`: matches
+    CHANGELOG 2.7.48 #59 + overlap window sum (issue 8). To do: rebuild upstream with `-VcvarsVer 14.44` to rule out
+    the compiler, then this folder is the reference for the merged CPU code.
+  - `lin_cpu` does not run on base / upstream (`mt=` in MFlowFps is ours); expected.

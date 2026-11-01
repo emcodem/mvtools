@@ -89,6 +89,12 @@ def run(plugins, out, args):
         env['AVSMD5_ZERO_VECTOR_HEADER'] = '1'
     acmd = [sys.executable, compare.AVSMD5] if compare.AVSMD5.endswith('.py') else [compare.AVSMD5]
     names = expand(args, plugins)
+    # the plugin folder's libraries: avstp.dll there or not changes MAnalyse's output (slices with avstp threads), so a
+    # diff between two folders made with different libraries is not a code difference
+    with open(os.path.join(out, 'plugins.txt'), 'w') as fh:
+        for f in sorted(os.listdir(plugins)):
+            if f.lower().endswith(('.dll', '.so')):
+                fh.write('%-28s %12d\n' % (f, os.path.getsize(os.path.join(plugins, f))))
     failed = 0
     for name in names:
         fname = name.replace('@', '_at_')
@@ -118,8 +124,20 @@ def run(plugins, out, args):
     return 1 if failed else 0
 
 
+def avstp_present(d):
+    p = os.path.join(d, 'plugins.txt')
+    if not os.path.exists(p):
+        return None
+    with open(p) as fh:
+        return any(line.lower().startswith(('avstp.dll', 'libavstp.so')) for line in fh)
+
+
 def diff(a_dir, b_dir):
     names = sorted({f[:-4] for d in (a_dir, b_dir) for f in os.listdir(d) if f.endswith('.md5')})
+    pa, pb = avstp_present(a_dir), avstp_present(b_dir)
+    if pa is not None and pb is not None and pa != pb:
+        print('WARNING: avstp only in %s: MAnalyse slices differently, vectors differ for that reason alone'
+              % (a_dir if pa else b_dir))
     bad = 0
     for n in names:
         a, b = os.path.join(a_dir, n + '.md5'), os.path.join(b_dir, n + '.md5')
