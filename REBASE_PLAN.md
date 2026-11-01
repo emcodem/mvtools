@@ -87,10 +87,17 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   `git rerere` is enabled for the repo. (Open: if a linear history is wanted later, squash into groups first.)
 - **D2: upstream wins for CPU code, ours is re-applied on top.** In every conflicting filter file, take upstream's
   version and add our GPU hooks to it again; don't keep our copy of code upstream deleted (YUY2, lsb, out32).
-- **D3: CMake: ours wins**, plus upstream's additions: llvm-mingw ARM64 toolchain (`cmake/toolchains/`), version
-  resource for MinGW builds, `cmake_minimum_required(3.8.2...3.31)`, new source files (`overlap_neon.cpp`, NEON
-  SAD / degrain files, `Yuy2Planar.h`) in `Sources/Files.cmake`. The MSVC solution: upstream's, plus our vcxproj
-  additions.
+- **D3: CMake is our only build; the Visual Studio solution stays exactly upstream's.** (Decided 2026-11-01.) We
+  build and test with CMake only (`build_windows.ps1` / `build_linux.sh`), so nothing has to be tested twice.
+  `mvtools.sln`, `mvtools.slnx`, every `*.vcxproj(.filters)` and upstream's `.bat` build helpers are taken from
+  upstream unchanged in every merge (`git checkout upstream/mvtools-pfmod -- <file>`), our earlier vcxproj edits are
+  dropped; they then build only upstream's CPU mvtools2 (our new sources are not in them), which is fine. Not
+  deleted: deleting them would make every upstream change to them a conflict. CMake files: ours win, plus
+  upstream's additions: llvm-mingw ARM64 toolchain (`cmake/toolchains/`), `ENABLE_NEON_SIMD` and the ISA filters of
+  upstream's `Sources/Files.cmake` (taken as upstream has it), version resource for MinGW builds,
+  `cmake_minimum_required(3.8.2...3.31)` style range. Upstream's "use the sln for MSVC" guard is not taken. README /
+  CMake messages that point to the solution for clang-cl / 32 bit are reworded (not supported by our build).
+  Step 0 showed our CMake files build upstream's sources unchanged (only `-DMVTOOLS_GPU=OFF` needed).
 - **D4: `param` layout (issue 1), keeping the 0x80 marker.** The marker says "written by our MSuper, the other bits
   are real". It was added because the original MSuper never wrote `param` (uninitialised stack bytes); upstream now
   always writes it, but a super clip from another / older mvtools2 DLL in the same script can still carry garbage,
@@ -119,7 +126,8 @@ all in the conflicting files, so resolving the conflicts takes care of them.
    17 CPU / 7 GPU / 17 cudafilters chains, the GPU = CPU chains). Also build plain upstream a74dcb6 and run the CPU
    chains with it: after the merge, our CPU output must equal upstream's, and our GPU output must equal our CPU.
    Add `upstream` as a remote permanently (`git remote add upstream https://github.com/pinterf/mvtools`).
-1. Merge, resolve build files first (D3) so it compiles at all: `CMakeLists.txt` ×4, `Files.cmake`, vcxproj.
+1. Merge, resolve build files first (D3) so it compiles at all: `CMakeLists.txt` ×4, `Files.cmake`; solution,
+   vcxproj and `.bat` files reset to upstream's.
 2. `SuperParams64Bits.h` and `MVSuper.cpp/.h` (issue 1, D4).
 3. `Interface.cpp` (issue 2), then the filters: `MVDegrain3` / `MDegrainN` (issue 4), `MVCompensate` (issue 5),
    `MVAnalyse` / `GroupOfPlanes` (issue 3), `MVFlowFps`, `MVBlockFps`, `SimpleResize`, `MVMask`.
