@@ -16,6 +16,23 @@
 #include <mutex>
 #include <vector>
 
+// Supported devices: compute capability 6.0 (Pascal) and newer. A few instructions of the fast paths need newer
+// devices (cp.async: 8.0; ld.acquire / st.release, __nanosleep, __grid_constant__: 7.0); the device code uses
+// MVC_ARCH_BELOW(n) to pick a fallback that computes the same results. It is true only while compiling device code for
+// an architecture below n (never in the host pass), so the code for 8.0+ is exactly what it was before.
+#if defined(__CUDA_ARCH__)
+  #define MVC_ARCH_BELOW(n) (__CUDA_ARCH__ < (n))
+#else
+  #define MVC_ARCH_BELOW(n) 0
+#endif
+// __grid_constant__ (kernel parameters addressable in place, 7.0+); below 7.0 the parameter is copied when its address
+// is taken (slower, same results)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+  #define MVC_GRID_CONSTANT
+#else
+  #define MVC_GRID_CONSTANT __grid_constant__
+#endif
+
 #ifdef MVC_PIX8
   typedef uint8_t mvc_pix;
   #define MVC_NS mvc8
@@ -29,7 +46,7 @@
 namespace mvc
 {
   // ---- device selection (mvcuda_core.cu) -------------------------------------------------------------------------
-  // The device used: MVCUDA_DEVICE if set, else the first with compute capability >= 8.0. Every public entry point
+  // The device used: MVCUDA_DEVICE if set, else the first with compute capability >= 6.0. Every public entry point
   // calls use_device() first (cudaSetDevice is per thread); it returns false when there is no usable device.
   int usable_device_count();
   bool use_device();

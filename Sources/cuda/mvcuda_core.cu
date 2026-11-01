@@ -33,7 +33,8 @@ namespace mvc
         for (int i = 0; i < n; i++)
         {
           cudaDeviceProp p;
-          if (cudaGetDeviceProperties(&p, i) != cudaSuccess || p.major < 8)
+          // compute capability 6.0 (Pascal) or newer: the oldest the device code has paths for (MVC_ARCH_BELOW)
+          if (cudaGetDeviceProperties(&p, i) != cudaSuccess || p.major < 6)
             continue;
           r.count++;
           if (r.index < 0 && (wanted < 0 || wanted == i))

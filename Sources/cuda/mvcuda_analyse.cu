@@ -468,14 +468,25 @@ namespace
     int prev_x, prev_y, prev_sad; // result of the previous block of the row (left predictor), passed without a global round trip
   };
 
-  // 4-byte asynchronous global -> shared copy (no registers, completes in the background)
+  // 4-byte asynchronous global -> shared copy (no registers, completes in the background). cp.async needs compute
+  // capability 8.0: older devices (Pascal .. Turing) copy through a register at once (the source pictures are read-only
+  // during the kernel; the barriers that follow cp_async_wait_all publish the shared data in both forms).
   __device__ __forceinline__ void cp_async4(void *dst_shared, const void *src_global)
   {
+#if MVC_ARCH_BELOW(800)
+    *(unsigned *)dst_shared = __ldg((const unsigned *)src_global);
+#else
     const unsigned s = (unsigned)__cvta_generic_to_shared(dst_shared);
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(src_global));
+#endif
   }
+#if MVC_ARCH_BELOW(800)
+  __device__ __forceinline__ void cp_async_commit() {}
+  __device__ __forceinline__ void cp_async_wait_all() {}
+#else
   __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::); }
   __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::); }
+#endif
   __device__ __forceinline__ void prefetch_l1(const void *p) { asm volatile("prefetch.global.L1 [%0];" :: "l"(p)); }
 
   // Packed SADs (k_wave pk_load / pk_sum, k_search eval_candidate_pk): a lane takes 4 columns of a row; their reference
@@ -1802,15 +1813,39 @@ namespace
   // of two; lane = column), 32 / GW candidates at a time; no block-wide barriers. The fold over the candidates runs
   // in every lane with identical values, in the CPU order (same code as the slice kernel and AnaChecker).
 
+  // ld.acquire / st.release (and __nanosleep) need compute capability 7.0. Below that: a volatile load (L2, never a
+  // stale L1 line) followed by a fence, and a fence followed by a volatile store, the classic pre-Volta pattern. The
+  // data published this way is read with __ldcg (ld.global.cg) everywhere in k_wave, which on Pascal is also what keeps
+  // it from coming out of a non-coherent L1 line.
   __device__ __forceinline__ int ld_acquire(const int *p)
   {
+#if MVC_ARCH_BELOW(700)
+    const int v = *(const volatile int *)p;
+    __threadfence();
+    return v;
+#else
     int v;
     asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
+#endif
   }
   __device__ __forceinline__ void st_release(int *p, int v)
   {
+#if MVC_ARCH_BELOW(700)
+    __threadfence();
+    *(volatile int *)p = v;
+#else
     asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
+  }
+  // pause between polls (7.0+); a plain spin below
+  __device__ __forceinline__ void poll_pause(unsigned ns)
+  {
+#if MVC_ARCH_BELOW(700)
+    (void)ns;
+#else
+    __nanosleep(ns);
+#endif
   }
 
   // Waits until *p >= need (acquire loads) and returns the value read; seen: a value read before (with acquire
@@ -1825,7 +1860,7 @@ namespace
     {
       seen = ld_acquire(p);
       if (MVC_WAVE_SLEEP > 0 && seen < need)
-        __nanosleep(MVC_WAVE_SLEEP);
+        poll_pause(MVC_WAVE_SLEEP);
     }
     return seen;
   }
@@ -2593,9 +2628,11 @@ namespace
   __device__ const int g_fix_dy[26] = { 0, 0, 1, -1, 2, 1, 0, -1, -2, -2, -1, 0, 1, 2, 3, 4, 3, -3, -4, -3, 0, 2, 2, 0, -2, -2 };
 
   // GEN = false: only the fixed batches of wave_plan (no mvc_refine code: small and fast to compile);
-  // GEN = true: every search type through mvc_refine
+  // GEN = true: every search type through mvc_refine.
+  // The body of the k_wave kernels: k_wave takes the WaveCall by value (__grid_constant__, 7.0+: about 8 KB of kernel
+  // parameters, more than the 4 KB devices below 7.0 accept); k_wave_p reads it from device memory (devices below 7.0).
   template <int GW, int BSY, int CHH, bool GEN>
-  __global__ void __maxnreg__(GEN ? 255 : MVC_WAVE_REGS) k_wave(const __grid_constant__ WaveCall c)
+  __device__ __forceinline__ void wave_body(const WaveCall &c)
   {
     const int lane = threadIdx.x; // thread index in the CTA (all WAVE_NW warps work on one block row)
     int cur = -1;                 // level of the previous row of this CTA
@@ -2662,7 +2699,7 @@ namespace
         {
           if (level < c.nl - 1)
             while (ld_acquire(c.level_ready + level) == 0)
-              __nanosleep(256);
+              poll_pause(256);
           g_ws.a = c.lv[level];
           const int pl = wave_plan(a.search_type, a.radius);
           const int ring_r = pl == WP_RING ? ring_radius_of(a.search_type, a.radius) : pl == WP_GEN ? 0 : 1;
@@ -3080,12 +3117,81 @@ namespace
     }
   }
 
+  // The wavefront kernel with the call by value (7.0+). Devices below 7.0 accept 4 KB of kernel parameters, and the
+  // call is about 8 KB: in their device code the parameter is a placeholder and the kernel is empty (never launched
+  // there, wave_by_pointer). The kernel must still exist with the same name in every architecture's code: nvcc
+  // registers the kernels the host launches from one device pass (the lowest architecture), so a kernel missing there
+  // is an "invalid device function" on every device.
+#if MVC_ARCH_BELOW(700)
+  struct WaveArg
+  {
+    int unused;
+  };
+#else
+  struct WaveArg
+  {
+    WaveCall c;
+  };
+#endif
+  template <int GW, int BSY, int CHH, bool GEN>
+  __global__ void __maxnreg__(GEN ? 255 : MVC_WAVE_REGS) k_wave(const MVC_GRID_CONSTANT WaveArg arg)
+  {
+#if MVC_ARCH_BELOW(700)
+    (void)arg;
+#else
+    wave_body<GW, BSY, CHH, GEN>(arg.c);
+#endif
+  }
+  // the same with the call in device memory: the form for devices below 7.0 (an empty kernel in the code for 7.0+, which
+  // never launches it: wave_by_pointer)
+  template <int GW, int BSY, int CHH, bool GEN>
+  __global__ void __maxnreg__(GEN ? 255 : MVC_WAVE_REGS) k_wave_p(const WaveCall *__restrict__ pc)
+  {
+#if MVC_ARCH_BELOW(700)
+    wave_body<GW, BSY, CHH, GEN>(*pc);
+#else
+    (void)pc;
+#endif
+  }
+
+  // true when the device runs code compiled for an architecture below 7.0 (a Pascal card, or a PTX-only build for 6.x
+  // JIT-compiled for a newer one): then the wavefront call goes through k_wave_p
+  bool wave_by_pointer()
+  {
+    static const bool v = [] {
+      cudaFuncAttributes fa = {};
+      if (cudaFuncGetAttributes(&fa, k_wave_p<4, 0, 0, false>) != cudaSuccess)
+        return false;
+      return fa.ptxVersion < 70;
+    }();
+    return v;
+  }
+
+  // dc: the call in device memory (k_wave_p), or nullptr (k_wave)
+  template <int GW, int BSY, int CHH, bool GEN>
+  void launch_wave_k(const WaveCall &c, const WaveCall *dc, int grid, cudaStream_t st)
+  {
+    if (dc)
+      k_wave_p<GW, BSY, CHH, GEN><<<grid, WAVE_NT, 0, st>>>(dc);
+    else
+    {
+#if !MVC_ARCH_BELOW(700)
+      // (host code: the device pass below 7.0 only parses it, with its placeholder WaveArg)
+      WaveArg arg;
+      arg.c = c;
+      k_wave<GW, BSY, CHH, GEN><<<grid, WAVE_NT, 0, st>>>(arg);
+#else
+      k_wave<GW, BSY, CHH, GEN><<<grid, WAVE_NT, 0, st>>>(WaveArg{});
+#endif
+    }
+  }
+
   // Picks the k_wave instance: the ring-only kernels (no mvc_refine) with compile-time row counts for the square 16 and
   // 32 blocks (the QTGMC sizes); the general kernels (mvc_refine inlined at about 20 call sites) only with runtime row
   // loops, which keeps their compile time bounded. gen: some level needs mvc_refine. One CTA per row of the finest level
-  // (every level has at most as many rows); CTAs take rows by ticket until all levels are done.
+  // (every level has at most as many rows); CTAs take rows by ticket until all levels are done. dc: see launch_wave_k.
   template <int GW>
-  void launch_wave(const WaveCall &c, bool gen, cudaStream_t st)
+  void launch_wave(const WaveCall &c, const WaveCall *dc, bool gen, cudaStream_t st)
   {
     const LevelArgs &a = c.lv[0];
     const int grid = a.n_blk_y; // fewer CTAs (40-70% of the rows) were measured slower, section 24
@@ -3094,26 +3200,26 @@ namespace
     if (gen)
       return;
     if constexpr (GW < 16)
-      k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, 0, 0, false>(c, dc, grid, st);
 #else
     if constexpr (GW < 16)
     {
       if (gen)
-        k_wave<GW, 0, 0, true><<<grid, WAVE_NT, 0, st>>>(c);
+        launch_wave_k<GW, 0, 0, true>(c, dc, grid, st);
       else
-        k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+        launch_wave_k<GW, 0, 0, false>(c, dc, grid, st);
     }
     else if (gen)
-      k_wave<GW, 0, 0, true><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, 0, 0, true>(c, dc, grid, st);
 #endif
     else if (a.bs_y == GW && a.ch == 0)
-      k_wave<GW, GW, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, GW, 0, false>(c, dc, grid, st);
     else if (a.bs_y == GW && a.ch == GW / 2)
-      k_wave<GW, GW, GW / 2, false><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, GW, GW / 2, false>(c, dc, grid, st);
     else if (a.bs_y == GW && a.ch == GW)
-      k_wave<GW, GW, GW, false><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, GW, GW, false>(c, dc, grid, st);
     else
-      k_wave<GW, 0, 0, false><<<grid, WAVE_NT, 0, st>>>(c);
+      launch_wave_k<GW, 0, 0, false>(c, dc, grid, st);
   }
 
   int ilog2(int v)
@@ -3253,6 +3359,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   cudaStream_t st = nullptr; // the leased stream of the call (leased_call)
   std::shared_ptr<mvc::DevSuper> s_src, s_ref;
   int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr, *d_wave = nullptr;
+  WaveCall *d_wc = nullptr, *h_wc = nullptr; // devices below 7.0: the wavefront call in device memory (k_wave_p)
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
   // wavefront, all cleared per call: [row progress, all levels][bad blocks per row, all levels][ticket][finished rows per
   // level][global estimate ready per level][global estimate (x, y) per level][bad flag]
@@ -3502,12 +3609,24 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         wc.tim = d_tim;
       }
 #endif
+      if (wave_by_pointer())
+      {
+        // code for devices below 7.0: the call does not fit the kernel parameters, it goes to device memory (copied from
+        // pinned memory when there is some, else from wc, which a pageable copy reads before returning)
+        d_wc = (WaveCall *)mvc::dev_alloc(sizeof(WaveCall));
+        if (!d_wc)
+          return -2;
+        h_wc = (WaveCall *)mvc::pin_alloc(sizeof(WaveCall));
+        if (h_wc)
+          *h_wc = wc;
+        AN_CHECK(cudaMemcpyAsync(d_wc, h_wc ? h_wc : &wc, sizeof(WaveCall), cudaMemcpyHostToDevice, st));
+      }
       switch (wave_gw)
       {
-      case 4: launch_wave<4>(wc, wave_gen, st); break;
-      case 8: launch_wave<8>(wc, wave_gen, st); break;
-      case 16: launch_wave<16>(wc, wave_gen, st); break;
-      default: launch_wave<32>(wc, wave_gen, st); break;
+      case 4: launch_wave<4>(wc, d_wc, wave_gen, st); break;
+      case 8: launch_wave<8>(wc, d_wc, wave_gen, st); break;
+      case 16: launch_wave<16>(wc, d_wc, wave_gen, st); break;
+      default: launch_wave<32>(wc, d_wc, wave_gen, st); break;
       }
       AN_CHECK(cudaGetLastError());
 #ifdef MVC_WAVE_TIMING
@@ -3614,6 +3733,8 @@ done:
     mvc::dev_free(d_pay, pay_alloc);
   mvc::dev_free(d_freq, freq_bytes);
   mvc::pin_free(h_stage, pay_alloc);
+  mvc::dev_free(d_wc, sizeof(WaveCall));
+  mvc::pin_free(h_wc, sizeof(WaveCall));
   if (!wave)
     mvc::dev_free(d_glob, 2 * sizeof(int));
   return rc;

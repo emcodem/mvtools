@@ -58,7 +58,7 @@ extern "C" int mvcuda_api_version()
   return MVCUDA_API_VERSION;
 }
 
-// number of usable devices: compute capability 8.0 or newer (the kernels need cp.async); 0 = none
+// number of usable devices: compute capability 6.0 (Pascal) or newer; 0 = none
 extern "C" int mvcuda_device_count()
 {
   return mvc::usable_device_count();
