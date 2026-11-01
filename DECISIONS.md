@@ -5,6 +5,27 @@ plans (`GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`) describe how 
 list of choices that later work must respect or consciously revisit. Status: **decided**, **open** (needs a decision),
 **superseded** (with a pointer).
 
+## D11. Hardware target: compute capability 6.0 and newer; mvtools_cuda is built with CUDA 12 only (2026-11-01, decided)
+
+**Decision.** mvtools_cuda runs on compute capability 6.0 and newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx). The
+instructions that need newer devices (cp.async: 8.0; ld.acquire / st.release, `__nanosleep`, `__grid_constant__`: 7.0)
+have fallbacks that compute the same results (`MVC_ARCH_BELOW`, `mvcuda_internal.h`). The library is built with CUDA
+12 only, 12.8 or newer (12.9 recommended): machine code for 6.1 .. 12.0 plus PTX 6.0 and 8.0. On Windows that means the
+MSVC 14.4x host toolset (v143); `build_windows.ps1` selects it, CMake and `build.bat` refuse other toolkits.
+
+**Why.** CUDA 13 no longer compiles for Pascal or Volta, so one toolkit for every build keeps one DLL for every card;
+two release variants (CUDA 13 for 7.5+, CUDA 12 for older cards) would double the testing. The sm_80+ code is the same
+as before (bit-identical output on the RTX 5090). The fallbacks are bit-exact as PTX 6.1 on the RTX 5090 (golden 85/85,
+QTGMC Fast framemd5, cudafilters regression), about 5 % slower there.
+
+**Consequences.**
+- Builds need CUDA 12.8 .. 12.x and, on Windows, the "MSVC v143" component next to VS 2026's own 14.5x toolset (CUDA
+  12 does not compile with the VS 2026 STL); the whole CMake build then uses 14.4x.
+- New device code must keep a `MVC_ARCH_BELOW(700)` / `(800)` path, and changes to it need a test of the
+  `-CudaArch 61-virtual` build (Pascal code only, JIT-compiled for the local GPU).
+- Not verified on real 6.x / 7.0 hardware yet.
+- Supersedes D1.
+
 ## D10. masktools tables under VapourSynth: the bridge ports masktools' arithmetic (2026-11-01, decided)
 
 **Decision.** CudaKeepOnlyBobShimmerFixes, CudaLutxy, CudaQtgmcSharpLimit (smode 1 / 2) and CudaQtgmcAddNoise build
@@ -105,6 +126,6 @@ frames between plugins on plain AviSynth+ (no Neo). cudafilters uses only AviSyn
 Interlaced tests use real interlaced material (the PAL MXF clip), never fake-interlaced clips; QTGMC tests read it with
 ffms2 (LWLibav returns wrong frames on random access in MXF).
 
-## D1. Hardware target: NVIDIA compute capability 8.0 and newer (2026-10-28, decided)
+## D1. Hardware target: NVIDIA compute capability 8.0 and newer (2026-10-28, superseded by D11 on 2026-11-01)
 
 RTX 30xx and newer; older cards count as "no usable device" and run on the CPU.

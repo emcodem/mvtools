@@ -158,7 +158,7 @@ shimmer fixes, tweak search clip.
 QTGMC denoises through `sneo_dfttest(U=.., V=.., sigma=Sigma*4, tbsize=noiseTD, threads=FftThreads, fft_threads=FftThreads, Dither=DftDither)` (Slower and
 slower noise presets) and `sneo_FFT3D(u=.., v=.., sigma=Sigma, bt=noiseTD, ncpu=FftThreads)` (Fast / Faster noise presets); `noiseTD = Select(NoiseTR, 1, 3, 5)`. Both
 wrappers try the Neo plugins and fall back to `dfttest` / `FFT3DFilter` (the exact backend in the FFAStrans setup is step 1, see P0). Both are FFTW float filters, so
-the port uses **cuFFT** (static link, cc 8.0+ builds) and cannot be bit-exact; the acceptance bar is calibrated as described in section 2.
+the port uses **cuFFT** (static link, in the CUDA 12 build for cc 6.0+, DECISIONS.md D11) and cannot be bit-exact; the acceptance bar is calibrated as described in section 2.
 
 **Common method.** (1) Read the source of the build in use and write a short spec of exactly what it computes (window, block layout, overlap, edge
 handling, sigma mapping, rounding, dithering) from the source, not from documentation. (2) Implement on the GPU with batched real-to-complex FFTs over all
@@ -203,7 +203,7 @@ the CPU for bisecting. Measurements with `run_qtgmc_full.ps1` / `run_qtgmc_prof.
 - **Licensing:** code taken from KTGMC / NNEDI3 is GPL (compatible with mvtools); KFM is MIT. Keep attribution in the file headers of every ported kernel.
 - **Scope creep:** the presets' optional features (SourceMatch, Lossless, ShutterBlur, EZDenoise, ...) need more stages; wire them only when the stage exists and
   the CPU path is the fallback otherwise.
-- **Windows build:** CUDA toolkit 13.x + VS 18 Build Tools as today (`Sources\cuda\build.bat`, about 2 min); the new plugin gets its own vcxproj; cuFFT static link adds size.
+- **Windows build:** CUDA toolkit 12.9 + VS 18 Build Tools with the MSVC v143 toolset as today (DECISIONS.md D11) (`Sources\cuda\build.bat`, about 2 min); the new plugin gets its own vcxproj; cuFFT static link adds size.
 
 ## 10. Decisions I made without asking (change if you disagree)
 

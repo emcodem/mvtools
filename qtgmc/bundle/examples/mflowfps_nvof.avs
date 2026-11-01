@@ -3,7 +3,7 @@
 # the GPU. This is uConvert's uc_frc_nvof option.
 # NOT bit-exact with anything: NVOFA is another algorithm. It follows true motion better on fast pans and is faster
 # than the exhaustive search, but finds vectors with a lower SAD less often; judge the result by eye.
-# Needs an NVIDIA GPU with NVOFA (Turing / RTX 20xx or newer; this bundle's kernels need RTX 30xx or newer). Without it
+# Needs an NVIDIA GPU with NVOFA (Turing / RTX 20xx or newer). Without it
 # CudaNVOFAvailable() is false and the script takes the exact MAnalyse branch below.
 # Progressive input only (deinterlace first, e.g. with QTGMC).
 clip_file = "C:\path\to\progressive.mp4"

@@ -5,15 +5,21 @@ param(
   [Parameter(Mandatory = $true)][string]$Out,
   [string]$Flags = '',
   # other targets, e.g. '-gencode arch=compute_61,code=compute_61' (PTX 6.1 only: the Pascal code paths, JIT-compiled for
-  # the local GPU); the toolkit comes from CUDA_PATH (CUDA 12.x for anything below 7.5)
-  [string]$Arch = '-gencode arch=compute_120,code=sm_120'
+  # the local GPU)
+  [string]$Arch = '-gencode arch=compute_120,code=sm_120',
+  # toolkit and host compiler as build.bat: CUDA 12 (MVCUDA_CUDA_PATH, else CUDA_PATH_V12_9, else the default 12.9 folder)
+  # with MSVC 14.44 ('default' = the installation's default toolset)
+  [string]$VcvarsVer = '14.44'
 )
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
 $obj = Join-Path $Out 'obj_cuda'
 New-Item -ItemType Directory -Force $obj | Out-Null
 $vcvars = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
-$cuda = if ($env:CUDA_PATH) { $env:CUDA_PATH } else { 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4' }
+$vcArg = if ($VcvarsVer -and $VcvarsVer -ne 'default') { " -vcvars_ver=$VcvarsVer" } else { '' }
+$cuda = @($env:MVCUDA_CUDA_PATH, $env:CUDA_PATH_V12_9, 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9') |
+  Where-Object { $_ -and (Test-Path (Join-Path $_ 'bin\nvcc.exe')) } | Select-Object -First 1
+if (-not $cuda) { throw 'CUDA 12 nvcc not found (install CUDA 12.9 or set MVCUDA_CUDA_PATH)' }
 $nvcc = Join-Path $cuda 'bin\nvcc.exe'
 $common = "-DMVCUDA_EXPORTS -O3 --std=c++17 $Flags $Arch -Xcompiler `"/MT /O2`""
 $hdr = @('mvcuda.h', 'mvcuda_internal.h')
@@ -27,7 +33,9 @@ $units = [ordered]@{
   'mvcuda_flow_8.cu' = @('mvcuda_flow.cu'); 'mvcuda_flow_16.cu' = @('mvcuda_flow.cu')
 }
 $stampFile = Join-Path $obj 'flags.txt'
-$flagsChanged = -not (Test-Path $stampFile) -or ((Get-Content $stampFile -Raw).Trim() -ne $common)
+# the toolkit and the host toolset are part of the stamp: objects of another compiler are rebuilt
+$stamp = "$nvcc$vcArg $common"
+$flagsChanged = -not (Test-Path $stampFile) -or ((Get-Content $stampFile -Raw).Trim() -ne $stamp)
 $jobs = @()
 foreach ($u in $units.Keys) {
   $o = Join-Path $obj ($u -replace '\.cu$', '.obj')
@@ -39,7 +47,7 @@ foreach ($u in $units.Keys) {
   Set-Content $bat -Encoding ascii -Value @(
     '@echo off',
     'set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"',
-    "call `"$vcvars`" >nul || exit /b 1",
+    "call `"$vcvars`"$vcArg >nul || exit /b 1",
     "cd /d `"$src`"",
     "`"$nvcc`" -c -o `"$o`" $u $common > `"$log`" 2>&1")
   $jobs += [pscustomobject]@{ unit = $u; log = $log; p = (Start-Process cmd -ArgumentList '/c', "`"$bat`"" -NoNewWindow -PassThru) }
@@ -52,14 +60,14 @@ foreach ($j in $jobs) {
 }
 if ($failed) { exit 1 }
 Write-Host ("compiled {0} unit(s) in {1:N0} s: {2}" -f $jobs.Count, $sw.Elapsed.TotalSeconds, (($jobs | ForEach-Object unit) -join ' '))
-Set-Content $stampFile $common
+Set-Content $stampFile $stamp
 $objs = ($units.Keys | ForEach-Object { '"' + (Join-Path $obj ($_ -replace '\.cu$', '.obj')) + '"' }) -join ' '
 $dll = Join-Path $Out 'mvtools_cuda.dll'
 $bat = Join-Path $obj 'link.bat'
 Set-Content $bat -Encoding ascii -Value @(
   '@echo off',
   'set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"',
-  "call `"$vcvars`" >nul || exit /b 1",
+  "call `"$vcvars`"$vcArg >nul || exit /b 1",
   "`"$nvcc`" -shared -o `"$dll`" $objs $Arch -Xcompiler `"/MT /O2`"")
 cmd /c "`"$bat`"" 2>&1 | Select-String 'error' | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { exit 1 }

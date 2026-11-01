@@ -16,6 +16,8 @@ Findings that shape the design:
   MAnalyse's kernels use `cp.async` (`mvcuda_analyse.cu:445`); `build.bat` builds sm_80..sm_120 with CUDA 13.4, which
   cannot target anything older than sm_75. Every GeForce card that passes this gate already has an OFA engine, so an
   NVENC path that *requires* mvtools_cuda would add almost no cards.
+  *Update 2026-11-01 (DECISIONS.md D11): mvtools_cuda now runs on compute capability 6.0+ (CUDA 12.9 build), so
+  Pascal cards (no OFA engine) pass the gate too; this argument was made under the 8.0 limit and needs a fresh look.*
 - NVENC needs no CUDA kernels. An ME-only session runs on a CUDA context made with the **driver API** alone
   (`nvcuda.dll` / `libcuda.so.1`, shipped with the driver, no compute-capability gate): luma copied into a device buffer
   registered with NVENC, vectors from `nvEncCreateMVBuffer` read back. D3D11 would also work but is Windows-only.

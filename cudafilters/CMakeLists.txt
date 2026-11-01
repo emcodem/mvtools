@@ -9,11 +9,12 @@ target_include_directories(cudafilters PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../Sources/cuda")
 
 if(MSVC)
-  set_target_properties(cudafilters PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded")
-  target_compile_definitions(cudafilters PRIVATE _CRT_SECURE_NO_WARNINGS)
-elseif(MINGW)
-  set_target_properties(cudafilters PROPERTIES PREFIX "")
+  # cudafilters.vcxproj, Release|x64: Unicode, static CRT
+  set_target_properties(cudafilters PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  target_compile_definitions(cudafilters PRIVATE _CRT_SECURE_NO_WARNINGS _WINDOWS _USRDLL UNICODE _UNICODE)
+  mv_msvc_release_flags(cudafilters)
 endif()
+mv_windows_names(cudafilters)
 if(NOT WIN32)
   target_link_libraries(cudafilters PRIVATE ${CMAKE_DL_LIBS})
 endif()

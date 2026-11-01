@@ -32,7 +32,7 @@ http://sam.zoy.org/wtfpl/COPYING for more details.
 
 #define NOMINMAX
 
-#include <Windows.h>
+#include <windows.h>
 
 
 

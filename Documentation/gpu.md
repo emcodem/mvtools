@@ -27,8 +27,10 @@ the work got here; this page describes what the functions do now (library API ve
 | File | Built by | Notes |
 |---|---|---|
 | `mvtools2.dll` | `mvtools.sln` | The plugin as before |
-| `mvtools_cuda.dll` | `Sources\cuda\build.bat` (CUDA 13.x toolkit + MSVC build tools) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
+| `mvtools_cuda.dll` | `Sources\cuda\build.bat` or CMake (CUDA 12.9 toolkit; on Windows with the MSVC 14.4x toolset, v143. CUDA 13 is not used: it has no Pascal / Volta targets) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
 | `cudafilters.dll` | `cudafilters\cudafilters.vcxproj` (see `cudafilters\README.md`) | Optional. Must sit in the same folder as the other two |
+
+All the files are built by the root CMake / `build_windows.ps1` too (README "Build Instructions").
 
 All three files must come from one build: the plugins check the library API version and run on the CPU when it does not
 match.
@@ -41,8 +43,9 @@ Requirements:
   through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"), `gpu=true` included (same output as AviSynth+;
   `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under VapourSynth (namespace `cuda`) covers only
   CudaUpload / CudaDownload and the Merge filters so far (`VAPOURSYNTH_PLAN.md`).
-- An NVIDIA GPU with compute capability 8.0 or newer (RTX 30xx, 40xx, 50xx, A100, H100). Older cards count as "no usable
-  device". The first device with cc >= 8.0 is used; `MVCUDA_DEVICE=n` picks another.
+- An NVIDIA GPU with compute capability 6.0 or newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx); older cards count as
+  "no usable device". The first usable device is used; `MVCUDA_DEVICE=n` picks another. Pascal / Volta are verified
+  only as PTX 6.1 on an RTX 50xx, not yet on real 6.x / 7.0 hardware.
 - `CudaNNEDI3` and `CudaKeepOnlyBobShimmerFixes` call into other plugins: they need `plugins_JPSDR.dll` (nnedi3), and
   `QTGMC.avsi` (`QTGMC_KeepOnlyBobShimmerFixes`) with masktools2 and RgTools, loaded.
 
@@ -464,7 +467,7 @@ Read once per process.
 
 | Variable | Effect |
 |---|---|
-| `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 8.0 or newer) |
+| `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 6.0 or newer) |
 | `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames, uploaded pictures and the super pyramids kept with them), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
 | `MVCUDA_WAVE=0` | MAnalyse with `meander=false` uses the slice kernel instead of the wavefront kernel (for comparisons) |
 | `MVCUDA_SPIN` | Waits for the GPU spin a CPU core instead of sleeping |

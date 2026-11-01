@@ -1,12 +1,18 @@
 """compare.py: the same mvtools2 chains in AviSynth+ (avsmd5) and VapourSynth (vsmd5.py, mvtools_vsbridge) on the same
 raw input with the same libmvtools2.so; the framemd5 of both must be identical (VAPOURSYNTH_PLAN.md, verification).
 
-usage: python compare.py [chain ...]      (inside the Linux test setup; inputs from gen_inputs.py)
+usage: python compare.py [chain ...]      (inputs from gen_inputs.py)
        python compare.py cpu | gpu | cf   (the CPU chains / the gpu_* chains / the cudafilters chains; default: cpu gpu)
 env:   MVPF_PLUGIN_DIR  folder with libmvtools2.so and libmvtools_vsbridge.so (+ libmvtools_cuda.so for the GPU chains;
-                        without it the gpu_* chains run the CPU fallback in both hosts and must still match)
-       AVSMD5           avsmd5 binary (default ~/opt/bin/avsmd5)
+                        without it the gpu_* chains run the CPU fallback in both hosts and must still match); Windows:
+                        mvtools2.dll, mvtools_vsbridge.dll, mvtools_cuda.dll, cudafilters.dll
+       MVPF_CLIPS       folder with seg1_40.yuv, seg1_40_hd420p8.yuv, seg1_40_hd444p10.yuv (default ~/clips)
+       AVSMD5           avsmd5 binary (default ~/opt/bin/avsmd5; Windows: avsmd5.py next to this file, AviSynth+'s C API)
        MVPF_THREADS     VapourSynth threads (default: VS's own)
+Windows: AviSynth+ has no RawSource, so the AviSynth side reads lossless FFV1 copies of the raw files (<name>.mkv next to
+the .yuv, made by `python compare.py mkv` with ffmpeg) through LSMASHSource ($MVPF_LSMASH = LSMASHSource.dll); the chains
+`source*` check that both hosts see the same input. lin_cpu / lin_gpu use the AviSynth script built in here (Linux:
+~/build/test/lin_*.avs when present).
 """
 import os
 import re
@@ -14,26 +20,64 @@ import subprocess
 import sys
 import time
 
+WIN = sys.platform == 'win32'
 HERE = os.path.dirname(os.path.abspath(__file__))
-CLIPS = os.path.expanduser('~/clips')
-PLUGINS = os.environ.get('MVPF_PLUGIN_DIR', os.path.expanduser('~/build/test/vsplugins'))
-AVSMD5 = os.environ.get('AVSMD5', os.path.expanduser('~/opt/bin/avsmd5'))
-TMP = os.environ.get('TMPDIR', '/tmp')
+CLIPS = os.environ.get('MVPF_CLIPS', os.path.expanduser('~/clips')).replace('\\', '/')
+PLUGINS = os.environ.get('MVPF_PLUGIN_DIR', os.path.expanduser('~/build/test/vsplugins')).replace('\\', '/')
+AVSMD5 = os.environ.get('AVSMD5', os.path.join(HERE, 'avsmd5.py') if WIN else os.path.expanduser('~/opt/bin/avsmd5'))
+TMP = os.environ.get('TMPDIR', os.environ.get('TEMP', '/tmp')).replace('\\', '/')
+LSMASH = os.environ.get('MVPF_LSMASH', 'C:/dev/uconvert/dlls/LSMASHSource.dll').replace('\\', '/')
+
+
+def lib_name(name):
+    return name + '.dll' if WIN else 'lib%s.so' % name
+
+
+# raw inputs: name -> (file, width, height, AviSynth pixel type, VS format, ffmpeg pix_fmt)
+RAW = {
+    'uhd422p10': ('seg1_40.yuv', 3840, 2160, 'YUV422P10', 'vs.YUV422P10', 'yuv422p10le'),
+    'hd420p8': ('seg1_40_hd420p8.yuv', 1920, 1080, 'YV12', 'vs.YUV420P8', 'yuv420p'),
+    'hd444p10': ('seg1_40_hd444p10.yuv', 1920, 1080, 'YUV444P10', 'vs.YUV444P10', 'yuv444p10le'),
+}
+
+
+def avs_raw(name):
+    f, w, h, pt, _, _ = RAW[name]
+    if WIN:  # the lossless FFV1 copy (docstring); cache=false: no .lwi file next to the clip. CombinePlanes sets the
+        # pixel type RawSource reports (LSMASH gives I420 for 4:2:0 8 bit; MAnalyse stores the type in the vector header)
+        return ('CombinePlanes(LWLibavVideoSource("%s/%s", cache=false), planes="YUV", source_planes="YUV", '
+                'pixel_type="%s").AssumeFPS(30000, 1001)' % (CLIPS, f.replace('.yuv', '.mkv'), pt))
+    return 'RawSource("%s/%s", %d, %d, "%s", 30000, 1001)' % (CLIPS, f, w, h, pt)
+
+
+def vs_raw(name):
+    f, w, h, _, fmt, _ = RAW[name]
+    return "raw_source('%s/%s', %d, %d, %s, 30000, 1001)" % (CLIPS, f, w, h, fmt)
+
+
+# the stored reference chains of the Linux setup (~/build/test/lin_cpu.avs, lin_gpu.avs) where that file is missing
+LIN_AVS = ('LoadPlugin("{plugins}/{mvtools2}")\n'
+           'm = {src}\n'
+           'pre = m\n'
+           'supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4)\n'
+           'sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1)\n'
+           'bv = MAnalyse(supf, isb=true, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, '
+           'gpu={gpu})\n'
+           'fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, truemotion=true, chroma=true, '
+           'gpu={gpu})\n'
+           'bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, '
+           'chroma=true, gpu={gpu})\n'
+           'fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, '
+           'chroma=true, gpu={gpu})\n'
+           'out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false, mt=true)\n'
+           'return out.Prefetch(6)\n')
 
 # source name -> (AviSynth source, VapourSynth source)
-SOURCES = {
-    'uhd422p10': ('RawSource("%s/seg1_40.yuv", 3840, 2160, "YUV422P10", 30000, 1001)' % CLIPS,
-                  "raw_source('%s/seg1_40.yuv', 3840, 2160, vs.YUV422P10, 30000, 1001)" % CLIPS),
-    'hd420p8': ('RawSource("%s/seg1_40_hd420p8.yuv", 1920, 1080, "YV12", 30000, 1001)' % CLIPS,
-                "raw_source('%s/seg1_40_hd420p8.yuv', 1920, 1080, vs.YUV420P8, 30000, 1001)" % CLIPS),
-    'hd444p10': ('RawSource("%s/seg1_40_hd444p10.yuv", 1920, 1080, "YUV444P10", 30000, 1001)' % CLIPS,
-                 "raw_source('%s/seg1_40_hd444p10.yuv', 1920, 1080, vs.YUV444P10, 30000, 1001)" % CLIPS),
-    # planar RGB: the 4:4:4 planes relabelled (no chain uses it yet: mvtools2's MAnalyse accepts YUV only) without arithmetic (G=Y, B=U, R=V) on both sides
-    'hdrgbp10': ('CombinePlanes(RawSource("%s/seg1_40_hd444p10.yuv", 1920, 1080, "YUV444P10", 30000, 1001), '
-                 'planes="GBR", source_planes="YUV", pixel_type="RGBP10")' % CLIPS,
-                 "core.std.ShufflePlanes(raw_source('%s/seg1_40_hd444p10.yuv', 1920, 1080, vs.YUV444P10, 30000, "
-                 "1001), planes=[2, 0, 1], colorfamily=vs.RGB)" % CLIPS),
-}
+SOURCES = {n: (avs_raw(n), vs_raw(n)) for n in RAW}
+# planar RGB: the 4:4:4 planes relabelled (no chain uses it yet: mvtools2's MAnalyse accepts YUV only) without arithmetic
+# (G=Y, B=U, R=V) on both sides
+SOURCES['hdrgbp10'] = ('CombinePlanes(%s, planes="GBR", source_planes="YUV", pixel_type="RGBP10")' % avs_raw('hd444p10'),
+                       'core.std.ShufflePlanes(%s, planes=[2, 0, 1], colorfamily=vs.RGB)' % vs_raw('hd444p10'))
 
 # common analysis prefixes (AviSynth, VapourSynth)
 ANA = ('sup = MSuper(c, pel=2)\n'
@@ -45,6 +89,9 @@ ANA = ('sup = MSuper(c, pel=2)\n'
 
 # name -> (source, AviSynth body, VapourSynth body); the body leaves the result in `out`
 CHAINS = {
+    'source': ('hd444p10', 'out = c\n', 'out = c\n'),  # both hosts read the same input (Windows: FFV1 vs raw)
+    'source_420': ('hd420p8', 'out = c\n', 'out = c\n'),
+    'source_uhd': ('uhd422p10', 'out = c\n', 'out = c\n'),
     'vectors': ('hd420p8', ANA[0] + 'out = bv\n', ANA[1] + 'out = bv\n'),
     'storevect': ('hd420p8', ANA[0] + 'out = MStoreVect(bv, fv)\n', ANA[1] + 'out = mv.MStoreVect([bv, fv])\n'),
     'restorevect': ('hd420p8',
@@ -203,24 +250,33 @@ def run_chain(name):
     avs_src, vs_src = SOURCES[src]
     avs = os.path.join(TMP, 'vsb_%s.avs' % name)
     vpy = os.path.join(TMP, 'vsb_%s.vpy' % name)
+    pre = 'LoadPlugin("%s")\n' % LSMASH if WIN else ''
     if avs_body is None:
-        avs_text = open(os.path.expanduser('~/build/test/%s.avs' % name)).read()
-        avs_text = avs_text.replace('/home/emcodem/build/test/plugins', PLUGINS)
+        stored = os.path.expanduser('~/build/test/%s.avs' % name)
+        if not WIN and os.path.exists(stored):
+            avs_text = open(stored).read().replace('/home/emcodem/build/test/plugins', PLUGINS)
+        else:
+            avs_text = pre + LIN_AVS.format(plugins=PLUGINS, mvtools2=lib_name('mvtools2'), src=avs_src,
+                                            gpu='true' if name == 'lin_gpu' else 'false')
         write(avs, avs_text)
         vpy = os.path.join(HERE, '%s.vpy' % name)
     else:
         cf = name in CF_CHAINS
-        write(avs, 'LoadPlugin("%s/libmvtools2.so")\n%sc = %s\n%sreturn out\n'
-              % (PLUGINS, 'LoadPlugin("%s/libcudafilters.so")\n' % PLUGINS if cf else '', avs_src, avs_body))
+        write(avs, '%sLoadPlugin("%s/%s")\n%sc = %s\n%sreturn out\n'
+              % (pre, PLUGINS, lib_name('mvtools2'),
+                 'LoadPlugin("%s/%s")\n' % (PLUGINS, lib_name('cudafilters')) if cf else '', avs_src, avs_body))
         write(vpy, 'import vapoursynth as vs\nfrom vstest import core, load_mvtools, load_cudafilters, raw_source\n'
                    'load_mvtools()\n%smv = core.mvpf\nc = %s\n%sout.set_output()\n'
               % ('load_cudafilters()\ncf = core.cuda\n' if cf else '', vs_src, vs_body))
     a_md5, v_md5 = avs[:-4] + '.avs.md5', vpy.replace('.vpy', '') + '.vs.md5'
     if avs_body is None:
         v_md5 = os.path.join(TMP, 'vsb_%s.vs.md5' % name)
-    env = dict(os.environ, MVPF_PLUGIN_DIR=PLUGINS)
+    env = dict(os.environ, MVPF_PLUGIN_DIR=PLUGINS, MVPF_RAW=os.environ.get('MVPF_RAW', '%s/%s' % (CLIPS, RAW['uhd422p10'][0])))
     t0 = time.time()
-    a = subprocess.run([AVSMD5, avs, a_md5], capture_output=True, text=True)
+    acmd = [sys.executable, AVSMD5] if AVSMD5.endswith('.py') else [AVSMD5]
+    if WIN:  # AviSynth+ on Windows leaves the unused vector-header bytes uninitialised (avsmd5.py)
+        env['AVSMD5_ZERO_VECTOR_HEADER'] = '1'
+    a = subprocess.run(acmd + [avs, a_md5], capture_output=True, text=True, env=env)
     t1 = time.time()
     cmd = [sys.executable, os.path.join(HERE, 'vsmd5.py'), vpy, v_md5]
     if os.environ.get('MVPF_THREADS'):
@@ -238,7 +294,23 @@ def run_chain(name):
     return 'DIFF', '%d of %d lines differ, first at line %d' % (diff, max(len(al), len(vl)), first), t1 - t0, t2 - t1
 
 
+def make_mkv():
+    """Windows: the lossless FFV1 copies of the raw inputs for the AviSynth side (ffmpeg on the PATH)."""
+    for f, w, h, _, _, pix in RAW.values():
+        src = os.path.join(CLIPS, f)
+        dst = src[:-4] + '.mkv'
+        if os.path.exists(dst):
+            continue
+        subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', pix,
+                        '-s', '%dx%d' % (w, h), '-r', '30000/1001', '-i', src, '-c:v', 'ffv1', '-level', '3',
+                        '-slices', '16', dst], check=True)
+        print(dst)
+
+
 def main():
+    if sys.argv[1:] == ['mkv']:
+        make_mkv()
+        return 0
     names = []
     for a in sys.argv[1:] or ['cpu', 'gpu']:
         names += CPU_NAMES if a == 'cpu' else list(GPU_CHAINS) if a == 'gpu' else list(CF_CHAINS) if a == 'cf' else [a]

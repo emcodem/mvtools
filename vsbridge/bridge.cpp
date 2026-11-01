@@ -97,7 +97,40 @@ void install_crash_handler()
   sigaction(SIGABRT, &sa, nullptr);
 }
 #else
-void install_crash_handler() {}
+// MVBRIDGE_DEBUG only: on an unhandled exception print each frame as module + offset (resolve with the .pdb, e.g.
+// `cdb -z <dll>` / `ln <module>+<offset>`, or dumpbin /disasm). Called on the faulting thread; no allocation.
+LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
+{
+  char line[600];
+  int len = snprintf(line, sizeof(line), "mvtools_vsbridge: exception 0x%08lx at address %p\n",
+                     ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0ul,
+                     ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr);
+  fwrite(line, 1, (size_t)len, stderr);
+  void *frames[64];
+  const USHORT n = CaptureStackBackTrace(0, 64, frames, nullptr);
+  for (USHORT i = 0; i < n; ++i)
+  {
+    HMODULE m = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)frames[i], &m) && m)
+      GetModuleFileNameA(m, name, sizeof(name));
+    len = snprintf(line, sizeof(line), "  #%d %s +0x%zx\n", (int)i, name,
+                   (size_t)((const char *)frames[i] - (const char *)m));
+    fwrite(line, 1, (size_t)len, stderr);
+  }
+  fflush(stderr);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void install_crash_handler()
+{
+  static bool done = false;
+  if (done || !debug_log())
+    return;
+  done = true;
+  SetUnhandledExceptionFilter(crash_filter);
+}
 #endif
 
 void *aligned_alloc64(size_t size)

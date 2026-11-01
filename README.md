@@ -6,7 +6,7 @@ x86 and x64 versions
 From December 20, 2020: Linux port
 This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 (`gpu=true`, the `cudafilters` plugin and QTGMC
 on the GPU, see "GPU" below); VapourSynth support for mvtools2 and cudafilters through `mvtools_vsbridge` (namespaces
-`mvpf` and `cuda`, output bit-identical with AviSynth+; Linux done, Windows to follow; see "VapourSynth" below)
+`mvpf` and `cuda`, output bit-identical with AviSynth+; Linux and Windows; see "VapourSynth" below)
 
 File: mvtools2.dll
 
@@ -46,15 +46,62 @@ Source code:
 
 ## Build Instructions
 
-Note:
+One CMake build (root `CMakeLists.txt`) makes every library of this repo on Windows (MSVC + Ninja) and Linux (GCC /
+Clang): the AviSynth+ plugins, the VapourSynth bridge and the optional GPU libraries. All of them go into one folder
+(`<build dir>/bin`), which is also the layout they expect at run time (each plugin loads its helpers from its own folder).
 
-Windows MSVC builds are using external assembler source - if there exists.
+| Library (Windows / Linux) | What | Needs to build |
+|---|---|---|
+| `mvtools2.dll` / `libmvtools2.so` | mvtools2 (AviSynth+; VapourSynth `mvpf`) | C++17 compiler; MSVC: NASM |
+| `DePan.dll`, `DePanEstimate.dll` / `libdepan.so`, `libdepanestimate.so` | DePan plugins | |
+| `mvtools_vsbridge.dll` / `libmvtools_vsbridge.so` | VapourSynth host for the plugins (`-DMVTOOLS_VAPOURSYNTH=OFF` skips it) | nothing extra (headers vendored) |
+| `cudafilters.dll` / `libcudafilters.so` | GPU filters (AviSynth+; VapourSynth `cuda`) | nothing extra (`-DMVTOOLS_GPU=OFF` skips it) |
+| `mvtools_cuda.dll` / `libmvtools_cuda.so` | CUDA backend, loaded at run time | CUDA 12.8 .. 12.x, 12.9 recommended (`CMAKE_CUDA_COMPILER`); Windows: MSVC 14.4x (v143) as host compiler; `-DMVTOOLS_CUDA=OFF` skips it |
 
-Other builds are using internal SIMD code, governed by defines in def.h
+The CUDA part is built with CUDA 12 only: CUDA 13 has no Pascal (GTX 10xx) or Volta targets any more. CMake checks the
+toolkit (and on Windows the MSVC version) and builds everything else without mvtools_cuda, with a warning, when they do
+not fit.
 
-### Windows MSVC
+Options: `MVTOOLS_CUDA_ARCH` (CUDA architectures, e.g. `120-real` for a fast build for the local RTX 50xx only,
+`61-virtual` for the Pascal code paths only, JIT-compiled by the driver for the local GPU; default: the release list in
+`Sources/cuda/CMakeLists.txt`, compute capability 6.1 .. 12.0), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
+default ON: `/MT`, no Visual C++ redistributable needed), `MVTOOLS_DIST_DIR` (the collect folder).
 
-- Prerequisite: for asm compilation use nasm https://www.nasm.us/ 
+Note: Windows MSVC builds use the external assembler sources (`Sources/asm`, NASM); all other builds (Linux, MinGW) use the
+internal SIMD code, governed by defines in `def.h`.
+
+### Windows (CMake + Ninja + MSVC, x64)
+
+Prerequisites: Visual Studio 2022 / 2026 or the Build Tools with the C++ workload (includes CMake and Ninja), NASM
+(https://www.nasm.us/), and for mvtools_cuda the CUDA toolkit 12.9 (12.8 or newer 12.x; only the components "nvcc" and
+"cudart" are needed, not the driver of the installer) with the MSVC 14.4x toolset (v143): VS 2022, or in the VS 2026
+installer the component "MSVC v143 - VS 2022 C++ x64/x86 build tools". CUDA 12 does not compile with the VS 2026 STL
+(14.5x).
+
+    .\build_windows.ps1                                    # Release, everything it finds -> build\win-x64\bin, about 2.5 min
+    .\build_windows.ps1 -NoCuda                            # CPU plugins + bridge + cudafilters, about 20 s
+    .\build_windows.ps1 -BuildDir C:\b -Nasm C:\tools\nasm\nasm.exe -CudaArch 120-real   # local RTX 50xx only
+
+`build_windows.ps1` finds Visual Studio with vswhere, takes nvcc from `-Nvcc` / `CUDA_PATH_V12_9` / `CUDA_PATH_V12_8` / the
+newest installed 12.x toolkit / `CUDA_PATH` / the PATH (the first CUDA 12.8+ one), loads `vcvars64.bat` into the session
+(with CUDA: the newest MSVC 14.4x toolset, or `-VcvarsVer`), takes CMake and Ninja from Visual Studio, NASM from `-Nasm` /
+`NASMPATH` / the PATH, and passes further arguments with `-CMakeArgs '-DX=Y'`. With CUDA the whole build uses the 14.4x
+toolset (the toolset of `Sources/mvtools.vcxproj` too). By hand, from a prompt with that toolset
+(`vcvars64.bat -vcvars_ver=14.44`):
+
+    cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_NASM_COMPILER=C:/tools/nasm/nasm.exe ^
+          -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/bin/nvcc.exe"
+    cmake --build build
+
+mvtools2.dll gets the code generation of `Sources/mvtools.vcxproj` (Release|x64): `/O2 /Ob2 /Oi /Ot /Oy /GT /GF /Gy /GS-`,
+whole-program optimisation (`/GL`, `/LTCG`, `/OPT:REF /OPT:ICF`), `/arch:AVX2` for the `*_avx2.cpp` files only, the NASM
+sources with the project's per-file defines and include paths, the version resource; same output (framemd5) and speed as
+the solution build. Differences: static CRT (the project uses `/MD`) and the VapourSynth entry point
+(`VapourSynthPluginInit2`, `Sources/VapourSynthEntry.cpp`), which the solution does not compile.
+
+The Visual Studio solution still works for the AviSynth+ DLLs (mvtools2, DePan, DePanEstimate, cudafilters):
+
+- Prerequisite: for asm compilation use nasm https://www.nasm.us/
   Visual Studio integration: https://github.com/ShiftMediaProject/VSNASM/releases
 
   Compiler nasm.exe can appear in e.g. `C:\Program Files\Microsoft Visual Studio\18\Community\VC\`
@@ -76,7 +123,8 @@ Other builds are using internal SIMD code, governed by defines in def.h
 
   Some nasm versions (e.g. the one valid around 2022.Dec.) will throw a lot of warnings on x265 assembler files. Temporarily they are silenced with -w-macro-params-legacy parameter.
 
-* build from IDE
+* build from IDE, or `MSBuild Sources\mvtools.vcxproj /p:Configuration=Release /p:Platform=x64` (add
+  `/p:PlatformToolset=v145` when only VS 2026 is installed). `Sources\cuda\build.bat` still builds mvtools_cuda.dll alone.
 
 ### Windows Visual Studio + Intel C++ Compiler ICX and ICL
 
@@ -84,37 +132,24 @@ Other builds are using internal SIMD code, governed by defines in def.h
 
 * build from IDE
 
-## Windows GCC
-(mingw installed by msys2)
-From the 'build' folder under project root:
+### Linux
 
-    del ..\CMakeCache.txt
-    cmake .. -G "MinGW Makefiles" -DENABLE_INTEL_SIMD:bool=on
-    @rem test: cmake .. -G "MinGW Makefiles" -DENABLE_INTEL_SIMD:bool=off
-    cmake --build . --config Release  
+    ./build_linux.sh [build dir]               # default build/linux-x64; libraries in <build dir>/bin
 
-## Linux build instructions
+or by hand:
 
-* Clone repo
+    cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build
 
-        git clone https://github.com/pinterf/mvtools
-        cd mvtools
-        cmake -B build -S .
-        cmake --build build
+* `build_linux.sh` reads `NVCC`, `CUDA_HOST_CXX`, `CUDA_ARCH`, `BUILD_TYPE`, `CMAKE_EXTRA` from the environment
+  (`NVCC=none` skips libmvtools_cuda.so); CMake and Ninja can come from `pip install cmake ninja`.
+* GPU part: `libmvtools_cuda.so` is built when a CUDA 12.8 .. 12.x compiler is found (CUDA 12.9 recommended; CUDA 13 is
+  not used, it has no Pascal / Volta targets), `libcudafilters.so` always. CUDA 12.9 accepts GCC 14 and older as host
+  compiler: with a newer default g++ pass `-DCMAKE_CUDA_HOST_COMPILER=g++-14` (build_linux.sh: `CUDA_HOST_CXX=g++-14`).
+  Point CMake at nvcc if it is not on the PATH, or switch it off:
 
-  Useful hints:        
-  build after clean:
-
-      cmake --build build --clean-first
-
-  delete CMake cache
-
-      rm build/CMakeCache.txt
-
-* GPU part (this branch): `libmvtools_cuda.so` and the `libcudafilters.so` plugin are built when a CUDA compiler is
-  found (CUDA 12.8+ / 13.x, compute capability 8.0+). Point CMake at nvcc if it is not on the PATH, or switch it off:
-
-        cmake -B build -S . -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+        cmake -B build -S . -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
+        cmake -B build -S . -DMVTOOLS_CUDA=OFF                     # no libmvtools_cuda.so
         cmake -B build -S . -DMVTOOLS_GPU=OFF                      # CPU plugins only
         cmake -B build -S . -DMVTOOLS_CUDA_ARCH=120-real           # development: local RTX 50xx only, faster
 
@@ -123,8 +158,7 @@ From the 'build' folder under project root:
   CudaNNEDI3 reads `nnedi3_weights.bin` from the folder of `libcudafilters.so`. Without avstp (Windows only) the CPU
   search runs single-sliced, while `gpu=true` reproduces the 24-thread CPU result (set `MVTOOLS_GPU_SLICES=1` to match
   the single-sliced CPU result).
-
-* Find binaries at
+* Find binaries in `build/bin` (copied there after each build), or at
 
         build/Sources/libmvtools2.so
         build/DePan/libdepan.so
@@ -136,14 +170,44 @@ From the 'build' folder under project root:
 * Install binaries
 
         cd build
-        sudo make install
+        sudo cmake --install .
+
+  Useful hints: build after clean `cmake --build build --clean-first`; delete the CMake cache `rm build/CMakeCache.txt`.
+
+### Cross compiling the Windows DLLs on Linux (MinGW-w64): experimental, not for releases
+
+    cmake -G Ninja -S . -B build/mingw -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake   # -DMINGW_ROOT=~/opt/mingw/usr for unpacked packages
+    cmake --build build/mingw
+
+This compiles and links mvtools2.dll, DePan.dll, DePanEstimate.dll, mvtools_vsbridge.dll and cudafilters.dll
+with GCC 13 (packages `g++-mingw-w64-x86-64-posix`, `binutils-mingw-w64-x86-64`; without root they
+can be unpacked with `apt download` + `dpkg -x`, see `cmake/toolchain-mingw64.cmake`), statically linked (only
+KERNEL32 / msvcrt imports), with the expected exports. **But the DLLs do not work yet** (tested 2026-11-01 on Windows 11):
+AviSynth+ 3.7 (MSVC build) loads the GCC-built mvtools2.dll / DePan.dll without registering any function ("There is no
+function named 'MSuper'"), and under VapourSynth (GCC-built bridge) the functions register but MDegrain2 crashes. The
+Windows release DLLs therefore come from MSVC (`build_windows.ps1`). Further limits even once that is solved:
+
+* mvtools_cuda.dll cannot be cross compiled: nvcc on Linux has no Windows target (on Windows it needs MSVC as host
+  compiler). Build it with `build_windows.ps1`; the plain C interface would allow mixing it with GCC-built plugins.
+* The GCC mvtools2.dll uses the intrinsic code instead of the NASM sources and has no avstp support (`def.h`), so the
+  CPU search runs single-sliced under AviSynth+, as on Linux: slower than the MSVC build.
+
+## Windows GCC
+(mingw installed by msys2)
+From the 'build' folder under project root:
+
+    del ..\CMakeCache.txt
+    cmake .. -G "MinGW Makefiles" -DENABLE_INTEL_SIMD:bool=on
+    @rem test: cmake .. -G "MinGW Makefiles" -DENABLE_INTEL_SIMD:bool=off
+    cmake --build . --config Release  
 
 ## GPU (this branch)
 
 CUDA paths for MSuper / MAnalyse / MRecalculate / MCompensate / MDegrain1..6 / MFlowFps (`gpu=true`, default false),
 bit-exact with the CPU result; settings, formats or machines the GPU does not cover run the CPU code with the same
-output. Needs an NVIDIA GPU with compute capability 8.0+ (RTX 30xx and newer) and `mvtools_cuda.dll` next to
-`mvtools2.dll`.
+output. Needs an NVIDIA GPU with compute capability 6.0+ (GTX 10xx and newer) and `mvtools_cuda.dll` next to
+`mvtools2.dll` (built with CUDA 12.9, "Build Instructions"). Pascal / Volta are verified only as PTX 6.1 on an RTX 50xx,
+not yet on real 6.x / 7.0 hardware.
 
 * Reference of every GPU parameter, the `cudafilters` plugin and the environment variables: `Documentation/gpu.md`.
 * `cudafilters/`: GPU versions of the AviSynth core, MaskTools2, RgTools and NNEDI3 stages QTGMC uses, plus
@@ -154,7 +218,7 @@ output. Needs an NVIDIA GPU with compute capability 8.0+ (RTX 30xx and newer) an
   github.com/emcodem/mvtools.
 * Design notes and measurements: `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`, `DECISIONS.md`.
 
-## VapourSynth (this branch; Linux, Windows to follow)
+## VapourSynth (this branch; Linux and Windows)
 
 Not part of the Windows release bundles yet.
 
@@ -168,11 +232,11 @@ Put these files into one folder (VapourSynth's plugin folder for autoloading, or
 
 | File | Needed for |
 |---|---|
-| `libmvtools2.so` | mvtools2 (`core.mvpf`) |
-| `libmvtools_vsbridge.so` | always: the bridge both plugins load from their own folder |
-| `libmvtools_cuda.so` | optional: `gpu=true` and the cudafilters' GPU paths (without it: CPU, see below) |
-| `libcudafilters.so` | optional: cudafilters (`core.cuda`) |
-| `nnedi3_weights.bin` | optional: CudaNNEDI3 on Linux |
+| `libmvtools2.so` / `mvtools2.dll` | mvtools2 (`core.mvpf`) |
+| `libmvtools_vsbridge.so` / `mvtools_vsbridge.dll` | always: the bridge both plugins load from their own folder |
+| `libmvtools_cuda.so` / `mvtools_cuda.dll` | optional: `gpu=true` and the cudafilters' GPU paths (without it: CPU, see below) |
+| `libcudafilters.so` / `cudafilters.dll` | optional: cudafilters (`core.cuda`) |
+| `nnedi3_weights.bin` | optional: CudaNNEDI3 (always needed under VapourSynth, also on Windows) |
 
 Denoising on the CPU (the AviSynth function and parameter names, `Documentation/mvtools2.html` applies):
 
@@ -206,8 +270,9 @@ AviSynth-only filter stops with an error instead (set `MVBRIDGE_FALLBACK=nearest
 VapourSynth replacement; details below).
 
 * Build: on by default (`-DMVTOOLS_VAPOURSYNTH=OFF` to skip); no VapourSynth installation needed (`VapourSynth4.h` is
-  in `Sources/include`). Status: Linux done; Windows waits for the CMake build of this branch (the MSVC solution does
-  not build the bridge yet).
+  in `Sources/include`). Status: Linux and Windows (CMake build: `build_linux.sh` / `build_windows.ps1`;
+  the MSVC solution does not build the bridge). Windows test: `vsbridge/test/compare.py` with `pip install vapoursynth`
+  in a venv, the AviSynth+ side through `avsmd5.py` (docstring of compare.py).
 * Install: `libmvtools_vsbridge.so` must sit in the same folder as `libmvtools2.so` (VapourSynth's plugin folder, or
   any folder used with `core.std.LoadPlugin`). Without it the namespace `mvpf` exists but is empty, and the reason is
   printed to stderr.

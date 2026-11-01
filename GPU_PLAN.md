@@ -122,7 +122,7 @@ and frames that need the CPU's bad-vector wide search (`MVCUDA_NEEDS_CPU`).
 
 ### Use
 
-- Build `Sources\cuda\build.bat` -> `mvtools_cuda.dll` (CUDA 13.x toolkit; machine code for compute capability 8.0, 8.6, 8.9, 9.0, 12.0 plus PTX for 8.0, so RTX 30xx and newer; static runtime: only the driver is needed at run time; the PTX path was checked on the RTX 5090 with `CUDA_FORCE_PTX_JIT=1`, the 30/40 series machine code itself is untested on real hardware; `MVCUDA_DEVICE=n` picks a device, default the first one with cc >= 8.0) and
+- Build `Sources\cuda\build.bat` -> `mvtools_cuda.dll` (CUDA 12.9 toolkit with the MSVC 14.4x / v143 toolset, DECISIONS.md D11; machine code for compute capability 6.1, 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 12.0 plus PTX for 6.0 and 8.0, so GTX 10xx and newer; static runtime: only the driver is needed at run time; the PTX paths were checked on the RTX 5090 with `CUDA_FORCE_PTX_JIT=1` and a PTX 6.1 only build, the machine code for older cards is untested on real hardware; `MVCUDA_DEVICE=n` picks a device, default the first one with cc >= 6.0) and
   the plugin as before; put `mvtools_cuda.dll` next to `mvtools2.dll`.
 - `MAnalyse(..., gpu=true)` and `MRecalculate(..., gpu=true)`; `uconvert.avsi`: `global uc_frc_gpu = true` after the Import (default false).
 - The vectors equal the CPU **multi-threaded** result for the same slice count: the GPU uses the avstp thread count (24 if mt is on but no thread
@@ -227,8 +227,8 @@ concurrent bv/fv analysis (Prefetch already overlaps frames), recalc upload cut 
 
 ### Portability
 
-The build targets compute capability 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX (RTX 30xx and newer; older cards report "no usable device", `MVCUDA_DEVICE` selects a device). The PTX path
-(`CUDA_FORCE_PTX_JIT=1`) passes the exactness tests on the 5090; the 30/40-series machine code itself has not been run on such a card.
+The build (CUDA 12.9, DECISIONS.md D11) targets compute capability 6.1 / 7.0 / 7.5 / 8.0 / 8.6 / 8.9 / 9.0 / 12.0 plus PTX 6.0 and 8.0 (GTX 10xx and newer; older cards report "no usable device", `MVCUDA_DEVICE` selects a device). The PTX paths
+(`CUDA_FORCE_PTX_JIT=1`, and a PTX 6.1 only build for the pre-Volta code) pass the exactness tests on the 5090; the machine code for older cards has not been run on such a card.
 
 ## Next step
 

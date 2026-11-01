@@ -7,7 +7,6 @@ FILE(GLOB DePan_Sources RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
   "include/avs/*.h"
 )
 
-message("${DePan_Sources}")
 
 IF( MSVC OR MINGW )
     # Export definitions in general are not needed on x64 and only cause warnings,
@@ -19,8 +18,4 @@ IF( MSVC OR MINGW )
     #  LIST(APPEND DePan_Sources "DePan.def")
     # endif() 
 ENDIF()
-
-IF( MSVC_IDE )
-    # Ninja, unfortunately, seems to have some issues with using rc.exe
-    LIST(APPEND DePan_Sources "DePan.rc")
-ENDIF()
+# the version resource (.rc) is added by CMakeLists.txt for Windows builds

@@ -16,7 +16,6 @@ ELSE()
 ENDIF()
 
 
-message("${MvTools2_Sources}")
 
 IF( MSVC OR MINGW )
     # Export definitions in general are not needed on x64 and only cause warnings,
@@ -28,8 +27,4 @@ IF( MSVC OR MINGW )
     #  LIST(APPEND MvTools2_Sources "MvTools2.def")
     # endif() 
 ENDIF()
-
-IF( MSVC_IDE )
-    # Ninja, unfortunately, seems to have some issues with using rc.exe
-    LIST(APPEND MvTools2_Sources "MvTools2.rc")
-ENDIF()
+# the version resource (.rc) is added by CMakeLists.txt for Windows builds
