@@ -1,0 +1,170 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_wave of Sources/cuda/mvcuda_analyse.cu for one level: meander=false and one slice, i.e. the CPU result of
+// MAnalyse(meander=false, mt=false). Without meander a block depends on its left neighbour, the block above and, on the
+// smallest level and on the last row, the block above-right; the bottom-right predictor of the other rows is the not yet
+// searched (interpolated) vector. So block (x, y) can run as soon as row y - 1 has finished block x (x + 1 for the
+// up-right predictor): one workgroup per block row at a time, rows handed out in order by an atomic ticket, a progress
+// counter per row. A row only waits for a row with a smaller ticket, whose workgroup is already running, so the number
+// of workgroups does not matter for progress (only for speed).
+//
+// Vulkan gives no forward-progress guarantee between workgroups: every wait is bounded (spin_max polls) and a timeout sets
+// the abort flag, which ends every other wait at once; the host then reports -4 (the caller uses the CPU).
+//
+// Bad vectors (PseudoEPZSearch): a block above badSAD waits until the rows above are complete, so the count of bad
+// blocks before it in raster order is known, and runs the CPU's wide search (UMH / exhaustive rings) when it applies.
+
+#define ANA_WG 128
+layout(local_size_x = ANA_WG) in;
+
+#define BAD_RANGE A.bad_range
+#include "ana_level.glsl"
+
+shared int s_row, s_fail, s_badcnt;
+
+// waits until state[pos] >= need (invocation 0 only); false on timeout or abort (and then the abort flag is set)
+bool wait_for(int pos, int need, inout int seen)
+{
+  const uint64_t st = A.state;
+  int polls = 0;
+  while (seen < need)
+  {
+    seen = atomicOr(PI32(st).v[pos], 0);
+    if (seen >= need)
+      break;
+    if (atomicOr(PI32(st).v[ST_ABORT], 0) != 0 || ++polls > A.spin_max)
+    {
+      atomicExchange(PI32(st).v[ST_ABORT], 1);
+      return false;
+    }
+  }
+  memoryBarrierBuffer(); // acquire: the vectors published before the counter
+  return true;
+}
+
+void main()
+{
+  const int tid = ana_tid();
+  const uint64_t st = A.state, vec = A.vec;
+  const int nbx = A.n_blk_x, nby = A.n_blk_y;
+  const int prog = ST_PROG, rowbad = ST_PROG + nby;
+  for (;;)
+  {
+    if (tid == 0)
+    {
+      const int t = atomicAdd(PI32(st).v[ST_TICKET], 1);
+      s_row = (t < nby && atomicOr(PI32(st).v[ST_ABORT], 0) == 0) ? t : -1;
+      s_fail = 0;
+    }
+    memoryBarrierShared();
+    barrier();
+    const int row = s_row;
+    if (row < 0)
+      return;
+    const bool is_top = row == 0, is_bottom = row == nby - 1;
+    const int lag = (A.smallest != 0 || is_bottom) ? 2 : 1;
+    int seen = 0; // progress of the row above as last read (invocation 0)
+    int left_x = 0, left_y = 0, left_sad = 0, row_bad = 0;
+    for (int blkx = 0; blkx < nbx; blkx++)
+    {
+      const int idx = row * nbx + blkx;
+      block_setup(blkx, row);
+      if (tid == 0)
+      {
+        const bool side = blkx < nbx - 1;
+        // own and bottom-right: interpolated by the previous dispatch (or zero), not searched yet
+        s_nb[0] = PI32(vec).v[3 * idx];
+        s_nb[1] = PI32(vec).v[3 * idx + 1];
+        s_nb[2] = PI32(vec).v[3 * idx + 2];
+        const bool p3_below = !is_bottom && A.smallest == 0 && side;
+        s_nb[13] = 0;
+        if (p3_below)
+        {
+          const int q = 3 * (idx + nbx + 1);
+          s_nb[6] = PI32(vec).v[q];
+          s_nb[7] = PI32(vec).v[q + 1];
+          s_nb[8] = PI32(vec).v[q + 2];
+          s_nb[13] = 1;
+        }
+        s_nb[12] = is_top ? 0 : 1;
+        if (!is_top)
+        {
+          const int need = blkx + lag < nbx ? blkx + lag : nbx;
+          if (!wait_for(prog + row - 1, need, seen))
+            s_fail = 1;
+          else
+          {
+            // vectors other workgroups wrote in this dispatch: atomic reads (a plain load may hit a stale L1 line of
+            // this SM, e.g. the interpolated predictor read as the bottom-right neighbour of an earlier row)
+            const int u = 3 * (idx - nbx);
+            s_nb[3] = atomicOr(PI32(vec).v[u], 0);
+            s_nb[4] = atomicOr(PI32(vec).v[u + 1], 0);
+            s_nb[5] = atomicOr(PI32(vec).v[u + 2], 0);
+            if (!p3_below && side)
+            {
+              const int q = 3 * (idx - nbx + 1);
+              s_nb[6] = atomicOr(PI32(vec).v[q], 0);
+              s_nb[7] = atomicOr(PI32(vec).v[q + 1], 0);
+              s_nb[8] = atomicOr(PI32(vec).v[q + 2], 0);
+              s_nb[13] = 1;
+            }
+          }
+        }
+        s_nb[14] = blkx > 0 ? 1 : 0;
+        s_nb[9] = left_x;
+        s_nb[10] = left_y;
+        s_nb[11] = left_sad;
+      }
+      memoryBarrierShared();
+      barrier();
+      if (s_fail != 0)
+        return;
+      search_block(blkx, row, is_top);
+
+      if (idx > 1 && ck_bsad > A.bad_sad)
+      {
+        barrier(); // s_badcnt / s_fail
+        if (tid == 0)
+        {
+          int cnt = row_bad;
+          if (row > 0)
+          {
+            int seen2 = 0;
+            if (!wait_for(prog + row - 1, nbx, seen2)) // rows finish in order: then every row above is complete
+              s_fail = 1;
+            else
+              for (int r = 0; r < row; r++)
+                cnt += atomicOr(PI32(st).v[rowbad + r], 0);
+          }
+          s_badcnt = cnt;
+        }
+        memoryBarrierShared();
+        barrier();
+        if (s_fail != 0)
+          return;
+        const int badcount = s_badcnt;
+        if (ck_bsad > A.bad_sad + A.bad_sad * badcount / 16) // BADCOUNT_LIMIT
+        {
+          row_bad++;
+          refine_run(T_BAD, 0);
+        }
+      }
+      left_x = ck_bx;
+      left_y = ck_by;
+      left_sad = ck_bsad;
+      if (tid == 0)
+      {
+        if (blkx == nbx - 1)
+          PI32C(st).v[rowbad + row] = row_bad;
+        PI32(vec).v[3 * idx] = ck_bx;
+        PI32(vec).v[3 * idx + 1] = ck_by;
+        PI32(vec).v[3 * idx + 2] = ck_bsad;
+        memoryBarrierBuffer(); // release: the vector before the counter
+        atomicExchange(PI32(st).v[prog + row], blkx + 1);
+      }
+      memoryBarrierShared();
+      barrier(); // the next block's neighbours and candidate lists
+    }
+  }
+}

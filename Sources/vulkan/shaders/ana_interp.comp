@@ -1,0 +1,107 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_interp of Sources/cuda/mvcuda_analyse.cu: InterpolatePrediction for every block of a level from the vectors of the
+// coarser level (the predictors the search of the level starts from), one invocation per block.
+
+layout(local_size_x = 128) in;
+
+#include "ana_nlambda.glsl"
+
+struct Args
+{
+  uint64_t coarse, vec, nlam;
+  int n_blk_x, n_blk_y, c_blk_x, c_blk_y;
+  int bs_x, bs_y, ov_x, ov_y, log_pel, log_pel_coarse;
+  int lambda_level, lsad, n_slices, pad_;
+};
+ARGS(Args)
+
+void main()
+{
+  const int index = int(gl_GlobalInvocationID.x);
+  if (index >= A.n_blk_x * A.n_blk_y)
+    return;
+  int norm_factor = 3 - A.log_pel + A.log_pel_coarse;
+  const int mul_factor = norm_factor < 0 ? -norm_factor : 0;
+  norm_factor = norm_factor < 0 ? 0 : norm_factor;
+  const int normov = (A.bs_x - A.ov_x) * (A.bs_y - A.ov_y);
+  const int aoddx = A.bs_x * 3 - A.ov_x * 2, aevenx = A.bs_x * 3 - A.ov_x * 4;
+  const int aoddy = A.bs_y * 3 - A.ov_y * 2, aeveny = A.bs_y * 3 - A.ov_y * 4;
+  const bool no_overlap = (A.ov_x == 0 && A.ov_y == 0);
+  const bool small_overlap = A.ov_x <= (A.bs_x >> 1) && A.ov_y <= (A.bs_y >> 1);
+  const int cbx = A.c_blk_x, cby = A.c_blk_y;
+
+  const int k = index % A.n_blk_x, l = index / A.n_blk_x;
+  int i = k, j = l;
+  if (i >= 2 * cbx)
+    i = 2 * cbx - 1;
+  if (j >= 2 * cby)
+    j = 2 * cby - 1;
+  const int offy = -1 + 2 * (j & 1), offx = -1 + 2 * (i & 1);
+  const int iper2 = i / 2, jper2 = j / 2;
+  int q1, q2, q3, q4; // block indices of the coarse level
+#define CV(ix, iy) ((ix) + (iy) * cbx)
+  if (i == 0 || i >= 2 * cbx - 1)
+  {
+    if (j == 0 || j >= 2 * cby - 1)
+      q1 = q2 = q3 = q4 = CV(iper2, jper2);
+    else
+    {
+      q1 = q2 = CV(iper2, jper2);
+      q3 = q4 = CV(iper2, jper2 + offy);
+    }
+  }
+  else if (j == 0 || j >= 2 * cby - 1)
+  {
+    q1 = q2 = CV(iper2, jper2);
+    q3 = q4 = CV(iper2 + offx, jper2);
+  }
+  else
+  {
+    q1 = CV(iper2, jper2);
+    q2 = CV(iper2 + offx, jper2);
+    q3 = CV(iper2, jper2 + offy);
+    q4 = CV(iper2 + offx, jper2 + offy);
+  }
+#undef CV
+  const uint64_t cv = A.coarse;
+  const ivec3 v1 = ivec3(PI32(cv).v[3 * q1], PI32(cv).v[3 * q1 + 1], PI32(cv).v[3 * q1 + 2]);
+  const ivec3 v2 = ivec3(PI32(cv).v[3 * q2], PI32(cv).v[3 * q2 + 1], PI32(cv).v[3 * q2 + 2]);
+  const ivec3 v3 = ivec3(PI32(cv).v[3 * q3], PI32(cv).v[3 * q3 + 1], PI32(cv).v[3 * q3 + 2]);
+  const ivec3 v4 = ivec3(PI32(cv).v[3 * q4], PI32(cv).v[3 * q4 + 1], PI32(cv).v[3 * q4 + 2]);
+  int x, y;
+  int64_t tmp_sad;
+  if (no_overlap)
+  {
+    x = 9 * v1.x + 3 * v2.x + 3 * v3.x + v4.x;
+    y = 9 * v1.y + 3 * v2.y + 3 * v3.y + v4.y;
+    tmp_sad = 9L * int64_t(v1.z) + 3L * int64_t(v2.z) + 3L * int64_t(v3.z) + int64_t(v4.z) + 8L;
+  }
+  else if (small_overlap)
+  {
+    const int ax1 = offx > 0 ? aoddx : aevenx;
+    const int ax2 = (A.bs_x - A.ov_x) * 4 - ax1;
+    const int ay1 = offy > 0 ? aoddy : aeveny;
+    const int ay2 = (A.bs_y - A.ov_y) * 4 - ay1;
+    const int a11 = ax1 * ay1, a12 = ax1 * ay2, a21 = ax2 * ay1, a22 = ax2 * ay2;
+    x = (a11 * v1.x + a21 * v2.x + a12 * v3.x + a22 * v4.x) / normov;
+    y = (a11 * v1.y + a21 * v2.y + a12 * v3.y + a22 * v4.y) / normov;
+    tmp_sad = (int64_t(a11) * v1.z + int64_t(a21) * v2.z + int64_t(a12) * v3.z + int64_t(a22) * v4.z) / int64_t(normov);
+  }
+  else
+  {
+    x = (v1.x + v2.x + v3.x + v4.x) << 2;
+    y = (v1.y + v2.y + v3.y + v4.y) << 2;
+    tmp_sad = (int64_t(v1.z) + v2.z + v3.z + v4.z + 2L) << 2;
+  }
+  const uint64_t o = A.vec;
+  PI32(o).v[3 * index] = (x >> norm_factor) << mul_factor;
+  PI32(o).v[3 * index + 1] = (y >> norm_factor) << mul_factor;
+  PI32(o).v[3 * index + 2] = int(tmp_sad >> 4);
+  // nLambda of the block (its predictor SAD is this one): 0 on the first row of a slice
+  bool first_row = false;
+  for (int t = 0; t < A.n_slices; t++)
+    first_row = first_row || (t * A.n_blk_y / A.n_slices == l);
+  PI32(A.nlam).v[index] = calc_nlambda(A.lambda_level, A.lsad, int(tmp_sad >> 4), first_row);
+}

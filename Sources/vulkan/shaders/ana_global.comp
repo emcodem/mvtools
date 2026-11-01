@@ -1,0 +1,122 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_global of Sources/cuda/mvcuda_analyse.cu: PlaneOfBlocks::estimate_global_mv_doubled_slice on the vectors of the coarser
+// level, one workgroup. freq: device scratch of 2 * 16384 ints (cleared here).
+
+#define NT 256
+layout(local_size_x = NT) in;
+
+struct Args
+{
+  uint64_t vec, freq, glob;
+  int n_blk, use_global;
+};
+ARGS(Args)
+
+shared int s_min[2], s_max[2], s_sum[2], s_num;
+shared int s_cnt[NT], s_idx[NT];
+
+void main()
+{
+  const int tid = int(gl_LocalInvocationIndex);
+  const int freq_size = 16384; // 2 * 8192: coarse planes have pel 1
+  if (A.use_global == 0)
+  {
+    if (tid == 0)
+    {
+      PI32(A.glob).v[0] = 0;
+      PI32(A.glob).v[1] = 0;
+    }
+    return;
+  }
+  const uint64_t f = A.freq, vec = A.vec;
+  for (int i = tid; i < 2 * freq_size; i += NT)
+    PI32C(f).v[i] = 0;
+  if (tid < 2)
+  {
+    s_min[tid] = freq_size - 1;
+    s_max[tid] = 0;
+    s_sum[tid] = 0;
+  }
+  if (tid == 0)
+    s_num = 0;
+  memoryBarrierBuffer();
+  memoryBarrierShared();
+  barrier();
+  for (int i = tid; i < A.n_blk; i += NT)
+  {
+    for (int c = 0; c < 2; c++)
+    {
+      const int ind = (freq_size >> 1) + PI32(vec).v[3 * i + c];
+      if (ind >= 0 && ind < freq_size)
+      {
+        atomicAdd(PI32C(f).v[c * freq_size + ind], 1);
+        atomicMax(s_max[c], ind);
+        atomicMin(s_min[c], ind);
+      }
+    }
+  }
+  memoryBarrierBuffer();
+  memoryBarrierShared();
+  barrier();
+  // most frequent value per component, the lowest one on ties (the CPU's ascending scan): NT / 2 invocations per
+  // component over strides, then a tree reduction
+  {
+    const int half_ = NT / 2, c = tid / half_, ln = tid - c * half_;
+    int count = -1, index = s_min[c];
+    for (int i = s_min[c] + ln; i <= s_max[c]; i += half_)
+    {
+      const int v = PI32C(f).v[c * freq_size + i];
+      if (v > count)
+      {
+        count = v;
+        index = i;
+      }
+    }
+    s_cnt[tid] = count;
+    s_idx[tid] = index;
+    memoryBarrierShared();
+    barrier();
+    for (int o = half_ / 2; o > 0; o >>= 1)
+    {
+      if (ln < o)
+      {
+        const int oc = s_cnt[tid + o], oi = s_idx[tid + o];
+        if (oc > s_cnt[tid] || (oc == s_cnt[tid] && oi < s_idx[tid]))
+        {
+          s_cnt[tid] = oc;
+          s_idx[tid] = oi;
+        }
+      }
+      memoryBarrierShared();
+      barrier();
+    }
+  }
+  const int medx = s_idx[0] - (freq_size >> 1), medy = s_idx[NT / 2] - (freq_size >> 1);
+  for (int i = tid; i < A.n_blk; i += NT)
+  {
+    const int vx = PI32(vec).v[3 * i], vy = PI32(vec).v[3 * i + 1];
+    if (abs(vx - medx) < 6 && abs(vy - medy) < 6)
+    {
+      atomicAdd(s_sum[0], vx);
+      atomicAdd(s_sum[1], vy);
+      atomicAdd(s_num, 1);
+    }
+  }
+  memoryBarrierShared();
+  barrier();
+  if (tid == 0)
+  {
+    if (s_num > 0)
+    {
+      PI32(A.glob).v[0] = 2 * s_sum[0] / s_num;
+      PI32(A.glob).v[1] = 2 * s_sum[1] / s_num;
+    }
+    else
+    {
+      PI32(A.glob).v[0] = 2 * medx;
+      PI32(A.glob).v[1] = 2 * medy;
+    }
+  }
+}

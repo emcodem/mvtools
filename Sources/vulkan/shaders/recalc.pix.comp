@@ -1,0 +1,140 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_recalc of Sources/cuda/mvcuda_recalc.cu (PlaneOfBlocks::recalculate_mv_slice): every block is independent (it starts
+// from the interpolated / nearest old vector and never reads results of this pass), one workgroup per block. Workgroups
+// (gx, gy): block index = gy * gx_count + gx.
+
+#define ANA_WG 64
+layout(local_size_x = ANA_WG) in;
+
+struct Args
+{
+  uint64_t ref[3][16];
+  uint64_t src[3];
+  uint64_t old_vec, out_vec;
+  int ew[3], hpad[3], vpad[3];
+  int ext_w0, ext_h0, pel, log_pel, bits, log_x_uv, log_y_uv;
+  int blk_x, blk_y, ov_x, ov_y, n_blk_x, n_blk_y;
+  int old_n_x, old_n_y, old_size_x, old_size_y, old_ov_x, old_ov_y, log_pel_old;
+  int lambda_level, pnew, th_sad, smooth_, radius, chroma_scale, n_slices, search_type, has_chroma, cw, ch, pad_;
+};
+ARGS(Args)
+
+#define E_REF(p, s) A.ref[p][s]
+#define E_SRC(p) A.src[p]
+#define E_EW(p) A.ew[p]
+#define E_PEL A.pel
+#define E_LP A.log_pel
+#define E_BSX A.blk_x
+#define E_BSY A.blk_y
+#define E_CW A.cw
+#define E_CH A.ch
+#define E_LXUV A.log_x_uv
+#define E_LYUV A.log_y_uv
+#define E_CSCALE A.chroma_scale
+#define E_BITS A.bits
+#define E_PNEW A.pnew
+
+#include "ana_common.glsl"
+
+ivec3 old_vec(int bx, int by)
+{
+  const int i = 3 * (bx + by * A.old_n_x);
+  return ivec3(PI32(A.old_vec).v[i], PI32(A.old_vec).v[i + 1], PI32(A.old_vec).v[i + 2]);
+}
+
+void main()
+{
+  const int idx = int(gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x);
+  if (idx >= A.n_blk_x * A.n_blk_y)
+    return; // uniform for the workgroup
+  const int blkx = idx % A.n_blk_x, blky = idx / A.n_blk_x;
+  const int step_x = A.blk_x - A.ov_x, step_y = A.blk_y - A.ov_y;
+  e_x0 = A.hpad[0] + blkx * step_x;
+  e_y0 = A.vpad[0] + blky * step_y;
+  e_x1 = A.hpad[1] + blkx * (step_x >> A.log_x_uv);
+  e_y1 = A.vpad[1] + blky * (step_y >> A.log_y_uv);
+
+  // search boundaries (recalculate_mv_slice)
+  ck_dxmax = A.pel * (A.ext_w0 - e_x0 - A.blk_x);
+  ck_dymax = A.pel * (A.ext_h0 - e_y0 - A.blk_y);
+  ck_dxmin = -A.pel * e_x0;
+  ck_dymin = -A.pel * e_y0;
+
+  // interpolated / nearest old vector
+  const int step_x_old = A.old_size_x - A.old_ov_x, step_y_old = A.old_size_y - A.old_ov_y;
+  const int center_x = A.blk_x / 2 + step_x * blkx;
+  const int blkxold = (center_x - A.old_size_x / 2) / step_x_old;
+  const int center_y = A.blk_y / 2 + step_y * blky;
+  const int blkyold = (center_y - A.old_size_y / 2) / step_y_old;
+  const int delta_x = max(0, center_x - (A.old_size_x / 2 + step_x_old * blkxold));
+  const int delta_y = max(0, center_y - (A.old_size_y / 2 + step_y_old * blkyold));
+  const int bx1 = min(A.old_n_x - 1, max(0, blkxold)), bx2 = min(A.old_n_x - 1, max(0, blkxold + 1));
+  const int by1 = min(A.old_n_y - 1, max(0, blkyold)), by2 = min(A.old_n_y - 1, max(0, blkyold + 1));
+  int vx, vy;
+  if (A.smooth_ == 1)
+  {
+    const ivec3 v1 = old_vec(bx1, by1), v2 = old_vec(bx2, by1), v3 = old_vec(bx1, by2), v4 = old_vec(bx2, by2);
+    const int v1x = v1.x * step_x_old + delta_x * (v2.x - v1.x);
+    const int v1y = v1.y * step_x_old + delta_x * (v2.y - v1.y);
+    const int v2x = v3.x * step_x_old + delta_x * (v4.x - v3.x);
+    const int v2y = v3.y * step_x_old + delta_x * (v4.y - v3.y);
+    vx = (v1x + delta_y * (v2x - v1x) / step_y_old) / step_x_old;
+    vy = (v1y + delta_y * (v2y - v1y) / step_y_old) / step_x_old;
+  }
+  else
+  {
+    ivec3 v;
+    if (delta_x * 2 < step_x_old && delta_y * 2 < step_y_old)
+      v = old_vec(bx1, by1);
+    else if (delta_x * 2 >= step_x_old && delta_y * 2 < step_y_old)
+      v = old_vec(bx2, by1);
+    else if (delta_x * 2 < step_x_old && delta_y * 2 >= step_y_old)
+      v = old_vec(bx1, by2);
+    else
+      v = old_vec(bx2, by2);
+    vx = v.x;
+    vy = v.y;
+  }
+  // to the new pel, clip to the search area
+  vx = (vx << A.log_pel) >> A.log_pel_old;
+  vy = (vy << A.log_pel) >> A.log_pel_old;
+  const int pred_x = vx < ck_dxmin ? ck_dxmin : (vx >= ck_dxmax ? ck_dxmax - 1 : vx);
+  const int pred_y = vy < ck_dymin ? ck_dymin : (vy >= ck_dymax ? ck_dymax - 1 : vy);
+
+  // nLambda is 0 on the first block row of every slice
+  bool first_row = false;
+  for (int t = 0; t < A.n_slices; t++)
+    first_row = first_row || (t * A.n_blk_y / A.n_slices == blky);
+  ck_nlam = first_row ? 0 : A.lambda_level;
+  ck_px = pred_x;
+  ck_py = pred_y;
+  ck_bx = pred_x;
+  ck_by = pred_y;
+
+  // SAD of the predictor
+  load_src_block();
+  clear_sums(1);
+  if (ana_tid() == 0)
+  {
+    s_xs[e_bo + 0] = pred_x;
+    s_ys[e_bo + 0] = pred_y;
+  }
+  memoryBarrierShared();
+  barrier();
+  eval_batch(1, false);
+  ck_bsad = s_sl[e_bo + 0] + cand_sc(0);
+  ck_min = ck_bsad;
+  barrier();
+
+  if (ck_bsad > A.th_sad)
+    refine_run(A.search_type, A.radius);
+
+  if (ana_tid() == 0)
+  {
+    PI32(A.out_vec).v[3 * idx] = ck_bx;
+    PI32(A.out_vec).v[3 * idx + 1] = ck_by;
+    PI32(A.out_vec).v[3 * idx + 2] = ck_bsad;
+  }
+}

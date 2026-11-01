@@ -1,0 +1,86 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// k_search of Sources/cuda/mvcuda_analyse.cu: one workgroup per slice of block rows (the CPU's slices), the blocks of a
+// slice one after the other (meander order), the candidates of a block spread over the workgroup. A block whose SAD is
+// above badSAD (the CPU would run its wide search, which depends on a count shared by the slices) sets the bad flag: the
+// host then returns MVCUDA_NEEDS_CPU.
+
+#define ANA_WG 256
+layout(local_size_x = ANA_WG) in;
+
+#include "ana_level.glsl"
+
+shared int s_prev[3]; // the previous block of the row (left predictor)
+
+void main()
+{
+  const int tid = ana_tid();
+  const int slice = int(gl_WorkGroupID.x);
+  const int beg = slice * A.n_blk_y / A.n_slices, end = (slice + 1) * A.n_blk_y / A.n_slices;
+  const int nbx = A.n_blk_x;
+  // rows of this dispatch (the host cuts the slices into chunks of rows so that no dispatch runs for long: a row starts
+  // without a left neighbour, so nothing but the vectors in memory passes from one chunk to the next)
+  const int r0 = beg + A.chunk * A.chunk_rows, r1 = min(end, r0 + A.chunk_rows);
+  for (int blky = r0; blky < r1; blky++)
+  {
+    const int dir = ((blky & 1) == 0 || A.meander == 0) ? 1 : -1;
+    const int start = dir == 1 ? 0 : nbx - 1;
+    const bool is_top = blky == beg, is_bottom = blky == end - 1;
+    for (int it = 0; it < nbx; it++)
+    {
+      const int blkx = start + it * dir;
+      const int idx = blky * nbx + blkx;
+      block_setup(blkx, blky);
+      if (tid == 0)
+      {
+        // vectors of this workgroup's slice were written by this invocation (or by the interpolation dispatch)
+        const uint64_t v = A.vec;
+        const bool side = (dir == 1 && blkx < nbx - 1) || (dir == -1 && blkx > 0);
+        s_nb[0] = PI32(v).v[3 * idx];
+        s_nb[1] = PI32(v).v[3 * idx + 1];
+        s_nb[2] = PI32(v).v[3 * idx + 2];
+        s_nb[12] = is_top ? 0 : 1;
+        if (!is_top)
+        {
+          const int u = 3 * (idx - nbx);
+          s_nb[3] = PI32(v).v[u];
+          s_nb[4] = PI32(v).v[u + 1];
+          s_nb[5] = PI32(v).v[u + 2];
+        }
+        int q = -1;
+        if (!is_bottom && A.smallest == 0 && side)
+          q = 3 * (idx + nbx + dir);
+        else if (!is_top && side)
+          q = 3 * (idx - nbx + dir);
+        s_nb[13] = q >= 0 ? 1 : 0;
+        if (q >= 0)
+        {
+          s_nb[6] = PI32(v).v[q];
+          s_nb[7] = PI32(v).v[q + 1];
+          s_nb[8] = PI32(v).v[q + 2];
+        }
+        s_nb[14] = it > 0 ? 1 : 0;
+        s_nb[9] = s_prev[0];
+        s_nb[10] = s_prev[1];
+        s_nb[11] = s_prev[2];
+      }
+      memoryBarrierShared();
+      barrier();
+      search_block(blkx, blky, is_top);
+      if (tid == 0)
+      {
+        if (idx > 1 + beg * nbx && ck_bsad > A.bad_sad)
+          atomicExchange(PI32(A.state).v[ST_BAD], 1);
+        PI32(A.vec).v[3 * idx] = ck_bx;
+        PI32(A.vec).v[3 * idx + 1] = ck_by;
+        PI32(A.vec).v[3 * idx + 2] = ck_bsad;
+        s_prev[0] = ck_bx;
+        s_prev[1] = ck_by;
+        s_prev[2] = ck_bsad;
+      }
+      memoryBarrierShared();
+      barrier();
+    }
+  }
+}
