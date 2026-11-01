@@ -333,6 +333,34 @@ namespace
     glob_estimate(vec, n_blk, freq, glob_out, use_global, threadIdx.x, blockDim.x);
   }
 
+  // payload header of the slice path, written on the device into the cleared buffer (no host-to-device copy: a copy above
+  // about 100 KiB goes to the copy engine, whose in-order queue then held every later upload behind this call's stream
+  // and serialised all analyses from 752x576 frames up, E1)
+  struct PayHeader
+  {
+    int words, nl;
+    int pos[MVCUDA_MAX_LEVELS], val[MVCUDA_MAX_LEVELS];
+  };
+  __global__ void k_pay_header(int *pay, const PayHeader h)
+  {
+    const int t = threadIdx.x;
+    if (t == 0)
+    {
+      pay[0] = h.words;
+      pay[1] = 1;
+    }
+    if (t < h.nl)
+      pay[h.pos[t]] = h.val[t];
+  }
+
+  // the slice path's result to the pinned host buffer, written by the SMs (as k_wave's host_out): a device-to-host copy
+  // waits in the copy engine's queue for this call's kernels and holds the uploads queued behind it (E1)
+  __global__ void k_pay_out(int *__restrict__ host, const int *__restrict__ pay, int n)
+  {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+      host[i] = __ldcg(pay + i);
+  }
+
   __device__ __forceinline__ int median3(int a, int b, int c)
   {
     if (a < b)
@@ -3235,7 +3263,6 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // the bad flag
   const size_t pay_alloc = pay_bytes + wave_bytes;
   int *h_stage = (int *)mvc::pin_alloc(pay_alloc); // pinned copy of that buffer (pageable copies block inside the driver)
-  std::vector<int> host;
   WaveCall wc = {};
 
   int bad = 0;
@@ -3290,19 +3317,19 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     }
     else
     {
-      // the payload header and a cleared bad flag, through the pinned buffer (also the result's way back: same stream)
-      int *h = h_stage;
-      if (!h)
+      // the payload header and a cleared bad flag, made on the device (memset + k_pay_header; see k_pay_header for why
+      // not a copy of a host buffer)
+      PayHeader ph = {};
+      ph.words = words;
+      ph.nl = nl;
+      for (int l = 0; l < nl; l++)
       {
-        host.assign(words + 1, 0);
-        h = host.data();
+        ph.pos[l] = offs[l] - 1;
+        ph.val[l] = nbx[l] * nby[l] * 3 + 1;
       }
-      std::memset(h, 0, pay_alloc);
-      h[0] = words;
-      h[1] = 1;
-      for (int l = nl - 1; l >= 0; l--)
-        h[offs[l] - 1] = nbx[l] * nby[l] * 3 + 1;
-      AN_CHECK(cudaMemcpyAsync(d_pay, h, pay_alloc, cudaMemcpyHostToDevice, st));
+      AN_CHECK(cudaMemsetAsync(d_pay, 0, pay_alloc, st));
+      k_pay_header<<<1, 32, 0, st>>>(d_pay, ph);
+      AN_CHECK(cudaGetLastError());
       AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
     }
     bool wave_gen = false;
@@ -3514,7 +3541,11 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     if (self_finish)
       ; // k_wave hands the result over itself
     else if (h_stage)
-      AN_CHECK(cudaMemcpyAsync(h_stage, d_pay, pay_alloc, cudaMemcpyDeviceToHost, st));
+    {
+      const int n = (int)(pay_alloc / sizeof(int));
+      k_pay_out<<<(n + 255) / 256 < 64 ? (n + 255) / 256 : 64, 256, 0, st>>>(h_stage, d_pay, n);
+      AN_CHECK(cudaGetLastError());
+    }
     else
     {
       AN_CHECK(cudaMemcpyAsync(payload, d_pay, pay_bytes, cudaMemcpyDeviceToHost, st));

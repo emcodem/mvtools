@@ -167,13 +167,17 @@ result depends on the number of slices. The GPU reproduces that:
   faster GPU mode. To keep the output independent of where a frame was searched, the CPU fallback of such a filter
   searches in one slice too, whatever `mt` says.
 
+Before 2026-11-01b the slice search (`meander=true`) was serialised for frames larger than about 736x576: its result
+buffer went through the GPU's copy engine, whose queue held every later upload (GPU_PIPELINE_PLAN.md section 31). HD
+QTGMC with `meander=true` was then slower than the CPU; it is now about 6x faster at the same, byte-identical result.
+
 **Speed of the wider settings.** With `meander=true`, exhaustive radii above 3 (the finest level with `search=3`, every
 coarse level with `searchparam` above 3) use a parallel exhaustive pass: the reference area of all candidates in
 shared memory, candidates pruned by their vector cost like the CPU's, one parallel minimum. Measured (RTX 5090 against
 24 CPU threads, MAnalyse only): PAL 1500 frames Prefetch 8, `pelsearch=24`: 8 bit 1.31 ms/frame (CPU 1.54), 10 bit 1.75
-(CPU 2.12); UHD 10 bit 4:2:2, 32x32 blocks: `pelsearch=8` 31 ms/frame (CPU 24), `pelsearch=24` 52 (CPU 31). At UHD the
-GPU searches of different frames do not run at the same time yet (GPU_PIPELINE_PLAN.md section 29), so there the CPU is
-still faster for large radii. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
+(CPU 2.12). UHD 10 bit 4:2:2, 32x32 blocks, 40 frames, Prefetch 3: `pelsearch=8` 0.52 s (CPU 0.85),
+`pelsearch=24` 0.77 s (CPU 1.08); before 2026-11-01b the GPU searches of different frames did not run at the same time
+there (GPU_PIPELINE_PLAN.md section 31) and the CPU was faster. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
 slower); `trymany` uses the parallel pass for its exhaustive refines.
 `trymany` with `meander=false` uses the slice kernel with one slice (the wavefront kernel does not implement it).
 `pel=4` keeps 16 sub-pel planes per plane on the device (4 times the memory of pel 2).
@@ -424,8 +428,9 @@ in a script, as uconvert's `uc_frc_nvof` does.
 
 `qtgmc\make_qtgmc_gpu.py` makes a patched copy of `QTGMC.avsi` (`QTGMC_gpu.avsi`) that uses these filters and the
 mvtools2 `gpu` parameters. Run it with `python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]`. The source file is only
-read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false), and
-`global QTGMC_gpu_meander = true` keeps MAnalyse on the slice search instead of the wavefront search.
+read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false).
+`QTGMC_gpu_meander` (default true) keeps MAnalyse on the slice search, so the result is byte-identical to the stock CPU
+QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (faster, slightly different vectors).
 
 The Windows release bundle wraps this: `QTGMC_gpu_load.avsi` (source: `qtgmc\bundle\`) loads every DLL and script from
 its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all the QTGMC GPU switches (`QTGMC_gpu`,

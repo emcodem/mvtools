@@ -1310,3 +1310,38 @@ part the GPU does not touch (decode, CPU-only filters; section 28 T6), so 5x is 
 - X4 Tolerance-based fallback instead of the exact one: fewer forced CPU frames; possible flicker at fallback frames.
 
 **Suggested order:** E1, then section 28 T0-T2, then decide on X1 (e.g. an `exact=false` mode) with a visual comparison.
+
+## 31. E1 found and fixed: copy-engine queue serialised the slice search above 100 KiB payloads (2026-11-01, release 2026-11-01b)
+
+Trigger: user's HD QTGMC Fast (bundle 2026-11-01, default meander=true) ran at 0.75x realtime, slower than the CPU.
+**Cliff, not scaling:** SD content resized: 736x576 0.25 s / 200 frames, 752x576 1.54 s; 720x576 fast, 720x592 slow.
+The threshold is the slice path's payload buffer (vectors + header, one per MAnalyse call) crossing 100 KiB (99,744 B at
+720x576 fast, 106,668 B at 768x576 slow). Prefetch, MVCUDA_CACHE_MB, MVCUDA_SPIN, CUDA_DEVICE_MAX_CONNECTIONS: no effect.
+**Mechanism (from nsys, profile\out\nsys\e1_*.sqlite):** the call initialised the payload with a pinned H2D
+cudaMemcpyAsync on its leased stream and fetched it with a D2H cudaMemcpyAsync. Up to ~100 KiB the driver puts an H2D copy
+inline in the command stream; above it the copy goes to the copy engine, whose queue is in order across streams. That
+copy (behind its own stream's super/k_level work, which waits on s14) and the D2H result copies (waiting on their k_search)
+held every later upload on s13 (source frames); s14 (cudafilters pipeline, in order) waited 1.6 s on those uploads; the
+next analyses' k_level0 wait on s14: k_search never overlapped (max 1 at HD, 8 at PAL). Not a hardware/SM limit: identical
+kernel configs and durations on both sides of the cliff.
+**Fix (mvcuda_analyse.cu, slice path only):** payload cleared with cudaMemsetAsync + header written by k_pay_header (no
+H2D copy); result written to the pinned buffer by k_pay_out through UVA (as k_wave's host_out; no D2H copy). Test DLL
+`profile\build_e1` (dev build sm_120; mvtools2 / cudafilters / avstp = build_rel18).
+**Results (meander=true, QTGMC Fast):** 768x576 SD content 1.59 -> 0.23 s; CrowdRun HD 8 bit 200 frames 4.77 -> 0.86 s;
+user's script (ProRes 10-bit 4:2:2 1080i, 500 frames + Spline64Resize) 13.1-13.5 -> 2.2-2.3 s (meander=false: 1.34-1.45 s);
+SD PAL 1460 frames 1.9 -> 1.8 s. md5 identical to the release DLL and to stock CPU QTGMC (HD 30A6BACFB084, SD B9ACFDE1F1AE);
+golden 85/85, run_s234 63/63, run_partm 27/27.
+**Found on the way (pre-existing, not caused by the fix):** SD content resized to 768x576 (SeparateFields.Spline36Resize.Weave,
+200 frames) gives two md5 classes run to run with the release DLL too (frame 24 only); not investigated.
+**Release 2026-11-01b:** set `profile\build_rel19` (build.bat mvtools_cuda.dll all archs; mvtools2 / cudafilters / avstp = build_rel18).
+Tests on it: golden 85/85, run_s234 63/63, run_partm 27/27, cf_regression 65/65, presetcheck -Fallback Fast / Slower / Placebo
+ALL PASS. QTGMC (bundle loader, Prefetch 12, rtime best of 2, output frames), CPU / GPU meander=true / GPU meander=false:
+PAL 1500 Fast 3.4 / 1.9 / 0.9, Slower 7.0 / 5.3 / 2.0, Placebo 13.6 / 12.7 / 5.9; XDCAM HD 500 Fast 7.0 / 1.9 / 0.9,
+Slower 15.0 / 5.4 / 2.1, Placebo 35.9 / 16.3 / 9.1 (old meander=true HD: 12.3 / 34.0 / 94.2). UHD MAnalyse 40 frames
+(build_s5p uhd8/uhd24): pelsearch 8 1.11 -> 0.52 s (CPU 0.85), 24 1.68 -> 0.77 s (CPU 1.08): the section 29 'never overlap'
+was this bug. Exactness meander=true vs stock CPU (framemd5): PAL Fast/Slower/Placebo, HD Fast/Placebo equal. HD Slower:
+stock CPU QTGMC itself differs run to run (2-8 frames each run, different frames), Fast 1 frame in 1 of 6 runs; old and
+new GPU DLL show the same kind of variation (old/new give the same alternative values, e.g. frame 13); not investigated.
+**Open:** the remaining gap to meander=false
+at HD (k_search serial chain, section 30 T2), other copy-engine copies that wait on kernels (CudaDownload D2H on s15,
+mvcuda_recalc / flow / nvof_vec stage copies) could hold uploads the same way.

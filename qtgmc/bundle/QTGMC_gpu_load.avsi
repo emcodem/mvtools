@@ -25,7 +25,9 @@ Import(QTGMC_gpu_bundle + "scripts\Zs_RF_Shared.avsi")
 Import(QTGMC_gpu_bundle + "scripts\SMDegrain.avsi")
 Import(QTGMC_gpu_bundle + "scripts\QTGMC_gpu.avsi")
 
-# every GPU switch on: search clip, motion analysis, NNEDI3 and the output side on the GPU (meander=false motion search)
+# every GPU switch on: search clip, motion analysis, NNEDI3 and the output side on the GPU. The motion search follows
+# QTGMC_gpu_meander (scripts\QTGMC_gpu.avsi, default true = byte-identical to the stock CPU QTGMC; set
+# global QTGMC_gpu_meander = false after QTGMC_gpu_on() for the faster wavefront search with slightly different vectors)
 function QTGMC_gpu_on()
 {
 	global QTGMC_gpu = true
