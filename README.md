@@ -5,8 +5,8 @@ Still supporting Windows XP.
 x86 and x64 versions
 From December 20, 2020: Linux port
 This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 (`gpu=true`, the `cudafilters` plugin and QTGMC
-on the GPU, see "GPU" below); VapourSynth support through `mvtools_vsbridge` (namespace `mvpf`, work in progress, see
-"VapourSynth" below)
+on the GPU, see "GPU" below); VapourSynth support for mvtools2 and cudafilters through `mvtools_vsbridge` (namespaces
+`mvpf` and `cuda`, output bit-identical with AviSynth+; Linux done, Windows to follow; see "VapourSynth" below)
 
 File: mvtools2.dll
 
@@ -154,13 +154,56 @@ output. Needs an NVIDIA GPU with compute capability 8.0+ (RTX 30xx and newer) an
   github.com/emcodem/mvtools.
 * Design notes and measurements: `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`, `DECISIONS.md`.
 
-## VapourSynth (this branch, work in progress)
+## VapourSynth (this branch; Linux, Windows to follow)
 
 Not part of the Windows release bundles yet.
 
 mvtools2 runs under VapourSynth (API 4.0, so R55 or newer; tested with R81) unchanged: `mvtools_vsbridge` is a small AviSynth+ host on top of
 the VapourSynth API, and `libmvtools2.so` / `mvtools2.dll` only gained a `VapourSynthPluginInit2` entry point that loads
 it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOURSYNTH_PLAN.md`.
+
+### Quick start
+
+Put these files into one folder (VapourSynth's plugin folder for autoloading, or any folder you load from):
+
+| File | Needed for |
+|---|---|
+| `libmvtools2.so` | mvtools2 (`core.mvpf`) |
+| `libmvtools_vsbridge.so` | always: the bridge both plugins load from their own folder |
+| `libmvtools_cuda.so` | optional: `gpu=true` and the cudafilters' GPU paths (without it: CPU, see below) |
+| `libcudafilters.so` | optional: cudafilters (`core.cuda`) |
+| `nnedi3_weights.bin` | optional: CudaNNEDI3 on Linux |
+
+Denoising on the CPU (the AviSynth function and parameter names, `Documentation/mvtools2.html` applies):
+
+    import vapoursynth as vs
+    core = vs.core
+    core.std.LoadPlugin('/path/to/plugins/libmvtools2.so')   # not needed when autoloaded
+
+    clip = core.lsmas.LWLibavSource('input.mkv')             # any source filter
+    sup = core.mvpf.MSuper(clip, pel=2)
+    bv1 = core.mvpf.MAnalyse(sup, isb=True, delta=1, blksize=16, overlap=8)
+    fv1 = core.mvpf.MAnalyse(sup, isb=False, delta=1, blksize=16, overlap=8)
+    bv2 = core.mvpf.MAnalyse(sup, isb=True, delta=2, blksize=16, overlap=8)
+    fv2 = core.mvpf.MAnalyse(sup, isb=False, delta=2, blksize=16, overlap=8)
+    core.mvpf.MDegrain2(clip, sup, bv1, fv1, bv2, fv2, thSAD=400).set_output()
+
+The same on the GPU (`Documentation/gpu.md`): add `gpu=True` to MSuper, MAnalyse and MDegrain2. To keep the frames on
+the GPU between filters, wrap the chain in cudafilters' upload / download:
+
+    core.std.LoadPlugin('/path/to/plugins/libcudafilters.so')
+    u = core.cuda.CudaUpload(clip)
+    sup = core.mvpf.MSuper(u, pel=2, gpu=True)
+    bv = core.mvpf.MAnalyse(sup, isb=True, blksize=16, overlap=8, gpu=True)
+    fv = core.mvpf.MAnalyse(sup, isb=False, blksize=16, overlap=8, gpu=True)
+    out = core.mvpf.MDegrain1(u, sup, bv, fv, thSAD=400, gpu=True)
+    core.cuda.CudaDownload(out).set_output()
+
+Frame-rate conversion works the same way: `core.mvpf.MFlowFps(clip, sup, bv, fv, num=60000, den=1001, gpu=True)`.
+Check stderr on the first run: a missing bridge or GPU library is reported there, never as a crash. Without
+`libmvtools_cuda.so`, mvtools2 computes `gpu=True` on the CPU with the same output; a cudafilter whose CPU fallback is an
+AviSynth-only filter stops with an error instead (set `MVBRIDGE_FALLBACK=nearest` to accept a close, not bit-identical,
+VapourSynth replacement; details below).
 
 * Build: on by default (`-DMVTOOLS_VAPOURSYNTH=OFF` to skip); no VapourSynth installation needed (`VapourSynth4.h` is
   in `Sources/include`). Status: Linux done; Windows waits for the CMake build of this branch (the MSVC solution does
@@ -182,7 +225,10 @@ it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOUR
 * Formats: Gray, YUV 4:2:0 / 4:2:2 / 4:4:4, 8-16 bit, 32 bit float where mvtools2 supports it. Vector
   clips appear in VapourSynth as Gray8 clips; pass them only to `mvpf` filters: a vector or super clip that went through
   another VapourSynth filter (e.g. `std.Trim`) is not recognised.
-* Output is bit-identical with AviSynth+ on the same system (17 CPU and 7 GPU test chains, `vsbridge/test/compare.py`).
+### Details
+
+* Output is bit-identical with AviSynth+ on the same system (17 CPU, 7 GPU and 17 cudafilters test chains,
+  `vsbridge/test/compare.py`; further cudafilters tests against AviSynth+ on Windows in `vsbridge/test/`).
   `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
   it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan.
 * cudafilters: namespace `cuda` (`core.cuda.CudaUpload`, ...), `libcudafilters.so` next to the bridge. All filters work
