@@ -1,6 +1,6 @@
 // CudaGaussResize(clip, width, height, src_left, src_top, src_width, src_height, p, b, s, force, keep_center, placement) and
 // CudaBilinearResize(clip, width, height, src_left, src_top, src_width, src_height, force, keep_center, placement):
-// AviSynth+ GaussResize / BilinearResize on the GPU (GPU_PIPELINE_PLAN.md section 15, stage 5: QTGMC blurs the search clip with
+// AviSynth+ GaussResize / BilinearResize on the GPU (QTGMC blurs the search clip with
 // GaussResize(w, h, 0, 0, w + eps, h + eps, p=2); SrchClipPP 1 uses BilinearResize to half size and back), bit for bit. The passes, their order and the programs follow
 // FilteredResize::CreateResize / CreateResizeH / CreateResizeV and the FilteredResizeH / V constructors of AviSynth+ 3.7.5
 // (resample.cpp, GPL v2 or later); the arithmetic is in mvcuda_resample.cu. The CPU filter with the same arguments is

@@ -1,4 +1,4 @@
-// CudaBob(clip, b, c, height): AviSynth+ Bob on the GPU (GPU_PIPELINE_PLAN.md section 15, stage 1), bit for bit.
+// CudaBob(clip, b, c, height): AviSynth+ Bob on the GPU, bit for bit.
 // Bob = SeparateFields, then FilteredResizeV of every field (Mitchell-Netravali kernel b, c; subrange_top +0.25 for top
 // fields and -0.25 for bottom fields; Fieldwise picks by the field parity). The GPU reads the field rows straight from
 // the frame (row step 2). Returns token frames (CudaDownload gives normal frames). The CPU Bob with the same arguments is

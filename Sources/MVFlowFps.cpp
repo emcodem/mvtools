@@ -204,7 +204,7 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
   isRGB = vi.IsPlanarRGB() || vi.IsPlanarRGBA(); // planar only
   needDistinctChroma = !is444 && !isGrey && !isRGB;
 
-  // ---- GPU rendering: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
+  // ---- GPU rendering: only for the configuration the GPU code reproduces bit-exactly
   if (gpu_flag)
   {
     const bool sharp_ok = super_param_valid(params) && super_param_sharp(params) == 2 && !super_param_pelclip(params);

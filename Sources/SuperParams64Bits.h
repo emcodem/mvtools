@@ -38,7 +38,7 @@ public:
   unsigned char param; // SUPER_PARAM_ flags (bit 0, upstream) and our MSuper settings (bits 1-7), see below
 };
 
-// Bits 1-7 of param (REBASE_PLAN.md D4): MSuper's own settings, for the GPU paths of MAnalyse / MRecalculate / MFlowFps
+// Bits 1-7 of param (this fork; upstream uses only bit 0): MSuper's own settings, for the GPU paths of MAnalyse / MRecalculate / MFlowFps
 // (they rebuild the sub-pel planes themselves, bit-identical only for matching settings) and for lite super clips.
 //   bits 1-4  rfilter * 3 + sharp (rfilter 0..4, sharp 0..2: 15 values, 15 is never written)
 //   bit 5     pelclip used

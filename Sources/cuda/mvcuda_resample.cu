@@ -1,4 +1,4 @@
-// Resampling with AviSynth+ FilteredResizeV semantics (GPU_PIPELINE_PLAN.md section 15, stage 1: Bob). The programs are
+// Resampling with AviSynth+ FilteredResizeV semantics (used by CudaBob). The programs are
 // made on the host by the plugin with AviSynth's own code (cudafilters\Resample.cpp); this file only evaluates them,
 // with the integer arithmetic of AviSynth's C resampler (avs_core\filters\resample.cpp, resize_v_c_planar).
 

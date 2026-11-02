@@ -1,5 +1,5 @@
 # Same chain as the AviSynth+ Linux reference ~/build/test/lin_gpu.avs (MSuper, MAnalyse, MRecalculate, MFlowFps;
-# UHD 10-bit 4:2:2, MAnalyse / MRecalculate on the GPU): the framemd5 must be identical (VAPOURSYNTH_PLAN.md, verification).
+# UHD 10-bit 4:2:2, MAnalyse / MRecalculate on the GPU): the framemd5 must be identical.
 import os
 import vapoursynth as vs
 from vstest import core, load_mvtools, raw_source

@@ -3,8 +3,8 @@
 python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]
 
 The source is read only. The global QTGMC_gpu (default false) is declared at the top of the copy; set
-`global QTGMC_gpu = true` after Import to switch the GPU on. Calls changed (MVTools2 with the gpu parameter, see
-GPU_QTGMC_PLAN.md): the analysis MSuper (srchClip.MSuper), MAnalyse, MRecalculate. All other mvtools calls are untouched.
+`global QTGMC_gpu = true` after Import to switch the GPU on. Calls changed (MVTools2 with the gpu parameter): the
+analysis MSuper (srchClip.MSuper), MAnalyse, MRecalculate. All other mvtools calls are untouched.
 """
 import re
 import sys
@@ -29,7 +29,7 @@ def main():
     sub('msuper', r'(srchClip\.MSuper\( pel=SubPel, sharp=SubPelInterp, hpad=hpad, vpad=vpad, chroma=ChromaMotion)(, mt=bomt)? \)',
         lambda m: m.group(1) + (m.group(2) or '') + ', gpu=QTGMC_gpu )')
     # MAnalyse: "DCT=DCT, chroma=ChromaMotion, mt=bomt )" and "DCT=DCT, chroma=ChromaMotion ) : NOP()"
-    # (meander=false with the GPU: wavefront search, GPU_PIPELINE_PLAN.md W; QTGMC_gpu_meander=true keeps the slice kernel = stock result)
+    # (meander=false with the GPU: wavefront search; QTGMC_gpu_meander=true keeps the slice kernel = stock result)
     sub('manalyse_mt', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion, mt=bomt) \)',
         r'\1, gpu=QTGMC_gpu, meander=!QTGMC_gpu || QTGMC_gpu_meander )')
     sub('manalyse', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion) \) : NOP\(\)',
@@ -40,11 +40,11 @@ def main():
     # ShutterBlur MRecalculate
     sub('mrecalc_sb', r'(truemotion=TrueMotion, lambda=Lambda, pnew=PNew, DCT=DCT, chroma=ChromaMotion) \) :', r'\1, gpu=QTGMC_gpu ) :')
 
-    # GPU search clip (cudafilters.dll, GPU_PIPELINE_PLAN.md sections 17 and 22): bob, temporal soften, merges,
+    # GPU search clip (cudafilters.dll): bob, temporal soften, merges,
     # KeepOnlyBobShimmerFixes, RemoveGrain 12, Gauss / Bilinear resize, the SrchClipPP 3 mt_lutxy pair as Cuda* filters,
     # bit-exact; for every preset's pre-filter (TR0 0..2, SrchClipPP 0..3, with or without chroma motion), 4:2:2 / 4:4:4 /
-    # Y input, 4:2:0 without chroma motion (with it, Slower / Very Slow / Placebo differ from the CPU chain: open, see
-    # GPU_PIPELINE_PLAN.md section 25 B4), 8 to 16 bit (stages without a GPU path at a bit depth fall back to their CPU
+    # Y input, 4:2:0 without chroma motion (with it, Slower / Very Slow / Placebo differ from the CPU chain; cause not found
+    # yet), 8 to 16 bit (stages without a GPU path at a bit depth fall back to their CPU
     # filters inside)
     sub('srchclip_gpu', r'(\n\tsrchClip    = srchcheck         \? srchClip : \\\n(?:[^\n]*\\\n)*[^\n]*\n)',
         lambda m: m.group(1) + '\tsrchClip    = (QTGMC_gpu && QTGMC_gpu_search && !srchcheck && InputType == 0 && UseEdiExt == 0 && TR0 >= 0 && TR0 <= 2 \\\n'
@@ -56,7 +56,7 @@ def main():
     # back to the plugin itself where it is not exact) with QTGMC_gpu_edi
     sub('nnedi3', r'Input\.NNEDI3\(', 'Input.QTGMC_gpu_nnedi3(')
 
-    # GPU output side (GPU_PIPELINE_PLAN.md sections 20 and 22): with QTGMC_gpu_out, for the structures it reproduces
+    # GPU output side: with QTGMC_gpu_out, for the structures it reproduces
     # (every preset's defaults: TR1 0..2, TR2 0..3, SMode 0..2 incl. Precise, SLMode 0 / 2 with SLRad 1 / 3, Sbb 0..3,
     # SubPel 1 / 2, grain / noise restore of a CPU-made noise clip), edi -> MSuper -> MCompensate -> MDegrain -> resharp ->
     # limit -> back blend -> MDegrain -> KeepOnlyBobShimmerFixes -> noise runs on the GPU; addNoise2 is that result,

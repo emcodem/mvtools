@@ -1,5 +1,5 @@
 // CudaMerge / CudaMergeLuma / CudaMergeChroma(clip, clip2, weight): AviSynth+ Merge, MergeLuma, MergeChroma on the GPU
-// (GPU_PIPELINE_PLAN.md section 15), bit for bit with what AviSynth+ 3.7.5 runs on SSE2 / AVX2 CPUs. The per-plane
+// bit for bit with what AviSynth+ 3.7.5 runs on SSE2 / AVX2 CPUs. The per-plane
 // decisions follow the GetFrame functions of merge.cpp; the arithmetic is in mvcuda_merge.cu. Returns token frames (or a
 // source frame unchanged where the CPU filter returns it unchanged). The CPU filter is built too (VideoInfo, fallback).
 

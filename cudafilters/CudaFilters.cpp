@@ -1,6 +1,6 @@
-// cudafilters.dll: AviSynth+ filters that run on the GPU through mvtools_cuda.dll (GPU_PIPELINE_PLAN.md). This file:
+// cudafilters.dll: AviSynth+ filters that run on the GPU through mvtools_cuda.dll. This file:
 // the library loader, the token-frame helpers every GPU filter of the plugin uses, CudaUpload and CudaDownload
-// (milestone D), and the plugin entry point.
+// and the plugin entry point.
 //
 // Token frames: a GPU filter keeps its result in device memory and returns an ordinary frame of the declared format
 // whose first bytes (row 0 of the Y plane) hold a MvCudaTokenHeader. Every 8th luma row of a token frame is black, so

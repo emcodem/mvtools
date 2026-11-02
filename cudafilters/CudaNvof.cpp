@@ -1,6 +1,6 @@
 // CudaNVOFAnalyse(clip, isb, delta, blksize, blksizeV, overlap, overlapV, pel, hpad, vpad, chroma, preset): motion vectors
 // from NVIDIA's optical flow accelerator (NVOFA) as a vector clip in MAnalyse's format, for MRecalculate, MFlowFps,
-// MDegrain, MCompensate (NVOF_FILTER_PLAN.md). It takes the plain clip: no MSuper pyramid is searched. One level
+// MDegrain, MCompensate. It takes the plain clip: no MSuper pyramid is searched. One level
 // (nLvCount 1), vectors at 1/pel pixel, clamped to the area MAnalyse's search reaches with the given padding (hpad / vpad
 // must be those of the MSuper used downstream). NOT MAnalyse's search, and not bit-exact with anything on the CPU.
 // CudaNVOFAvailable() tells a script whether NVOFA can be used.

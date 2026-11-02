@@ -1,5 +1,5 @@
 // NVIDIA's optical flow accelerator (NVOFA, Optical Flow SDK through nvofapi64.dll of the driver): the session pool behind
-// mvcuda_nvof_token (mvcuda_nvof_vec.cu, cudafilters' CudaNVOFAnalyse). Background: docs/dev/ARCHITECTURE.md (CudaNVOFAnalyse), compare/nvofa_frc.
+// mvcuda_nvof_token (mvcuda_nvof_vec.cu, cudafilters' CudaNVOFAnalyse). SDK: https://github.com/NVIDIA/NVIDIAOpticalFlowSDK
 #ifndef MVCUDA_NVOFA_H
 #define MVCUDA_NVOFA_H
 

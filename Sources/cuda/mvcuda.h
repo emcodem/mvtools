@@ -201,7 +201,7 @@ MVCUDA_API int mvcuda_flow_host(const MvCudaSuperParams *sp, const MvCudaFlowPar
 // goes away)
 MVCUDA_API void mvcuda_cache_clear();
 
-// ---- device frames and tokens (GPU_PIPELINE_PLAN.md section 4, milestone D), see mvcuda_frames.cu ---------------------
+// ---- device frames and tokens, see mvcuda_frames.cu ---------------------
 // A token stands for one frame kept in device memory. GPU filters return ordinary AviSynth frames whose first bytes hold a
 // MvCudaTokenHeader instead of the picture ("token frames"); a consumer finds the device frame by the token. The registry
 // has a byte budget (MVCUDA_CACHE_MB fixes it; default 256 MB, grown while frames have to be made again, up to a third of

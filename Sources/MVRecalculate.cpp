@@ -426,7 +426,7 @@ MVRecalculate::MVRecalculate(
     srd._analysis_data_divided = analysisDataDivided;
   }
 
-  // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md)
+  // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly
   if (gpu_flag)
   {
     const bool super_ok = super_param_gpu_rebuildable(params); // SuperParams64Bits.h, D4

@@ -118,7 +118,7 @@ private:
   MV_FORCEINLINE void use_block_uv(const BYTE * &p, int &np, int &WRef, bool isUsable, const MVClip &mvclip, int i, const MVPlane *pPlane, const BYTE *pSrcCur, int xx, int nSrcPitch);
   Denoise1to6Function *get_denoise123_function(int BlockX, int BlockY, int _bits_per_pixel, bool _out16_flag, int _level, arch_t _arch);
 
-  // GPU path (MDegrain1 gpu=true, GPU_PIPELINE_PLAN.md section 20): source and super from token clips, token output.
+  // GPU path (gpu=true): source and super from token clips, token output.
   // One lock per instance: a token regeneration can call in from another thread.
   bool _super_lite = false;
   bool _gpu_ok = false;

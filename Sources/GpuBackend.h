@@ -1,6 +1,6 @@
 // Optional GPU backend: loads mvtools_cuda.dll (next to mvtools2.dll) at run time. No CUDA types or link
 // dependencies in this plugin; if the library, a device or a matching API version is missing, usable() is false and the
-// filters run their CPU code. See GPU_PLAN.md.
+// filters run their CPU code.
 
 #ifndef __MV_GPU_BACKEND__
 #define __MV_GPU_BACKEND__
@@ -82,7 +82,7 @@ public:
   // cudafilters does: a filter that does not understand tokens shows obvious stripes, not a plausible picture)
   static void write_token(PVideoFrame &dst, const MvCudaTokenHeader &h);
 
-  // One input picture of a GPU call (GPU_PIPELINE_PLAN.md section 25, usage rule: token frames in -> token frames out,
+  // One input picture of a GPU call (usage rule: token frames in -> token frames out,
   // normal frames in -> normal frames out): a device frame already (token), or a host picture that with_inputs uploads
   // once under a content key (the clip and the frame number), shared by every GPU filter reading that picture.
   struct Input

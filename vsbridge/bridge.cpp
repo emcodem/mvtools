@@ -1,4 +1,4 @@
-// mvtools_vsbridge: the AviSynth+ host side under VapourSynth. See bridge_core.h and VAPOURSYNTH_PLAN.md.
+// mvtools_vsbridge: the AviSynth+ host side under VapourSynth. See bridge_core.h.
 //
 // Pieces, in file order:
 //   frames      VideoFrame / VideoFrameBuffer construction (core mode), wrapping VS frames as AviSynth frames and back
@@ -756,7 +756,7 @@ PVideoFrame VSClip::GetFrame(int n, IScriptEnvironment *env)
   if (!f)
   {
     // not in the request set: learn the offset for the next frames, then fetch synchronously (safe in VS: the pool
-    // thread is parked as reserveThread, see VAPOURSYNTH_PLAN.md step 1)
+    // thread is parked as reserveThread during the wait)
     // learned only for the filter whose GetFrame this is (not e.g. a producer regenerating a GPU frame on its behalf)
     BridgeFilter *owner = c ? c->filter : nullptr;
     const int input_index = owner ? owner->input_of(this) : -1;
@@ -1294,7 +1294,7 @@ AVSValue call_function(const FuncDef &def, const AVSValue &args, const char *con
 // constructor (and takes its VideoInfo from it) even when the GPU computes every frame; it pulls fallback frames only
 // when the GPU is unusable (library or device missing, format not covered) or fails for a frame (device allocation
 // failed, kernel error). A stand-in has the VideoInfo the AviSynth+ filter would report, so the GPU path runs and stays
-// bit-identical. What a fallback frame is, is a global choice (VAPOURSYNTH_PLAN.md, step 4):
+// bit-identical. What a fallback frame is, is a global choice:
 //   MVBRIDGE_FALLBACK=strict   (default) an error naming the missing filter: VS output is AviSynth+'s or an error
 //   MVBRIDGE_FALLBACK=nearest  the closest VapourSynth filter (std.Merge, ...): not bit-identical to AviSynth+; names
 //                              without a mapping stay an error

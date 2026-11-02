@@ -1,5 +1,6 @@
-// GPU version of MRecalculate (GPU_PLAN.md M4), bit-exact against PlaneOfBlocks::recalculate_mv_slice for the
-// production configuration: exhaustive search (search=3), smooth 0/1, 16-bit samples, luma + chroma SAD.
+// GPU version of MRecalculate, bit-exact against PlaneOfBlocks::recalculate_mv_slice for the
+// configurations GpuBackend admits: every search type within the radius limits, smooth 0/1, pel 1 / 2 / 4, 8- and
+// 16-bit samples, luma (+ chroma) SAD.
 //
 // Every block is independent (it starts from the interpolated vector of the previous analysis and never reads
 // neighbour results of the current pass), so one warp handles one block. The CPU code evaluates candidates

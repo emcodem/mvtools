@@ -151,7 +151,7 @@ mv_plugin_exports(mvtools2)
 mv_plugin_exports(depan)
 mv_plugin_exports(depanestimate)
 
-# VapourSynth: mvtools_vsbridge, an AviSynth+ host for VapourSynth that runs the plugins unchanged (VAPOURSYNTH_PLAN.md).
+# VapourSynth: mvtools_vsbridge, an AviSynth+ host for VapourSynth that runs the plugins unchanged.
 # The plugins only gain a VapourSynthPluginInit2 export that opens it at run time; no VapourSynth installation is needed to
 # build (VapourSynth4.h is vendored in Sources/include).
 option(MVTOOLS_VAPOURSYNTH "Build mvtools_vsbridge (VapourSynth support)" ON)

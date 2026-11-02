@@ -140,7 +140,7 @@ private:
   std::vector <conc::AtomicInt <int> >
             _boundary_cnt_arr;
 
-  // GPU path (gpu=true, GPU_PIPELINE_PLAN.md section 20): the super clip is MSuper(gpu=true) of a token clip; output
+  // GPU path (gpu=true): the super clip is MSuper(gpu=true) of a token clip; output
   // frames are token frames. One lock per instance: a token regeneration can call in from another thread.
   bool           _super_lite;
   bool           _gpu_ok;

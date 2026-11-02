@@ -1,5 +1,5 @@
 // VapourSynth entry point of mvtools2 (namespace mvpf). The filters run unchanged through mvtools_vsbridge, a small
-// AviSynth+ host for VapourSynth that lives in its own library next to this one (VAPOURSYNTH_PLAN.md, decision 5):
+// AviSynth+ host for VapourSynth that lives in its own library next to this one:
 // this file only opens the bridge and hands it AvisynthPluginInit3. Under AviSynth+ this function is never called.
 //
 // The bridge is loaded lazily and checked like every optional library (dyn_lib.h): when it is missing or broken the

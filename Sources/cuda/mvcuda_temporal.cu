@@ -1,4 +1,4 @@
-// AviSynth+ TemporalSoften on device frames (GPU_PIPELINE_PLAN.md section 15, stage 2), bit for bit with
+// AviSynth+ TemporalSoften on device frames, bit for bit with
 // avs_core\filters\focus.cpp of AviSynth+ 3.7.5 (TemporalSoften::GetFrame, accumulate_line_c / accumulate_line_16_sse41,
 // calculate_sad_c).
 //

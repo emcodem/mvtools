@@ -1,6 +1,7 @@
-// GPU version of MAnalyse's hierarchical search (GPU_PLAN.md M3), bit-exact against GroupOfPlanes::SearchMVs /
-// PlaneOfBlocks::search_mv_slice for the production configuration: exhaustive search at every level, truemotion
-// parameters, global MV, meander, 16-bit samples, chroma on, dct 0, divide 0, no temporal predictor, tryMany off.
+// GPU version of MAnalyse's hierarchical search, bit-exact against GroupOfPlanes::SearchMVs /
+// PlaneOfBlocks::search_mv_slice for every configuration GpuBackend::search_supported admits: all search types and
+// search_coarse within the radius limits, trymany / trymanyall, pel 1 / 2 / 4, 8- and 16-bit samples, chroma on or
+// off (not: dct, divide, temporal predictor).
 //
 // Parallelism. Inside a plane the block search is a chain: with meander a block depends on its left neighbour in scan
 // order and on the block above, which snakes through the whole plane. The CPU code removes the chain by cutting the
@@ -939,7 +940,7 @@ namespace
     }
 
     // ExpandingSearch rings 1..r around the current best vector (the exhaustive refine) in one parallel pass, for
-    // radii above 3 (GPU_PIPELINE_PLAN.md section 29). All candidates share the centre, so the CPU's sequence of CheckMV
+    // radii above 3. All candidates share the centre, so the CPU's sequence of CheckMV
     // ends at the earliest candidate with the lowest full cost below the starting minimum, provided every part of the
     // cost chain is >= 0 (then an early exit against the running minimum rejects exactly what the final sum would):
     // a block-wide minimum of (cost << 15 | index). Thread per candidate, K candidates per thread and pass, the SADs
@@ -1467,7 +1468,7 @@ namespace
   };
 
   // Candidate checker for mvc_refine run by ONE warp (k_search trymany: the 7 Refines of PseudoEPZSearch in parallel,
-  // one warp each, GPU_PIPELINE_PLAN.md section 33). A batch is evaluated 8 candidates at a time (eval_multi: the loads of
+  // one warp each). A batch is evaluated 8 candidates at a time (eval_multi: the loads of
   // a group in flight together), then folded in the CPU's order with the CheckMV cost chain of AnaChecker::run_batch.
   // No shared memory and no block barrier: every lane holds every SAD (warp sums) and the same scalar state.
   struct WarpChecker
@@ -1613,9 +1614,9 @@ namespace
 
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial.
   // Threads per block: with 768 the kernel was capped at 80 registers and the SAD code spilled 2.7 KB per thread, which
-  // made the candidate rounds limited by local-memory traffic; 256 compiles without spills (GPU_PIPELINE_PLAN.md
-  // section 25, S1: FRC chain -9%).
-  // (a 512-thread variant for the exhaustive_fast levels was measured: no gain, GPU_PIPELINE_PLAN.md section 29)
+  // made the candidate rounds limited by local-memory traffic; 256 compiles without spills (uc_FRC
+  // chain -9%).
+  // (a 512-thread variant for the exhaustive_fast levels was measured: no gain)
   constexpr int SEARCH_THREADS = 256;
 
   // one Refine of trymany in one warp (one copy of the mvc_refine code for WarpChecker; two call sites in k_search)
@@ -1627,7 +1628,7 @@ namespace
       mvc_refine::refine(wk, type, radius);
   }
 
-  // PseudoEPZSearch with tryMany (GPU_PIPELINE_PLAN.md section 33): the 7 Refines around zero, global, the predictor and
+  // PseudoEPZSearch with tryMany: the 7 Refines around zero, global, the predictor and
   // predictors[0..3] run at the same time, Refine m in warp m % nwarps (they share only the phase A SADs sl7 / sc7 and the
   // predictors). Start states as the CPU: zero and global with their penalties, the predictor at its plain SAD (all
   // three taken unconditionally); Refine m >= 3 starts from predictor m - 3 when CheckMV0 takes it against
@@ -1963,7 +1964,7 @@ namespace
   }
 
   // TM: the instance for the trymany levels (LevelArgs::try_many); the other instance has no trymany code (its register
-  // allocation, and so the speed of every other search, stays as without it: GPU_PIPELINE_PLAN.md section 33)
+  // allocation, and so the speed of every other search, stays as without it; inlined, the trymany code made the plain search spill)
   template <bool TM>
   __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search(LevelArgs a)
   {
@@ -2514,7 +2515,7 @@ namespace
   }
 
   // ================================================================================================================
-  // Wavefront search (GPU_PIPELINE_PLAN.md W): meander=false and one slice, i.e. the CPU result of
+  // Wavefront search: meander=false and one slice, i.e. the CPU result of
   // MAnalyse(meander=false, mt=false). Without meander a block depends on its left neighbour, on the block above and,
   // on the smallest level and on the last row, on the block above-right (FetchPredictors); the bottom-right predictor
   // of the other rows is the not yet searched (interpolated) vector. So block (x, y) can run as soon as row y - 1 has
@@ -2564,7 +2565,7 @@ namespace
 
   // Waits until *p >= need (acquire loads) and returns the value read; seen: a value read before (with acquire
   // semantics) or 0. A relaxed poll followed by one fence.acq_rel was measured slower: the fence sits on the wavefront's
-  // critical path at almost every block (GPU_PIPELINE_PLAN.md section 24). MVC_WAVE_SLEEP: optional pause between polls.
+  // critical path at almost every block. MVC_WAVE_SLEEP: optional pause between polls.
 #ifndef MVC_WAVE_SLEEP
 #define MVC_WAVE_SLEEP 0
 #endif
@@ -2690,7 +2691,7 @@ namespace
     TmIn tmin;                                // trymany: inputs of trymany_par
   };
   // register cap of the fixed-plan k_wave kernels and the registers of reference samples one lane keeps in flight in
-  // wave_eval_inl. Measured on the RTX 5090 (GPU_PIPELINE_PLAN.md section 24): 96 / 24 beat 255 / 64 by 17-19% in QTGMC
+  // wave_eval_inl. Measured on the RTX 5090: 96 / 24 beat 255 / 64 by 17-19% in QTGMC
   // Fast / Slower (more resident CTAs per SM with 6-8 analyses in flight, and less spilling); 80 and 128 were slower.
 #ifndef MVC_WAVE_REGS
 #define MVC_WAVE_REGS 96

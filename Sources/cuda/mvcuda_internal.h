@@ -249,7 +249,7 @@ namespace mvc
   // the pipeline stream before anything the caller queues later); nullptr on failure
   std::shared_ptr<DevSubpel> frame_subpel(const std::shared_ptr<DevFrame> &fr, int hpad, int vpad);
   // The super frame (MSuper pyramid with sub-pel planes) of fr for the parameters p, kept with the frame and counted in the
-  // registry budget (GPU_PIPELINE_PLAN.md section 25, M2). A stored one serves when it covers p: same padding, pel and
+  // registry budget. A stored one serves when it covers p: same padding, pel and
   // sharp, at least p's levels and chroma, and the same rfilter when p has more than one level (only the first reduction
   // uses it; level 0 does not depend on it). Otherwise build makes it on s, which the caller has ordered after the work
   // that made fr; a stored one built on another stream is waited for on s. The caller keeps out until s has passed its

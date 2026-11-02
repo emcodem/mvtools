@@ -1,5 +1,5 @@
-// mvtools_vsbridge: masktools2 filters the bridge computes itself: mt_lut, mt_lutxy, mt_adddiff (VAPOURSYNTH_PLAN.md,
-// step 4, masktools tables).
+// mvtools_vsbridge: masktools2 filters the bridge computes itself: mt_lut, mt_lutxy, mt_adddiff (the CPU
+// fallbacks of cudafilters' stages need them, and masktools2 does not exist under VapourSynth).
 //
 // cudafilters build their GPU lookup tables by running mt_lutxy / mt_lut + mt_adddiff on a test pattern
 // (cudafilters/CudaKobs.cpp, lut_from_cpu), and use the same filters as their CPU fallback. VapourSynth has no masktools,

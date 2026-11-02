@@ -1,10 +1,10 @@
 """baseline.py: framemd5 of compare.py's chains in AviSynth+ only, kept in a folder, to compare two builds (e.g. before
-and after a merge, or ours against plain upstream; REBASE_PLAN.md step 0).
+and after a merge, or ours against plain upstream).
 
 usage: python baseline.py run <plugin dir> <out dir> [group | chain ...]
        python baseline.py diff <dir A> <dir B>
 groups: cpu     compare.py's CPU chains (`, gpu=false` removed, so they also run on builds without the gpu parameter)
-        gpucpu  the GPU chains with `gpu=true` removed: the CPU result each GPU chain must equal (Documentation/gpu.md)
+        gpucpu  the GPU chains with `gpu=true` removed: the CPU result each GPU chain must equal
         gpu     the GPU chains as they are
         cf      the cudafilters chains (cudafilters.dll in the plugin dir)
         default: cpu gpucpu gpu, plus cf when cudafilters.dll is in the plugin dir

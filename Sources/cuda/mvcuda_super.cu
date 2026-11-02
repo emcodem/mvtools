@@ -1,6 +1,6 @@
-// GPU version of MSuper (GPU_PLAN.md M2): pyramid reduction (rfilter 4 / 2), edge padding and the pel=2 Wiener
+// GPU version of MSuper: pyramid reduction (rfilter 4 / 2), edge padding and the pel=2 Wiener
 // sub-pel planes, all in integer arithmetic so the result can be bit-exact against the CPU code
-// (MVPlane.cpp, Interpolation.cpp RB2Cubic* / *Wiener, Padding.cpp). 16-bit container samples only.
+// (MVPlane.cpp, Interpolation.cpp RB2Cubic* / *Wiener, Padding.cpp). 8- and 16-bit container samples.
 //
 // Plane layout everywhere (host and device): packed rows, ew = w + 2*hpad samples per row, eh = h + 2*vpad rows,
 // i.e. the padded plane without the pitch gap. This is also the layout of the golden-data plane dumps.

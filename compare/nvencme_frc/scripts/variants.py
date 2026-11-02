@@ -2,8 +2,8 @@
 
 Every variant is the uc_FRC chain on seg1_wires_pole.mp4, output frames 8..247 of MFlowFps (as compare/nvofa_frc):
 - exact / medium: compare/nvofa_frc/scripts/avs/frc_flow.avs (profile\\build_nvofa), MVCUDA_NVOFA unset / medium;
-- NVENC: avs/frc_nvencme.avs with the prototype profile\\build_nvme_proto\\nvencme_proto.dll (source: the session
-  scratchpad, see ../README.md) in place of MAnalyse.
+- NVENC: avs/frc_nvencme.avs with the prototype profile\\build_nvme_proto\\nvencme_proto.dll (source:
+  ../proto) in place of MAnalyse.
 """
 import os
 

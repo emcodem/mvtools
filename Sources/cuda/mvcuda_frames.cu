@@ -1,4 +1,4 @@
-// Device frames behind tokens (GPU_PIPELINE_PLAN.md section 4, milestone D): the registry with its byte budget and
+// Device frames behind tokens: the registry with its byte budget and
 // LRU eviction, host upload / download, and the producer table used to make an evicted frame again.
 
 #include "mvcuda_internal.h"
@@ -68,7 +68,7 @@ namespace mvc
     // Byte budget of the registry. MVCUDA_CACHE_MB: fixed. Otherwise it starts at BUDGET_START and grows while frames
     // have to be made again after their eviction (budget_count_put / budget_count_regen), up to budget_cap(): a chain needs
     // from about 256 MB (QTGMC Fast PAL) to well over 512 MB (Slower / Placebo HD), and a budget far above the working set
-    // only keeps VRAM (GPU_PIPELINE_PLAN.md sections 23, 24).
+    // only keeps VRAM.
     const size_t BUDGET_START = (size_t)256 << 20;
     const long long *budget_fixed_mb()
     {

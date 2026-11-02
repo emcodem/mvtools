@@ -1,5 +1,8 @@
 // mvtools_vsbridge: a small AviSynth+ host on top of VapourSynth (API 4), so that AviSynth+ plugins of this repo
-// (mvtools2, later cudafilters) run unchanged under VapourSynth. See VAPOURSYNTH_PLAN.md, decisions 1-6.
+// (mvtools2, cudafilters) run unchanged under VapourSynth, bit-identical with AviSynth+. Design: frames are requested
+// as base(n) = n * frames_in / frames_out plus offsets learned per input (a miss fetches synchronously, which only
+// costs speed); the AviSynth VideoInfo of every node sits in a registry keyed by VSNode*; vector clips travel as
+// Gray8 carriers; VS functions keep the AviSynth function and parameter names.
 //
 // This library compiles avisynth.h in core mode (BUILDING_AVSCORE, set by CMake): the member functions of VideoInfo,
 // VideoFrame, AVSValue, ... are defined here (avs_interface.cpp, from AviSynth+) and handed to the plugin as its

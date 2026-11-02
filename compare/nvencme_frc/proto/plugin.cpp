@@ -1,5 +1,5 @@
 // NVENCMEProto(clip, isb, delta, blksize, blksizeV, overlap, overlapV, pel, hpad, vpad, chroma, preset, codec, half):
-// throwaway prototype of NVENCMEAnalyse (NVENCMEAnalyse.md) for the visual comparison. A one-level vector clip in
+// throwaway prototype of NVENCMEAnalyse for the visual comparison. A one-level vector clip in
 // MAnalyse's format (the layout of cudafilters' CudaNVOFAnalyse) from NVENC's ME-only mode, standalone (CPU frames,
 // own CUDA driver context). SADs are written as 0: use MRecalculate downstream, it recomputes them
 // (PlaneOfBlocks.cpp:3358-3362). half=true: ME on the luma downscaled 2x2 (twice the search range, half the precision).

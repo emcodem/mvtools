@@ -1,5 +1,5 @@
 // CudaKeepOnlyBobShimmerFixes(input, ref, rep, chroma): QTGMC_KeepOnlyBobShimmerFixes of QTGMC.avsi on the GPU (8 to 10
-// bit; GPU_PIPELINE_PLAN.md section 15, stages 4 and 16, section 25 B2), and CudaRemoveGrain(clip, mode, modeU, modeV) for
+// bit), and CudaRemoveGrain(clip, mode, modeU, modeV) for
 // the modes the GPU has (12, 20; 8 to 16 bit). Bit for bit with masktools2 / RgTools; the arithmetic is in mvcuda_kobs.cu.
 //
 // The function's two mt_lutxy expressions are not re-implemented: the plugin runs the installed mt_lutxy once on an

@@ -1,5 +1,5 @@
 // VapourSynth entry point of cudafilters (namespace cuda). The filters run unchanged through mvtools_vsbridge, the small
-// AviSynth+ host for VapourSynth next to this library (VAPOURSYNTH_PLAN.md, decision 5), exactly as mvtools2's
+// AviSynth+ host for VapourSynth next to this library, exactly as mvtools2's
 // Sources/VapourSynthEntry.cpp does. Under AviSynth+ this function is never called.
 //
 // The bridge is loaded lazily and checked like every optional library (dyn_lib.h): when it is missing or broken the

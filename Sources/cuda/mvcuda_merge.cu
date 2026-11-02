@@ -1,4 +1,4 @@
-// AviSynth+ Merge / MergeLuma / MergeChroma on device frames (GPU_PIPELINE_PLAN.md section 15, stages 3, 5, 12, 13), bit
+// AviSynth+ Merge / MergeLuma / MergeChroma on device frames (QTGMC search clip and output side), bit
 // for bit with what AviSynth+ 3.7.5 runs on SSE2 / AVX2 CPUs (avs_core\filters\merge.cpp merge_plane,
 // intel\merge_avx2.cpp / merge_sse.cpp): weighted merge (a * invweight + b * weight + 16384) >> 15 with weights scaled to
 // 32767; for 16-bit data the vector body works on samples shifted to signed, which gives one more than the scalar formula

@@ -1,4 +1,5 @@
-// Golden-data dump for the GPU port (GPU_PLAN.md, milestone M1).
+// Golden-data dump for the GPU port: the CPU's parameters, super planes and per-level vectors, to test the GPU
+// kernels against.
 //
 // Compiled in only when MV_GOLDEN_DUMP is defined; without it every hook below is an empty macro, so the
 // normal build is unchanged. At run time nothing is written unless the environment variable MVDUMP_DIR is set.

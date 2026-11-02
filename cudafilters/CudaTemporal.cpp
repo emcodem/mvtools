@@ -1,5 +1,5 @@
 // CudaTemporalSoften(clip, radius, luma_threshold, chroma_threshold, scenechange, mode): AviSynth+ TemporalSoften on the GPU
-// (GPU_PIPELINE_PLAN.md section 15, stage 2), bit for bit; mode is ignored as by the CPU filter. Returns token frames. The
+// bit for bit; mode is ignored as by the CPU filter. Returns token frames. The
 // CPU TemporalSoften with the same arguments is built too (VideoInfo, exact fallback).
 
 #include "CudaCommon.h"

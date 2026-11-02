@@ -1,4 +1,4 @@
-// Motion vectors from NVIDIA's optical flow accelerator (NVOFA) for cudafilters' CudaNVOFAnalyse (NVOF_FILTER_PLAN.md):
+// Motion vectors from NVIDIA's optical flow accelerator (NVOFA) for cudafilters' CudaNVOFAnalyse:
 // one vector field in MAnalyse's payload format with a single level, from the flow of the source picture into the
 // reference picture. NOT MAnalyse's search (another algorithm, not bit-exact with anything on the CPU); MAnalyse stays
 // exact and does not use this unit.

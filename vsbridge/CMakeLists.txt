@@ -1,4 +1,4 @@
-# mvtools_vsbridge: AviSynth+ host for VapourSynth (VAPOURSYNTH_PLAN.md, decision 5). Compiles avisynth.h in core mode
+# mvtools_vsbridge: AviSynth+ host for VapourSynth. Compiles avisynth.h in core mode
 # (BUILDING_AVSCORE): the AviSynth+ member functions live here and reach the plugins as their AVS_Linkage table, so this
 # must stay a library of its own, never linked into a plugin.
 

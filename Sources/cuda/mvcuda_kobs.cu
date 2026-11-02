@@ -1,5 +1,5 @@
-// MaskTools / RgTools building blocks on device frames and QTGMC_KeepOnlyBobShimmerFixes (GPU_PIPELINE_PLAN.md
-// section 15, stages 4, 5, 16; 9..16 bit: section 25 B2), bit for bit with masktools2 2.2.30 and RgTools 1.2 as they run
+// MaskTools / RgTools building blocks on device frames and QTGMC_KeepOnlyBobShimmerFixes (8 to
+// 16 bit), bit for bit with masktools2 2.2.30 and RgTools 1.2 as they run
 // on SSE4.1 CPUs. max = (1 << bits) - 1, half = 1 << (bits - 1):
 //   mt_makediff  clip(x - y + half)              mt_adddiff  clip(x + y - half)
 //   mt_inpand / mt_expand mode="vertical" with the default threshold: min / max of the sample and its vertical neighbours,

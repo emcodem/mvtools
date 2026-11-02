@@ -1,5 +1,5 @@
 """compare.py: the same mvtools2 chains in AviSynth+ (avsmd5) and VapourSynth (vsmd5.py, mvtools_vsbridge) on the same
-raw input with the same libmvtools2.so; the framemd5 of both must be identical (VAPOURSYNTH_PLAN.md, verification).
+raw input with the same libmvtools2.so; the framemd5 of both must be identical.
 
 usage: python compare.py [chain ...]      (inputs from gen_inputs.py)
        python compare.py cpu | gpu | cf   (the CPU chains / the gpu_* chains / the cudafilters chains; default: cpu gpu)
@@ -148,7 +148,7 @@ def vs_body(avs):
     return re.sub(r'\bfalse\b', 'False', re.sub(r'\btrue\b', 'True', vs))
 
 
-# GPU chains (Documentation/gpu.md): lite super (MSuper gpu=true) and the GPU paths of MAnalyse, MRecalculate,
+# GPU chains: lite super (MSuper gpu=true) and the GPU paths of MAnalyse, MRecalculate,
 # MCompensate, MDegrain2 and MFlowFps; normal frames in and out (token frames need cudafilters' CudaUpload)
 GPU_ANA = ('sup = MSuper(c, pel=2, gpu=true)\n'
            'bv = MAnalyse(sup, isb=true, blksize=16, overlap=8, gpu=true)\n'

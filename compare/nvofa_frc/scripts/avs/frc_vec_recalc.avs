@@ -1,6 +1,6 @@
 # uc_FRC chain, GPU build profile\build_nvofa. The search used by MAnalyse is chosen by the environment of the process:
 #   MVCUDA_NVOFA unset         -> exact GPU search (k_search, md5 = CPU)
-#   MVCUDA_NVOFA=fast|medium|slow -> NVOFA optical flow (see compare/nvofa_frc/README.md), MRecalculate refines as usual
+#   MVCUDA_NVOFA=fast|medium|slow -> NVOFA optical flow, MRecalculate refines as usual
 LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
 LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
 LoadPlugin("C:\dev\mvtools\profile\build_nvofa\mvtools2.dll")

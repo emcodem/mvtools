@@ -1,4 +1,4 @@
-// NVENC ME-only prototype core (NVENCMEAnalyse.md, throwaway): CUDA driver API context + NVENC sessions in ME-only
+// NVENC ME-only prototype core (throwaway): CUDA driver API context + NVENC sessions in ME-only
 // mode, 8-bit luma pairs in, vectors on an 8x8 grid in quarter pel out. Windows only. Every library is loaded at run
 // time; a missing / broken one only makes available() false, it never crashes or hangs.
 #pragma once

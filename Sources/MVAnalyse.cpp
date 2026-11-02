@@ -410,7 +410,7 @@ MVAnalyse::MVAnalyse(
     analysisData.pixelsize, // PF
     analysisData.bits_per_pixel,
     (_dct_factory_ptr.get() != 0) ? &_dct_pool : 0,
-    // gpu=true with meander=false means the single-slice result (the GPU wavefront search, GPU_PIPELINE_PLAN.md W):
+    // gpu=true with meander=false means the single-slice result (the GPU wavefront search):
     // the CPU path of such a filter (fallback frames, unsupported settings) searches in one slice too, so the output
     // does not depend on where a frame was searched
     _mt_flag && !(gpu_flag && !meander),
@@ -447,7 +447,7 @@ MVAnalyse::MVAnalyse(
     outfilebuf = NULL;
   }
 
-  // ---- GPU search: only for the configuration the GPU code reproduces bit-exactly (GPU_PLAN.md); anything else
+  // ---- GPU search: only for the configuration the GPU code reproduces bit-exactly; anything else
   // stays on the CPU, silently
   if (gpu_flag)
   {
