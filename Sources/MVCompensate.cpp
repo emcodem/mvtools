@@ -19,7 +19,6 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 #include	"ClipFnc.h"
-#include	"ProfSkip.h"
 #include "commonfunctions.h"
 #include "MaskFun.h"
 #include "MVCompensate.h"
@@ -482,8 +481,6 @@ PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
     if (_super_lite)
       ref = MVSuper::CompleteLite(ref, super->GetVideoInfo(), _mt_flag, env_ptr);
 
-    if (mv_prof_skip("compensate"))
-      return src;
 
     for (int p = 0; p < planecount; ++p) {
       const int plane = planes[p];

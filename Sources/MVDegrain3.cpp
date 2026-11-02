@@ -20,7 +20,6 @@
 #include "ClipFnc.h"
 #include "Interpolation.h"
 #include "MVDegrain3.h"
-#include "ProfSkip.h"
 #include "MVDegrain3_avx2.h"
 #include "MVFrame.h"
 #include "MVGroupOfFrames.h"
@@ -773,9 +772,6 @@ PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
       if (isUsableB[j])
         refB[j] = MVSuper::CompleteLite(refB[j], super->GetVideoInfo(), false, env);
     }
-
-  if (mv_prof_skip("degrain"))
-    return src;
 
   for (int j = level - 1; j >= 0; j--)
   {
