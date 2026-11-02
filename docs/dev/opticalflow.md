@@ -1,5 +1,9 @@
 # NVOFA test: Optical Flow SDK vectors in place of k_search (uc_FRC)
 
+> **Status 2026-11-02 (historical):** the `MVCUDA_NVOFA` hook described here was removed from MAnalyse again (exact-only);
+> the same computation became the filter `CudaNVOFAnalyse` (cudafilters, library API 17, see ARCHITECTURE.md). The
+> build files named below (`build.bat`, `build_dev.bat`) are replaced by CMake. The results section stays valid.
+
 ## Context
 On uc_FRC, k_search takes about 95% of GPU kernel time (2.24 ms x 1603, ~3.6 s of 6.57 s wall). NVIDIA's Optical Flow Accelerator
 (NVOFA) is a fixed-function unit, so a search run there would leave the SMs. The user wants two things: the speed gain, and how

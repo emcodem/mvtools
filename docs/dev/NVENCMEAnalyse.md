@@ -1,5 +1,9 @@
 # NVENCMEAnalyse: motion vectors from the NVENC motion estimator (plan)
 
+> **Status 2026-11-02:** on hold. DTL's own DX12_ME build was tried (compare/dtl_dx12_frc): same vectors as our D3D12
+> prototype, far behind NVOFA. Phase 0 (CMake as the only build, Linux, Windows) is done. Open idea: TODO.md / DTL list
+> item 14 (NVENC for cards without NVOFA).
+
 **Status 2026-10-31: plugin on hold, prototype results negative (section "Prototype results" below); next step:
 DTL's own DX12_ME build, unchanged.** Decisions in this file are the user's unless marked "proposal".
 Related: CudaNVOFAnalyse (the NVOFA sibling, implemented; [ARCHITECTURE.md](ARCHITECTURE.md)),
