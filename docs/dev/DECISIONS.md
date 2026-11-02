@@ -12,7 +12,7 @@ list of choices that later work must respect or consciously revisit. Status: **d
 instructions that need newer devices (cp.async: 8.0; ld.acquire / st.release, `__nanosleep`, `__grid_constant__`: 7.0)
 have fallbacks that compute the same results (`MVC_ARCH_BELOW`, `mvcuda_internal.h`). The library is built with CUDA
 12 only, 12.8 or newer (12.9 recommended): machine code for 6.1 .. 12.0 plus PTX 6.0 and 8.0. On Windows that means the
-MSVC 14.4x host toolset (v143); `build_windows.ps1` selects it, CMake and `build.bat` refuse other toolkits.
+MSVC 14.4x host toolset (v143); `build_windows.ps1` selects it, CMake refuses other toolkits.
 
 **Why.** CUDA 13 no longer compiles for Pascal or Volta, so one toolkit for every build keeps one DLL for every card;
 two release variants (CUDA 13 for 7.5+, CUDA 12 for older cards) would double the testing. The sm_80+ code is the same
@@ -87,20 +87,40 @@ fits small, stable filters whose only contract is parameters in, pixels out; mvt
   2.7.47) and proving CPU output = stock with the golden tests is the way to keep that true (see D8).
 - The price: users switch their mvtools2.dll to this fork to use the GPU (FFAStrans ships its own copy).
 
-## D8. How scripts call the mvtools GPU paths (2026-10-30, open)
+## D8. How scripts call the GPU paths: Cuda* names, token out, explicit fallback (2026-11-02, decided; not implemented yet)
 
-The cudafilters style is one `Cuda*` function per CPU filter, same parameters. mvtools uses a `gpu=true` parameter.
-Proposed: add `CudaMSuper`, `CudaMAnalyse`, `CudaMRecalculate`, `CudaMCompensate`, `CudaMDegrain1..6`, `CudaMFlowFps` to
-`mvtools2.dll` (same filters with the GPU on), switch `uc_frc_gpu` and `make_qtgmc_gpu.py` to them, then keep `gpu=true`
-as a compatibility switch or remove it. Open: whether `gpu=true` stays; whether to rebase on upstream first.
+Asked 2026-10-30, decided by the user 2026-11-02. Supersedes D6 and the "silent fallback, opt-in" part of D5.
+- **Names.** mvtools2 gets `CudaMSuper`, `CudaMAnalyse`, `CudaMRecalculate`, `CudaMCompensate`, `CudaMDegrain1..6` /
+  `CudaMDegrainN`, `CudaMFlowFps` (same parameters as the CPU filter). The `gpu` parameter is **removed**: MSuper,
+  MAnalyse, ... are pure CPU again, exactly as upstream. `make_qtgmc_gpu.py`, the bundle examples, uconvert's
+  `uc_frc_gpu` and the docs switch to the new names.
+- **One rule for every filter of this repo (mvtools2 and cudafilters):** a Cuda* filter accepts normal or token frames
+  (normal ones are uploaded inside the filter) and always returns token frames; the script ends the GPU part with
+  `CudaDownload`. `CudaUpload` stays (no longer needed). `CudaDownload` passes normal frames through.
+- **Vector clips stay normal frames** (small host data; CPU consumers such as MMask, MFlowBlur, MBlockFps, MDepan,
+  MStoreVect read them directly). The library keeps a device copy per vector frame so GPU consumers do not upload them
+  again (measure the host round trip with nsys first).
+- **Fallback is explicit:** `global cuda_cpu_fallback = true / false` (AviSynth+, read once when a filter is created, so
+  it must be set before the first Cuda* call), else the environment variable `CUDA_CPU_FALLBACK=0/1` (VapourSynth has
+  no script globals; the script global wins under AviSynth+). **Default false.** Optionally a per-call
+  `cpu_fallback=` parameter overrides both.
+  - false: a Cuda* filter that cannot run on the GPU at all (no device, library missing, unsupported settings) stops
+    with an error at creation that names the reason and the alternatives (`cuda_cpu_fallback = true` or the M* / CPU
+    filter).
+  - true: such a filter runs its CPU code and returns normal frames (CudaDownload passes them through), so one script
+    works on machines with and without a GPU.
+  - Either way, single frames that need the CPU during a run (field-based clip, delta <= 0, bad-vector search with
+    meander=true, a frame that cannot be regenerated) are computed on the CPU and uploaded: the output stays a token.
+- Bit-exactness (D5) is unchanged. uconvert work (deploy, HD pel 4, LWLibav fallback) waits for this, so uconvert.avsi
+  is edited once.
 
-## D6. Usage rule for every GPU filter (2026-10-30, decided)
+## D6. Usage rule for every GPU filter (2026-10-30, superseded by D8)
 
 Token frames in, token frames out; normal frames in, normal frames out (computed on the GPU, uploaded and downloaded by
 the filter). Existing scripts keep working unchanged. Implemented for cudafilters and, with Part M, for mvtools
 (`GPU_PIPELINE_PLAN.md` section 25).
 
-## D5. Bit-exact, silent fallback, opt-in (2026-10-28 onwards, decided)
+## D5. Bit-exact, silent fallback, opt-in (2026-10-28 onwards, decided; fallback and opt-in superseded by D8)
 
 Every integer GPU path gives exactly the CPU filter's result with the same arguments (for mvtools: the CPU result with
 the same slice count). Anything the GPU does not cover runs on the CPU, per call or per frame, without an error and with

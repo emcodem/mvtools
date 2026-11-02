@@ -8,6 +8,16 @@ predictors, sub-pel / chroma precision, area mode, hardware ME, the reference qu
 
 Mark an item done by deleting it here (the commit message says what was done). **User** = needs a decision by the user.
 
+## Next: D8 (decided 2026-11-02, see DECISIONS.md)
+
+- Cuda* names for the mvtools GPU filters, `gpu` parameter removed, every Cuda* filter returns tokens (normal input
+  uploaded), vector clips normal with a device copy cache, `cuda_cpu_fallback` global / `CUDA_CPU_FALLBACK` env
+  (default false = error at creation), per-frame CPU results uploaded. Then QTGMC script, bundle examples, docs, tests
+  (all suites use `gpu=true` today), VapourSynth names.
+- Waiting for D8: uconvert.avsi (`C:\dev\uconvert`): deploy a new all-arch DLL set (replaces its mvtools2.dll too:
+  2.7.48 CPU result), uc_FRC HD branch with the whole pel-4 chain on the GPU, the MxfSource -> LWLibav fallback (wrong
+  frames on random access with Prefetch: use ffms2 or no Prefetch there).
+
 ## Tests and release
 
 - trymany / trymanyall / search_coarse cases for `vsbridge/test/compare.py` and the Linux test run (agreed 2026-11-02).
@@ -81,11 +91,9 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Build / code hygiene
 
-- `MVTOOLS_SKIP` (`Sources/ProfSkip.h`) is compiled into release builds and makes MDegrain / MCompensate / MMask /
-  MFlowBlur skip their pixel work (wrong output): put it behind a build define or document it.
-- Upstream's `mvtools.sln` / `mvtools.vcxproj` lack GpuBackend.cpp and VapourSynthEntry.cpp (probably no longer link);
-  `cudafilters.vcxproj` (no VapourSynth entry, toolset v145) and `Sources/cuda/build.bat` are unmaintained: fix or
-  remove (the vcxproj files are upstream's, see RP D3 in git history).
+- `Sources/cuda/build_dev.bat` duplicates `build_dev.ps1` (own unit list, unmaintained): remove when nobody uses it.
+- Upstream's `mvtools.vcxproj` builds mvtools2.dll again (GPU backend + VapourSynth entry added 2026-11-02) but is not
+  part of any test run; CMake stays the tested build.
 - Some cudafilters arguments are unnamed in the `AddFunction` strings (positional only), though gpu.md names them:
   CudaTemporalSoften, CudaQtgmcSharpLimit, CudaQtgmcBackBlend, CudaQtgmcAddNoise, CudaGaussResize, CudaBilinearResize.
 - Not tested: Clang, aarch64.
@@ -96,13 +104,10 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Deployment / scripts - User
 
-- Deploy cudafilters.dll + mvtools_cuda.dll to `C:\dev\uconvert\dlls`; which render nodes have a GPU.
-- uc_FRC HD branch could run the whole pel-4 chain on the GPU (uconvert.avsi untouched).
+- Which render nodes have a GPU.
 - LWLibav `threads=4` in the production scripts; higher Prefetch for Very Slow / Placebo (24: Placebo 12.3 -> 8.1 s).
-- `measure=false` for QTGMC's FFT3DFilter would make Very Slow / Placebo deterministic (not in QTGMC_gpu.avsi).
-- uconvert.avsi falls back from MxfSource to LWLibav with Prefetch: that fallback would give wrong frames (untested).
-- Branch `gpu_portable` (Vulkan, stopped): keep or delete.
-- D8 in [DECISIONS.md](DECISIONS.md): `Cuda*` names for the mvtools GPU filters, fate of `gpu=true`.
+- Decided 2026-11-02, no action: QTGMC's FFT3DFilter keeps stock `measure=true` (rare second md5 class in Very Slow /
+  Placebo is FFTW, not the GPU); branch `gpu_portable` is kept; non-exact options stay parked.
 
 ## Unexplained (the CPU does it too)
 
