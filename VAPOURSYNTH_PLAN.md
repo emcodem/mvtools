@@ -342,9 +342,12 @@ identical. `mt_tables.py` 100 cases (+ 6 planar RGB) identical with and without 
 - Measure `MVBRIDGE_FALLBACK=nearest` per mapping against AviSynth+ (runs without `libmvtools_cuda.so` send every frame
   through the fallback): differing frames, share of differing pixels, largest difference; document per filter.
   (Postponed by the user, 2026-10-31.)
-- Windows: build and run the bridge there (waits for CMake on Windows, NVENCMEAnalyse.md Phase 0 step 3); then the
-  same tests with VS portable on Windows, where the references of `mt_tables.py` / `stand_ins.py` / `cf_chains.py` were
-  made.
+- ~~Windows: build and run the bridge there.~~ Done 2026-11-01 (CMake build `build_windows.ps1`; VapourSynth from
+  `pip install vapoursynth` in a venv, AviSynth+ through `avsmd5.py`): compare.py's chains AviSynth+ = VapourSynth on
+  Windows as on Linux, also after the upstream 2.7.48 merge (REBASE_PLAN.md, 2026-11-02, 45 chains, with and without
+  `mvtools_cuda.dll`).
+- MDepan under VapourSynth: not verified yet. Upstream 2.7.48 zeroes the reserved field of the motion data header
+  (REBASE_PLAN.md issue 7), so a test can now compare the data clip byte for byte.
 - Optional: nearest mappings to VS plugins when loaded (zsmooth TemporalSoften / RemoveGrain, znedi3); QTGMC_gpu.avsi
   as a whole under VS (needs the script's non-GPU parts in VS form).
 
@@ -365,13 +368,13 @@ per plugin, each host ignores the other entry point), `cmake/plugin_exports.map`
    MSuper, MAnalyse, MCompensate.~~ Done 2026-10-31 on Linux (findings above).
 3. ~~MDegrain1..N, MRecalculate, MFlowFps / MFlowInter / MBlockFps (temporal requests), then the rest of
    `Interface.cpp`.~~ Done 2026-10-31 on Linux, CPU path; GPU path (`gpu=true`) done 2026-10-31 (findings above).
-   Open: MDepan, Windows build (needs Phase 0 step 3 of NVENCMEAnalyse.md: CMake on Windows).
+   Open: MDepan. Windows build done 2026-11-01 (CMake).
 4. cudafilters through the same shim; CudaNVOFAnalyse. In progress: entry point, token frames end to end, Merge*
    stand-ins with `MVBRIDGE_FALLBACK` done 2026-10-31, masktools port (`mt_lut` / `mt_lutxy` / `mt_adddiff`, D10)
    and stand-ins for every other fallback name, CudaNVOFAnalyse and the planar RGB test 2026-11-01 (findings above).
-   Done on Linux except the nearest measurement (postponed); Windows waits for CMake.
+   Done on Linux and Windows except the nearest measurement (postponed).
 5. DePan / DePanEstimate (optional, same shim).
-6. Docs: README (VS usage, namespace, formats), `Documentation/`.
+6. ~~Docs: README (VS usage, namespace, formats), `Documentation/`.~~ Done (README "VapourSynth", `Documentation/gpu.md`).
 
 ## Verification
 

@@ -13,7 +13,10 @@ the work got here; this page describes what the functions do now (library API ve
 ## Principles
 
 - **Bit-exact.** Every GPU path gives exactly the result of the CPU filter it replaces, with the same arguments. The
-  reference for mvtools2 is the CPU result with the same slice count (see `meander` under MAnalyse below).
+  reference for mvtools2 is the CPU result with the same slice count (see `meander` under MAnalyse below). Since
+  2026-11-02 that is the CPU code of upstream mvtools 2.7.48, whose symmetric rounding of luma vectors to the chroma
+  grid (#59) changes the results of subsampled clips (4:2:0, 4:2:2, 4:1:1) with chroma; the GPU paths follow it, so
+  their output there differs from builds of this branch before that date.
 - **Silent fallback.** `gpu=true` is a request. When the GPU library or device is missing, or the format or settings are
   not covered, the filter runs its CPU code and returns the same output. Single frames can fall back too, for example
   when a device frame was evicted and cannot be made again. Nothing in the script has to change.
@@ -122,7 +125,8 @@ only the picture inside its padding rows:
 - `pel` 1 or 2, `sharp=2`, `rfilter` 2 or 4, no `pelclip` (with `pel=4` it makes the normal super: MCompensate and MDegrain
   have no pel-4 GPU path yet, and a lite super would make them rebuild it on the CPU for every frame they read; MAnalyse,
   MRecalculate and MFlowFps take the normal pel-4 super on the GPU)
-- planar YUV (not Y only, not YUY2), 8-bit or 16-bit container
+- planar YUV (not Y only), 8-bit or 16-bit container. YUY2 counts as 4:2:2: since upstream 2.7.48 every filter converts
+  a YUY2 clip to YV16 at its input (and its output back), so the GPU paths see YV16
 - chroma subsampling 1 or 2 in each direction
 - `hpad` divisible by the horizontal chroma ratio, `vpad` by the vertical one, height divisible by the vertical one
 
@@ -154,8 +158,14 @@ The GPU path is used when all of these hold:
 | `pelsearch` (finest level) | 1 to 24; 1 to 64 for `search=3` (exhaustive) |
 | `searchparam` (coarse levels, when there is more than one level) | 1 to 64 (the coarse levels search exhaustively); 1 to 24 for `search=6` / `7` (horizontal / vertical) |
 | `trymany` | true or false |
+| `trymanyall` | false only (upstream 2.7.48: `trymany` on the finest level too) |
+| `search_coarse` | 3 only, the default (upstream 2.7.48: search type of the coarse levels; 3 = exhaustive, as before) |
 | `divide`, `dct`, `temporal`, `multi` | 0 / false only |
 | `outfile` | not set |
+
+Settings outside the table give the CPU result, not an error (`MVTOOLS_GPU_LOG=1` prints "not supported here, using
+the CPU"). Errors that the CPU filter raises at creation stay errors with `gpu=true`, e.g. since 2.7.48 `dct` 5 to 10
+(SATD) with a block size not divisible by 4 (MAnalyse and MRecalculate).
 
 Single frames run on the CPU when the clip is field-based (a field shift is needed), when `delta` is 0 or less (static
 reference), or when the GPU reports that the frame needs the CPU's bad-vector wide search (`badSAD` / `badrange`).
@@ -228,7 +238,8 @@ The GPU path is used when all of these hold:
 - 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `limit` and `limitC` 255 (the default)
-- `lsb`, `out16`, `out32` false
+- `lsb` and `out16` false. Since upstream 2.7.48 `lsb=true` is `out16=true` plus a conversion to stacked 8-bit, so it
+  runs on the CPU as well; `out32` no longer exists
 
 The output is token frames when the source clip is a token clip, otherwise normal frames (the pictures are uploaded), and
 normal frames for frames made on the CPU. MDegrainN has no `gpu` parameter.

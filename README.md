@@ -299,7 +299,7 @@ VapourSynth replacement; details below).
 
 ### Details
 
-* Output is bit-identical with AviSynth+ on the same system (17 CPU, 7 GPU and 17 cudafilters test chains,
+* Output is bit-identical with AviSynth+ on the same system (17 CPU, 8 GPU and 17 cudafilters test chains,
   `vsbridge/test/compare.py`; further cudafilters tests against AviSynth+ on Windows in `vsbridge/test/`).
   `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
   it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan.
