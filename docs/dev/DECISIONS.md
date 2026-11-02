@@ -1,7 +1,8 @@
 # Decisions
 
 Decisions about the GPU work in this fork, newest first. Each entry: what was decided, why, and what it rules out. The
-plans (`GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`) describe how the work got done; this file is the short
+former plans (`GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`, ...; in git at af2e51e) describe how the work got
+done, `ARCHITECTURE.md` summarises the design; this file is the short
 list of choices that later work must respect or consciously revisit. Status: **decided**, **open** (needs a decision),
 **superseded** (with a pointer).
 

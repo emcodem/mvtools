@@ -15,7 +15,7 @@
 > `NVME_NOINTRA=1`, `NVME_CHROMA=1`, `NVME_P16=1` (16x16 partitions only), `NVME_PSEUDO=<k>` (colour into the luma), `NVME_SESSIONS=<n>` (pool size, default 2),
 > `NVME_TUNING=<n>` (tuning used for the preset config).
 
-Early visual check for [NVENCMEAnalyse.md](../../NVENCMEAnalyse.md) step 5, done before the plugin exists: a throwaway
+Early visual check for [NVENCMEAnalyse.md](../../docs/dev/NVENCMEAnalyse.md) step 5, done before the plugin exists: a throwaway
 AviSynth filter `NVENCMEProto` ([proto/](proto/), standalone mode only, Windows) takes the place of MAnalyse in the
 uc_FRC chain of [compare/nvofa_frc](../nvofa_frc/) — same clip, same chain (MRecalculate 16/8 → MFlowFps 24000/1001),
 same crops, slow motion and spot workflow. Output layout as CudaNVOFAnalyse (one level, 32/16 blocks, pel 2); SADs are

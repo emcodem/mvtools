@@ -7,7 +7,7 @@
 > Not judged by eye yet; preview frames of the tree section in [For the visual check](#for-the-visual-check).
 > Problems found in his build (for DTL): [Notes for DTL](#notes-for-dtl).
 
-The next step of [NVENCMEAnalyse.md](../../NVENCMEAnalyse.md) ("Prototype results and next step"): DTL2020's own
+The next step of [NVENCMEAnalyse.md](../../docs/dev/NVENCMEAnalyse.md) ("Prototype results and next step"): DTL2020's own
 build of the D3D12 video motion estimator path (`optSearchOption=5 / 6`), unchanged, in the uc_FRC chain of
 [compare/nvofa_frc](../nvofa_frc/), against our references and our reimplementation
 ([compare/nvencme_frc](../nvencme_frc/), `NVENCMEProto(dx12=8)`).
