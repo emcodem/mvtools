@@ -7,7 +7,7 @@
 > MAnalyse output in all 300 vector frames. The scripts here that set `MVCUDA_NVOFA` need the experiment's build
 > (`profile\build_nvofa`, source: commit 574cd22).
 
-Experiment of [opticalflow.md](../../docs/dev/opticalflow.md): MAnalyse's GPU block search (k_search) replaced by NVOFA vectors
+Experiment (plan file opticalflow.md, removed; in git at 5675824): MAnalyse's GPU block search (k_search) replaced by NVOFA vectors
 (Optical Flow SDK, `nvofapi64.dll` of the driver). MRecalculate refines them and MFlowFps interpolates, both unchanged.
 Switched by the environment of the process: `MVCUDA_NVOFA=fast|medium|slow`, off when unset. **Not bit-exact** with the
 CPU search (another algorithm); with the variable unset the output is unchanged (md5 BFE44775F811 = CPU fallback).

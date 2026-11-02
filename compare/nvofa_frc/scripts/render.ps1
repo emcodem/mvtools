@@ -1,4 +1,4 @@
-# Renders the comparison of opticalflow.md: the uc_FRC output with the exact GPU search and with NVOFA (fast, medium).
+# Renders the NVOFA comparison (compare/nvofa_frc/README.md): the uc_FRC output with the exact GPU search and with NVOFA (fast, medium).
 #   .\render.ps1 [-W <work folder>]   (big PNGs go to the work folder, the page images to ..\img)
 param([string]$W = "$env:TEMP\nvofa_frc")
 $A = "$PSScriptRoot\avs\frc_flow.avs"; $I = "$PSScriptRoot\..\img"

@@ -98,7 +98,7 @@ their last versions are in git at commit af2e51e (`git show af2e51e:GPU_PIPELINE
 - NVIDIA optical flow accelerator vectors as a MAnalyse-format vector clip (one level), accepted by MRecalculate,
   MFlowFps, MDegrain, MCompensate. Gray input, per-block median, clamp, own SAD from a levels=1 super. Not exact.
 - nvofapi64 loaded at run time; without NVOFA the function returns MAnalyse itself; a failed frame gets MAnalyse's
-  level 0. Background and visual judgement: [opticalflow.md](opticalflow.md), `compare/nvofa_frc`.
+  level 0. Experiment and visual judgement: `compare/nvofa_frc`.
 
 ## VapourSynth bridge (`vsbridge/`, DECISIONS.md D9 / D10)
 

@@ -7,7 +7,7 @@
 **Status 2026-10-31: plugin on hold, prototype results negative (section "Prototype results" below); next step:
 DTL's own DX12_ME build, unchanged.** Decisions in this file are the user's unless marked "proposal".
 Related: CudaNVOFAnalyse (the NVOFA sibling, implemented; [ARCHITECTURE.md](ARCHITECTURE.md)),
-[opticalflow.md](opticalflow.md), [compare/nvofa_frc/README.md](../../compare/nvofa_frc/README.md).
+[compare/nvofa_frc/README.md](../../compare/nvofa_frc/README.md).
 
 ## Context
 CudaNVOFAnalyse (cudafilters.dll, library API 17) gives MAnalyse-format vectors from NVIDIA's optical flow engine
