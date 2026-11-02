@@ -12,7 +12,8 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
   (`Sources\cuda\mvcuda_refine.cuh:42`) = 64 for exhaustive, 24 for every other type; checked at
   `Sources\cuda\mvcuda_recalc.cu:276`.
 - MRecalculate has **no `trymany` parameter** at all (CPU or GPU) - needs adding in MVRecalculate.cpp first.
-- `trymany` + `meander=false` drops to the slow one-slice slice kernel (k_wave lacks it).
+- ~~`trymany` + `meander=false` drops to the slow one-slice slice kernel (k_wave lacks it).~~ Fixed 2026-11-02
+  (08e5ff9): trymany runs in k_wave, trymany Refines in parallel warps (GPU_PIPELINE_PLAN.md section 33).
 
 ## TODO
 
@@ -21,8 +22,10 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
 2. MRecalculate: add `trymany` (CPU path first, then GPU via `LevelArgs::try_many` as in MAnalyse); bit-exact vs CPU.
 3. Raise the non-exhaustive radius cap (UMH at least 50) in `max_param`, and make large UMH radii fast (today sequential
    batches: PAL trymany+UMH6 4.9 s GPU vs 0.1 s CPU, GPU_PIPELINE_PLAN.md section 27; section 29 did this for exhaustive).
-4. trymany in k_wave (meander=false), or document the slowdown.
+4. **DONE 2026-11-02 (08e5ff9):** trymany in k_wave (meander=false), or document the slowdown.
 5. Tests: run_s234 / run_qtgmc_vec with these settings, exact vs gpu=false; benchmark PAL + HD against the CPU.
+   **Partly done 2026-11-02:** run_s234 has the MAnalyse trymany / trymanyall / search_coarse cases (exact); DTL's
+   settings (MRecalculate UMH radius 50 + trymany) not tested yet, needs 1-3.
 
 ## Hex (search=4) / UMH (search=5) above radius 24 on the GPU
 
