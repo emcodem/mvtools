@@ -204,3 +204,39 @@ all in the conflicting files, so resolving the conflicts takes care of them.
   with a stand-in `nvofapi64.dll` in the host's application folder, which Windows searches first): a damaged file
   (error 193) and a DLL without `NvOFAPICreateInstanceCuda` both log once and give exactly the no-`mvtools_cuda`
   output in cf_nvof / cf_nvof_degrain, AviSynth+ = VapourSynth with the damaged file.
+- 2026-11-02, before step 7: `gpu_work` had one commit more than this branch (0288391: without a thread pool the GPU
+  search uses 1 slice like the CPU, was 24), so it was merged in (3383de1; a merge, so that step 7 stays a
+  fast-forward). The merge 17c5bb5 had stored `README.md`, `Documentation/mvtools2.html` (also without its BOM) and
+  `Sources/MVDegrain3.h` with LF while both parents have CRLF (core.autocrlf normalises conflict resolutions): restored
+  in 3383de1 / 3b1411e, so their diffs against upstream are only our changes again. `build_linux.sh` is executable in
+  git now (was 100644 since f9553c5: `./build_linux.sh` failed on a fresh clone).
+- 2026-11-02, step 6 (docs, 99a9228): README and `mvtools2.html` were already merged section by section in 17c5bb5
+  (checked against every upstream change since cdf04a5); `gpu.md`: trymanyall / search_coarse != 3 / lsb fall back,
+  the SATD block-size error stays an error, YUY2 reaches the GPU as YV16, the CPU reference is 2.7.48 (#59);
+  `VAPOURSYNTH_PLAN.md` todo list. Checked ad hoc on Windows: YUY2 MSuper / MAnalyse / MDegrain1 / MFlowFps with
+  gpu=true run on the GPU and equal the CPU; search_coarse=2, trymanyall=true, MDegrain lsb=true log "not supported
+  here" and equal the CPU.
+- 2026-11-02, final tests at 3383de1 (code unchanged since). **Windows** (`build_merge\bin`, avstp, RTX 5090):
+  `baseline\merge_final` = `merge_step5` in all 52 chains, GPU = CPU in all 7 GPU chains, lin_gpu = lin_cpu; without
+  avstp (`bin_noavstp`, `merge_final_noavstp`): GPU = CPU in all 7 (0288391), the slicing differences against the avstp
+  run are issue 9; without `mvtools_cuda.dll` (`merge_final_nocuda`): as in the fallback test above. compare.py cpu gpu
+  cf: AviSynth+ = VapourSynth in all 45 chains with and without avstp. VapourSynth against the stored references:
+  cf_chains 19 / 19 (needs `nnedi3_weights.bin` in the plugin folder, `bin_vs`), stand_ins 22 / 22, mt_tables
+  100 / 100; without `mvtools_cuda.dll` stand_ins and mt_tables pass, the cf_chains cases whose fallback is an
+  AviSynth-only plugin stop with the bridge's strict-mode error (by design).
+  **Linux** (WSL Ubuntu, GCC 15.2, CUDA 12.9 with g++-14 as host compiler, `build_linux.sh`, `~/build/merge_lin`):
+  builds without errors (SSE2 base, `-mavx2` per file; no libcuda / fftw NEEDED); warnings only the known nvcc ones,
+  DePan's unused fgets result (upstream) and a GCC `-Wstringop-overflow` false positive in `CudaNvof.cpp`
+  (memset of the header into `GetWritePtr()`). Upstream a74dcb6 built with upstream's own CMake crashes in
+  `AvisynthPluginInit3` under our AviSynth+ (`~/.local/lib/libavisynth.so.11`): its library exports all 3636 symbols,
+  including `AVS_linkage`, which libavisynth exports as read-only data too, so the plugin's store goes to libavisynth's
+  copy (ELF interposition) and faults; our build exports only the entry points (`cmake/plugin_exports.map`). An upstream
+  issue, worth reporting (needs `-fvisibility=hidden` or a version script). Reference therefore built from a74dcb6 with
+  our CMake files (`~/build/up2_lin`, as on Windows in step 0): merged CPU = upstream in all 26 chains (lin_cpu does not
+  run upstream). Ours (`~/build/test/baseline/m_full`): all 52 chains run, GPU = CPU in all 7, lin_gpu = lin_cpu (1
+  slice now); without `libmvtools_cuda.so` and with a truncated one (4 MB of 95 MB): identical to each other and to the
+  full run except cf_nvof / cf_nvof_degrain (MAnalyse fallback), no crash. compare.py cpu gpu cf: AviSynth+ = VapourSynth
+  in all 45 chains; without the library the 11 AviSynth-core-fallback cf chains give the strict-mode error, as on
+  Windows. cf_chains 19 / 19, stand_ins 22 / 22, mt_tables 100 / 100 (without the library: as on Windows).
+  Not tested: Clang (not installed in WSL), aarch64. Next: step 7 (fast-forward `gpu_work`, update
+  `origin/mvtools-pfmod`) waits for the user.
