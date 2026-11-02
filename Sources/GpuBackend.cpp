@@ -79,8 +79,11 @@ int GpuBackend::slice_threads(bool mt_flag)
     if (v >= 1)
       return v;
   }
+  // without a thread pool (avstp missing, VapourSynth, Linux) the CPU slicer runs one slice: so does the GPU, otherwise
+  // gpu=true would differ from the CPU result and from its own CPU fallback. MVTOOLS_GPU_SLICES or meander=false (the
+  // wavefront search, exact against the one-slice CPU search with meander=false) give the GPU its parallelism back.
   const int n = AvstpWrapper::use_instance().get_nbr_threads();
-  return n > 1 ? n : 24;
+  return n > 1 ? n : 1;
 }
 
 unsigned long long GpuBackend::frame_key(const void *clip, int n)

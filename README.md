@@ -126,8 +126,8 @@ or by hand:
   `libmvtools_cuda.so` must sit in the same folder as `libmvtools2.so` / `libcudafilters.so`; it needs only the NVIDIA
   driver at run time (static CUDA runtime). Without the library, the driver or a usable GPU, the filters use the CPU.
   CudaNNEDI3 reads `nnedi3_weights.bin` from the folder of `libcudafilters.so`. Without avstp (Windows only) the CPU
-  search runs single-sliced, while `gpu=true` reproduces the 24-thread CPU result (set `MVTOOLS_GPU_SLICES=1` to match
-  the single-sliced CPU result).
+  search runs single-sliced and `gpu=true` follows it, which is slow on the GPU: use `meander=false` for the fast
+  wavefront search (identical to the CPU with `meander=false`, `Documentation/gpu.md`).
 * Find binaries in `build/bin` (copied there after each build), or at
 
         build/Sources/libmvtools2.so
@@ -255,14 +255,17 @@ Denoising on the CPU (the AviSynth function and parameter names, `Documentation/
     fv2 = core.mvpf.MAnalyse(sup, isb=False, delta=2, blksize=16, overlap=8)
     core.mvpf.MDegrain2(clip, sup, bv1, fv1, bv2, fv2, thSAD=400).set_output()
 
-The same on the GPU (`Documentation/gpu.md`): add `gpu=True` to MSuper, MAnalyse and MDegrain2. To keep the frames on
+The same on the GPU (`Documentation/gpu.md`): add `gpu=True` to MSuper, MAnalyse and MDegrain2. Under VapourSynth there
+is no avstp thread pool, so the CPU search runs in one slice and `gpu=True` follows it to stay identical: that is slow
+on the GPU. Add `meander=False` to MAnalyse (and MRecalculate) for the fast GPU search (wavefront); its result is
+identical to the CPU with `meander=False`, slightly different from the default `meander=True`. To keep the frames on
 the GPU between filters, wrap the chain in cudafilters' upload / download:
 
     core.std.LoadPlugin('/path/to/plugins/libcudafilters.so')
     u = core.cuda.CudaUpload(clip)
     sup = core.mvpf.MSuper(u, pel=2, gpu=True)
-    bv = core.mvpf.MAnalyse(sup, isb=True, blksize=16, overlap=8, gpu=True)
-    fv = core.mvpf.MAnalyse(sup, isb=False, blksize=16, overlap=8, gpu=True)
+    bv = core.mvpf.MAnalyse(sup, isb=True, blksize=16, overlap=8, meander=False, gpu=True)
+    fv = core.mvpf.MAnalyse(sup, isb=False, blksize=16, overlap=8, meander=False, gpu=True)
     out = core.mvpf.MDegrain1(u, sup, bv, fv, thSAD=400, gpu=True)
     core.cuda.CudaDownload(out).set_output()
 
