@@ -1372,3 +1372,85 @@ they fell back to the CPU (REBASE_PLAN.md issue 3). Both are now in the CUDA sea
   search_coarse 2 / 4 0.88 / 0.83 s, trymany 2.92 s (CPU 0.54), trymany + trymanyall 4.31 s (CPU 0.68). trymany stays
   the open item of section 27 (7 serial Refines per block through mvc_refine in 24 slice CTAs); trymanyall adds them at
   level 0. Ideas there: run the 7 independent Refines of one block in parallel warps (they share only the inputs).
+
+## 33. trymany / trymanyall made fast; trymany in k_wave (2026-11-02; library API 19 unchanged, uncommitted)
+
+Start (section 32): PAL MXF 500 frames, Prefetch 8, MAnalyse search=4 pel 2 16x16 overlap 8, decode included:
+default 0.72 s (CPU 0.48), trymany 2.92 s (CPU 0.54), trymany + trymanyall 4.31 s (CPU 0.68); meander=false + trymany
+ran k_search with one slice at every level (s234 s5_tma_nm: 10.5 s vs 0.3 s for 20 frames).
+
+**Where the time went** (nsys per-level k_search time per frame, then `-DMVC_PHASE_PROF` cycle counters): trymany
+levels 1 / 2 / 3 took 19.2 / 10.2 / 3.8 ms per frame (plain 0.83 / 0.67 / 0.25): about 100k cycles per block in the 7
+sequential Refines (each 2 barriers per batch, one candidate per warp). Found on the way, each worth a fix of its own:
+1. `LevelArgs::packed_s` required `ew % 4 == 0` and aligned sub-planes. PAL 4:2:2 level 2 chroma has ew = 106, level 3
+   luma 122: every coarse level below level 1 took the one-candidate-at-a-time SAD form (phase A 3.3k instead of 1.5k
+   cycles). The packed reads never needed it: a lane reads every RP-th row (RP = 4 or 8 in every packed geometry), so
+   RP * ew keeps the word offset, which pk_fetch takes per lane at run time; the word after a row stays inside the plane
+   (a vector in range never reads the last row). Now only `MVCUDA_SEARCH_PACK=0` turns it off. Also speeds up the plain
+   search: levels 2 / 3 0.667 / 0.247 -> 0.355 / 0.130 ms per frame.
+2. Candidate lists in local memory: mvc_refine builds its lists in per-thread local arrays; reading them element by
+   element in a data-dependent loop cost about 3.6k cycles per group of 8 (local memory is effectively uncached here).
+3. Code generation: any trymany code inlined into k_search raised its register pressure (spills 156 B -> 1.3 KB), which
+   slowed the *plain* search too (PAL plain 0.71 -> 0.87 s). An out-of-line function with by-value arguments paid
+   3-6k cycles per block moving them through local memory.
+
+**What was built** (`Sources\cuda\mvcuda_analyse.cu`):
+- `k_search<TM>`: two instances; TM = true only for trymany levels. The plain instance has no trymany code: 0 spills
+  (before 156 B), level 0 4.25 -> 4.02 ms per frame.
+- `trymany_par` (out of line, one copy per kernel; inputs in shared memory `TmIn`, written by one thread before an existing
+  barrier, result returned by value `TmOut`): start states exactly as PseudoEPZSearch (zero / global with their
+  penalties, the predictor at its plain SAD, predictor m - 3 for Refine m >= 3 when CheckMV0 takes it against
+  verybigSAD + 1). A Refine whose predictor is not taken starts from Refine m - 1's result ("dependent"): those run after
+  the others, in order, in warp 0 (rare; `s6_tm_dep*` force them with lambda = 10^7). Then the lowest saved cost, the
+  first one on ties; with no cost below verybigSAD + 1 the last Refine's vector stays (CPU's workarea.bestMV).
+- Exhaustive Refine radius <= 3 (the default coarse type): the candidates depend only on the start vector, and the 7
+  start vectors mostly coincide (measured 1.0-1.4 distinct per block on PAL). The SADs of each distinct start vector's
+  rings are made once into a shared table (dynamic shared memory, k_search; a GEN-only static table in k_wave), spread
+  evenly over all warps in groups of <= 4 (`eval_multi<4>`, a larger group spilled inside trymany_par); then every
+  Refine folds its own CheckMV sequence over its vector's entries: lane-parallel (earliest lowest cost below the start
+  cost) when every candidate's cost chain is monotone (c1 >= 0, each partial sum >= the one before), else the sequential
+  early-exit fold. Same accept / reject decisions as the CPU in both cases.
+- Other types (hex, UMH, onetime, nstep, log, horizontal / vertical, exhaustive radius > 3 in k_wave): one Refine per
+  warp through `WarpChecker` (mvc_refine with a one-warp checker: no shared memory, no block barrier). Its `run_batch`
+  reads a chunk of 32 list entries with one local load per lane (lane j reads entry j) and hands them out by warp
+  shuffle; groups of 8 candidates go through `eval_multi` (`eval_multi_pk`: the reference words of the whole group are
+  loaded before any sum; other geometries one candidate at a time out of line); fold branch-free. The exhaustive Refine
+  of a WarpChecker (dependent Refines, k_wave radius > 3) makes its ring candidates in registers (`WarpChecker::exhaustive`).
+- k_search exhaustive radius > 3 with trymany keeps the old sequential form (exhaustive_fast needs the whole CTA).
+- k_wave (meander=false): trymany runs in the GEN kernels through the same trymany_par (4 warps), so meander=false +
+  trymany no longer drops to the one-slice k_search. `analyse_dev`: `wave` no longer excludes try_many; a try_many level
+  makes the call GEN.
+- `MVCUDA_TM_PAR=0` restores the old forms (k_search: the 7 Refines one after the other with the whole CTA; meander=false:
+  k_search in one slice), for A/B checks.
+- `-DMVC_PHASE_PROF` additions: dependent Refines and distinct start vectors per block, trymany_par stage cycles,
+  WarpChecker batch cycles.
+
+**Results** (RTX 5090 vs 24 threads, best of 3-5, High priority, decode included; `profile\bench_tm\bench.ps1`):
+
+| PAL, Prefetch 8              | 500 frames GPU (before) | CPU  | 1500 frames GPU | CPU  |
+|------------------------------|-------------------------|------|-----------------|------|
+| MAnalyse default             | 0.71 (0.71)             | 0.49 | 1.59            | 1.28 |
+| trymany                      | 0.82 (2.88)             | 0.52 | 1.91            | 1.39 |
+| trymany + trymanyall         | 0.93 (4.28)             | 0.68 | 2.20            | 1.82 |
+| meander=false + trymany      | 0.73 (1.93 for 50 fr.)  | 0.55 | 1.68            | 1.40 |
+| meander=false + trymanyall   | 0.92 (3.97 for 50 fr.)  | 0.66 | 2.21            | 1.81 |
+| MDegrain2 chain (4 analyses) | 1.99 default            | 1.20 |                 |      |
+| MDegrain2 chain, trymany     | 2.30 (10.45)            | 1.47 |                 |      |
+| MDegrain2 chain, trymanyall  | 2.68 (15.74)            | 2.24 |                 |      |
+
+k_search time per frame (nsys, 500 frames): plain 6.0 -> 5.3 ms; trymany 16.4 -> 6.8 ms; trymanyall 8.35 ms (level 0
+5.7 ms vs 4.0 without trymanyall).
+
+**Goal not reached: the GPU is still slower than the CPU on this SD clip**, with or without trymany. trymany now adds
+0.11 s (500 frames) over the GPU default, but the GPU default itself is behind the CPU here (0.71 vs 0.49 s; MDegrain2
+chain 1.99 vs 1.20 s). Prefetch 16 changes nothing on the GPU side (1500 frames: trymany 1.88 s, default 1.58 s), and
+decoding alone with full frames to ffmpeg takes 0.56 / 1.62 s for 500 / 1500 frames, so at SD these runs are limited by
+decode and per-frame host work rather than by the search kernels (the GPU activity of the default run spans 0.54 s of its 0.71 s).
+The remaining search cost is the meander slice chain at level 0 (section 30 item 1). Not tried: sharing the first
+(start-vector-only) batch of hex / UMH Refines like the exhaustive table (would cut trymanyall's level 0 cost).
+
+**Tests** (build `profile\build_tm\bin`, `build_windows.ps1 -CudaArch 120-real`, avstp from build_merge):
+`profile\run_s234.ps1`: 195/195 PASS (the 147 cases of section 32 plus 16 new S6 cases x 3 formats: 8-bit 4:2:2, 10-bit 4:2:2, 4:2:0; negative controls differ); 16 new S6 cases (dependent Refines meander true / false, 32x32 blocks, coarse
+onetime / nstep / log, exhaustive radius 5, bad-vector search with trymany meander=false, pel 1, luma only, negative
+control `s6_tm_nm_neg`). `vsbridge\test\baseline.py` (MVPF_CLIPS=`profile\vs_win\clips`) against `baseline\sc_api19`:
+all 52 chains the same, GPU = CPU in all 7 GPU chains. `run_presetcheck.ps1 -Fallback` Fast / Slower / Placebo ALL PASS (the packed_s change touches the meander=true search QTGMC uses). Golden dumps not used (stale since #59, section 32).

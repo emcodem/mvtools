@@ -61,9 +61,10 @@ namespace
     int *nlam;         // device: nLambda per block (k_interp writes it, k_wave reads it); unused on the smallest level
     int *rowbad;       // device: per block row, number of blocks that took the wide "bad vector" search
     int bad_range;     // MAnalyse badrange (> 0 UMH, < 0 exhaustive rings, 0 none)
-    int try_many;      // PseudoEPZSearch with tryMany (coarse levels of MAnalyse trymany=true): k_search only
+    int try_many;      // PseudoEPZSearch with tryMany (coarse levels of MAnalyse trymany=true, level 0 with trymanyall)
     int exh_fast;      // k_search: exhaustive radius > 3 through AnaChecker::exhaustive_fast (MVCUDA_EXH_FAST=0: off)
     int win_cap;       // k_search: samples of dynamic shared memory after the source buffers (reference window)
+    int tm_par;        // k_search trymany: the 7 Refines in parallel warps (WarpChecker; MVCUDA_TM_PAR=0: one after the other)
   };
 
   // One whole analysis call for the wavefront kernel (one launch for all levels): the rows of all levels, coarsest level
@@ -476,6 +477,7 @@ namespace
     int ring_dx[MAX_CAND], ring_dy[MAX_CAND];
     int nlambda;
     int prev_x, prev_y, prev_sad; // result of the previous block of the row (left predictor), passed without a global round trip
+    int tm[7][4];                 // trymany: result of each Refine (x, y, sad, cost), see k_search
   };
 
   // 4-byte asynchronous global -> shared copy (no registers, completes in the background). cp.async needs compute
@@ -733,10 +735,137 @@ namespace
       eval_candidate<0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
   }
 
+  // Candidates per group of eval_multi_pk: as many as fit about 64 registers of reference words per lane (at most 8)
+  template <int BX, int BSY, int CW, int CHH>
+  __host__ __device__ constexpr int multi_group()
+  {
+    constexpr int RP = 32 / (BX / 4), NR = BSY / RP;
+    constexpr int CRP = CW > 0 ? 16 / (CW / 4) : 1, NC = CHH / CRP;
+    constexpr int w = (NR + NC) * PK_WPR, k = 64 / w;
+    return k < 1 ? 1 : (k > 8 ? 8 : k);
+  }
+
+  // eval_candidate_pk for the first m (<= 8) of the candidates cx / cy, one warp: the reference words of a group of
+  // multi_group() candidates are all loaded before any of them is summed (one memory latency per group instead of per
+  // candidate). The SADs are the same integers as eval_candidate_pk's. Used by WarpChecker (trymany Refines one per warp).
+  template <int BX, int BSY, int CW, int CHH, int MAXG>
+  __device__ __forceinline__ void eval_multi_pk(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, const int *cx, const int *cy, int m, int lane, int *sl, int *sc)
+  {
+    constexpr int RP = 32 / (BX / 4), NR = BSY / RP;
+    constexpr int CRP = CW > 0 ? 16 / (CW / 4) : 1, NC = CHH / CRP;
+    constexpr int G0 = multi_group<BX, BSY, CW, CHH>(), G = G0 < MAXG ? G0 : MAXG;
+    static_assert(BSY % RP == 0 && (CHH == 0 || (CW <= 16 && CHH % CRP == 0)), "packed layout");
+    const int cg = lane % (BX / 4), rg = lane / (BX / 4);
+    const int pl = lane < 16 ? 1 : 2;
+    const int ccg = CW > 0 ? (lane & 15) % (CW / 4) : 0, crg = CW > 0 ? (lane & 15) / (CW / 4) : 0;
+    const unsigned *ql = (const unsigned *)(s_y + rg * BX + 4 * cg);
+    const unsigned *qc = (const unsigned *)((pl == 1 ? s_u : s_v) + crg * CW + 4 * ccg);
+    #pragma unroll
+    for (int g0 = 0; g0 < MAXG; g0 += G)
+    {
+      if (g0 >= m)
+        break;
+      unsigned wl[G][NR * PK_WPR], wc[G][NC > 0 ? NC * PK_WPR : 1];
+      int shl[G], shc[G];
+      #pragma unroll
+      for (int k = 0; k < G; k++)
+      {
+        const int i = g0 + k < m ? g0 + k : g0; // past m: repeat a valid candidate (never folded)
+        const int xp = x0 * a.pel + cx[i], yp = y0 * a.pel + cy[i];
+        const int sub = (xp & (a.pel - 1)) | ((yp & (a.pel - 1)) << a.log_pel);
+        const int rx = xp >> a.log_pel, ry = yp >> a.log_pel;
+        shl[k] = pk_fetch<NR>(a.ref[0][sub] + (size_t)(ry + rg) * a.ew[0] + rx + 4 * cg, (size_t)RP * a.ew[0], wl[k]);
+        shc[k] = 0;
+        if constexpr (CHH > 0)
+        {
+          const int xpc = x1 * a.pel + mvc::mv_to_chroma(cx[i], a.log_x_uv), ypc = y1 * a.pel + mvc::mv_to_chroma(cy[i], a.log_y_uv);
+          const int subc = (xpc & (a.pel - 1)) | ((ypc & (a.pel - 1)) << a.log_pel);
+          const int rxc = xpc >> a.log_pel, ryc = ypc >> a.log_pel;
+          shc[k] = pk_fetch<NC>(a.ref[pl][subc] + (size_t)(ryc + crg) * a.ew[pl] + rxc + 4 * ccg, (size_t)CRP * a.ew[pl], wc[k]);
+        }
+      }
+      #pragma unroll
+      for (int k = 0; k < G; k++)
+      {
+        if (g0 + k >= MAXG)
+          break;
+        unsigned sum_l = 0, sum_c = 0;
+        #pragma unroll
+        for (int i = 0; i < NR; i++)
+          sum_l = pk_row<PK_WPR>(wl[k] + PK_WPR * i, shl[k], ql + i * RP * BX * sizeof(pix) / 4, sum_l);
+        if constexpr (CHH > 0)
+        {
+          #pragma unroll
+          for (int i = 0; i < NC; i++)
+            sum_c = pk_row<PK_WPR>(wc[k] + PK_WPR * i, shc[k], qc + i * CRP * CW * sizeof(pix) / 4, sum_c);
+        }
+        sl[g0 + k] = warp_sum((int)sum_l);
+        sc[g0 + k] = scale_chroma(warp_sum((int)sum_c), a.chroma_scale);
+      }
+    }
+  }
+
+  // the other geometries of eval_multi: eval_dispatch one candidate after the other, out of line (keeps the code of
+  // WarpChecker::run_batch small)
+  struct Cand8
+  {
+    int v[16]; // x[0..7], y[0..7] / luma SADs [0..7], chroma SADs [8..15]
+  };
+  __device__ __noinline__ Cand8 eval_multi_seq(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, Cand8 c, int m, int lane, bool pair)
+  {
+    Cand8 r;
+    for (int k = 0; k < m; k++)
+      eval_dispatch(a, s_y, s_u, s_v, x0, y0, x1, y1, c.v[k], c.v[8 + k], lane, pair, r.v[k], r.v[8 + k]);
+    return r;
+  }
+
+  // SADs of the first m (<= 8) candidates cx / cy into sl / sc, one warp (every lane gets every value): eval_multi_pk for
+  // the packed geometries of eval_dispatch, else eval_dispatch one candidate after the other
+  // (MAXG: at most this many candidates, m <= MAXG; fewer registers for smaller values)
+  template <int MAXG = 8>
+  __device__ __forceinline__ void eval_multi(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, const int *cx, const int *cy, int m, int lane, bool pair, int *sl, int *sc)
+  {
+    if (a.packed_s)
+    {
+      if (a.bs_x == 32 && a.bs_y == 32 && a.cw == 16 && a.ch == 32)
+        return eval_multi_pk<32, 32, 16, 32, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+      if (a.bs_x == 32 && a.bs_y == 32 && a.cw == 16 && a.ch == 16)
+        return eval_multi_pk<32, 32, 16, 16, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 16)
+        return eval_multi_pk<16, 16, 8, 16, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 8)
+        return eval_multi_pk<16, 16, 8, 8, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+      if (a.bs_x == 32 && a.bs_y == 32 && a.ch == 0)
+        return eval_multi_pk<32, 32, 0, 0, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+      if (a.bs_x == 16 && a.bs_y == 16 && a.ch == 0)
+        return eval_multi_pk<16, 16, 0, 0, MAXG>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, sl, sc);
+    }
+    Cand8 c;
+    #pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+      c.v[k] = cx[k];
+      c.v[8 + k] = cy[k];
+    }
+    const Cand8 r = eval_multi_seq(a, s_y, s_u, s_v, x0, y0, x1, y1, c, m, lane, pair);
+    #pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+      sl[k] = r.v[k];
+      sc[k] = r.v[8 + k];
+    }
+  }
+
 #ifdef MVC_PHASE_PROF
   // per-phase cycle counters of the block loop (development aid, build with -DMVC_PHASE_PROF): [log2(blocks per row)][phase]
   __device__ unsigned long long g_prof[16][8];
   __device__ unsigned long long g_exh[6]; // exhaustive_fast: window, evaluation, reduction cycles, calls; runs, live runs
+  __device__ unsigned long long g_wkprof[8];
+  __device__ unsigned long long g_tmprof[16][6]; // trymany_par stages: starts, eval, sync, fold, sync, select (cycles)
+#define TPH(i) do { if (warp == 0 && wk.lane == 0) { long long n_ = clock64(); atomicAdd(&g_tmprof[tbk][i], (unsigned long long)(n_ - tt_)); tt_ = n_; } } while (0) // WarpChecker::run_batch: total cycles, eval cycles, calls, eval groups
 #define PH_START() ph_t = clock64()
 #define PH(i) do { if (tid == 0) { long long n_ = clock64(); atomicAdd(&g_prof[bk][i], (unsigned long long)(n_ - ph_t)); ph_t = n_; } } while (0)
 #else
@@ -1337,20 +1466,514 @@ namespace
     }
   };
 
+  // Candidate checker for mvc_refine run by ONE warp (k_search trymany: the 7 Refines of PseudoEPZSearch in parallel,
+  // one warp each, GPU_PIPELINE_PLAN.md section 33). A batch is evaluated 8 candidates at a time (eval_multi: the loads of
+  // a group in flight together), then folded in the CPU's order with the CheckMV cost chain of AnaChecker::run_batch.
+  // No shared memory and no block barrier: every lane holds every SAD (warp sums) and the same scalar state.
+  struct WarpChecker
+  {
+    int bx, by, min_cost, best_sad;
+    int dx_min, dx_max, dy_min, dy_max, pred_x, pred_y, nlambda;
+    const LevelArgs *a;
+    const pix *s_y, *s_u, *s_v;
+    int x0, y0, x1, y1;
+    int lane;
+    bool pair;
+    __device__ bool ok(int cx, int cy) const { return cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max; }
+
+    // one group of up to 8 candidates (m of them, coordinates cx / cy, batch indices base .. base + m - 1, dir values dv):
+    // SADs with the loads of the whole group in flight (eval_multi), then the fold in the CPU's order. Out-of-range
+    // vectors are never evaluated (they may point outside the padded planes): the current best vector (always in range)
+    // stands in for them, and the fold skips them.
+    __device__ __forceinline__ void group(int mode, int m, int (&cx)[8], int (&cy)[8], const int (&dv)[8], int &dir,
+      int bits, int pnew)
+    {
+      bool v[8];
+      #pragma unroll
+      for (int k = 0; k < 8; k++)
+      {
+        v[k] = k < m && ok(cx[k], cy[k]);
+        if (!v[k])
+        {
+          cx[k] = bx;
+          cy[k] = by;
+        }
+      }
+      int sl[8], sc[8];
+#ifdef MVC_PHASE_PROF
+      const long long we0 = clock64();
+#endif
+      eval_multi(*a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, m, lane, pair, sl, sc);
+#ifdef MVC_PHASE_PROF
+      if (lane == 0)
+      {
+        atomicAdd(&g_wkprof[1], (unsigned long long)(clock64() - we0));
+        atomicAdd(&g_wkprof[3], 1ull);
+      }
+#endif
+      #pragma unroll
+      for (int k = 0; k < 8; k++)
+      {
+        // the CheckMV cost chain: accepted when every partial sum is below the minimum (all three computed, no branches)
+        const int dxp = pred_x - cx[k], dyp = pred_y - cy[k];
+        const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+        const int c1 = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - bits);
+        const int c2 = c1 + sl[k] + (int)(((long long)pnew * sl[k]) >> 8);
+        const int cost = c2 + sc[k] + (int)(((long long)pnew * sc[k]) >> 8);
+        if (!(v[k] & (c1 < min_cost) & (c2 < min_cost) & (cost < min_cost)))
+          continue;
+        if (mode != mvc_refine::M_CHECKDIR)
+        {
+          bx = cx[k];
+          by = cy[k];
+        }
+        min_cost = cost;
+        best_sad = sl[k] + sc[k];
+        if (mode != mvc_refine::M_CHECK)
+          dir = dv[k];
+      }
+    }
+
+    // mvc_refine's batch: the lists are in the caller's local memory (each lane has its own copy, all equal), which is
+    // slow to read element by element (measured about 3.6k cycles per group of 8). Lane j reads entry base + j of a chunk
+    // of 32 (one load per list for the chunk), the groups take their entries by warp shuffle.
+    __device__ __noinline__ void run_batch(int mode, int n, const int *xs, const int *ys, const int *vals, int &dir)
+    {
+      const int bits = a->bits, pnew = a->pnew;
+#ifdef MVC_PHASE_PROF
+      const long long wt0 = clock64();
+#endif
+      for (int b0 = 0; b0 < n; b0 += 32)
+      {
+        const int j = b0 + lane < n ? b0 + lane : n - 1;
+        const int lx = xs[j], ly = ys[j], lv = vals ? vals[j] : j;
+        const int nc = n - b0 < 32 ? n - b0 : 32;
+        for (int c0 = 0; c0 < nc; c0 += 8)
+        {
+          const int m = nc - c0 < 8 ? nc - c0 : 8;
+          int cx[8], cy[8], dv[8];
+          #pragma unroll
+          for (int k = 0; k < 8; k++)
+          {
+            cx[k] = __shfl_sync(0xffffffffu, lx, (c0 + k) & 31);
+            cy[k] = __shfl_sync(0xffffffffu, ly, (c0 + k) & 31);
+            dv[k] = __shfl_sync(0xffffffffu, lv, (c0 + k) & 31);
+          }
+          group(mode, m, cx, cy, dv, dir, bits, pnew);
+        }
+      }
+#ifdef MVC_PHASE_PROF
+      if (lane == 0)
+      {
+        atomicAdd(&g_wkprof[0], (unsigned long long)(clock64() - wt0));
+        atomicAdd(&g_wkprof[2], 1ull);
+      }
+#endif
+    }
+
+    // ExpandingSearch rings 1..r around the start vector (the exhaustive Refine: one CheckMV sequence around a fixed
+    // centre, mvc_refine::refine S_EXHAUSTIVE) with the candidates made in registers, in groups of 8 in the CPU order
+    __device__ __noinline__ void exhaustive(int r)
+    {
+      const int bits = a->bits, pnew = a->pnew, mvx = bx, mvy = by;
+#ifdef MVC_PHASE_PROF
+      const long long wt0 = clock64();
+#endif
+      const int n = 4 * r * (r + 1);
+      int ri = 1, ki = 0, dummy = 0; // ring and index in the ring of the next candidate
+      const int dv[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+      for (int c0 = 0; c0 < n; c0 += 8)
+      {
+        const int m = n - c0 < 8 ? n - c0 : 8;
+        int cx[8], cy[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+        {
+          int dx, dy;
+          mvc_refine::expanding_point(ri, ki, dx, dy);
+          cx[k] = mvx + dx;
+          cy[k] = mvy + dy;
+          if (++ki == 8 * ri)
+          {
+            ki = 0;
+            ri++;
+          }
+        }
+        group(mvc_refine::M_CHECK, m, cx, cy, dv, dummy, bits, pnew);
+      }
+#ifdef MVC_PHASE_PROF
+      if (lane == 0)
+      {
+        atomicAdd(&g_wkprof[0], (unsigned long long)(clock64() - wt0));
+        atomicAdd(&g_wkprof[2], 1ull);
+      }
+#endif
+    }
+  };
+
   // one CUDA block per slice; every warp evaluates candidate vectors, the block order inside the slice is serial.
   // Threads per block: with 768 the kernel was capped at 80 registers and the SAD code spilled 2.7 KB per thread, which
   // made the candidate rounds limited by local-memory traffic; 256 compiles without spills (GPU_PIPELINE_PLAN.md
   // section 25, S1: FRC chain -9%).
   // (a 512-thread variant for the exhaustive_fast levels was measured: no gain, GPU_PIPELINE_PLAN.md section 29)
   constexpr int SEARCH_THREADS = 256;
+
+  // one Refine of trymany in one warp (one copy of the mvc_refine code for WarpChecker; two call sites in k_search)
+  __device__ __noinline__ void tm_refine_warp(WarpChecker &wk, int type, int radius)
+  {
+    if (type == mvc_refine::S_EXHAUSTIVE)
+      wk.exhaustive(radius); // the default coarse type: candidates made in registers
+    else
+      mvc_refine::refine(wk, type, radius);
+  }
+
+  // PseudoEPZSearch with tryMany (GPU_PIPELINE_PLAN.md section 33): the 7 Refines around zero, global, the predictor and
+  // predictors[0..3] run at the same time, Refine m in warp m % nwarps (they share only the phase A SADs sl7 / sc7 and the
+  // predictors). Start states as the CPU: zero and global with their penalties, the predictor at its plain SAD (all
+  // three taken unconditionally); Refine m >= 3 starts from predictor m - 3 when CheckMV0 takes it against
+  // nMinCost = verybigSAD + 1, else from Refine m - 1's result (bestMV kept) with that cost: such a dependent Refine runs
+  // after the others, in order, in warp 0. Then the lowest saved cost, the first one on ties. wk carries the block
+  // geometry; tm is shared scratch [7][4]. Called by every thread of the CTA with identical values (block barriers).
+  // value m (0 .. 6) of a 7-entry register array (a run-time index would put the array in local memory)
+  __device__ __forceinline__ int pick7(const int (&v)[7], int m)
+  {
+    int r = v[0];
+    #pragma unroll
+    for (int j = 1; j < 7; j++)
+      r = j == m ? v[j] : r;
+    return r;
+  }
+
+  const int TM_RING_MAX = 48; // candidates of ExpandingSearch(1..3): the shared SAD table of trymany_par per start vector
+
+  // inputs of trymany_par, written to shared memory by one thread before a block barrier (identical in every thread):
+  // passing them by value to the out-of-line function moved them through local memory (measured 3-6k cycles per block)
+  struct TmIn
+  {
+    WarpChecker wk;     // block geometry (lane unset)
+    int sl7[7], sc7[7]; // phase A SADs: zero, global, predictor, predictors[0..3]
+    Vec glob, pred, pv[4];
+  };
+  struct TmOut
+  {
+    int bx, by, sad, cost, info; // selected vector, its SAD and cost; info: dependent Refines | distinct starts << 8
+  };
+
+  // Out of line (one copy per kernel): inlined into k_search it made the trymany instance spill 1.3 KB.
+  __device__ __noinline__ TmOut trymany_par(const TmIn &in, const LevelArgs &a, int lane, int warp, int nwarps,
+    int (*tm)[4], int (*tsad)[2])
+  {
+    WarpChecker wk = in.wk;
+    wk.lane = lane;
+    const int *sl7 = in.sl7, *sc7 = in.sc7;
+    const Vec glob = in.glob, pred = in.pred;
+    const Vec *pv = in.pv;
+    int bx, by, best_sad, min_cost;
+#ifdef MVC_PHASE_PROF
+    long long tt_ = clock64();
+    const int tbk = 31 - __clz(a.n_blk_x);
+#else
+#define TPH(i) do {} while (0)
+#endif
+    const int verybig = 3 * a.bs_x * a.bs_y << a.bits; // PlaneOfBlocks::verybigSAD (integer samples)
+    int st_x[7], st_y[7], st_s[7], st_c[7];
+    unsigned dep = 0;
+    int nu_out = 0;
+    {
+      int sad = sl7[0] + sc7[0];
+      st_x[0] = 0; st_y[0] = 0; st_s[0] = sad; st_c[0] = sad + (int)(((long long)a.pzero * sad) >> 8);
+      sad = sl7[1] + sc7[1];
+      st_x[1] = glob.x; st_y[1] = glob.y; st_s[1] = sad; st_c[1] = sad + (int)(((long long)a.pglobal * sad) >> 8);
+      sad = sl7[2] + sc7[2];
+      st_x[2] = pred.x; st_y[2] = pred.y; st_s[2] = sad; st_c[2] = sad;
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+      const int m = 3 + i, cx = pv[i].x, cy = pv[i].y;
+      bool taken = false;
+      if (wk.ok(cx, cy))
+      {
+        const int dxp = wk.pred_x - cx, dyp = wk.pred_y - cy;
+        const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+        int cost = (int)((unsigned)wk.nlambda * (unsigned)dist) >> (16 - a.bits);
+        if (cost < verybig + 1)
+        {
+          cost += sl7[3 + i];
+          if (cost < verybig + 1)
+          {
+            cost += sc7[3 + i];
+            if (cost < verybig + 1)
+            {
+              taken = true;
+              st_x[m] = cx; st_y[m] = cy; st_s[m] = sl7[3 + i] + sc7[3 + i]; st_c[m] = cost;
+            }
+          }
+        }
+      }
+      if (!taken)
+      {
+        dep |= 1u << m;
+        st_x[m] = 0; st_y[m] = 0; st_s[m] = 0; st_c[m] = verybig + 1;
+      }
+    }
+    if (a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3)
+    {
+      // Exhaustive Refine (the default coarse type): its candidates depend only on the start vector, and the start
+      // vectors often coincide (zero / global, predictor / median / neighbours). The SADs of each distinct start
+      // vector's rings are made once, in groups of 8 spread over all warps, into the shared table tsad; then every
+      // Refine folds its own CheckMV sequence (its start cost) over its vector's entries in the CPU order.
+      const int r = a.radius, n = 4 * r * (r + 1), gpr = (n + 7) / 8;
+      int ux[7], uy[7], uid[7], nu = 0;
+      #pragma unroll
+      for (int m = 0; m < 7; m++)
+      {
+        ux[m] = 0;
+        uy[m] = 0;
+      }
+      #pragma unroll
+      for (int m = 0; m < 7; m++)
+      {
+        uid[m] = 0;
+        if ((dep >> m) & 1u)
+          continue;
+        int f = -1;
+        #pragma unroll
+        for (int j = 0; j < 7; j++)
+          if (j < nu && f < 0 && ux[j] == st_x[m] && uy[j] == st_y[m])
+            f = j;
+        if (f < 0)
+        {
+          #pragma unroll
+          for (int j = 0; j < 7; j++)
+            if (j == nu)
+            {
+              ux[j] = st_x[m];
+              uy[j] = st_y[m];
+            }
+          f = nu++;
+        }
+        uid[m] = f;
+      }
+      nu_out = nu;
+      TPH(0);
+      const int bits = a.bits, pnew = a.pnew;
+      // ring and index of candidate c (0 .. n - 1) of ExpandingSearch(1..r): its offset from the centre
+      auto ring_offset = [](int c, int &dx, int &dy) {
+        int ri = 1;
+        while (c >= 4 * ri * (ri + 1))
+          ri++;
+        mvc_refine::expanding_point(ri, c - 4 * ri * (ri - 1), dx, dy);
+      };
+      // the nu * n candidates spread evenly over the warps (q per warp and round; table entry u * n + c)
+      const int total = nu * n, q0 = (total + nwarps - 1) / nwarps, q = q0 < 4 ? q0 : 4; // groups of <= 4: registers
+      for (int t0 = warp * q; t0 < total; t0 += nwarps * q)
+      {
+        const int m = total - t0 < q ? total - t0 : q;
+        int cx[8], cy[8];
+        #pragma unroll
+        for (int k = 0; k < 4; k++)
+        {
+          const int t = t0 + (k < m ? k : 0), u = t / n, c = t - u * n;
+          const int cxu = pick7(ux, u), cyu = pick7(uy, u);
+          int dx, dy;
+          ring_offset(c, dx, dy);
+          cx[k] = cxu + dx;
+          cy[k] = cyu + dy;
+          if (!(k < m && wk.ok(cx[k], cy[k])))
+          {
+            cx[k] = cxu; // stand-in: the start vector is in range (never folded)
+            cy[k] = cyu;
+          }
+        }
+        int sl[8], sc[8];
+        eval_multi<4>(a, wk.s_y, wk.s_u, wk.s_v, wk.x0, wk.y0, wk.x1, wk.y1, cx, cy, m, wk.lane, wk.pair, sl, sc);
+        if (wk.lane == 0)
+          #pragma unroll
+          for (int k = 0; k < 4; k++)
+            if (k < m)
+            {
+              tsad[t0 + k][0] = sl[k];
+              tsad[t0 + k][1] = sc[k];
+            }
+      }
+      TPH(1);
+      __syncthreads();
+      TPH(2);
+      for (int m = warp; m < 7; m += nwarps)
+      {
+        if ((dep >> m) & 1u)
+          continue;
+        const int u = pick7(uid, m), mvx = pick7(ux, u), mvy = pick7(uy, u);
+        int cbx = pick7(st_x, m), cby = pick7(st_y, m), csad = pick7(st_s, m), cmin = pick7(st_c, m);
+        // CheckMV cost of candidate c (false: out of range); mono: every partial sum >= the one before (then the
+        // early-exit chain accepts exactly when the full cost is below the running minimum)
+        auto cost_of = [&](int c, int &cx, int &cy, int &sad, int &cost, bool &mono) -> bool {
+          int dx, dy;
+          ring_offset(c, dx, dy);
+          cx = mvx + dx;
+          cy = mvy + dy;
+          mono = true;
+          if (!wk.ok(cx, cy))
+            return false;
+          const int sl = tsad[u * n + c][0], sc = tsad[u * n + c][1];
+          const int dxp = wk.pred_x - cx, dyp = wk.pred_y - cy;
+          const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+          const int c1 = (int)((unsigned)wk.nlambda * (unsigned)dist) >> (16 - bits);
+          const int c2 = c1 + sl + (int)(((long long)pnew * sl) >> 8);
+          cost = c2 + sc + (int)(((long long)pnew * sc) >> 8);
+          mono = c1 >= 0 && c2 >= c1 && cost >= c2;
+          sad = sl + sc;
+          return true;
+        };
+        // lane-parallel: the CPU's CheckMV sequence ends at the earliest candidate with the lowest cost below the start
+        // cost (all chains monotone); else the sequential fold
+        unsigned long long key = ~0ull;
+        bool mono_all = true;
+        for (int c = wk.lane; c < n; c += 32)
+        {
+          int cx, cy, sad, cost;
+          bool mono;
+          if (!cost_of(c, cx, cy, sad, cost, mono))
+            continue;
+          mono_all = mono_all && mono;
+          if (mono && cost < cmin)
+          {
+            const unsigned long long k = ((unsigned long long)(unsigned)cost << 8) | (unsigned)c;
+            key = k < key ? k : key;
+          }
+        }
+        if (__all_sync(0xffffffffu, mono_all))
+        {
+          #pragma unroll
+          for (int o = 16; o > 0; o >>= 1)
+          {
+            const unsigned long long k = __shfl_xor_sync(0xffffffffu, key, o);
+            key = k < key ? k : key;
+          }
+          if (key != ~0ull)
+          {
+            int cx, cy, sad, cost;
+            bool mono;
+            cost_of((int)(key & 255u), cx, cy, sad, cost, mono);
+            cbx = cx;
+            cby = cy;
+            cmin = cost;
+            csad = sad;
+          }
+        }
+        else
+          for (int c = 0; c < n; c++)
+          {
+            int cx, cy, sad, cost;
+            bool mono;
+            if (!cost_of(c, cx, cy, sad, cost, mono))
+              continue;
+            // the chain with its early exits: every partial sum below the running minimum
+            const int sl = tsad[u * n + c][0];
+            const int dxp = wk.pred_x - cx, dyp = wk.pred_y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            const int c1 = (int)((unsigned)wk.nlambda * (unsigned)dist) >> (16 - bits);
+            const int c2 = c1 + sl + (int)(((long long)pnew * sl) >> 8);
+            if ((c1 < cmin) & (c2 < cmin) & (cost < cmin))
+            {
+              cbx = cx;
+              cby = cy;
+              cmin = cost;
+              csad = sad;
+            }
+          }
+        if (wk.lane == 0)
+        {
+          tm[m][0] = cbx;
+          tm[m][1] = cby;
+          tm[m][2] = csad;
+          tm[m][3] = cmin;
+        }
+      }
+      TPH(3);
+    }
+    else
+      for (int m = warp; m < 7; m += nwarps)
+      {
+        if ((dep >> m) & 1u)
+          continue;
+        wk.bx = pick7(st_x, m);
+        wk.by = pick7(st_y, m);
+        wk.best_sad = pick7(st_s, m);
+        wk.min_cost = pick7(st_c, m);
+        tm_refine_warp(wk, a.search_type, a.radius);
+        if (wk.lane == 0)
+        {
+          tm[m][0] = wk.bx;
+          tm[m][1] = wk.by;
+          tm[m][2] = wk.best_sad;
+          tm[m][3] = wk.min_cost;
+        }
+      }
+    __syncthreads();
+    if (dep)
+    {
+      if (warp == 0)
+        for (int m = 3; m < 7; m++)
+        {
+          if (!((dep >> m) & 1u))
+            continue;
+          wk.bx = tm[m - 1][0];
+          wk.by = tm[m - 1][1];
+          wk.best_sad = tm[m - 1][2];
+          wk.min_cost = verybig + 1;
+          tm_refine_warp(wk, a.search_type, a.radius);
+          __syncwarp();
+          if (wk.lane == 0)
+          {
+            tm[m][0] = wk.bx;
+            tm[m][1] = wk.by;
+            tm[m][2] = wk.best_sad;
+            tm[m][3] = wk.min_cost;
+          }
+          __syncwarp();
+        }
+      __syncthreads();
+    }
+    TPH(4);
+    // no saved cost below verybigSAD + 1: the CPU keeps workarea.bestMV, the last Refine's result
+    bx = tm[6][0];
+    by = tm[6][1];
+    best_sad = tm[6][2];
+    int sel_cost = verybig + 1;
+    for (int m = 0; m < 7; m++)
+      if (tm[m][3] < sel_cost)
+      {
+        bx = tm[m][0];
+        by = tm[m][1];
+        best_sad = tm[m][2];
+        sel_cost = tm[m][3];
+      }
+    min_cost = sel_cost;
+    TPH(5);
+#undef TPH
+    TmOut o;
+    o.bx = bx;
+    o.by = by;
+    o.sad = best_sad;
+    o.cost = min_cost;
+    o.info = __popc(dep) | (nu_out << 8); // dependent Refines, distinct start vectors (profiling)
+    return o;
+  }
+
+  // TM: the instance for the trymany levels (LevelArgs::try_many); the other instance has no trymany code (its register
+  // allocation, and so the speed of every other search, stays as without it: GPU_PIPELINE_PLAN.md section 33)
+  template <bool TM>
   __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search(LevelArgs a)
   {
     extern __shared__ __align__(16) pix s_dyn[];
     __shared__ BlockShared b;
+    __shared__ TmIn s_tmin; // trymany: inputs of trymany_par (TM instance only)
     __shared__ LevelArgs s_args; // copy of the kernel argument for the mvc_refine path: taking the address of the by-value argument would make every field access a slow generic load
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
     // exhaustive levels with radius <= 3 use the ring fold below, everything else mvc_refine (AnaChecker)
-    const bool ring_fold = a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3 && !a.try_many;
+    const bool ring_fold = a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3 && !TM;
     if (!ring_fold && tid == 0)
       s_args = a;
     const int slice = blockIdx.x;
@@ -1573,7 +2196,7 @@ namespace
         // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
         int best_x, best_y, best_sad, min_cost;
         int sl7[7], sc7[7]; // tryMany: the phase A SADs, kept for the refines (their batches overwrite b.sl / b.sc)
-        if (a.try_many)
+        if (TM)
           for (int i = 0; i < 7; i++)
           {
             sl7[i] = b.sl[i];
@@ -1625,6 +2248,38 @@ namespace
             min_cost = cost;
           }
         }
+        if (TM && a.tm_par && tid == 0)
+        {
+          // trymany_par's inputs (published by the barrier below)
+          WarpChecker &wk = s_tmin.wk;
+          wk.dx_min = dx_min;
+          wk.dx_max = dx_max;
+          wk.dy_min = dy_min;
+          wk.dy_max = dy_max;
+          wk.pred_x = pred.x;
+          wk.pred_y = pred.y;
+          wk.nlambda = nlambda;
+          wk.a = &s_args;
+          wk.s_y = s_y;
+          wk.s_u = s_u;
+          wk.s_v = s_v;
+          wk.x0 = x0[0];
+          wk.y0 = y0[0];
+          wk.x1 = x0[1];
+          wk.y1 = y0[1];
+          wk.pair = pair_chroma;
+          for (int i = 0; i < 7; i++)
+          {
+            s_tmin.sl7[i] = sl7[i];
+            s_tmin.sc7[i] = sc7[i];
+          }
+          s_tmin.glob = glob;
+          s_tmin.pred = pred;
+          s_tmin.pv[0] = p0;
+          s_tmin.pv[1] = p1;
+          s_tmin.pv[2] = p2;
+          s_tmin.pv[3] = p3;
+        }
         __syncthreads(); // everybody has read the phase A results before phase B overwrites them
         PH(2);
 
@@ -1657,8 +2312,27 @@ namespace
           ck.nwarps = nwarps;
           ck.pair = pair_chroma;
           ck.b = &b;
-          if (!a.try_many)
+          if (!TM)
             ck.refine_any(a.search_type, a.radius, s_dyn + 2 * blk_el, a.win_cap);
+          else if (a.tm_par)
+          {
+            // PseudoEPZSearch with tryMany, the 7 Refines at the same time (trymany_par; inputs in s_tmin)
+            const TmOut o = trymany_par(s_tmin, s_args, lane, warp, nwarps, b.tm,
+              (int (*)[2])(((size_t)(s_dyn + 2 * blk_el) + 15) & ~(size_t)15));
+            ck.bx = o.bx;
+            ck.by = o.by;
+            ck.best_sad = o.sad;
+            ck.min_cost = o.cost;
+            const int ndep = o.info;
+            (void)ndep;
+#ifdef MVC_PHASE_PROF
+            if (tid == 0)
+            {
+              atomicAdd(&g_prof[bk][6], (unsigned long long)(ndep & 255));
+              atomicAdd(&g_prof[bk][7], (unsigned long long)(ndep >> 8));
+            }
+#endif
+          }
           else
           {
             // PseudoEPZSearch with tryMany: a Refine around zero, global, the predictor and each of predictors[0..3],
@@ -2012,6 +2686,8 @@ namespace
     long long key[4];                         // per-warp minimum of the parallel fold
     unsigned long long kmin;                  // fused fold (wave_eval_inl with FOLD): minimum of (cost << 8 | index)
     int odd;                                  // fused fold: some cost part was negative or the sum overflowed
+    int tm[7][4];                             // trymany: result of each Refine (trymany_par)
+    TmIn tmin;                                // trymany: inputs of trymany_par
   };
   // register cap of the fixed-plan k_wave kernels and the registers of reference samples one lane keeps in flight in
   // wave_eval_inl. Measured on the RTX 5090 (GPU_PIPELINE_PLAN.md section 24): 96 / 24 beat 255 / 64 by 17-19% in QTGMC
@@ -3024,7 +3700,7 @@ namespace
         // the barrier after that batch's candidate list
         WPH(4);
 
-        if (!GEN || plan != WP_GEN)
+        if (!GEN || (plan != WP_GEN && !a.try_many))
         {
           // fixed batches (wave_plan), one SAD call site: [WP_UMH: cross + hex grid] [WP_HEX, WP_UMH: hexagon] rings
           // around the vector found so far (all rings of an exhaustive level in one batch: the hot path of every coarse
@@ -3062,6 +3738,52 @@ namespace
         }
         else if constexpr (GEN)
         {
+          if (a.try_many)
+          {
+            // (only the general kernels have this table: the ring-only kernels keep their shared-memory size)
+            __shared__ int s_tsad[7 * TM_RING_MAX][2];
+            // PseudoEPZSearch with tryMany: the 7 Refines in the WAVE_NW warps (WarpChecker, trymany_par); the
+            // refines only read the source block and the phase A SADs (inputs in g_ws.tmin, written by lane 0)
+            if (lane == 0)
+            {
+              WarpChecker &wk = g_ws.tmin.wk;
+              wk.dx_min = dx_min;
+              wk.dx_max = dx_max;
+              wk.dy_min = dy_min;
+              wk.dy_max = dy_max;
+              wk.pred_x = pred.x;
+              wk.pred_y = pred.y;
+              wk.nlambda = nlambda;
+              wk.a = &g_ws.a;
+              wk.s_y = s_y;
+              wk.s_u = s_u;
+              wk.s_v = s_v;
+              wk.x0 = x0[0];
+              wk.y0 = y0[0];
+              wk.x1 = x0[1];
+              wk.y1 = y0[1];
+              wk.pair = 2 * a.cw <= 32;
+              for (int i = 0; i < 7; i++)
+              {
+                g_ws.tmin.sl7[i] = g_ws.sl[i];
+                g_ws.tmin.sc7[i] = g_ws.sc[i];
+              }
+              g_ws.tmin.glob = glob;
+              g_ws.tmin.pred = pred;
+              g_ws.tmin.pv[0] = p0;
+              g_ws.tmin.pv[1] = p1;
+              g_ws.tmin.pv[2] = p2;
+              g_ws.tmin.pv[3] = p3;
+            }
+            __syncthreads();
+            const TmOut o = trymany_par(g_ws.tmin, g_ws.a, lane & 31, lane >> 5, WAVE_NW, g_ws.tm, s_tsad);
+            best_x = o.bx;
+            best_y = o.by;
+            best_sad = o.sad;
+            min_cost = o.cost;
+          }
+          else
+          {
           WaveChecker<GW, BSY, CHH> ck;
           ck.bx = best_x;
           ck.by = best_y;
@@ -3076,6 +3798,7 @@ namespace
           best_y = ck.by;
           best_sad = ck.best_sad;
           min_cost = ck.min_cost;
+          }
           WPH(5);
         }
         // Bad vector (PseudoEPZSearch): the threshold grows with badcount, the number of earlier bad blocks in raster order
@@ -3364,8 +4087,10 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // meander=false: wavefront kernel = CPU result with meander=false, mt=false (slice_threads is ignored); meander=true:
   // slice kernel = CPU result with slice_threads threads. MVCUDA_WAVE=0 forces the slice kernel (comparisons only).
   static const bool wave_allowed = [] { const char *e = getenv("MVCUDA_WAVE"); return !(e && e[0] == '0'); }();
-  // trymany: k_search only (with meander=false in one slice, the single-slice CPU result the wavefront kernel gives too)
-  const bool wave = !ap->meander && wave_allowed && !ap->try_many;
+  // trymany: the Refines one per warp (WarpChecker, trymany_par) in both kernels; MVCUDA_TM_PAR=0 restores the older
+  // forms (k_search: the 7 Refines one after the other with the whole CTA; meander=false: k_search in one slice)
+  static const bool tm_par_allowed = [] { const char *e = getenv("MVCUDA_TM_PAR"); return !(e && e[0] == '0'); }();
+  const bool wave = !ap->meander && wave_allowed && (!ap->try_many || tm_par_allowed);
   int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
   for (int l = 0; l < nl; l++)
   {
@@ -3529,16 +4254,14 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
             pk = pk && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
         }
         a.packed = pk ? 1 : 0;
-        // the slice kernel's packed form (eval_candidate_pk picks the block geometries it has): alignment only
+        // the slice kernel's packed form (eval_candidate_pk / eval_multi_pk pick the block geometries they have). Their
+        // reads need no aligned planes: a lane reads every RP-th row (RP = 4 or 8 in every packed geometry), so its rows
+        // share one offset in the aligned words (RP * ew is a multiple of 4 samples), which pk_fetch takes per lane at
+        // run time. (Before section 33 this also required ew % 4 == 0 and aligned sub-planes, which left the coarse
+        // levels of SD material, e.g. PAL 4:2:2 level 2 chroma ew = 106, on the one-candidate-at-a-time form.) The word
+        // after a row's 4 samples stays inside the plane: a vector in range never reads the last row.
         static const bool spack_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_PACK"); return !(e && e[0] == '0'); }();
-        bool pks = spack_allowed;
-        for (int p = 0; p < (a.has_chroma ? 3 : 1) && pks; p++)
-        {
-          pks = a.ew[p] % 4 == 0;
-          for (int i = 0; i < MVCUDA_MAX_SUB; i++)
-            pks = pks && ((size_t)a.ref[p][i] & (4 * sizeof(pix) - 1)) == 0;
-        }
-        a.packed_s = pks ? 1 : 0;
+        a.packed_s = spack_allowed ? 1 : 0;
       }
       a.ext_w = s_ref->pl[l * 3].d.ew;
       a.ext_h = s_ref->pl[l * 3].d.eh;
@@ -3574,7 +4297,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         a.prog = d_wave + row_off[l];
         a.rowbad = d_wave + w_rowbad + row_off[l];
         a.bad_range = ap->bad_range;
-        wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN;
+        wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN || a.try_many;
         wc.lv[l] = a;
         continue; // launched once for all levels below
       }
@@ -3594,6 +4317,10 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         static const bool exh_allowed = [] { const char *e = getenv("MVCUDA_EXH_FAST"); return !(e && e[0] == '0'); }();
         a.exh_fast = (exh_allowed && a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius > 3) ? 1 : 0;
         a.win_cap = 0;
+        // trymany Refines one per warp (WarpChecker), except the exhaustive radii > 3 (exhaustive_fast needs the whole CTA)
+        a.tm_par = (tm_par_allowed && a.try_many && !(a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius > 3)) ? 1 : 0;
+        if (a.tm_par && a.search_type == mvc_refine::S_EXHAUSTIVE)
+          shm += 7 * TM_RING_MAX * 2 * sizeof(int) + 16; // trymany_par's SAD table (16: its alignment)
         if (a.exh_fast)
         {
           static const int smem_max = [] {
@@ -3601,9 +4328,10 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
             cudaFuncAttributes fa = {};
-            cudaFuncGetAttributes(&fa, k_search);
+            cudaFuncGetAttributes(&fa, k_search<true>);
             const int dyn = v - (int)fa.sharedSizeBytes - 256;
-            cudaFuncSetAttribute(k_search, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+            cudaFuncSetAttribute(k_search<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+            cudaFuncSetAttribute(k_search<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
             return dyn;
           }();
           const int r = a.radius, nsub = a.pel * a.pel;
@@ -3617,7 +4345,10 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
             shm += need + 16; // 16: alignment of the window (AnaChecker::refine_any)
           }
         }
-        k_search<<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
+        if (a.try_many)
+          k_search<true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
+        else
+          k_search<false><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
       }
       AN_CHECK(cudaGetLastError());
     }
@@ -3751,8 +4482,23 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       }
       for (int k = 0; k < 16; k++)
         if (h[k][5])
-          std::fprintf(stderr, "phase cycles/block, blocks-per-row 2^%d: wait+pred %.0f  A %.0f  foldA %.0f  B %.0f  foldB %.0f  (n=%llu)\n", k,
-            (double)h[k][0] / h[k][5], (double)h[k][1] / h[k][5], (double)h[k][2] / h[k][5], (double)h[k][3] / h[k][5], (double)h[k][4] / h[k][5], h[k][5]);
+          std::fprintf(stderr, "phase cycles/block, blocks-per-row 2^%d: wait+pred %.0f  A %.0f  foldA %.0f  B %.0f  foldB %.0f  dep %.3f  distinct %.2f  (n=%llu)\n", k,
+            (double)h[k][0] / h[k][5], (double)h[k][1] / h[k][5], (double)h[k][2] / h[k][5], (double)h[k][3] / h[k][5], (double)h[k][4] / h[k][5],
+            (double)h[k][6] / h[k][5], (double)h[k][7] / h[k][5], h[k][5]);
+      {
+        unsigned long long wk[8] = {};
+        cudaMemcpyFromSymbol(wk, g_wkprof, sizeof(wk));
+        if (wk[2])
+          std::fprintf(stderr, "WarpChecker batches (run_batch / exhaustive): calls %llu, cycles/call %.0f, eval cycles/call %.0f, groups/call %.2f\n",
+            wk[2], (double)wk[0] / wk[2], (double)wk[1] / wk[2], (double)wk[3] / wk[2]);
+        unsigned long long tp[16][6] = {};
+        cudaMemcpyFromSymbol(tp, g_tmprof, sizeof(tp));
+        for (int k = 0; k < 16; k++)
+          if (h[k][5] && tp[k][5])
+            std::fprintf(stderr, "trymany_par cycles/block 2^%d: starts %.0f  eval %.0f  sync %.0f  fold %.0f  sync %.0f  select %.0f\n", k,
+              (double)tp[k][0] / h[k][5], (double)tp[k][1] / h[k][5], (double)tp[k][2] / h[k][5], (double)tp[k][3] / h[k][5],
+              (double)tp[k][4] / h[k][5], (double)tp[k][5] / h[k][5]);
+      }
       unsigned long long hw[16][12];
       cudaMemcpyFromSymbol(hw, g_wprof, sizeof(hw));
       for (int k = 0; k < 16; k++)
