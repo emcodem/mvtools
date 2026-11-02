@@ -55,6 +55,7 @@ all in the conflicting files, so resolving the conflicts takes care of them.
    until ported, `gpu=true` with them must fall back to the CPU (same rule as other unsupported settings, see
    `Documentation/gpu.md`), never give different vectors silently. Same check for the SATD block-size rule (dct 5-10 needs a
    block size divisible by 4), which upstream now enforces at creation.
+   **Done 2026-11-02 (API 19):** both options are on the GPU, bit-exact (GPU_PIPELINE_PLAN.md section 32).
 4. **lsb=true with gpu=true.** Upstream turns lsb into out16 + stacked conversion. Our GPU MDegrain either supports
    out16 and gets the same conversion, or falls back; decide when merging `MVDegrain3.cpp` / `MDegrainN.cpp`.
 5. **MCompensate `cclip`.** Upstream fixed `cclip` being read from the `thSAD2` argument. Check what our GPU

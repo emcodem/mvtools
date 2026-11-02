@@ -3310,17 +3310,20 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   if (!sp || !ap || !fs || !fr || !payload)
     return -4;
   // supported: luma only or luma + chroma, pel 1 or 2, field shift 0, every search type of mvcuda_refine.cuh
-  // (the coarse levels are exhaustive, as on the CPU, except for the horizontal / vertical types)
+  // (the coarse levels use search_type_coarse, exhaustive by default, as on the CPU, except for the horizontal / vertical
+  // types, which search every level with their own type)
   const int user_type = ap->search_type ? ap->search_type : mvc_refine::S_EXHAUSTIVE;
+  const int coarse_type = ap->search_type_coarse ? ap->search_type_coarse : mvc_refine::S_EXHAUSTIVE;
   if (sp->levels != ap->n_levels || ap->n_levels < 1 || ap->n_levels > MVCUDA_MAX_LEVELS
     || ap->search_param < 1 || ap->pel_search < 1 || ap->n_blk_x < 1 || !mvc_refine::supported_type(user_type)
+    || !mvc_refine::supported_type(coarse_type)
     || ap->n_blk_y < 1 || ap->slice_threads < 1 || ap->plevel < 0 || ap->plevel > 2 || ap->blk_x > 32)
     return -4;
   const bool horv = user_type == mvc_refine::S_HORIZONTAL || user_type == mvc_refine::S_VERTICAL;
   int lvl_type[MVCUDA_MAX_LEVELS];
   for (int l = 0; l < ap->n_levels; l++)
   {
-    lvl_type[l] = (l == 0 || horv) ? user_type : mvc_refine::S_EXHAUSTIVE;
+    lvl_type[l] = (l == 0 || horv) ? user_type : coarse_type;
     if ((l == 0 ? ap->pel_search : ap->search_param) > mvc_refine::max_param(lvl_type[l]))
       return -4;
   }
@@ -3552,7 +3555,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       a.bits = sp->bits_per_pixel;
       a.chroma_scale = ap->chroma_sad_scale;
       a.radius = (l == 0) ? ap->pel_search : ap->search_param;
-      a.try_many = (ap->try_many && l > 0) ? 1 : 0; // GroupOfPlanes::SearchMVs: never at the finest level
+      // GroupOfPlanes::SearchMVs: the finest level only with trymanyall, and never when it is the only level
+      a.try_many = (ap->try_many && (l > 0 || (ap->try_many_all && nl > 1))) ? 1 : 0;
       a.meander = ap->meander;
       a.use_global = ap->use_global;
       a.bad_sad = ap->bad_sad;

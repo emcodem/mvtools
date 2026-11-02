@@ -179,19 +179,20 @@ public:
   void remove_user();
 
   // Search configurations the GPU kernels implement (mvcuda_refine.cuh). type is a SearchType.h value. MAnalyse: p_fine is
-  // pelsearch (level 0), p_coarse is searchparam (the coarse levels run exhaustive for every type but horizontal /
-  // vertical); MRecalculate has one level, p_fine = p_coarse = searchparam, n_levels = 1.
-  static bool search_supported(int type, int p_fine, int p_coarse, int n_levels)
+  // pelsearch (level 0), p_coarse is searchparam, coarse_type the search type of the coarse levels (search_coarse,
+  // exhaustive by default; horizontal / vertical search every level with their own type); MRecalculate has one level,
+  // p_fine = p_coarse = searchparam, n_levels = 1.
+  static bool search_supported(int type, int p_fine, int p_coarse, int n_levels, int coarse_type = 8)
   {
-    const bool known = type == 1 || type == 2 || type == 4 || type == 8 || type == 16 || type == 32 || type == 64 || type == 128;
-    if (!known || p_fine < 1 || p_coarse < 1)
+    auto known = [](int t) { return t == 1 || t == 2 || t == 4 || t == 8 || t == 16 || t == 32 || t == 64 || t == 128; };
+    if (!known(type) || !known(coarse_type) || p_fine < 1 || p_coarse < 1)
       return false;
     const bool horv = type == 64 || type == 128;
-    // the coarse levels search exhaustively (GroupOfPlanes::SearchMVs), except for the horizontal / vertical types;
+    const int level_type = horv ? type : coarse_type; // GroupOfPlanes::SearchMVs
     // exhaustive radii up to 64 (mvc_refine::max_param), every other type up to 24
     if (p_fine > (type == 8 ? 64 : 24))
       return false;
-    if (n_levels > 1 && p_coarse > (horv ? 24 : 64))
+    if (n_levels > 1 && p_coarse > (level_type == 8 ? 64 : 24))
       return false;
     return true;
   }

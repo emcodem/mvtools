@@ -156,10 +156,9 @@ The GPU path is used when all of these hold:
 | `levels` | up to 12 (counted levels) |
 | `search` | 0 to 7 |
 | `pelsearch` (finest level) | 1 to 24; 1 to 64 for `search=3` (exhaustive) |
-| `searchparam` (coarse levels, when there is more than one level) | 1 to 64 (the coarse levels search exhaustively); 1 to 24 for `search=6` / `7` (horizontal / vertical) |
-| `trymany` | true or false |
-| `trymanyall` | false only (upstream 2.7.48: `trymany` on the finest level too) |
-| `search_coarse` | 3 only, the default (upstream 2.7.48: search type of the coarse levels; 3 = exhaustive, as before) |
+| `searchparam` (coarse levels, when there is more than one level) | 1 to 64 when the coarse levels search exhaustively (`search_coarse=3`, the default); 1 to 24 for the other coarse types and for `search=6` / `7` (horizontal / vertical, every level) |
+| `search_coarse` | 0 to 7 (upstream 2.7.48: search type of the coarse levels) |
+| `trymany`, `trymanyall` | true or false |
 | `divide`, `dct`, `temporal`, `multi` | 0 / false only |
 | `outfile` | not set |
 
@@ -196,6 +195,9 @@ shared memory, candidates pruned by their vector cost like the CPU's, one parall
 there (GPU_PIPELINE_PLAN.md section 31) and the CPU was faster. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
 slower); `trymany` uses the parallel pass for its exhaustive refines.
 `trymany` with `meander=false` uses the slice kernel with one slice (the wavefront kernel does not implement it).
+`trymany` is much slower on the GPU than on the CPU, more so with `trymanyall`: PAL 500 frames, Prefetch 8,
+`search=4`, MAnalyse only, RTX 5090 against 24 CPU threads: `trymany` 2.9 s (CPU 0.54), with `trymanyall` 4.3 s (CPU
+0.68), without either 0.72 s (CPU 0.48); `search_coarse` 2 or 4 cost about the same as the default 3 (0.83 / 0.88 s).
 `pel=4` keeps 16 sub-pel planes per plane on the device (4 times the memory of pel 2).
 
 The output is a normal vector clip; every consumer of vectors works unchanged.

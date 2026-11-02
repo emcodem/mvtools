@@ -1345,3 +1345,30 @@ new GPU DLL show the same kind of variation (old/new give the same alternative v
 **Open:** the remaining gap to meander=false
 at HD (k_search serial chain, section 30 T2), other copy-engine copies that wait on kernels (CudaDownload D2H on s15,
 mvcuda_recalc / flow / nvof_vec stage copies) could hold uploads the same way.
+
+## 32. search_coarse and trymanyall on the GPU (2026-11-02; library API 19)
+
+Upstream 2.7.48 added two MAnalyse options (CHANGELOG: #68 search_coarse from the SVP fork, trymanyall); after the merge
+they fell back to the CPU (REBASE_PLAN.md issue 3). Both are now in the CUDA search, bit-exact:
+- `MvCudaAnalyseParams` got `search_type_coarse` (SearchType.h value, 0 = exhaustive) and `try_many_all` (appended, API
+  19; golden `test_analyse.py` / `bench_analyse.py` ctypes structs too). `analyse_dev`: `lvl_type[l]` of the coarse levels
+  is the coarse type (horizontal / vertical keep their own type at every level, as GroupOfPlanes::SearchMVs); `try_many`
+  at level 0 when `try_many_all` and there are 2+ levels (the CPU's smallest-level rule `tryMany && nLevelCount > 1`
+  leaves a single-level search without trymany even with trymanyall).
+- The kernels needed nothing: k_search / k_wave already took the refine type per level (wave_plan / ring_radius_of /
+  mvc_refine), and the trymany path of k_search is level-independent (pel 1 / 2 / 4, bad-vector flag on the selected
+  vector = CPU's foundSAD).
+- `GpuBackend::search_supported(type, p_fine, p_coarse, n_levels, coarse_type)`: coarse `searchparam` limit 64 for an
+  exhaustive coarse type, 24 for the others (mvc_refine::max_param); outside it the CPU runs, as before.
+- Tests (build `profile\build_sc\bin` + avstp, `-CudaArch 120-real`): `profile\run_s234.ps1` got 28 S5 cases (search_coarse
+  0..7, meander=false, pel 1 / 4, coarse UMH radius 6, horizontal + coarse, trymanyall with exhaustive / hex / UMH /
+  exhaustive radius 6 / meander=false / pel 4 / levels=1 / without trymany, both together, forced fallback, coarse hex
+  radius 30 = CPU, negative controls `s5_sc_neg` / `s5_tma_neg` must differ): 147/147 with S2-S4 on 8-bit 4:2:2, 10-bit
+  4:2:2, 4:2:0. `vsbridge/test/baseline.py` (MVPF_CLIPS=`profile\vs_win\clips`): all 52 chains = `merge_final`, GPU = CPU
+  in all 7. Golden `run_all.py`: 11 failures per 4:2:0 / 4:2:2 tag with this build *and* with build_merge (API 18): the
+  golden dumps predate upstream #59 (chroma rounding, 4979a62), only chroma-affected SADs differ, f444 passes; dumps
+  need regenerating with the merged CPU.
+- Speed (PAL 500 frames, Prefetch 8, search=4, MAnalyse only, best of 3, decode included): default 0.72 s (CPU 0.48),
+  search_coarse 2 / 4 0.88 / 0.83 s, trymany 2.92 s (CPU 0.54), trymany + trymanyall 4.31 s (CPU 0.68). trymany stays
+  the open item of section 27 (7 serial Refines per block through mvc_refine in 24 slice CTAs); trymanyall adds them at
+  level 0. Ideas there: run the 7 independent Refines of one block in parallel warps (they share only the inputs).

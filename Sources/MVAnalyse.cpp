@@ -457,10 +457,8 @@ MVAnalyse::MVAnalyse(
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
       && !divideExtra && !_dctmode && !temporal_flag && !multi_flag
-      // upstream 2.7.48 options the CUDA search does not have (REBASE_PLAN.md issue 3): coarse levels exhaustive only
-      // (search_coarse 3, the behaviour before 2.7.48), no trymany at the finest level
-      && st_coarse == 3 && !tryManyAll
-      && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount)
+      // search_coarse (searchTypeCoarse) and trymanyall (upstream 2.7.48) are on the GPU since API 19
+      && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse)
       && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && analysisData.nBlkSizeX <= 32
       && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)))
       && lstrlen(_outfilename) == 0 && analysisData.nLvCount <= 12;
@@ -848,6 +846,8 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   ap.bad_sad = (int)badSAD;
   ap.bad_range = badrange;
   ap.try_many = tryMany ? 1 : 0;
+  ap.try_many_all = tryManyAll ? 1 : 0;
+  ap.search_type_coarse = (int)searchTypeCoarse;
   ap.search_param = nSearchParam;
   ap.pel_search = nPelSearch;
   ap.chroma_sad_scale = _gpu_effective_chroma_scale;
