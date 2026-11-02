@@ -57,7 +57,7 @@ not fit.
 
 Options: `MVTOOLS_CUDA_ARCH` (CUDA architectures, e.g. `120-real` for a fast build for the local RTX 50xx only,
 `61-virtual` for the Pascal code paths only, JIT-compiled by the driver for the local GPU; default: the release list in
-`Sources/cuda/CMakeLists.txt`, compute capability 6.1 .. 12.0), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
+`Sources/cuda/CMakeLists.txt`, machine code for compute capability 6.1 .. 12.0 plus PTX for 6.0 and newer GPUs), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
 default ON: `/MT`, no Visual C++ redistributable needed), `MVTOOLS_DIST_DIR` (the collect folder), `ENABLE_INTEL_SIMD` /
 `ENABLE_NEON_SIMD` (set from the target processor; both OFF gives a C-only build for testing).
 
@@ -80,7 +80,8 @@ installer the component "MSVC v143 - VS 2022 C++ x64/x86 build tools". CUDA 12 d
 `build_windows.ps1` finds Visual Studio with vswhere, takes nvcc from `-Nvcc` / `CUDA_PATH_V12_9` / `CUDA_PATH_V12_8` / the
 newest installed 12.x toolkit / `CUDA_PATH` / the PATH (the first CUDA 12.8+ one), loads `vcvars64.bat` into the session
 (with CUDA: the newest MSVC 14.4x toolset, or `-VcvarsVer`), takes CMake and Ninja from Visual Studio, NASM from `-Nasm` /
-`NASMPATH` / the PATH, and passes further arguments with `-CMakeArgs '-DX=Y'`. With CUDA the whole build uses the 14.4x
+`NASMPATH` / the PATH, and passes further arguments with `-CMakeArgs '-DX=Y'`. Other switches: `-Out <dir>` (collect
+folder), `-Config Release|RelWithDebInfo|Debug`, `-NoVapourSynth`, `-Clean`. With CUDA the whole build uses the 14.4x
 toolset. By hand, from a prompt with that toolset (`vcvars64.bat -vcvars_ver=14.44`):
 
     cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_ASM_NASM_COMPILER=C:/tools/nasm/nasm.exe ^
@@ -219,7 +220,7 @@ not yet on real 6.x / 7.0 hardware.
   and the example scripts of the Windows release bundle.
 * Windows release bundles (AviSynth+ x64, DLLs, patched QTGMC, examples, docs): GitHub releases `gpu-qtgmc-*` of
   github.com/emcodem/mvtools.
-* Design notes and measurements: `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md`, `GPU_PIPELINE_PLAN.md`, `DECISIONS.md`.
+* Developer notes: `docs/dev/` (`ARCHITECTURE.md` design and lessons, `DECISIONS.md`, `TODO.md` open work).
 
 ## VapourSynth (this branch; Linux and Windows)
 
@@ -227,7 +228,7 @@ Not part of the Windows release bundles yet.
 
 mvtools2 runs under VapourSynth (API 4.0, so R55 or newer; tested with R81) unchanged: `mvtools_vsbridge` is a small AviSynth+ host on top of
 the VapourSynth API, and `libmvtools2.so` / `mvtools2.dll` only gained a `VapourSynthPluginInit2` entry point that loads
-it. Under AviSynth+ nothing changes. Design, decisions and test results: `VAPOURSYNTH_PLAN.md`.
+it. Under AviSynth+ nothing changes. Design: `docs/dev/ARCHITECTURE.md` ("VapourSynth bridge").
 
 ### Quick start
 
@@ -257,7 +258,7 @@ Denoising on the CPU (the AviSynth function and parameter names, `Documentation/
 
 The same on the GPU (`Documentation/gpu.md`): add `gpu=True` to MSuper, MAnalyse and MDegrain2. Under VapourSynth there
 is no avstp thread pool, so the CPU search runs in one slice and `gpu=True` follows it to stay identical: that is slow
-on the GPU. Add `meander=False` to MAnalyse (and MRecalculate) for the fast GPU search (wavefront); its result is
+on the GPU. Add `meander=False` to MAnalyse for the fast GPU search (wavefront; MRecalculate is fast either way); its result is
 identical to the CPU with `meander=False`, slightly different from the default `meander=True`. To keep the frames on
 the GPU between filters, wrap the chain in cudafilters' upload / download:
 

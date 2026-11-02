@@ -7,8 +7,8 @@ This page covers the CUDA part of this mvtools build:
   plus fused QTGMC stages
 - the environment variables
 
-The design notes and measurements are in `GPU_PLAN.md`, `GPU_QTGMC_PLAN.md` and `GPU_PIPELINE_PLAN.md`. They describe how
-the work got here; this page describes what the functions do now (library API version 18).
+This page describes what the functions do now (library API version 19). Design notes for developers:
+`docs/dev/ARCHITECTURE.md`.
 
 ## Principles
 
@@ -29,28 +29,31 @@ the work got here; this page describes what the functions do now (library API ve
 
 | File | Built by | Notes |
 |---|---|---|
-| `mvtools2.dll` | `mvtools.sln` | The plugin as before |
-| `mvtools_cuda.dll` | `Sources\cuda\build.bat` or CMake (CUDA 12.9 toolkit; on Windows with the MSVC 14.4x toolset, v143. CUDA 13 is not used: it has no Pascal / Volta targets) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
-| `cudafilters.dll` | `cudafilters\cudafilters.vcxproj` (see `cudafilters\README.md`) | Optional. Must sit in the same folder as the other two |
+| `mvtools2.dll` | root CMake | The plugin as before |
+| `mvtools_cuda.dll` | root CMake (CUDA 12.9 toolkit; on Windows with the MSVC 14.4x toolset, v143. CUDA 13 is not used: it has no Pascal / Volta targets) | Must sit next to `mvtools2.dll`. Static CUDA runtime: only the NVIDIA driver is needed at run time |
+| `cudafilters.dll` | root CMake | Optional. Must sit in the same folder as the other two |
 
-All the files are built by the root CMake / `build_windows.ps1` too (README "Build Instructions").
+Build with `build_windows.ps1` or `build_linux.sh` (README "Build Instructions"); on Linux the files are
+`libmvtools2.so`, `libmvtools_cuda.so`, `libcudafilters.so`. Upstream's `mvtools.sln` / vcxproj files have no GPU or
+VapourSynth parts.
 
 All three files must come from one build: the plugins check the library API version and run on the CPU when it does not
 match.
 
 Requirements:
 
-- x64 AviSynth+. cudafilters needs AviSynth+ 3.6 or newer (interface V8) and refuses to load on older versions; 3.7.5 is the
-  tested version.
-- VapourSynth (work in progress, Linux only so far, not in the Windows release bundles): mvtools2 runs under VapourSynth
-  through `mvtools_vsbridge` (namespace `mvpf`, README "VapourSynth"), `gpu=true` included (same output as AviSynth+;
-  `libmvtools_cuda.so` next to `libmvtools2.so`). cudafilters under VapourSynth (namespace `cuda`) covers only
-  CudaUpload / CudaDownload and the Merge filters so far (`VAPOURSYNTH_PLAN.md`).
+- x64 AviSynth+ (Windows or Linux). cudafilters needs AviSynth+ 3.6 or newer (interface V8) and refuses to load on older
+  versions; 3.7.5 is the tested version.
+- VapourSynth (Windows and Linux): mvtools2 runs under VapourSynth through `mvtools_vsbridge` (namespace `mvpf`, README
+  "VapourSynth"), `gpu=true` included, with the same output as AviSynth+ (the GPU library next to the plugin). Every
+  cudafilter is available in namespace `cuda`; for the limits of their CPU fallbacks under VapourSynth and
+  `MVBRIDGE_FALLBACK` see README "VapourSynth".
 - An NVIDIA GPU with compute capability 6.0 or newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx); older cards count as
   "no usable device". The first usable device is used; `MVCUDA_DEVICE=n` picks another. Pascal / Volta are verified
   only as PTX 6.1 on an RTX 50xx, not yet on real 6.x / 7.0 hardware.
-- `CudaNNEDI3` and `CudaKeepOnlyBobShimmerFixes` call into other plugins: they need `plugins_JPSDR.dll` (nnedi3), and
-  `QTGMC.avsi` (`QTGMC_KeepOnlyBobShimmerFixes`) with masktools2 and RgTools, loaded.
+- `CudaNNEDI3` needs the nnedi3 weights: from a loaded `plugins_JPSDR.dll` (nnedi3), else `nnedi3_weights.bin` next to
+  cudafilters (under AviSynth+ its CPU fallback still needs nnedi3 itself). `CudaKeepOnlyBobShimmerFixes` needs
+  `QTGMC.avsi` (`QTGMC_KeepOnlyBobShimmerFixes`) with masktools2 and RgTools loaded.
 
 ## Token frames
 
@@ -167,7 +170,8 @@ the CPU"). Errors that the CPU filter raises at creation stay errors with `gpu=t
 (SATD) with a block size not divisible by 4 (MAnalyse and MRecalculate).
 
 Single frames run on the CPU when the clip is field-based (a field shift is needed), when `delta` is 0 or less (static
-reference), or when the GPU reports that the frame needs the CPU's bad-vector wide search (`badSAD` / `badrange`).
+reference), or, with `meander=true`, when the GPU reports that the frame needs the CPU's bad-vector wide search
+(`badSAD` / `badrange`); with `meander=false` the GPU runs that search itself.
 
 **Slices, `mt` and `meander`.** The CPU search with `mt=true` is split into horizontal slices, one per thread, and its
 result depends on the number of slices. The GPU reproduces that:
@@ -183,7 +187,7 @@ result depends on the number of slices. The GPU reproduces that:
   searches in one slice too, whatever `mt` says.
 
 Before 2026-11-01b the slice search (`meander=true`) was serialised for frames larger than about 736x576: its result
-buffer went through the GPU's copy engine, whose queue held every later upload (GPU_PIPELINE_PLAN.md section 31). HD
+buffer went through the GPU's copy engine, whose queue held every later upload. HD
 QTGMC with `meander=true` was then slower than the CPU; it is now about 6x faster at the same, byte-identical result.
 
 **Speed of the wider settings.** With `meander=true`, exhaustive radii above 3 (the finest level with `search=3`, every
@@ -192,12 +196,13 @@ shared memory, candidates pruned by their vector cost like the CPU's, one parall
 24 CPU threads, MAnalyse only): PAL 1500 frames Prefetch 8, `pelsearch=24`: 8 bit 1.31 ms/frame (CPU 1.54), 10 bit 1.75
 (CPU 2.12). UHD 10 bit 4:2:2, 32x32 blocks, 40 frames, Prefetch 3: `pelsearch=8` 0.52 s (CPU 0.85),
 `pelsearch=24` 0.77 s (CPU 1.08); before 2026-11-01b the GPU searches of different frames did not run at the same time
-there (GPU_PIPELINE_PLAN.md section 31) and the CPU was faster. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
-slower); `trymany` uses the parallel pass for its exhaustive refines.
-`trymany` with `meander=false` uses the slice kernel with one slice (the wavefront kernel does not implement it).
-`trymany` is much slower on the GPU than on the CPU, more so with `trymanyall`: PAL 500 frames, Prefetch 8,
-`search=4`, MAnalyse only, RTX 5090 against 24 CPU threads: `trymany` 2.9 s (CPU 0.54), with `trymanyall` 4.3 s (CPU
-0.68), without either 0.72 s (CPU 0.48); `search_coarse` 2 or 4 cost about the same as the default 3 (0.83 / 0.88 s).
+there and the CPU was faster. With `meander=false` (wavefront kernel) large radii keep the sequential batches (exact,
+slower).
+`trymany` / `trymanyall` run their refines in parallel on the GPU, with `meander=true` and `meander=false` (wavefront
+kernel) alike. PAL 500 frames, Prefetch 8, `search=4`, MAnalyse only, RTX 5090 against 24 CPU threads: default 0.71 s
+(CPU 0.49), `trymany` 0.82 s (CPU 0.52), with `trymanyall` 0.93 s (CPU 0.68), `meander=false` + `trymany` 0.73 s (CPU
+0.55); `search_coarse` 2 or 4 cost about the same as the default 3. At SD size the GPU search is still slower than 24
+CPU threads; the GPU gains at HD / UHD and in whole GPU chains.
 `pel=4` keeps 16 sub-pel planes per plane on the device (4 times the memory of pel 2).
 
 The output is a normal vector clip; every consumer of vectors works unchanged.
@@ -469,7 +474,7 @@ Read once per process.
 | `MVTOOLS_GPU_DISABLE` | Do not load `mvtools_cuda.dll`; everything runs on the CPU. cudafilters honours it too |
 | `MVTOOLS_GPU_LOG` | Print every GPU decision and per-frame fallback to stderr, and the device frame registry statistics when the last GPU filter is destroyed |
 | `MVTOOLS_GPU_FORCE_FALLBACK` | Every GPU call reports "use the CPU" (for testing the fallback paths) |
-| `MVTOOLS_GPU_SLICES=n` | Slice count of MAnalyse (`meander=true`) and MRecalculate on the GPU; changes the vector field compared with the CPU |
+| `MVTOOLS_GPU_SLICES=n` | Slice count of MAnalyse (`meander=true`) and MRecalculate on the GPU, only with `mt=true`; changes the vector field compared with the CPU |
 | `MVTOOLS_GPU_PROFILE` | Wall time per named phase, printed to stderr when the process ends |
 
 ### cudafilters (`cudafilters.dll`)
@@ -484,7 +489,11 @@ Read once per process.
 | Variable | Effect |
 |---|---|
 | `MVCUDA_DEVICE=n` | Use CUDA device n (it must have compute capability 6.0 or newer) |
-| `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames, uploaded pictures and the super pyramids kept with them), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
+| `MVCUDA_CACHE_MB=n` | Fixed byte budget of the device frame registry (token frames, uploaded pictures and the super pyramids kept with them), in MB. Default: automatic; starts at 256 MB (or 128 frames, whichever is larger, at most 1024 MB) and grows while frames have to be made again, up to a third of the free device memory at first use, at most 4096 |
 | `MVCUDA_WAVE=0` | MAnalyse with `meander=false` uses the slice kernel instead of the wavefront kernel (for comparisons) |
 | `MVCUDA_SPIN` | Waits for the GPU spin a CPU core instead of sleeping |
 | `MVCUDA_TIMING` | Kernel timings to stderr |
+
+For comparisons only (same output, older or slower code forms): `MVCUDA_TM_PAR=0` (trymany refines one after the
+other), `MVCUDA_EXH_FAST=0` (no parallel exhaustive pass), `MVCUDA_SEARCH_PACK=0` / `MVCUDA_WAVE_PACK=0` (no packed
+SADs), `MVCUDA_NOPIN` (no pinned host staging).
