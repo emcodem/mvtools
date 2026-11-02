@@ -98,6 +98,8 @@
     <ClCompile Include="FakeBlockData.cpp" />
     <ClCompile Include="FakeGroupOfPlanes.cpp" />
     <ClCompile Include="FakePlaneOfBlocks.cpp" />
+    <ClCompile Include="GoldenDump.cpp" />
+    <ClCompile Include="GpuBackend.cpp" />
     <ClCompile Include="GroupOfPlanes.cpp" />
     <ClCompile Include="info.cpp" />
     <ClCompile Include="Interpolation.cpp" />
@@ -113,6 +115,7 @@
     <ClCompile Include="SADFunctions.cpp" />
     <ClCompile Include="SimpleResize.cpp" />
     <ClCompile Include="Variance.cpp" />
+    <ClCompile Include="VapourSynthEntry.cpp" />
     <ClCompile Include="Interface.cpp">
       <Filter>Filters</Filter>
     </ClCompile>
@@ -358,6 +361,8 @@
     <ClInclude Include="FakeGroupOfPlanes.h" />
     <ClInclude Include="FakePlaneOfBlocks.h" />
     <ClInclude Include="fftwlite.h" />
+    <ClInclude Include="GoldenDump.h" />
+    <ClInclude Include="GpuBackend.h" />
     <ClInclude Include="GroupOfPlanes.h" />
     <ClInclude Include="info.h" />
     <ClInclude Include="Interpolation.h" />

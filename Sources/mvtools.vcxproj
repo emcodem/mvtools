@@ -1461,6 +1461,8 @@
     <ClCompile Include="FakeBlockData.cpp" />
     <ClCompile Include="FakeGroupOfPlanes.cpp" />
     <ClCompile Include="FakePlaneOfBlocks.cpp" />
+    <ClCompile Include="GoldenDump.cpp" />
+    <ClCompile Include="GpuBackend.cpp" />
     <ClCompile Include="GroupOfPlanes.cpp" />
     <ClCompile Include="info.cpp" />
     <ClCompile Include="Interface.cpp" />
@@ -1565,6 +1567,7 @@
     </ClCompile>
     <ClCompile Include="SimpleResize.cpp" />
     <ClCompile Include="Variance.cpp" />
+    <ClCompile Include="VapourSynthEntry.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AllocAlign.h" />
@@ -1641,6 +1644,8 @@
     <ClInclude Include="FakeGroupOfPlanes.h" />
     <ClInclude Include="FakePlaneOfBlocks.h" />
     <ClInclude Include="fftwlite.h" />
+    <ClInclude Include="GoldenDump.h" />
+    <ClInclude Include="GpuBackend.h" />
     <ClInclude Include="GroupOfPlanes.h" />
     <ClInclude Include="include\avisynth.h" />
     <ClInclude Include="include\avs\alignment.h" />

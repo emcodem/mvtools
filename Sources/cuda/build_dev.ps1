@@ -7,7 +7,7 @@ param(
   # other targets, e.g. '-gencode arch=compute_61,code=compute_61' (PTX 6.1 only: the Pascal code paths, JIT-compiled for
   # the local GPU)
   [string]$Arch = '-gencode arch=compute_120,code=sm_120',
-  # toolkit and host compiler as build.bat: CUDA 12 (MVCUDA_CUDA_PATH, else CUDA_PATH_V12_9, else the default 12.9 folder)
+  # toolkit and host compiler as the CMake build: CUDA 12 (MVCUDA_CUDA_PATH, else CUDA_PATH_V12_9, else the default 12.9 folder)
   # with MSVC 14.44 ('default' = the installation's default toolset)
   [string]$VcvarsVer = '14.44'
 )
