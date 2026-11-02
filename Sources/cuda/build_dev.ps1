@@ -1,4 +1,4 @@
-# Development build of mvtools_cuda.dll (sm_120 only, like build_dev.bat), with per-unit object caching and the units
+# Development build of mvtools_cuda.dll (sm_120 only by default), with per-unit object caching and the units
 # compiled in parallel. A unit is recompiled when one of its sources is newer than its object or the flags changed.
 #   .\build_dev.ps1 -Out C:\dev\mvtools\profile\build_w [-Flags '-DMVC_PHASE_PROF']
 param(

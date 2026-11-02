@@ -91,7 +91,6 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Build / code hygiene
 
-- `Sources/cuda/build_dev.bat` duplicates `build_dev.ps1` (own unit list, unmaintained): remove when nobody uses it.
 - Upstream's `mvtools.vcxproj` builds mvtools2.dll again (GPU backend + VapourSynth entry added 2026-11-02) but is not
   part of any test run; CMake stays the tested build.
 - Some cudafilters arguments are unnamed in the `AddFunction` strings (positional only), though gpu.md names them:
