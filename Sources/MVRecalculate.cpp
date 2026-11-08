@@ -426,28 +426,27 @@ MVRecalculate::MVRecalculate(
     srd._analysis_data_divided = analysisDataDivided;
   }
 
-  // ---- GPU recalculation: only for the configuration the GPU code reproduces bit-exactly
+  // ---- GPU recalculation (CudaMRecalculate): only for the configuration the GPU code reproduces bit-exactly
   if (gpu_flag)
   {
-    const bool super_ok = super_param_gpu_rebuildable(params); // SuperParams64Bits.h, D4
+    const bool super_ok = super_param_gpu_rebuildable(params); // rfilter 2 / 4, sharp 2, no pelclip (SuperParams64Bits.h)
     _gpu_rfilter = super_ok ? super_param_rfilter(params) : 0;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
-    _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar()
-      && !divideExtra && !_dctmode && _nbr_srd == 1
-      && GpuBackend::search_supported((int)searchType, nSearchParam, nSearchParam, 1)
-      && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && smooth >= 0 && smooth <= 1
-      && analysisData.nBlkSizeX <= 32 && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2))) && lstrlen(_outfilename) == 0;
-    if (GpuBackend::log_enabled())
-    {
-      std::fprintf(stderr, "MRecalculate gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
-      if (!_gpu_ok)
-        std::fprintf(stderr,
-          "  usable %d super_ok %d (param 0x%x) pixelsize %d yuy2 %d planar %d chroma %d modeYUV %d divide %d nbr_srd %d "
-          "searchType %d searchParam %d superPel %d smooth %d blkX %d outfile %d\n",
-          GpuBackend::instance().usable() ? 1 : 0, super_ok ? 1 : 0, params.param, pixelsize,
-          child->GetVideoInfo().IsYUY2() ? 1 : 0, child->GetVideoInfo().IsPlanar() ? 1 : 0, chroma ? 1 : 0, nModeYUV, divideExtra, _nbr_srd, (int)searchType, nSearchParam, nSuperPel,
-          smooth, analysisData.nBlkSizeX, (int)lstrlen(_outfilename));
-    }
+    GpuCheck c("CudaMRecalculate", "MRecalculate");
+    c.need(super_ok, "the super clip must come from CudaMSuper (or MSuper of this build) with rfilter 2 or 4, sharp 2 and no pelclip")
+      .need(pixelsize == 1 || pixelsize == 2, "only 8 to 16 bit integer formats")
+      .need(!child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar(), "only planar formats")
+      .need(!divideExtra, "divide is not supported")
+      .need(!_dctmode, "dct is not supported")
+      .need(_nbr_srd == 1, "multi-vector clips (tr > 0) are not supported")
+      .need(GpuBackend::search_supported((int)searchType, nSearchParam, nSearchParam, 1),
+        "search radius too large (exhaustive up to 64, other search types up to 24)")
+      .need(nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4, "only pel 1, 2 or 4")
+      .need(smooth >= 0 && smooth <= 1, "only smooth 0 or 1")
+      .need(analysisData.nBlkSizeX <= 32, "block sizes above 32 are not supported")
+      .need(!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)), "chroma=true needs 4:2:0, 4:2:2, 4:4:0 or 4:4:4")
+      .need(lstrlen(_outfilename) == 0, "outfile is not supported");
+    _gpu_ok = c.decide(env);
     if (_gpu_ok)
     {
       _gpu_slices = GpuBackend::slice_threads(mt_flag);

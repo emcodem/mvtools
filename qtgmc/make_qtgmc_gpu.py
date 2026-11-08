@@ -1,10 +1,12 @@
-"""Makes QTGMC_gpu.avsi from the FFAStrans QTGMC.avsi: every motion-analysis call that has a GPU path gets gpu=QTGMC_gpu.
+"""Makes QTGMC_gpu.avsi from the FFAStrans QTGMC.avsi: the motion analysis (MSuper of the search clip, MAnalyse,
+MRecalculate) goes through wrappers that call the Cuda* filters of mvtools2 with QTGMC_gpu, the CPU filters without.
 
 python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]
 
 The source is read only. The global QTGMC_gpu (default false) is declared at the top of the copy; set
-`global QTGMC_gpu = true` after Import to switch the GPU on. Calls changed (MVTools2 with the gpu parameter): the
-analysis MSuper (srchClip.MSuper), MAnalyse, MRecalculate. All other mvtools calls are untouched.
+`global QTGMC_gpu = true` after Import to switch the GPU on. A Cuda* filter that cannot run on the GPU stops with an
+error unless `global cuda_cpu_fallback = true` (then it runs on the CPU). The other mvtools calls of QTGMC are
+untouched; the GPU output side (QTGMC_gpu_out) replaces them as a whole.
 """
 import re
 import sys
@@ -25,20 +27,12 @@ def main():
         text, k = re.subn(pattern, repl, text, flags=flags)
         n[name] = k
 
-    # analysis super (both the mt= and the plain variant)
-    sub('msuper', r'(srchClip\.MSuper\( pel=SubPel, sharp=SubPelInterp, hpad=hpad, vpad=vpad, chroma=ChromaMotion)(, mt=bomt)? \)',
-        lambda m: m.group(1) + (m.group(2) or '') + ', gpu=QTGMC_gpu )')
-    # MAnalyse: "DCT=DCT, chroma=ChromaMotion, mt=bomt )" and "DCT=DCT, chroma=ChromaMotion ) : NOP()"
-    # (meander=false with the GPU: wavefront search; QTGMC_gpu_meander=true keeps the slice kernel = stock result)
-    sub('manalyse_mt', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion, mt=bomt) \)',
-        r'\1, gpu=QTGMC_gpu, meander=!QTGMC_gpu || QTGMC_gpu_meander )')
-    sub('manalyse', r'(global=GlobalMotion, DCT=DCT, chroma=ChromaMotion) \) : NOP\(\)',
-        r'\1, gpu=QTGMC_gpu, meander=!QTGMC_gpu || QTGMC_gpu_meander ) : NOP()')
-    # MRecalculate (RefineMotion): "lambda=Lambda, pnew=PNew, mt=bomt)" and "lambda=Lambda, pnew=PNew)"
-    sub('mrecalc_mt', r'(searchparam=SearchParam, lambda=Lambda, pnew=PNew, mt=bomt)\)', r'\1, gpu=QTGMC_gpu)')
-    sub('mrecalc', r'(searchparam=SearchParam, lambda=Lambda, pnew=PNew)\)', r'\1, gpu=QTGMC_gpu)')
-    # ShutterBlur MRecalculate
-    sub('mrecalc_sb', r'(truemotion=TrueMotion, lambda=Lambda, pnew=PNew, DCT=DCT, chroma=ChromaMotion) \) :', r'\1, gpu=QTGMC_gpu ) :')
+    # the analysis calls go through QTGMC_MSuper / QTGMC_MAnalyse / QTGMC_MRecalculate (defined at the end): CudaMSuper /
+    # CudaMAnalyse / CudaMRecalculate with QTGMC_gpu, else the CPU filters; same arguments
+    # (MAnalyse with the GPU: meander=QTGMC_gpu_meander; false = wavefront search, true = the slice kernel = stock result)
+    sub('msuper', r'srchClip\.MSuper\(', 'srchClip.QTGMC_MSuper(')
+    sub('manalyse', r'srchSuper\.MAnalyse\(', 'srchSuper.QTGMC_MAnalyse(')
+    sub('mrecalc', r'srchSuper\.MRecalculate\(', 'srchSuper.QTGMC_MRecalculate(')
 
     # GPU search clip (cudafilters.dll): bob, temporal soften, merges,
     # KeepOnlyBobShimmerFixes, RemoveGrain 12, Gauss / Bilinear resize, the SrchClipPP 3 mt_lutxy pair as Cuda* filters,
@@ -83,9 +77,34 @@ def main():
             'global QTGMC_gpu_out = false # with QTGMC_gpu: the output side (MCompensate, MDegrain, resharp, limits, back blend, repair, noise restore) on the GPU\n'
             'global QTGMC_gpu_edi_token = false # internal: the interpolated clip stays on the device (set by QTGMC for the GPU output side)\n'
             + text)
+    # the analysis wrappers: every parameter of the mvtools2 filter, passed on by name (an argument the caller leaves out
+    # stays undefined and the filter takes its default)
+    sup_p = ['hpad i', 'vpad i', 'pel i', 'levels i', 'chroma b', 'sharp i', 'rfilter i', 'pelclip c', 'isse b', 'planar b', 'mt b']
+    ana_p = ['blksize i', 'blksizeV i', 'levels i', 'search i', 'searchparam i', 'pelsearch i', 'isb b', 'lambda i', 'chroma b',
+             'delta i', 'truemotion b', 'lsad i', 'plevel i', 'global b', 'pnew i', 'pzero i', 'pglobal i', 'overlap i', 'overlapV i',
+             'outfile s', 'dct i', 'divide i', 'sadx264 i', 'badSAD i', 'badrange i', 'isse b', 'meander b', 'temporal b', 'trymany b',
+             'multi b', 'mt b', 'scaleCSAD i', 'search_coarse i', 'trymanyall b']
+    rec_p = ['thsad i', 'smooth i', 'blksize i', 'blksizeV i', 'search i', 'searchparam i', 'lambda i', 'chroma b', 'truemotion b',
+             'pnew i', 'overlap i', 'overlapV i', 'outfile s', 'dct i', 'divide i', 'sadx264 i', 'isse b', 'meander b', 'tr i', 'mt b',
+             'scaleCSAD i']
+    types = {'i': 'int', 'b': 'bool', 's': 'string', 'c': 'clip'}
+
+    def wrapper(name, clips, params, gpu_extra=None):
+        decl = ', '.join('%s "%s"' % (types[p.split()[1]], p.split()[0]) for p in params)
+        def call(fn, extra):
+            args = ', '.join('%s=%s' % (p.split()[0], extra.get(p.split()[0], p.split()[0])) for p in params)
+            return 'c.%s( %s%s )' % (fn, ''.join(x + ', ' for x in clips[1:]), args)
+        cdecl = ', '.join(['clip c'] + ['clip ' + x for x in clips[1:]])
+        return ('function QTGMC_%s( %s, %s )\n{\n\treturn QTGMC_gpu ? %s \\\n\t                 : %s\n}\n'
+                % (name, cdecl, decl, call('Cuda' + name, gpu_extra or {}), call(name, {})))
+    text += ('\n\n# The motion analysis of QTGMC: the Cuda* filters of mvtools2 with QTGMC_gpu, else the CPU filters (same arguments).\n'
+             '# With the GPU, MAnalyse searches with meander=QTGMC_gpu_meander unless meander is given.\n'
+             + wrapper('MSuper', ['c'], sup_p)
+             + wrapper('MAnalyse', ['c'], ana_p, {'meander': 'Default(meander, QTGMC_gpu_meander)'})
+             + wrapper('MRecalculate', ['c', 'vectors'], rec_p))
     text += ('\n\n# GPU version of the search clip pre-filter (QTGMC "Motion Analysis" from bobbed to srchClip), equal to the CPU lines it\n'
              '# replaces; where those leave chroma undefined (masktools U=V=1, RemoveGrain -1 without ChromaMotion) the GPU copies it\n'
-             '# (the luma-only analysis does not read it). download=false: token frames (only MSuper(gpu=true) / MAnalyse may consume them)\n'
+             '# (the luma-only analysis does not read it). download=false: token frames (only the Cuda* filters may consume them)\n'
              'function QTGMC_gpu_srchclip( clip c, int TR0, int Rep0, int SrchClipPP, bool ChromaMotion, bool RepChroma, int w, int h, \\\n'
              '                             float epsilon, bool download )\n'
              '{\n'
@@ -123,15 +142,15 @@ def main():
              '                            float bbWidth, float bbHeight )\n'
              '{\n'
              '\tedi      = edi.CudaUpload()  # an interpolation made on the CPU goes to the device here; token frames pass through\n'
-             '\tediSuper = edi.MSuper( pel=SubPel, sharp=SubPelInterp, levels=1, hpad=hpad, vpad=vpad, gpu=true )\n'
+             '\tediSuper = edi.CudaMSuper( pel=SubPel, sharp=SubPelInterp, levels=1, hpad=hpad, vpad=vpad )\n'
              '\ttsl      = SLMode == 2       # temporal limit right after the resharp (SLMode 4 is not admitted)\n'
-             '\tbComp1   = tsl ? edi.MCompensate( ediSuper, bVec1, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
-             '\tfComp1   = tsl ? edi.MCompensate( ediSuper, fVec1, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
-             '\tbComp3   = tsl && SLRad > 1 ? edi.MCompensate( ediSuper, bVec3, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
-             '\tfComp3   = tsl && SLRad > 1 ? edi.MCompensate( ediSuper, fVec3, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
+             '\tbComp1   = tsl ? edi.CudaMCompensate( ediSuper, bVec1, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
+             '\tfComp1   = tsl ? edi.CudaMCompensate( ediSuper, fVec1, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
+             '\tbComp3   = tsl && SLRad > 1 ? edi.CudaMCompensate( ediSuper, bVec3, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
+             '\tfComp3   = tsl && SLRad > 1 ? edi.CudaMCompensate( ediSuper, fVec3, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
              '\tnref     = !tsl ? 0 : SLRad > 1 ? 5 : 3\n'
-             '\tdegrain1 = TR1 > 0 ? edi.MDegrain1( ediSuper, bVec1, fVec1, thSAD=ThSAD1, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
-             '\tdegrain2 = TR1 > 1 ? edi.MDegrain1( ediSuper, bVec2, fVec2, thSAD=ThSAD1, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : edi\n'
+             '\tdegrain1 = TR1 > 0 ? edi.CudaMDegrain1( ediSuper, bVec1, fVec1, thSAD=ThSAD1, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
+             '\tdegrain2 = TR1 > 1 ? edi.CudaMDegrain1( ediSuper, bVec2, fVec2, thSAD=ThSAD1, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : edi\n'
              '\tsbb1     = Sbb == 1 || Sbb == 3\n'
              '\t# binomial1, vresharp, resharp and (without a back blend before it) the temporal limit in one step\n'
              '\tresharp  = CudaQtgmcSharpLimit( edi, degrain1, fComp1, bComp1, resharpExpr, rgBlur, Sovs, degrain2=degrain2, fComp3=fComp3, \\\n'
@@ -142,11 +161,11 @@ def main():
              '\t                                         bComp3=bComp3, nref=nref, sovs=Sovs ) : resharp\n'
              '\tbackBlend2  = Sbb >= 2 ? CudaQtgmcBackBlend( sharpLimit1, lossed1, bbWidth, bbHeight ) : sharpLimit1\n'
              '\taddNoise1   = GrainRestore > 0.0 ? CudaQtgmcAddNoise( backBlend2, finalNoise, grainExpr, use_expr=2, lutUV=CNmt1, addUV=CNmt2 ) : backBlend2\n'
-             '\tstableSuper = TR2 > 0 ? addNoise1.MSuper( pel=SubPel, sharp=SubPelInterp, levels=1, hpad=hpad, vpad=vpad, gpu=true ) : NOP()\n'
+             '\tstableSuper = TR2 > 0 ? addNoise1.CudaMSuper( pel=SubPel, sharp=SubPelInterp, levels=1, hpad=hpad, vpad=vpad ) : NOP()\n'
              '\tstable      = TR2 == 0 ? addNoise1 : \\\n'
-             '\t              TR2 == 1 ? addNoise1.MDegrain1( stableSuper, bVec1, fVec1, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : \\\n'
-             '\t              TR2 == 2 ? addNoise1.MDegrain2( stableSuper, bVec1, fVec1, bVec2, fVec2, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true ) : \\\n'
-             '\t                         addNoise1.MDegrain3( stableSuper, bVec1, fVec1, bVec2, fVec2, bVec3, fVec3, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2, gpu=true )\n'
+             '\t              TR2 == 1 ? addNoise1.CudaMDegrain1( stableSuper, bVec1, fVec1, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : \\\n'
+             '\t              TR2 == 2 ? addNoise1.CudaMDegrain2( stableSuper, bVec1, fVec1, bVec2, fVec2, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2 ) : \\\n'
+             '\t                         addNoise1.CudaMDegrain3( stableSuper, bVec1, fVec1, bVec2, fVec2, bVec3, fVec3, thSAD=ThSAD2, thSCD1=ThSCD1, thSCD2=ThSCD2 )\n'
              '\trepair2     = (Rep2 == 0) ? stable : CudaKeepOnlyBobShimmerFixes( stable, edi, Rep2, RepChroma )\n'
              '\treturn NoiseRestore > 0.0 ? CudaQtgmcAddNoise( repair2, finalNoise, noiseExpr, use_expr=3, clamp_float=true, lutUV=CNmt1, addUV=CNmt2 ) : repair2\n'
              '}\n')

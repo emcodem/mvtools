@@ -87,7 +87,7 @@ fits small, stable filters whose only contract is parameters in, pixels out; mvt
   2.7.47) and proving CPU output = stock with the golden tests is the way to keep that true (see D8).
 - The price: users switch their mvtools2.dll to this fork to use the GPU (FFAStrans ships its own copy).
 
-## D8. How scripts call the GPU paths: Cuda* names, token out, explicit fallback (2026-11-02, decided; not implemented yet)
+## D8. How scripts call the GPU paths: Cuda* names, token out, explicit fallback (2026-11-02, decided and implemented)
 
 Asked 2026-10-30, decided by the user 2026-11-02. Supersedes D6 and the "silent fallback, opt-in" part of D5.
 - **Names.** mvtools2 gets `CudaMSuper`, `CudaMAnalyse`, `CudaMRecalculate`, `CudaMCompensate`, `CudaMDegrain1..6` /
@@ -113,6 +113,13 @@ Asked 2026-10-30, decided by the user 2026-11-02. Supersedes D6 and the "silent 
     meander=true, a frame that cannot be regenerated) are computed on the CPU and uploaded: the output stays a token.
 - Bit-exactness (D5) is unchanged. uconvert work (deploy, HD pel 4, LWLibav fallback) waits for this, so uconvert.avsi
   is edited once.
+- Implementation notes (2026-11-02): the optional per-call `cpu_fallback=` was not added. CudaMSuper's output is the
+  lite super clip (the picture, or the token header of a token clip), not a separate upload: the Cuda* consumers upload
+  host pictures once by content key, as before. CudaMSuper is lite at pel 4 too (the CPU consumers complete it).
+  Per-frame CPU results are uploaded under the filter's own producer id, and its regeneration repeats GPU-or-CPU, so an
+  evicted CPU frame comes back. The vector-clip device cache is not done: a measurement first (TODO.md).
+  CudaDownload stays a copy-engine D2H copy: a kernel that writes through UVA was measured and was slower for QTGMC
+  (Fast PAL 3.82 vs 3.68 s) and equal for uc_FRC.
 
 ## D6. Usage rule for every GPU filter (2026-10-30, superseded by D8)
 
@@ -129,7 +136,7 @@ a calibrated tolerance and the user's visual judgement, never PSNR alone (`GPU_P
 
 ## D4. `meander=false` selects the wavefront search (2026-10-29, decided)
 
-With `gpu=true`, `meander=false` runs the wavefront kernel (equal to the CPU with one slice, the fallback then searches in
+With `gpu=true` (since D8: CudaMAnalyse), `meander=false` runs the wavefront kernel (equal to the CPU with one slice, the fallback then searches in
 one slice too); `meander=true` keeps the exact slice kernel. The user approved slightly different vectors when the
 pictures look the same: the GPU QTGMC uses `meander=false` by default, `QTGMC_gpu_meander=true` gives stock results.
 Switching that default to `meander=true` waits until the slice kernel is clearly faster than the CPU

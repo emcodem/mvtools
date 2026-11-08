@@ -4,6 +4,9 @@
 #   QTGMC_gpu_on()                         # GPU for everything that has a GPU version (default after this Import: off)
 #   c.QTGMC(Preset="Fast")
 #
+# A GPU stage that cannot run on this machine or with these settings stops with an error naming the reason; set
+# global cuda_cpu_fallback = true before QTGMC to run such stages on the CPU instead (same result, slower).
+#
 # All DLLs come from .\plugins (mvtools2.dll, mvtools_cuda.dll, cudafilters.dll and avstp.dll must stay together and come
 # from one build). FFT3DFilter (QTGMC Very Slow / Placebo noise processing) needs the FFTW library: it is loaded here with
 # LoadDLL, so nothing has to be added to PATH.

@@ -61,7 +61,8 @@ namespace
 
   // the GPU output frame of a token-producing filter, or the CPU result
   template <class Make>
-  PVideoFrame token_or_cpu(const char *who, bool ok, const PClip &cpu, const PClip &child, const VideoInfo &vi, int n, IScriptEnvironment *env, Make make)
+  PVideoFrame token_or_cpu(const char *who, bool ok, const PClip &cpu, const PClip &child, const VideoInfo &vi,
+    const MvCudaFrameFormat &fmt, unsigned long long producer, int n, IScriptEnvironment *env, Make make)
   {
     if (!ok)
       return cpu->GetFrame(n, env);
@@ -70,7 +71,8 @@ namespace
     {
       if (log_enabled())
         std::fprintf(stderr, "%s: frame %d rc=%d -> CPU filters\n", who, n, rc);
-      return cpu->GetFrame(n, env); // exact CPU result (its inputs go through CudaDownload)
+      // exact CPU result (its inputs go through CudaDownload), uploaded: the output stays a token clip
+      return cpu_token(cpu->GetFrame(n, env), vi, fmt, producer, n, env);
     }
     PVideoFrame src = child->GetFrame(n, env);
     PVideoFrame dst = env->NewVideoFrameP(vi, &src);
@@ -105,7 +107,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaSharpLimit *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaSharpLimit *self = static_cast<CudaSharpLimit *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
     CudaSharpLimit(PClip edi, PClip d1, PClip d2, PClip fc1, PClip bc1, PClip fc3, PClip bc3, const char *expr, int rg_blur, int sovs,
@@ -176,10 +181,10 @@ namespace
         _ok = (_q.lut = lut_from_cpu(expr, 1, env, bits)) != 0;
       if (_ok && smode == 2 && precise)
         _ok = (_q.lut_precise = lut_from_cpu(precise_expr, 2, env, bits)) != 0;
+      _ok = gpu_decide("CudaQtgmcSharpLimit", "the QTGMC CPU filter chain", _ok,
+        "these settings or this format are not supported (smode 1 / 2 up to 10 bit, smode 0 below 16 bit, sovs 0..255, all clips in one format)", env);
       if (_ok)
         _producer = lib.producer_register(&CudaSharpLimit::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaQtgmcSharpLimit: %s\n", _ok ? "GPU" : "using the CPU filters");
     }
 
     ~CudaSharpLimit()
@@ -195,7 +200,7 @@ namespace
 
     PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override
     {
-      return token_or_cpu("CudaQtgmcSharpLimit", _ok, _cpu, child, vi, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
+      return token_or_cpu("CudaQtgmcSharpLimit", _ok, _cpu, child, vi, _fmt, _producer, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
     }
 
     int __stdcall SetCacheHints(int cachehints, int frame_range) override
@@ -234,7 +239,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaBackBlend *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaBackBlend *self = static_cast<CudaBackBlend *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
     CudaBackBlend(PClip thin, PClip lossed, double src_w, double src_h, const PClip refs[5], int nref, int sovs, IScriptEnvironment *env)
@@ -285,10 +293,10 @@ namespace
         _pv = lib.resample_program_create(pv.target_size, pv.taps, pv.offset.data(), pv.coeff.data());
         _ok = _ph && _pv;
       }
+      _ok = gpu_decide("CudaQtgmcBackBlend", "the QTGMC CPU filter chain", _ok,
+        "these settings or this format are not supported (sovs 0..255, all clips in one format, src_width / src_height different from the size)", env);
       if (_ok)
         _producer = lib.producer_register(&CudaBackBlend::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaQtgmcBackBlend: %s\n", _ok ? "GPU" : "using the CPU filters");
     }
 
     ~CudaBackBlend()
@@ -304,7 +312,7 @@ namespace
 
     PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override
     {
-      return token_or_cpu("CudaQtgmcBackBlend", _ok, _cpu, child, vi, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
+      return token_or_cpu("CudaQtgmcBackBlend", _ok, _cpu, child, vi, _fmt, _producer, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
     }
 
     int __stdcall SetCacheHints(int cachehints, int frame_range) override
@@ -336,7 +344,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaAddNoise *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaAddNoise *self = static_cast<CudaAddNoise *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
     CudaAddNoise(PClip c, PClip noise, const char *expr, int use_expr, bool clamp_float, int lut_uv, int add_uv, IScriptEnvironment *env)
@@ -358,10 +369,10 @@ namespace
       if (_ok)
         _ok = (_lut = lut_from_frame(chain(pattern_clip(false, _fmt.bits_per_sample), pattern_clip(true, _fmt.bits_per_sample))->GetFrame(0, env),
           _fmt.bits_per_sample)) != 0;
+      _ok = gpu_decide("CudaQtgmcAddNoise", "the QTGMC CPU filter chain", _ok,
+        "these settings or this format are not supported (up to 10 bit, addUV 2, or 3 with lutUV 3, both clips in one format)", env);
       if (_ok)
         _producer = lib.producer_register(&CudaAddNoise::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaQtgmcAddNoise: %s\n", _ok ? "GPU" : "using the CPU filters");
     }
 
     ~CudaAddNoise()
@@ -375,7 +386,7 @@ namespace
 
     PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override
     {
-      return token_or_cpu("CudaQtgmcAddNoise", _ok, _cpu, child, vi, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
+      return token_or_cpu("CudaQtgmcAddNoise", _ok, _cpu, child, vi, _fmt, _producer, n, env, [&](MvCudaTokenHeader &h) { return make(n, env, h); });
     }
 
     int __stdcall SetCacheHints(int cachehints, int frame_range) override
@@ -437,7 +448,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaBinomial0 *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaBinomial0 *self = static_cast<CudaBinomial0 *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -470,10 +484,10 @@ namespace
       _tail = _ok ? (_fmt.width * _fmt.bytes_per_sample / 16 * 16) / _fmt.bytes_per_sample : 0;
       const int wc = _ok && _fmt.planes == 3 ? _fmt.width / _fmt.x_ratio_uv : 0;
       _tail_c = (wc * _fmt.bytes_per_sample / 16 * 16) / (_fmt.bytes_per_sample ? _fmt.bytes_per_sample : 1);
+      _ok = gpu_decide("CudaQtgmcBinomial0", "the QTGMC CPU filter chain", _ok,
+        "only planar Y / YUV 8 to 16 bit", env);
       if (_ok)
         _producer = lib.producer_register(&CudaBinomial0::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaQtgmcBinomial0: %s\n", _ok ? "GPU" : "using the CPU filters");
     }
 
     ~CudaBinomial0()
@@ -488,7 +502,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

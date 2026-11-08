@@ -140,7 +140,7 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
     env->ThrowError("MFlowFps : wrong super frame clip");
   }
 
-  const bool super_lite = MV_SUPER_IS_LITE(params); // MSuper(gpu=true): MVFinest completes it where the CPU path needs the real thing
+  const bool super_lite = MV_SUPER_IS_LITE(params); // CudaMSuper: MVFinest completes it where the CPU path needs the real thing
   if (nPel == 1 && !super_lite)
   {
     finest = super; // v2.0.9.1
@@ -207,12 +207,15 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
   // ---- GPU rendering: only for the configuration the GPU code reproduces bit-exactly
   if (gpu_flag)
   {
-    const bool sharp_ok = super_param_valid(params) && super_param_sharp(params) == 2 && !super_param_pelclip(params);
-    _gpu_ok = GpuBackend::instance().usable() && sharp_ok && (pixelsize_super == 1 || pixelsize_super == 2)
-      && vi.IsPlanar() && !vi.IsYUY2() && !isGrey && !isRGB && planecount == 3 && maskmode == 2 && (nPel == 1 || nPel == 2 || nPel == 4)
-      && (xRatioUVs[1] == 1 || xRatioUVs[1] == 2) && (yRatioUVs[1] == 1 || yRatioUVs[1] == 2);
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MFlowFps gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
+    GpuCheck c("CudaMFlowFps", "MFlowFps");
+    c.need(super_param_valid(params), "the super clip must come from CudaMSuper or MSuper of this build")
+      .need(super_param_sharp(params) == 2 && !super_param_pelclip(params), "the super clip must use sharp=2 and no pelclip")
+      .need(maskmode == 2, "only mask=2")
+      .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")
+      .need(vi.IsPlanar() && !vi.IsYUY2() && !isGrey && !isRGB && planecount == 3, "only planar YUV formats")
+      .need((xRatioUVs[1] == 1 || xRatioUVs[1] == 2) && (yRatioUVs[1] == 1 || yRatioUVs[1] == 2), "only 4:2:0, 4:2:2, 4:4:0 or 4:4:4 chroma")
+      .need(vi.width >= (int)sizeof(MvCudaTokenHeader), "the clip is too narrow for a GPU frame header (68 pixels)");
+    _gpu_ok = c.decide(env);
     if (_gpu_ok)
     {
       _super_clip = super;
@@ -568,8 +571,6 @@ bool MVFlowFps::gpu_flow(int n, int nleft, int nright, int time256, PVideoFrame 
       // the pictures: device frames, or host pictures uploaded once per super frame
       GpuBackend::Input in[2];
       const VideoInfo &svi = _super_clip->GetVideoInfo();
-      MvCudaTokenHeader src_tok;
-      const bool token_out = regen_out || GpuBackend::frame_token(src0, child->GetVideoInfo(), src_tok);
       const bool in_ok = GpuBackend::super_input(sl, svi, (const void *)_super_clip.operator->(), nleft, in[0])
         && GpuBackend::super_input(sr, svi, (const void *)_super_clip.operator->(), nright, in[1]) && in[0].fmt.planes == 3;
 
@@ -611,7 +612,7 @@ bool MVFlowFps::gpu_flow(int n, int nleft, int nright, int time256, PVideoFrame 
       MvCudaTokenHeader h;
       if (!in_ok)
         rc = -4;
-      else if (token_out)
+      else
       {
         rc = gpu.with_inputs(in, 2, env, [&](const unsigned long long *tk) {
           return gpu.flow_token(&sp, &fp, tk[0], tk[1], vb.data(), vf.data(), vbb.data(), vff.data(), _producer, n, &h);
@@ -623,22 +624,6 @@ bool MVFlowFps::gpu_flow(int n, int nleft, int nright, int time256, PVideoFrame 
           dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src0) : env->NewVideoFrame(vi);
           GpuBackend::write_token(dst, h);
         }
-      }
-      else
-      {
-        // normal frames in, normal frames out: the picture comes back in the same call
-        dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &src0) : env->NewVideoFrame(vi);
-        const int planes_y[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
-        void *dp[3];
-        int dpitch[3];
-        for (int p = 0; p < 3; p++)
-        {
-          dp[p] = dst->GetWritePtr(planes_y[p]);
-          dpitch[p] = dst->GetPitch(planes_y[p]);
-        }
-        rc = gpu.with_inputs(in, 2, env, [&](const unsigned long long *tk) {
-          return gpu.flow_token_host(&sp, &fp, tk[0], tk[1], vb.data(), vf.data(), vbb.data(), vff.data(), dp, dpitch);
-        });
       }
     }
     catch (...)
@@ -667,29 +652,47 @@ int MVFlowFps::gpu_regen(void *user, int frame, void *env_v, MvCudaTokenHeader *
 {
   MVFlowFps *self = static_cast<MVFlowFps *>(user);
   IScriptEnvironment *env = static_cast<IScriptEnvironment *>(env_v);
-  std::lock_guard<std::mutex> lk(self->_gpu_mutex);
-  const int nleft = (int)(int64_t(frame) * self->fa / self->fb);
-  int time256 = int((double(frame) * double(self->fa) / double(self->fb) - nleft) * 256 + 0.5);
-  const int off = self->mvClipB.GetDeltaFrame();
-  if (off <= 0)
-    return -4;
-  if (off > 1)
-    time256 = time256 / off;
-  if (time256 == 0 || time256 == 256)
-    return -4; // the source clip's frame, not one of ours
-  const int nright = nleft + off;
-  PVideoFrame mvF = self->mvClipF.GetFrame(nright, env);
-  self->mvClipF.Update(mvF, env);
-  PVideoFrame mvB = self->mvClipB.GetFrame(nleft, env);
-  self->mvClipB.Update(mvB, env);
-  if (!self->mvClipB.IsUsable() || !self->mvClipF.IsUsable())
-    return -4;
-  PVideoFrame unused;
-  return self->gpu_flow(frame, nleft, nright, time256, unused, out, env) ? 0 : -2;
+  {
+    std::lock_guard<std::mutex> lk(self->_gpu_mutex);
+    const int nleft = (int)(int64_t(frame) * self->fa / self->fb);
+    int time256 = int((double(frame) * double(self->fa) / double(self->fb) - nleft) * 256 + 0.5);
+    const int off = self->mvClipB.GetDeltaFrame();
+    if (off > 1)
+      time256 = time256 / off;
+    if (off > 0 && time256 != 0 && time256 != 256)
+    {
+      const int nright = nleft + off;
+      PVideoFrame mvF = self->mvClipF.GetFrame(nright, env);
+      self->mvClipF.Update(mvF, env);
+      PVideoFrame mvB = self->mvClipB.GetFrame(nleft, env);
+      self->mvClipB.Update(mvB, env);
+      PVideoFrame unused;
+      if (self->mvClipB.IsUsable() && self->mvClipF.IsUsable() && self->gpu_flow(frame, nleft, nright, time256, unused, out, env))
+        return 0;
+    }
+  }
+  // a frame the GPU does not make (a source frame, unusable vectors, a failed call): as GetFrame, uploaded
+  try
+  {
+    return GpuBackend::instance().upload_cpu_result(self->frame_inner(frame, env), self->vi, self->_producer, frame, *out);
+  }
+  catch (...)
+  {
+    return -2;
+  }
 }
 
 //-------------------------------------------------------------------------
 PVideoFrame __stdcall MVFlowFps::GetFrame(int n, IScriptEnvironment* env)
+{
+  PVideoFrame f = frame_inner(n, env);
+  if (!_gpu_ok)
+    return f;
+  // CudaMFlowFps: the frames made on the CPU are uploaded (GPU results are token frames already and pass through)
+  return GpuBackend::instance().cpu_result_token(f, vi, _producer, n, env);
+}
+
+PVideoFrame MVFlowFps::frame_inner(int n, IScriptEnvironment* env)
 {
   // with the GPU, a regeneration (gpu_regen) may come in from another thread: it shares the vector clip state
   std::unique_lock<std::mutex> gpu_lock(_gpu_mutex, std::defer_lock);

@@ -3,9 +3,9 @@ and after a merge, or ours against plain upstream).
 
 usage: python baseline.py run <plugin dir> <out dir> [group | chain ...]
        python baseline.py diff <dir A> <dir B>
-groups: cpu     compare.py's CPU chains (`, gpu=false` removed, so they also run on builds without the gpu parameter)
-        gpucpu  the GPU chains with `gpu=true` removed: the CPU result each GPU chain must equal
-        gpu     the GPU chains as they are
+groups: cpu     compare.py's CPU chains
+        gpucpu  the GPU chains as written in compare.py with `gpu=true` removed: the CPU result each GPU chain must equal
+        gpu     the GPU chains (Cuda* filters, compare.cuda_names; builds from 2026-11-02 on)
         cf      the cudafilters chains (cudafilters.dll in the plugin dir)
         default: cpu gpucpu gpu, plus cf when cudafilters.dll is in the plugin dir
 `run` also reports, in the same folder, every GPU chain against its gpucpu twin (must be `same`).
@@ -36,17 +36,14 @@ def avs_text(name, plugins):
     avs_src = compare.SOURCES[src][0]
     pre = 'LoadPlugin("%s")\n' % compare.LSMASH if compare.WIN else ''
     if body is None:  # lin_cpu / lin_gpu
-        text = pre + compare.LIN_AVS.format(plugins=plugins, mvtools2=compare.lib_name('mvtools2'), src=avs_src,
-                                            gpu='true' if base == 'lin_gpu' else 'false')
-    else:
+        return pre + compare.lin_avs(plugins, avs_src, base == 'lin_gpu' and not cpu_twin)
+    cf = compare.needs_cudafilters(base)
+    if cpu_twin:  # the chain as written with gpu=true removed: the CPU filters (CudaDownload not needed)
+        body = re.sub(r',\s*gpu=(true|false)', '', compare.RAW_BODIES[base])
         cf = base in compare.CF_CHAINS
-        text = ('%sLoadPlugin("%s/%s")\n%sc = %s\n%sreturn out\n'
-                % (pre, plugins, compare.lib_name('mvtools2'),
-                   'LoadPlugin("%s/%s")\n' % (plugins, compare.lib_name('cudafilters')) if cf else '', avs_src, body))
-    text = re.sub(r',\s*gpu=false', '', text)  # the default; builds without the parameter accept the chain
-    if cpu_twin:
-        text = re.sub(r',\s*gpu=true', '', text)
-    return text
+    return ('%sLoadPlugin("%s/%s")\n%sc = %s\n%sreturn out\n'
+            % (pre, plugins, compare.lib_name('mvtools2'),
+               'LoadPlugin("%s/%s")\n' % (plugins, compare.lib_name('cudafilters')) if cf else '', avs_src, body))
 
 
 def expand(args, plugins):

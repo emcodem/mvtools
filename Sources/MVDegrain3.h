@@ -118,15 +118,16 @@ private:
   MV_FORCEINLINE void use_block_uv(const BYTE * &p, int &np, int &WRef, bool isUsable, const MVClip &mvclip, int i, const MVPlane *pPlane, const BYTE *pSrcCur, int xx, int nSrcPitch);
   Denoise1to6Function *get_denoise123_function(int BlockX, int BlockY, int _bits_per_pixel, bool _out16_flag, int _level, arch_t _arch);
 
-  // GPU path (gpu=true): source and super from token clips, token output.
+  // GPU path (CudaMDegrain1..6): super clip from CudaMSuper, token output (frames computed on the CPU are uploaded).
   // One lock per instance: a token regeneration can call in from another thread.
   bool _super_lite = false;
   bool _gpu_ok = false;
   int _gpu_hpad = 0, _gpu_vpad = 0; // padding of the super clip (pel-2 sub-pel planes)
   unsigned long long _producer = 0;
   std::mutex _gpu_mutex;
-  int gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host);
+  int gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src);
   static int gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
+  PVideoFrame cpu_frame(int n, IScriptEnvironment *env);
 };
 
 #pragma warning( push )

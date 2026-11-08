@@ -294,8 +294,8 @@ AVSValue __cdecl Create_CudaNVOFAnalyse(AVSValue args, void *, IScriptEnvironmen
   }
   if (!nvof_usable())
   {
-    if (log_enabled())
-      std::fprintf(stderr, "CudaNVOFAnalyse: NVOFA not available, using MAnalyse\n");
+    // with cuda_cpu_fallback: MAnalyse with the same block layout
+    gpu_decide("CudaNVOFAnalyse", "MAnalyse", false, "no NVIDIA optical flow accelerator (Turing or newer GPU and its driver)", env);
     return make_manalyse(c, isb, delta, bx, by, ox, oy, pel, hpad, vpad, chroma, env);
   }
   return new CudaNVOFAnalyse(c, isb, delta, bx, by, ox, oy, pel, hpad, vpad, chroma, preset, env);

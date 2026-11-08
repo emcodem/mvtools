@@ -4,6 +4,7 @@
 #include "SuperParams64Bits.h"
 #include "cuda/dyn_lib.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,6 +62,64 @@ bool GpuBackend::log_enabled()
   return on;
 }
 
+namespace
+{
+  // "1", "true", "yes" (any case) = true; "0", "false", "no" = false; anything else = def
+  bool parse_flag(const char *s, bool def)
+  {
+    if (s == nullptr)
+      return def;
+    std::string v(s);
+    for (auto &c : v)
+      c = (char)std::tolower((unsigned char)c);
+    if (v == "1" || v == "true" || v == "yes")
+      return true;
+    if (v == "0" || v == "false" || v == "no")
+      return false;
+    return def;
+  }
+}
+
+bool GpuBackend::cpu_fallback_allowed(IScriptEnvironment *env)
+{
+  if (env != nullptr)
+  {
+    try
+    {
+      const AVSValue v = env->GetVarDef("cuda_cpu_fallback", AVSValue());
+      if (v.IsBool())
+        return v.AsBool();
+      if (v.IsInt())
+        return v.AsInt() != 0;
+      if (v.IsString())
+        return parse_flag(v.AsString(), false);
+    }
+    catch (...)
+    {
+    }
+  }
+  return parse_flag(std::getenv("CUDA_CPU_FALLBACK"), false);
+}
+
+bool GpuCheck::decide(IScriptEnvironment *env) const
+{
+  if (_why == nullptr)
+  {
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "%s: using the GPU\n", _name);
+    return true;
+  }
+  if (GpuBackend::cpu_fallback_allowed(env))
+  {
+    if (GpuBackend::log_enabled())
+      std::fprintf(stderr, "%s: not on the GPU (%s), running %s on the CPU (cuda_cpu_fallback)\n", _name, _why, _cpu_name);
+    return false;
+  }
+  env->ThrowError("%s: cannot run on the GPU: %s.\nUse %s for the CPU, or set global cuda_cpu_fallback = true "
+    "(environment variable CUDA_CPU_FALLBACK=1) to run it on the CPU when the GPU cannot.", _name, _why, _cpu_name);
+  return false;
+}
+
 bool GpuBackend::force_fallback()
 {
   static const bool on = (std::getenv("MVTOOLS_GPU_FORCE_FALLBACK") != nullptr);
@@ -80,7 +139,7 @@ int GpuBackend::slice_threads(bool mt_flag)
       return v;
   }
   // without a thread pool (avstp missing, VapourSynth, Linux) the CPU slicer runs one slice: so does the GPU, otherwise
-  // gpu=true would differ from the CPU result and from its own CPU fallback. MVTOOLS_GPU_SLICES or meander=false (the
+  // CudaMAnalyse would differ from the CPU result and from its own CPU fallback. MVTOOLS_GPU_SLICES or meander=false (the
   // wavefront search, exact against the one-slice CPU search with meander=false) give the GPU its parallelism back.
   const int n = AvstpWrapper::use_instance().get_nbr_threads();
   return n > 1 ? n : 1;
@@ -238,6 +297,42 @@ bool GpuBackend::download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, co
   return frame_download(h.token, d, dp) == 0;
 }
 
+int GpuBackend::upload_cpu_result(const PVideoFrame &f, const VideoInfo &vi, unsigned long long producer, int n, MvCudaTokenHeader &h)
+{
+  MvCudaFrameFormat fmt;
+  if (!_usable || !make_format(vi, vi.width, vi.height, true, fmt))
+    return -4;
+  if (frame_token(f, vi, h))
+    return 0; // a token frame already
+  const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
+  const void *src[3] = { 0, 0, 0 };
+  int pitch[3] = { 0, 0, 0 };
+  for (int p = 0; p < fmt.planes; p++)
+  {
+    src[p] = f->GetReadPtr(planes_l[p]);
+    pitch[p] = f->GetPitch(planes_l[p]);
+  }
+  const int rc = frame_upload(&fmt, src, pitch, producer, n, &h);
+  if (log_enabled())
+    std::fprintf(stderr, "mvtools gpu: CPU result of frame %d uploaded, rc=%d\n", n, rc);
+  return rc;
+}
+
+PVideoFrame GpuBackend::cpu_result_token(const PVideoFrame &f, const VideoInfo &vi, unsigned long long producer, int n, IScriptEnvironment *env)
+{
+  MvCudaTokenHeader h;
+  if (frame_token(f, vi, h))
+    return f; // a token frame already (e.g. the source frame of a token clip passed through)
+  if (upload_cpu_result(f, vi, producer, n, h) != 0)
+    env->ThrowError("mvtools: the CPU result of frame %d could not be uploaded to the GPU", n);
+  bool v8 = true;
+  try { env->CheckVersion(8); }
+  catch (const AvisynthError &) { v8 = false; }
+  PVideoFrame dst = v8 ? env->NewVideoFrameP(vi, const_cast<PVideoFrame *>(&f)) : env->NewVideoFrame(vi);
+  write_token(dst, h);
+  return dst;
+}
+
 void GpuBackend::remove_user()
 {
   if (--_users != 0)
@@ -260,6 +355,7 @@ GpuBackend::GpuBackend()
   , flow_token(nullptr)
   , flow_token_host(nullptr)
   , frame_upload_keyed(nullptr)
+  , frame_upload(nullptr)
   , frame_download(nullptr)
   , frame_stats(nullptr)
   , token_regenerate(nullptr)
@@ -270,10 +366,12 @@ GpuBackend::GpuBackend()
   , compensate(nullptr)
   , degrain(nullptr)
   , _usable(false)
+  , _why("the GPU library was not loaded")
   , _users(0)
 {
   if (std::getenv("MVTOOLS_GPU_DISABLE") != nullptr)
   {
+    _why = "disabled by the environment variable MVTOOLS_GPU_DISABLE";
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: disabled by MVTOOLS_GPU_DISABLE\n");
     return;
@@ -282,6 +380,7 @@ GpuBackend::GpuBackend()
   const std::filesystem::path dir = dynlib::module_dir(reinterpret_cast<const void *>(&GpuBackend::instance));
   if (dir.empty())
   {
+    _why = "the plugin folder could not be determined";
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: cannot determine the plugin folder\n");
     return;
@@ -290,6 +389,11 @@ GpuBackend::GpuBackend()
   void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
   if (lib == nullptr)
   {
+#ifdef _WIN32
+    _why = "mvtools_cuda.dll was not found or could not be loaded from the plugin folder";
+#else
+    _why = "libmvtools_cuda.so was not found or could not be loaded from the plugin folder";
+#endif
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: %s not loaded from the plugin folder (%s), using the CPU\n", dynlib::cuda_lib_name,
         dynlib::last_error().c_str());
@@ -303,6 +407,7 @@ GpuBackend::GpuBackend()
   flow_token = reinterpret_cast<decltype(flow_token)>(dynlib::symbol(lib, "mvcuda_flow_token"));
   flow_token_host = reinterpret_cast<decltype(flow_token_host)>(dynlib::symbol(lib, "mvcuda_flow_token_host"));
   frame_upload_keyed = reinterpret_cast<decltype(frame_upload_keyed)>(dynlib::symbol(lib, "mvcuda_frame_upload_keyed"));
+  frame_upload = reinterpret_cast<decltype(frame_upload)>(dynlib::symbol(lib, "mvcuda_frame_upload"));
   frame_download = reinterpret_cast<decltype(frame_download)>(dynlib::symbol(lib, "mvcuda_frame_download"));
   frame_stats = reinterpret_cast<decltype(frame_stats)>(dynlib::symbol(lib, "mvcuda_frame_stats"));
   token_regenerate = reinterpret_cast<decltype(token_regenerate)>(dynlib::symbol(lib, "mvcuda_token_regenerate"));
@@ -312,15 +417,22 @@ GpuBackend::GpuBackend()
   producer_unregister = reinterpret_cast<decltype(producer_unregister)>(dynlib::symbol(lib, "mvcuda_producer_unregister"));
   compensate = reinterpret_cast<decltype(compensate)>(dynlib::symbol(lib, "mvcuda_compensate"));
   degrain = reinterpret_cast<decltype(degrain)>(dynlib::symbol(lib, "mvcuda_degrain"));
-  if (version == nullptr || count == nullptr || cache_clear == nullptr || recalc_token == nullptr || flow_token == nullptr
-    || frame_upload_keyed == nullptr || flow_token_host == nullptr || analyse_token == nullptr || frame_download == nullptr || token_regenerate == nullptr || token_pin == nullptr || token_unpin == nullptr || producer_register == nullptr || producer_unregister == nullptr || compensate == nullptr || degrain == nullptr
-    || version() != MVCUDA_API_VERSION || count() <= 0)
+  const bool exports_ok = version != nullptr && count != nullptr && cache_clear != nullptr && recalc_token != nullptr && flow_token != nullptr
+    && frame_upload_keyed != nullptr && frame_upload != nullptr && flow_token_host != nullptr && analyse_token != nullptr && frame_download != nullptr
+    && token_regenerate != nullptr && token_pin != nullptr && token_unpin != nullptr && producer_register != nullptr && producer_unregister != nullptr
+    && compensate != nullptr && degrain != nullptr;
+  if (!exports_ok || version() != MVCUDA_API_VERSION)
+    _why = "the GPU library does not match this mvtools2 build (API version): use the DLLs of one release together";
+  else if (count() <= 0)
+    _why = "no usable NVIDIA GPU (needs compute capability 6.0 or newer and a current driver)";
+  if (!exports_ok || version() != MVCUDA_API_VERSION || count() <= 0)
   {
     if (log_enabled())
       std::fprintf(stderr, "mvtools gpu: library unusable (missing exports, API version or no device), using the CPU\n");
     return;
   }
   _usable = true;
+  _why = "";
   if (log_enabled())
     std::fprintf(stderr, "mvtools gpu: backend loaded\n");
 }

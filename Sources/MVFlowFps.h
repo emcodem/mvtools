@@ -131,15 +131,16 @@ private:
 
   bool _mt_flag;
 
-  // GPU rendering (GpuBackend / mvtools_cuda.dll) of the mask=2 path: decided at construction, CPU fallback per frame.
-  // Output like the source clip: token frames for token frames (made again on request through _producer), else normal
-  // frames. _gpu_mutex: GetFrame and the regeneration share the vector clip state.
+  // GPU rendering (CudaMFlowFps, GpuBackend / mvtools_cuda.dll) of the mask=2 path: decided at construction, CPU
+  // fallback per frame. Output: token frames (made again on request through _producer); frames made on the CPU (source
+  // frames at time 0, unusable vectors) are uploaded. _gpu_mutex: GetFrame and the regeneration share the vector clip state.
   bool _gpu_ok;
   PClip _super_clip;
   unsigned long long _producer = 0;
   std::mutex _gpu_mutex;
   bool gpu_flow(int n, int nleft, int nright, int time256, PVideoFrame &dst, MvCudaTokenHeader *regen_out, IScriptEnvironment *env);
   static int gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
+  PVideoFrame frame_inner(int n, IScriptEnvironment *env); // the GPU token or the CPU frame
 
   // Per-frame state read by process_slice()
   BYTE *_cpPDst[3];

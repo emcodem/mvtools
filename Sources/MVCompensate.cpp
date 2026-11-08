@@ -203,7 +203,7 @@ MVCompensate::MVCompensate(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
-  // a lite super (MSuper(gpu=true)): the GPU path reads its token pictures, the CPU path completes the frames
+  // a lite super (CudaMSuper): the GPU path reads its token pictures, the CPU path completes the frames
   _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
@@ -251,20 +251,26 @@ MVCompensate::MVCompensate(
     _boundary_cnt_arr.resize(nBlkY);
   }
 
-  // GPU path: 8 to 16 bit planar, pel 1 or 2, single compensation, no recursion / fields, lite super (MSuper(gpu=true)) of
-  // a token clip (token frames out) or of a normal clip (pictures uploaded, normal frames out)
+  // GPU path (CudaMCompensate): 8 to 16 bit planar, pel 1 or 2, single compensation, no recursion / fields, super clip
+  // from CudaMSuper; token frames out (the source pictures uploaded when they are normal frames)
   if (gpu_flag)
   {
-    GpuBackend &gpu = GpuBackend::instance();
-    _gpu_ok = gpu.usable() && _super_lite && (pixelsize_super == 1 || pixelsize_super == 2) && (nPel == 1 || nPel == 2) && recursion == 0 && !fields && !_multi_flag
-      && vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || planecount == 3) && vi.width >= (int)sizeof(MvCudaTokenHeader);
+    GpuCheck c("CudaMCompensate", "MCompensate");
+    c.need(_super_lite, "the super clip must come from CudaMSuper")
+      .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")
+      .need(nPel == 1 || nPel == 2, "only pel 1 or 2")
+      .need(recursion == 0, "recursion is not supported")
+      .need(!fields, "fields=true is not supported")
+      .need(!_multi_flag, "multi-vector clips (tr > 0) are not supported")
+      .need(vi.IsPlanar() && !vi.IsYUY2() && !vi.IsRGB() && (vi.IsY() || planecount == 3), "only planar Y or YUV formats")
+      .need(vi.width >= (int)sizeof(MvCudaTokenHeader), "the clip is too narrow for a GPU frame header (68 pixels)");
+    _gpu_ok = c.decide(env_ptr);
     if (_gpu_ok)
     {
+      GpuBackend &gpu = GpuBackend::instance();
       _producer = gpu.producer_register(&MVCompensate::gpu_regen, this);
       gpu.add_user(); // the upload keys name clips: forgotten when the last GPU filter goes
     }
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MCompensate gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, CPU");
   }
 
   if (recursion > 0)
@@ -315,15 +321,24 @@ MVCompensate::~MVCompensate()
 int MVCompensate::gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
 {
   MVCompensate *self = static_cast<MVCompensate *>(user);
+  IScriptEnvironment *e = static_cast<IScriptEnvironment *>(env);
   std::lock_guard<std::mutex> lk(self->_gpu_mutex);
-  bool host;
-  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr, host);
+  if (self->gpu_make(frame, e, *out, nullptr) == 0)
+    return 0;
+  // a frame the GPU cannot make (as in GetFrame): the CPU result, uploaded
+  try
+  {
+    return GpuBackend::instance().upload_cpu_result(self->cpu_frame(frame, e), self->vi, self->_producer, frame, *out);
+  }
+  catch (...)
+  {
+    return -2;
+  }
 }
 
 // The compensated frame as a device frame: 0 and the token in h; 3 = not a compensated frame (CPU path returns the
-// centre clip); other = the CPU path. props_src receives the frame whose properties the CPU path would copy. host: the
-// super frames are normal frames (their pictures uploaded), so the result goes back as a normal frame.
-int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host)
+// centre clip); other = the CPU path. props_src receives the frame whose properties the CPU path would copy.
+int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src)
 {
   int nsrc, nvec, vindex;
   if (!compute_src_frame(nsrc, nvec, vindex, n))
@@ -345,7 +360,6 @@ int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h,
   // a host picture is uploaded with the super's planes: all of the output's planes must be there
   if (!GpuBackend::super_input(src, svi, sclip, nsrc, in[0]) || (in[0].host && in[0].fmt.planes != (vi.IsY() ? 1 : 3)))
     return -1;
-  host = in[0].host;
   if (props_src)
     *props_src = src;
   GpuBackend &gpu = GpuBackend::instance();
@@ -355,7 +369,7 @@ int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h,
     if (!scBehavior && nref < vi.num_frames && nref >= 0)
     {
       PVideoFrame r = super->GetFrame(nref, env);
-      if (!GpuBackend::super_input(r, svi, sclip, nref, in[0]) || in[0].host != host)
+      if (!GpuBackend::super_input(r, svi, sclip, nref, in[0]) || (in[0].host && in[0].fmt.planes != (vi.IsY() ? 1 : 3)))
         return -1;
       if (props_src)
         *props_src = r;
@@ -402,30 +416,28 @@ int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h,
 PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
 {
   std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
-  if (_gpu_ok)
+  if (!_gpu_ok)
+    return cpu_frame(n, env_ptr);
+  MvCudaTokenHeader h;
+  PVideoFrame props;
+  const int rc = gpu_make(n, env_ptr, h, &props);
+  if (rc == 0)
   {
-    MvCudaTokenHeader h;
-    PVideoFrame props;
-    bool host = false;
-    int rc = gpu_make(n, env_ptr, h, &props, host);
-    if (rc == 0)
-    {
-      PVideoFrame dst = env_ptr->NewVideoFrame(vi);
-      if (has_at_least_v8 && props)
-        env_ptr->copyFrameProps(props, dst);
-      if (!host)
-      {
-        GpuBackend::write_token(dst, h);
-        return dst;
-      }
-      // normal frames in, normal frames out (the device frame was made or found by this thread a moment ago)
-      if (GpuBackend::instance().download_frame(h, dst, vi))
-        return dst;
-      rc = -2;
-    }
-    if (rc != 3 && GpuBackend::log_enabled())
-      std::fprintf(stderr, "MCompensate gpu frame %d rc=%d -> CPU\n", n, rc);
+    PVideoFrame dst = env_ptr->NewVideoFrame(vi);
+    if (has_at_least_v8 && props)
+      env_ptr->copyFrameProps(props, dst);
+    GpuBackend::write_token(dst, h);
+    return dst;
   }
+  if (rc != 3 && GpuBackend::log_enabled())
+    std::fprintf(stderr, "CudaMCompensate frame %d rc=%d -> CPU\n", n, rc);
+  // the CPU result, uploaded: the output stays a token clip
+  return GpuBackend::instance().cpu_result_token(cpu_frame(n, env_ptr), vi, _producer, n, env_ptr);
+}
+
+// MCompensate's own (CPU) frame n
+PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
+{
   int nsrc;
   int nvec;
   int vindex;

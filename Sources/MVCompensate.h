@@ -140,14 +140,15 @@ private:
   std::vector <conc::AtomicInt <int> >
             _boundary_cnt_arr;
 
-  // GPU path (gpu=true): the super clip is MSuper(gpu=true) of a token clip; output
-  // frames are token frames. One lock per instance: a token regeneration can call in from another thread.
+  // GPU path (CudaMCompensate): the super clip is CudaMSuper's; output frames are token frames, also for frames
+  // computed on the CPU (uploaded). One lock per instance: a token regeneration can call in from another thread.
   bool           _super_lite;
   bool           _gpu_ok;
   unsigned long long _producer;
   std::mutex     _gpu_mutex;
-  int            gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host);
+  int            gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h, PVideoFrame *props_src);
   static int     gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
+  PVideoFrame    cpu_frame(int n, IScriptEnvironment* env_ptr);
 };
 
 #endif

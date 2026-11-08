@@ -1,6 +1,8 @@
 # QTGMC with the whole chain on the GPU. Set the clip and the preset; open in AvsPmod / VirtualDub / ffmpeg.
-# 8 to 16 bit input: 8 and 10 bit run every stage on the GPU; at higher bit depths the stages without a GPU path
-# (lookup tables, NNEDI3) run their CPU filters with the same result.
+# 8 to 16 bit input: 8 and 10 bit run every stage on the GPU. A stage without a GPU path (above 10 bit: lookup tables,
+# NNEDI3; NNEDI3 also on CPUs where the nnedi3 plugin does not take its AVX2 + FMA path) stops the script with an error
+# that names it; with global cuda_cpu_fallback = true (set it before QTGMC) such stages run their CPU filters with the
+# same result.
 clip_file = "C:\path\to\interlaced.mxf"
 preset    = "Fast"   # any QTGMC preset: Ultra Fast .. Placebo
 

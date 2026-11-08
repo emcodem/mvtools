@@ -31,7 +31,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaTemporalSoften *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaTemporalSoften *self = static_cast<CudaTemporalSoften *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -50,10 +53,11 @@ namespace
       _scenechange *= ((vi.width / 32) * 32) * vi.height;
       CudaLib &lib = CudaLib::get();
       _ok = lib.ok && make_format(vi, _fmt) && _radius > 0 && (_luma > 0 || _chroma > 0);
+      _ok = gpu_decide("CudaTemporalSoften", "TemporalSoften", _ok,
+        make_format(vi, _fmt) ? "radius 0 or both thresholds 0 (TemporalSoften returns the clip unchanged): leave the filter out"
+                              : "only planar Y / YUV 8 to 16 bit", env);
       if (_ok)
         _producer = lib.producer_register(&CudaTemporalSoften::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaTemporalSoften: %s\n", _ok ? "GPU" : "GPU, format or settings not usable, using TemporalSoften on the CPU");
     }
 
     ~CudaTemporalSoften()
@@ -68,7 +72,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

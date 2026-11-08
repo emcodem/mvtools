@@ -8,23 +8,38 @@ predictors, sub-pel / chroma precision, area mode, hardware ME, the reference qu
 
 Mark an item done by deleting it here (the commit message says what was done). **User** = needs a decision by the user.
 
-## Next: D8 (decided 2026-11-02, see DECISIONS.md)
+## Next
 
-- Cuda* names for the mvtools GPU filters, `gpu` parameter removed, every Cuda* filter returns tokens (normal input
-  uploaded), vector clips normal with a device copy cache, `cuda_cpu_fallback` global / `CUDA_CPU_FALLBACK` env
-  (default false = error at creation), per-frame CPU results uploaded. Then QTGMC script, bundle examples, docs, tests
-  (all suites use `gpu=true` today), VapourSynth names.
-- Waiting for D8: uconvert.avsi (`C:\dev\uconvert`): deploy a new all-arch DLL set (replaces its mvtools2.dll too:
-  2.7.48 CPU result), uc_FRC HD branch with the whole pel-4 chain on the GPU, the MxfSource -> LWLibav fallback (wrong
-  frames on random access with Prefetch: use ffms2 or no Prefetch there).
+- uconvert.avsi (`C:\dev\uconvert`, D8 done): switch `uc_frc_gpu` to the Cuda* names (+ CudaDownload at the end of the
+  FRC chain, cudafilters.dll loaded), deploy a new all-arch DLL set (replaces its mvtools2.dll too: 2.7.48 CPU result),
+  uc_FRC HD branch with the whole pel-4 chain on the GPU (CudaMSuper is lite at pel 4 since D8; `run_frc_pel4.ps1`
+  passes), the MxfSource -> LWLibav fallback (wrong frames on random access with Prefetch: use ffms2 or no Prefetch
+  there). The `profile\avs\m\frc_ucdep_*` / `frc_uc_*` templates use uconvert.avsi and follow it.
+- Crash: `MAnalyse(..., divide=2)` dies with an access violation (exit -1073741819) after a few frames, with and without
+  Prefetch, build `profile\build_d8\bin` (CPU MAnalyse). Chain: Dancers.mxf SelectOdd -> 1920x1080 10-bit 4:2:2,
+  RemoveGrain(22), MSuper of the half-size picture (pel 4, hpad/vpad 8, rfilter 4), MAnalyse blksize 8 overlap 4
+  search 3 searchparam 2 truemotion=false chroma=true divide=2, MScaleVect(2), MRecalculate 8x8, MFlowFps. Script:
+  `TESTFILES\reach_for_phc\01_mvtools_params\avs\V5_divide2.avs`. Not isolated yet (an MShow-based bisect failed on its own); check
+  whether stock 2.7.48 crashes too, and 8-bit / 4:2:0 / full size.
+- mc FRC fallback is too weak (2026-11-02, `TESTFILES\reach_for_phc`): no MAnalyse / MRecalculate / NVOFA setting keeps
+  Dancers' fast leg whole (frames 15 and 37 at 50p); uc_FRCFallback (nearest source picture where the refined-vector
+  SAD is high) is what keeps the leg today, and that is not good enough either. Design and test a better fallback
+  (detection + replacement), see `TESTFILES\reach_for_phc\README.md`.
+- D8 left over: vector clips' device copy cache (measure the host round trip with nsys first, DECISIONS.md D8).
+- **User:** should the bundle's `QTGMC_gpu_on()` also set `cuda_cpu_fallback = true`? Today QTGMC above 10 bit, or on a
+  CPU where nnedi3 does not take its AVX2 + FMA path (AVX-512, older CPUs), stops with the CudaNNEDI3 / lookup-table
+  creation error unless the script sets it.
 
 ## Tests and release
 
 - trymany / trymanyall / search_coarse cases for `vsbridge/test/compare.py` and the Linux test run (agreed 2026-11-02).
 - Golden dumps (`profile\golden`) predate upstream #59: 11 failures per 4:2:0 / 4:2:2 tag (f444 passes). Regenerate with
   the merged CPU build.
-- Next release: everything since gpu-2026-11-01c (2.7.48 rebase, search_coarse / trymanyall, fast trymany) is only in
-  dev builds. Full matrix: Windows AviSynth+, Windows VapourSynth, Linux, all-arch build with register / spill check.
+- Next release: everything since gpu-2026-11-01c (2.7.48 rebase, search_coarse / trymanyall, fast trymany, D8 Cuda*
+  names) is only in dev builds. Full matrix: Windows AviSynth+, Windows VapourSynth, Linux, all-arch build with register
+  / spill check. D8: the VapourSynth bundle examples (`examples/*.vpy`, written in the release folder) and
+  `profile\release_tools\vs_example_test.py` / `lin_ex.sh` still use `gpu=True` / `gpu=true`: switch to the Cuda*
+  names (+ CudaDownload). The `compare/` experiment scripts stay as run (old DLL sets, `gpu=true`).
 - No run on 30 / 40-series or older hardware yet (machine code for those archs never executed; DLL 47 MB, could be
   trimmed).
 - Not done from the first plan: R2-R8 test matrix for the GPU variant, R10 side-by-side by the user, R12 soak test (VRAM
@@ -47,8 +62,9 @@ Mark an item done by deleting it here (the commit message says what was done). *
 - trymany: share the first (start-vector-only) batch of hex / UMH Refines like the exhaustive table (trymanyall level 0
   5.7 vs 4.0 ms / frame).
 - Interleave bVec and fVec wavefronts in one CTA.
-- Copy-engine copies that wait on kernels (CudaDownload D2H, recalc / flow / nvof_vec stage copies) may block uploads the
-  way E1 did. Check with nsys.
+- Copy-engine copies that wait on kernels (recalc / flow / nvof_vec stage copies) may block uploads the way E1 did. Check
+  with nsys. CudaDownload measured 2026-11-02: no such effect in uc_FRC UHD or QTGMC Fast (a UVA-writing kernel instead
+  was slower for QTGMC); one 11.5 s uc_FRC series that looked like it did not reproduce.
 - 4 concurrent uc_FRC jobs +6% since Part M (17.4 -> 18.5 s); not re-measured after E1. User: no need to optimise.
 - VRAM: return free buffers (`cudaMallocAsync` with a release threshold; only the transient overshoot); sub-pel planes
   computed on the fly instead of stored (pel 2 frame = 4x; pel 4 via a shared-memory window, see DTL list).
@@ -68,7 +84,8 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Features (each falls back to the CPU exactly today)
 
-- pel 4 for MCompensate / MDegrain (`mvcuda_comp.cu` refuses pel other than 1 / 2), then lite MSuper at pel 4.
+- pel 4 for CudaMCompensate / CudaMDegrain (`mvcuda_comp.cu` refuses pel other than 1 / 2; CudaMSuper is lite at pel 4
+  already, the CPU MCompensate / MDegrain complete it).
 - Lookup tables above 10 bit and at 9 bit; SharpLimit at 16 bit (Merge rounds differently); CudaNNEDI3 above 10 bit
   (other float order) and at 9 bit.
 - QTGMC 4:2:0 + ChromaMotion: the GPU search clip differs from the CPU (Slower, Very Slow, Placebo); stage not found

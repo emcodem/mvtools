@@ -45,11 +45,28 @@ namespace cf
     decltype(&mvcuda_nvof_token) nvof_token = nullptr;
     decltype(&mvcuda_nvof_available) nvof_available = nullptr;
 
+    const char *why = "the GPU library was not loaded"; // why ok is false ("" when ok)
+
     static CudaLib &get();
 
   private:
     CudaLib();
   };
+
+  // Creation-time decision of a Cuda* filter (the same rule as the mvtools2 Cuda* filters). ok: the GPU path can run;
+  // why: the reason when not (nullptr: the library's reason, else "this format or these settings"). Returns ok, or
+  // false when the CPU filter may run instead (script global cuda_cpu_fallback, else the environment variable
+  // CUDA_CPU_FALLBACK; default false); otherwise throws an error naming the reason and the alternatives.
+  bool gpu_decide(const char *name, const char *cpu_name, bool ok, const char *why, IScriptEnvironment *env);
+  bool cpu_fallback_allowed(IScriptEnvironment *env);
+
+  // A frame the filter computed on the CPU (per-frame fallback) as a token frame of producer / frame n, so the output
+  // stays a token clip and a consumer that finds it evicted asks the producer again. Token frames pass through.
+  PVideoFrame cpu_token(const PVideoFrame &f, const VideoInfo &vi, const MvCudaFrameFormat &fmt, unsigned long long producer, int n,
+    IScriptEnvironment *env);
+  // the same for a regeneration: frame n of cpu uploaded as producer / n into out; 0 on success
+  int cpu_regen(const PClip &cpu, int n, const VideoInfo &vi, const MvCudaFrameFormat &fmt, unsigned long long producer,
+    void *env, MvCudaTokenHeader *out);
 
   inline bool log_enabled()
   {

@@ -11,11 +11,8 @@ m = m * int(os.environ.get('MVPF_LOOP', '1'))  # longer clips for prefetch / war
 mv = core.mvpf
 supf = mv.MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4)
 sup = mv.MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1)
-bv = mv.MAnalyse(supf, isb=True, blksize=32, overlap=16, search=3, searchparam=2, truemotion=True, chroma=True, gpu=False)
-fv = mv.MAnalyse(supf, isb=False, blksize=32, overlap=16, search=3, searchparam=2, truemotion=True, chroma=True,
-                 gpu=False)
-bv = mv.MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=True, chroma=True,
-                     gpu=False)
-fv = mv.MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=True, chroma=True,
-                     gpu=False)
+bv = mv.MAnalyse(supf, isb=True, blksize=32, overlap=16, search=3, searchparam=2, truemotion=True, chroma=True)
+fv = mv.MAnalyse(supf, isb=False, blksize=32, overlap=16, search=3, searchparam=2, truemotion=True, chroma=True)
+bv = mv.MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=True, chroma=True)
+fv = mv.MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=True, chroma=True)
 mv.MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=False, mt=True).set_output()

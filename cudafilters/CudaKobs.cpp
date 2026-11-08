@@ -131,7 +131,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaKobs *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaKobs *self = static_cast<CudaKobs *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -154,10 +157,11 @@ namespace
         _lut2 = lut_from_cpu("x 127 scalef > x y range_half > range_half y ? ?", 1, env, _fmt.bits_per_sample);
         _ok = _lut1 && _lut2;
       }
+      _ok = gpu_decide("CudaKeepOnlyBobShimmerFixes", "QTGMC_KeepOnlyBobShimmerFixes", _ok,
+        (ed == 2 || ed == 5 || od >= 3) ? "rep 2x, 5x and x3..x9 are not supported"
+                                        : "only planar Y / YUV 8 or 10 bit, both clips in the same format", env);
       if (_ok)
         _producer = lib.producer_register(&CudaKobs::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaKeepOnlyBobShimmerFixes: %s\n", _ok ? "GPU" : "settings or format not supported, using the CPU function");
     }
 
     ~CudaKobs()
@@ -177,7 +181,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env);
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);
@@ -208,7 +212,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaRemoveGrain *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaRemoveGrain *self = static_cast<CudaRemoveGrain *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -227,6 +234,8 @@ namespace
       for (int p = 0; p < _fmt.planes; p++)
         _ok = _ok && (_mode[p] == -1 || _mode[p] == 0 || _mode[p] == 12 || _mode[p] == 20
           || (_mode[p] == 11 && (env->GetCPUFlags() & CPUF_SSE4_1))); // RgTools' SSE4.1 mode 11 is mode 12
+      _ok = gpu_decide("CudaRemoveGrain", "RemoveGrain", _ok,
+        make_format(vi, _fmt) ? "only modes -1, 0, 11 (on SSE4.1 CPUs), 12 and 20" : "only planar Y / YUV 8 to 16 bit", env);
       if (_ok)
         _producer = lib.producer_register(&CudaRemoveGrain::regen, this);
     }
@@ -243,7 +252,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env);
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

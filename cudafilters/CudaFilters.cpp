@@ -10,6 +10,8 @@
 #include "CudaCommon.h"
 #include "dyn_lib.h"
 
+#include <cctype>
+
 namespace cf
 {
   CudaLib &CudaLib::get()
@@ -21,14 +23,25 @@ namespace cf
   CudaLib::CudaLib()
   {
     if (std::getenv("MVTOOLS_GPU_DISABLE"))
+    {
+      why = "disabled by the environment variable MVTOOLS_GPU_DISABLE";
       return;
+    }
     const std::filesystem::path dir = dynlib::module_dir(reinterpret_cast<const void *>(&CudaLib::get));
     if (dir.empty())
+    {
+      why = "the plugin folder could not be determined";
       return;
+    }
     // the same file mvtools2 loads: one process-wide instance, so both plugins share one frame registry
     void *lib = dynlib::open(dir / dynlib::cuda_lib_name);
     if (!lib)
     {
+#ifdef _WIN32
+      why = "mvtools_cuda.dll was not found or could not be loaded from the plugin folder";
+#else
+      why = "libmvtools_cuda.so was not found or could not be loaded from the plugin folder";
+#endif
       if (log_enabled())
         std::fprintf(stderr, "cudafilters: %s not loaded (%s)\n", dynlib::cuda_lib_name, dynlib::last_error().c_str());
       return;
@@ -66,8 +79,125 @@ namespace cf
     CF_LOAD(nvof_token, "mvcuda_nvof_token");
     CF_LOAD(nvof_available, "mvcuda_nvof_available");
 #undef CF_LOAD
-    ok = version && count && upload && download && producer_register && producer_unregister && regenerate && stats
-      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_create_bits && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && upload_keyed && nvof_token && nvof_available && version() == MVCUDA_API_VERSION && count() > 0;
+    const bool exports_ok = version && count && upload && download && producer_register && producer_unregister && regenerate && stats
+      && resample_program_create && resample_program_free && resample_v && resample_2d && temporal_soften && merge && lut2_create && lut2_create_bits && lut2_free && kobs && removegrain && pin && unpin && nnedi3_create && nnedi3_free && nnedi3 && mt && qtgmc_sharp && qtgmc_backblend && temporal_binomial && upload_keyed && nvof_token && nvof_available;
+    if (!exports_ok || version() != MVCUDA_API_VERSION)
+      why = "the GPU library does not match this cudafilters build (API version): use the DLLs of one release together";
+    else if (count() <= 0)
+      why = "no usable NVIDIA GPU (needs compute capability 6.0 or newer and a current driver)";
+    else
+    {
+      ok = true;
+      why = "";
+    }
+  }
+
+  namespace
+  {
+    // "1", "true", "yes" (any case) = true; "0", "false", "no" = false; anything else = def
+    bool parse_flag(const char *s, bool def)
+    {
+      if (s == nullptr)
+        return def;
+      std::string v(s);
+      for (auto &c : v)
+        c = (char)std::tolower((unsigned char)c);
+      if (v == "1" || v == "true" || v == "yes")
+        return true;
+      if (v == "0" || v == "false" || v == "no")
+        return false;
+      return def;
+    }
+  }
+
+  bool cpu_fallback_allowed(IScriptEnvironment *env)
+  {
+    if (env != nullptr)
+    {
+      try
+      {
+        const AVSValue v = env->GetVarDef("cuda_cpu_fallback", AVSValue());
+        if (v.IsBool())
+          return v.AsBool();
+        if (v.IsInt())
+          return v.AsInt() != 0;
+        if (v.IsString())
+          return parse_flag(v.AsString(), false);
+      }
+      catch (...)
+      {
+      }
+    }
+    return parse_flag(std::getenv("CUDA_CPU_FALLBACK"), false);
+  }
+
+  bool gpu_decide(const char *name, const char *cpu_name, bool ok, const char *why, IScriptEnvironment *env)
+  {
+    CudaLib &lib = CudaLib::get();
+    if (ok && lib.ok)
+    {
+      if (log_enabled())
+        std::fprintf(stderr, "%s: GPU\n", name);
+      return true;
+    }
+    const char *reason = !lib.ok ? lib.why : (why ? why : "this format or these settings are not supported on the GPU");
+    if (cpu_fallback_allowed(env))
+    {
+      if (log_enabled())
+        std::fprintf(stderr, "%s: not on the GPU (%s), running %s on the CPU (cuda_cpu_fallback)\n", name, reason, cpu_name);
+      return false;
+    }
+    env->ThrowError("%s: cannot run on the GPU: %s.\nUse %s for the CPU, or set global cuda_cpu_fallback = true "
+      "(environment variable CUDA_CPU_FALLBACK=1) to run it on the CPU when the GPU cannot.", name, reason, cpu_name);
+    return false;
+  }
+
+  namespace
+  {
+    int upload_frame(const PVideoFrame &f, const VideoInfo &vi, const MvCudaFrameFormat &fmt, unsigned long long producer, int n,
+      MvCudaTokenHeader &h)
+    {
+      if (read_token(f, vi, h))
+        return 0; // a token frame already
+      const void *planes[3] = {};
+      int pitches[3] = {};
+      for (int p = 0; p < fmt.planes; p++)
+      {
+        planes[p] = f->GetReadPtr(g_planes[p]);
+        pitches[p] = f->GetPitch(g_planes[p]);
+      }
+      const int rc = CudaLib::get().upload(&fmt, planes, pitches, producer, n, &h);
+      if (log_enabled())
+        std::fprintf(stderr, "cudafilters: CPU result of frame %d uploaded, rc=%d\n", n, rc);
+      return rc;
+    }
+  }
+
+  PVideoFrame cpu_token(const PVideoFrame &f, const VideoInfo &vi, const MvCudaFrameFormat &fmt, unsigned long long producer, int n,
+    IScriptEnvironment *env)
+  {
+    MvCudaTokenHeader h;
+    if (read_token(f, vi, h))
+      return f;
+    if (upload_frame(f, vi, fmt, producer, n, h) != 0)
+      env->ThrowError("cudafilters: the CPU result of frame %d could not be uploaded to the GPU", n);
+    PVideoFrame dst = env->NewVideoFrameP(vi, const_cast<PVideoFrame *>(&f));
+    write_token(dst, h);
+    return dst;
+  }
+
+  int cpu_regen(const PClip &cpu, int n, const VideoInfo &vi, const MvCudaFrameFormat &fmt, unsigned long long producer, void *env,
+    MvCudaTokenHeader *out)
+  {
+    try
+    {
+      PVideoFrame f = cpu->GetFrame(n, static_cast<IScriptEnvironment *>(env));
+      return upload_frame(f, vi, fmt, producer, n, *out);
+    }
+    catch (...)
+    {
+      return -2;
+    }
   }
 
   bool make_format(const VideoInfo &vi, MvCudaFrameFormat &f)
@@ -187,11 +317,10 @@ namespace
       : GenericVideoFilter(c), _ok(false), _producer(0)
     {
       CudaLib &lib = CudaLib::get();
-      _ok = lib.ok && make_format(vi, _fmt);
+      _ok = gpu_decide("CudaUpload", "the clip without CudaUpload", make_format(vi, _fmt),
+        "only planar Y / YUV 8 to 16 bit, 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4, at least 68 bytes wide", env);
       if (_ok)
         _producer = lib.producer_register(&CudaUpload::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaUpload: %s\n", _ok ? "device frames" : "GPU or format not usable, frames stay on the CPU");
     }
 
     ~CudaUpload()
@@ -208,7 +337,7 @@ namespace
       if (!_ok || read_token(src, vi, h))
         return src; // GPU not usable, or already a token
       if (upload(src, n, h) != 0)
-        return src; // the frame stays on the CPU; consumers accept normal frames
+        env->ThrowError("CudaUpload: frame %d could not be uploaded to the GPU", n);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);
       return dst;
