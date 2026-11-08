@@ -47,6 +47,7 @@
 #include "MVAnalyse.h"
 #include "MVRecalculate.h"
 #include "MVSuper.h"
+#include "GpuBackend.h"
 
 // Test & helpers filters
 #include "Padding.h"
@@ -57,6 +58,9 @@
 
 #include <avisynth.h>
 #include <stdint.h>
+
+// user_data bit of the MDegrain1..6 registrations: the CudaMDegrain1..6 names (the other filters: user_data != nullptr)
+static constexpr intptr_t CUDA_FLAG = 0x100;
 
 
 
@@ -122,7 +126,7 @@ AVSValue __cdecl Create_MVCompensate(AVSValue args, void* user_data, IScriptEnvi
     args[14].AsBool(true),	// center
     args[15].IsClip() ? yuy2_to_yv16(args[15].AsClip(), planar, env) : 0, // cclip
     args[16].AsInt(thsad),  // thSAD2  todo sad_t float
-    args[17].AsBool(false), // gpu
+    user_data != nullptr,   // CudaMCompensate
     env
   ); });
 }
@@ -207,7 +211,7 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
     args[32].AsInt(0),   // scaleCSAD
     args[33].AsInt(3),   // search_coarse default EXHAUSTIVE - svp
     args[34].AsBool(false),   // trymanyall default false
-    args[35].AsBool(false),   // gpu (ours: after upstream's parameters)
+    user_data != nullptr,     // CudaMAnalyse
     env
   );
 }
@@ -314,7 +318,7 @@ AVSValue __cdecl Create_MVFlowInter(AVSValue args, void*, IScriptEnvironment* en
     env); });
 }
 
-AVSValue __cdecl Create_MVFlowFps(AVSValue args, void*, IScriptEnvironment* env)
+AVSValue __cdecl Create_MVFlowFps(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   double ml = args[7].AsFloat(100);
   if (ml <= 0)
@@ -338,7 +342,7 @@ AVSValue __cdecl Create_MVFlowFps(AVSValue args, void*, IScriptEnvironment* env)
     args[11].AsBool(true),  // isse
     args[13].AsInt(0), // optDebug
     args[14].AsBool(true),  // mt
-    args[15].AsBool(false), // gpu
+    user_data != nullptr,   // CudaMFlowFps
     env
   ); });
 }
@@ -378,7 +382,9 @@ static void check_lsb_source(const VideoInfo& vi, bool out16, const char* name, 
 
 AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
-  int level = (int)(intptr_t)user_data;
+  // user_data: the radius, plus CUDA_FLAG for the CudaMDegrain1..6 names
+  const bool cuda = ((intptr_t)user_data & CUDA_FLAG) != 0;
+  int level = (int)((intptr_t)user_data & ~CUDA_FLAG);
 
   int plane_param_index = 6; // base: MDegrain1
   int thsad_param_index = 4;
@@ -452,7 +458,7 @@ AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnviro
     args[11 + param_index_shift].AsBool(true),  // isse
     args[14 + param_index_shift].AsBool(true),  // mt
     out16 || lsb,           // out16
-    args[16 + param_index_shift].AsBool(false),  // gpu (ours)
+    cuda,                   // CudaMDegrain1..6
     level,
     env
   );
@@ -461,7 +467,7 @@ AVSValue __cdecl Create_MVDegrainX(AVSValue args, void* user_data, IScriptEnviro
   return degrain; });
 }
 
-AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
+AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   int plane = args[6].AsInt(4);
   int YUVplanes;
@@ -493,6 +499,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
   const float limit = args[7].AsFloatf(255.f); // change limit. 2.7.25-: use 255 as default for all bit depth v42:float
   const int thSAD2 = args[14].AsInt(thSAD);  // thSAD2
   const int thSADC2 = args[15].AsInt(thSADC); // thSADC2
+  const bool cuda = user_data != nullptr; // CudaMDegrainN
   const bool lsb = args[13].AsBool(false);
   const bool out16 = args[17].AsBool(false);
   if (lsb)
@@ -534,13 +541,15 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
         args[11].AsBool(true),   // isse
         args[16].AsBool(true),   // mt
         out16 || lsb,            // out16
-        false,                   // gpu: MDegrainN has no gpu parameter
+        cuda,                    // CudaMDegrainN
         tr, // PF: level
         env
       );
     }
   }
   // Standard MDegrainN
+  if (!degrain && cuda)
+    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD and thSADC2 = thSADC").decide(env);
   if (!degrain)
     degrain = new MDegrainN(
     source,                  // source
@@ -566,7 +575,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void*, IScriptEnvironment* env)
   return degrain; });
 }
 
-AVSValue __cdecl Create_MVRecalculate(AVSValue args, void*, IScriptEnvironment* env)
+AVSValue __cdecl Create_MVRecalculate(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   int blksize = args[4].AsInt(8);       // block size horizontal
   int blksizeV = args[5].AsInt(blksize); // block size vertical
@@ -610,7 +619,7 @@ AVSValue __cdecl Create_MVRecalculate(AVSValue args, void*, IScriptEnvironment* 
     args[20].AsInt(0),       // tr
     args[21].AsBool(true),   // mt
     args[22].AsInt(0), // scaleCSAD
-    args[23].AsBool(false), // gpu
+    user_data != nullptr,   // CudaMRecalculate
     env
   );
 }
@@ -637,7 +646,7 @@ AVSValue __cdecl Create_MVBlockFps(AVSValue args, void*, IScriptEnvironment* env
   ); });
 }
 
-AVSValue __cdecl Create_MVSuper(AVSValue args, void*, IScriptEnvironment* env)
+AVSValue __cdecl Create_MVSuper(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   // YUY2: the super clip is made from YV16 (Yuy2Planar.h) and stays YV16, flagged for MShow
   const bool planar = args[10].AsBool(false);
@@ -654,7 +663,7 @@ AVSValue __cdecl Create_MVSuper(AVSValue args, void*, IScriptEnvironment* env)
     args[9].AsBool(true),   // isse2
     args[11].AsBool(true), // mt
     args[0].AsClip()->GetVideoInfo().IsYUY2(), // yuy2_source
-    args[12].AsBool(false), // gpu
+    user_data != nullptr,   // CudaMSuper
     env
   );
 }
@@ -732,25 +741,37 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
 #endif
   env->AddFunction("MShow", "cc[scale]i[sil]i[tol]i[showsad]b[number]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVShow, 0);
-  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[gpu]b", Create_MVAnalyse, 0);
+  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b", Create_MVAnalyse, 0);
+  env->AddFunction("CudaMAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b", Create_MVAnalyse, (void *)1);
   env->AddFunction("MMask", "cc[ml]f[gamma]f[kind]i[time]f[Ysc]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVMask, 0);
-  env->AddFunction("MCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i[gpu]b", Create_MVCompensate, 0);
+  env->AddFunction("MCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, 0);
+  env->AddFunction("CudaMCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, (void *)1);
   env->AddFunction("MSCDetection", "cc[Ysc]i[thSCD1]i[thSCD2]i[isse]b", Create_MVSCDetection, 0);
   env->AddFunction("MDepan", "cc[mask]c[zoom]b[rot]b[pixaspect]f[error]f[info]b[log]s[wrong]f[zerow]f[range]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVDepan, 0);
   env->AddFunction("MFlow", "ccc[time]f[mode]i[fields]b[thSCD1]i[thSCD2]i[isse]b[planar]b[tclip]c", Create_MVFlow, 0);
   env->AddFunction("MFlowInter", "cccc[time]f[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[tclip]c", Create_MVFlowInter, 0);
-  env->AddFunction("MFlowFps", "cccc[num]i[den]i[mask]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[optDebug]i[mt]b[gpu]b", Create_MVFlowFps, 0);
+  env->AddFunction("MFlowFps", "cccc[num]i[den]i[mask]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[optDebug]i[mt]b", Create_MVFlowFps, 0);
+  env->AddFunction("CudaMFlowFps", "cccc[num]i[den]i[mask]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[optDebug]i[mt]b", Create_MVFlowFps, (void *)1);
   env->AddFunction("MFlowBlur", "cccc[blur]f[prec]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVFlowBlur, 0);
-  env->AddFunction("MDegrain1", "cccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)1);
-  env->AddFunction("MDegrain2", "cccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)2);
-  env->AddFunction("MDegrain3", "cccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)3);
-  env->AddFunction("MDegrain4", "cccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)4);
-  env->AddFunction("MDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)5);
-  env->AddFunction("MDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b[gpu]b", Create_MVDegrainX, (void *)6);
+  env->AddFunction("MDegrain1", "cccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)1);
+  env->AddFunction("CudaMDegrain1", "cccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(1 | CUDA_FLAG));
+  env->AddFunction("MDegrain2", "cccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)2);
+  env->AddFunction("CudaMDegrain2", "cccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(2 | CUDA_FLAG));
+  env->AddFunction("MDegrain3", "cccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)3);
+  env->AddFunction("CudaMDegrain3", "cccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(3 | CUDA_FLAG));
+  env->AddFunction("MDegrain4", "cccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)4);
+  env->AddFunction("CudaMDegrain4", "cccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(4 | CUDA_FLAG));
+  env->AddFunction("MDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)5);
+  env->AddFunction("CudaMDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(5 | CUDA_FLAG));
+  env->AddFunction("MDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)6);
+  env->AddFunction("CudaMDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(6 | CUDA_FLAG));
   env->AddFunction("MDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b", Create_MDegrainN, 0);
-  env->AddFunction("MRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i[gpu]b", Create_MVRecalculate, 0);
+  env->AddFunction("CudaMDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b", Create_MDegrainN, (void *)1);
+  env->AddFunction("MRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, 0);
+  env->AddFunction("CudaMRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, (void *)1);
   env->AddFunction("MBlockFps", "cccc[num]i[den]i[mode]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b", Create_MVBlockFps, 0);
-  env->AddFunction("MSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b[gpu]b", Create_MVSuper, 0);
+  env->AddFunction("MSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, 0);
+  env->AddFunction("CudaMSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, (void *)1);
   env->AddFunction("MStoreVect", "c+[vccs]s", Create_MStoreVect, 0);
   env->AddFunction("MRestoreVect", "c[index]i", Create_MRestoreVect, 0);
   env->AddFunction("MScaleVect", "c[scale]f[scaleV]f[mode]i[flip]b[adjustSubPel]b[bits]i", Create_MScaleVect, 0);

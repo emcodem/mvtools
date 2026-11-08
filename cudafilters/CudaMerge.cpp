@@ -31,7 +31,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaMerge *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaMerge *self = static_cast<CudaMerge *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -72,10 +75,13 @@ namespace
         const int rowsize = w * _fmt.bytes_per_sample;
         _tail[p] = kind == MERGE_CHROMA ? w : (rowsize / 16 * 16) / _fmt.bytes_per_sample;
       }
+      static const char *const gpu_names[3] = { "CudaMerge", "CudaMergeLuma", "CudaMergeChroma" };
+      static const char *const cpu_names[3] = { "Merge", "MergeLuma", "MergeChroma" };
+      const int ki = kind == MERGE_ALL ? 0 : kind == MERGE_LUMA ? 1 : 2;
+      _ok = gpu_decide(gpu_names[ki], cpu_names[ki], _ok,
+        "only planar Y / YUV 8 to 16 bit, both clips in the same format (CudaMergeChroma: YUV)", env);
       if (_ok)
         _producer = lib.producer_register(&CudaMerge::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaMerge: %s\n", _ok ? "GPU" : "GPU or formats not usable, using the CPU filter");
     }
 
     ~CudaMerge()
@@ -95,7 +101,7 @@ namespace
         return _clip->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

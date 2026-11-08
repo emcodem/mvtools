@@ -122,7 +122,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaNnedi3 *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaNnedi3 *self = static_cast<CudaNnedi3 *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
     // The raw nnedi3 weights (the standard nnedi3_weights.bin, 13574928 bytes): resource 101 of the loaded
@@ -341,7 +344,7 @@ namespace
 
       CudaLib &lib = CudaLib::get();
       if (!lib.ok)
-        _why = "GPU library not usable";
+        _why = lib.why;
       else if (!make_format(svi, _fmt) || (_fmt.bits_per_sample != 8 && _fmt.bits_per_sample != 10) || !svi.IsPlanar() || svi.IsRGB())
         _why = "only 8 or 10-bit planar YUV / Y (above 10 bit the plugin takes its C extract; 9 bit untested)";
       else if (dh || field < 0 || field > 3)
@@ -362,8 +365,7 @@ namespace
         _ok = true;
         _producer = lib.producer_register(&CudaNnedi3::regen, this);
       }
-      if (log_enabled())
-        std::fprintf(stderr, "CudaNNEDI3: %s%s\n", _ok ? "GPU" : "CPU nnedi3: ", _ok ? "" : _why);
+      gpu_decide("CudaNNEDI3", "nnedi3", _ok, _why, env);
     }
 
     ~CudaNnedi3()
@@ -380,7 +382,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result (its input goes through CudaDownload)
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(_field > 1 ? n >> 1 : n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

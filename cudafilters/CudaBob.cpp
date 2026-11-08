@@ -36,7 +36,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaBob *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaBob *self = static_cast<CudaBob *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_out_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -69,10 +72,10 @@ namespace
           }
         }
       }
+      _ok = gpu_decide("CudaBob", "Bob", _ok,
+        _src_vi.IsFieldBased() ? "field-based clips are not supported" : "only planar Y / YUV 8 to 16 bit, 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4", env);
       if (_ok)
         _producer = lib.producer_register(&CudaBob::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "CudaBob: %s\n", _ok ? "GPU" : "GPU or format not usable, using Bob on the CPU");
     }
 
     ~CudaBob()
@@ -92,7 +95,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result
+        return cpu_token(_cpu->GetFrame(n, env), vi, _out_fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n >> 1, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

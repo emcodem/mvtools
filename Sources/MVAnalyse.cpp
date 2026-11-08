@@ -410,7 +410,7 @@ MVAnalyse::MVAnalyse(
     analysisData.pixelsize, // PF
     analysisData.bits_per_pixel,
     (_dct_factory_ptr.get() != 0) ? &_dct_pool : 0,
-    // gpu=true with meander=false means the single-slice result (the GPU wavefront search):
+    // CudaMAnalyse with meander=false means the single-slice result (the GPU wavefront search):
     // the CPU path of such a filter (fallback frames, unsupported settings) searches in one slice too, so the output
     // does not depend on where a frame was searched
     _mt_flag && !(gpu_flag && !meander),
@@ -447,23 +447,29 @@ MVAnalyse::MVAnalyse(
     outfilebuf = NULL;
   }
 
-  // ---- GPU search: only for the configuration the GPU code reproduces bit-exactly; anything else
-  // stays on the CPU, silently
+  // ---- GPU search (CudaMAnalyse): only for the configuration the GPU code reproduces bit-exactly
   if (gpu_flag)
   {
-    // rfilter 2 / 4, sharp 2, no pelclip, written by our MSuper (SuperParams64Bits.h, D4)
+    // rfilter 2 / 4, sharp 2, no pelclip, written by our MSuper (see SuperParams64Bits.h)
     const bool super_ok = super_param_gpu_rebuildable(params);
     _gpu_rfilter = super_ok ? super_param_rfilter(params) : 0;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
-    _gpu_ok = GpuBackend::instance().usable() && super_ok && (pixelsize == 1 || pixelsize == 2) && !vi.IsYUY2() && vi.IsPlanar()
-      && !divideExtra && !_dctmode && !temporal_flag && !multi_flag
-      // search_coarse (searchTypeCoarse) and trymanyall (upstream 2.7.48) are on the GPU since API 19
-      && GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse)
-      && (nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4) && analysisData.nBlkSizeX <= 32
-      && (!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)))
-      && lstrlen(_outfilename) == 0 && analysisData.nLvCount <= 12;
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MAnalyse gpu requested: %s\n", _gpu_ok ? "using the GPU" : "not supported here, using the CPU");
+    GpuCheck c("CudaMAnalyse", "MAnalyse");
+    c.need(super_ok, "the super clip must come from CudaMSuper (or MSuper of this build) with rfilter 2 or 4, sharp 2 and no pelclip")
+      .need(pixelsize == 1 || pixelsize == 2, "only 8 to 16 bit integer formats")
+      .need(!vi.IsYUY2() && vi.IsPlanar(), "only planar formats")
+      .need(!divideExtra, "divide is not supported")
+      .need(!_dctmode, "dct is not supported")
+      .need(!temporal_flag, "temporal=true is not supported")
+      .need(!multi_flag, "multi=true is not supported")
+      .need(GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse),
+        "search radius too large (exhaustive up to 64, other search types up to 24)")
+      .need(nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4, "only pel 1, 2 or 4")
+      .need(analysisData.nBlkSizeX <= 32, "block sizes above 32 are not supported")
+      .need(!chroma || ((xr == 1 || xr == 2) && (yr == 1 || yr == 2)), "chroma=true needs 4:2:0, 4:2:2, 4:4:0 or 4:4:4")
+      .need(lstrlen(_outfilename) == 0, "outfile is not supported")
+      .need(analysisData.nLvCount <= 12, "more than 12 levels are not supported");
+    _gpu_ok = c.decide(env);
     if (_gpu_ok)
     {
       _gpu_slices = GpuBackend::slice_threads(mt_flag);

@@ -32,12 +32,16 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaMtOp *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaMtOp *self = static_cast<CudaMtOp *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
     // op: the operation of a processed plane; modes: masktools Y / U / V; cpu: the CPU filter (same arguments)
-    CudaMtOp(PClip a, PClip b, PClip c, int op, const int modes[3], PClip cpu, unsigned long long lut, int p1, int p2, const char *who)
+    CudaMtOp(PClip a, PClip b, PClip c, int op, const int modes[3], PClip cpu, unsigned long long lut, int p1, int p2, const char *who,
+      const char *cpu_name, IScriptEnvironment *env)
       : GenericVideoFilter(a), _b(b), _c(c), _cpu(cpu), _lut(lut), _p1(p1), _p2(p2)
     {
       vi = _cpu->GetVideoInfo();
@@ -52,10 +56,12 @@ namespace
         else
           _ok = false;
       }
+      _ok = gpu_decide(who, cpu_name, _ok,
+        make_format(vi, _fmt) ? "these settings are not supported (Y / U / V only 2 or 3; CudaLogic only mode min / max; "
+                                "CudaExpand / CudaInpand only mode vertical; CudaClamp over- / undershoot 0..255; CudaLutxy 8 or 10 bit)"
+                              : "only planar Y / YUV 8 to 16 bit", env);
       if (_ok)
         _producer = lib.producer_register(&CudaMtOp::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "%s: %s\n", who, _ok ? "GPU" : "using the CPU filter");
     }
 
     ~CudaMtOp()
@@ -72,7 +78,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env); // exact CPU result (its inputs go through CudaDownload)
+        return cpu_token(_cpu->GetFrame(n, env), vi, _fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);
@@ -127,7 +133,7 @@ AVSValue __cdecl Create_CudaLogic(AVSValue args, void *, IScriptEnvironment *env
   const int op = !_stricmp(mode, "min") ? MVCUDA_MT_MIN : !_stricmp(mode, "max") ? MVCUDA_MT_MAX : -1;
   if (op < 0)
     m[0] = m[1] = m[2] = 0; // other logic modes: the CPU filter
-  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[1].AsClip(), op, m, cpu, 0, 0, 0, "CudaLogic");
+  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[1].AsClip(), op, m, cpu, 0, 0, 0, "CudaLogic", "mt_logic", env);
 }
 
 AVSValue __cdecl Create_CudaClamp(AVSValue args, void *, IScriptEnvironment *env)
@@ -143,7 +149,7 @@ AVSValue __cdecl Create_CudaClamp(AVSValue args, void *, IScriptEnvironment *env
   // overshoot / undershoot in sample units, as masktools scales them (paramscale "i8")
   const int bits = cpu->GetVideoInfo().BitsPerComponent();
   return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[2].AsClip(), MVCUDA_MT_CLAMP, m, cpu, 0, scale_i8(over, bits),
-    scale_i8(under, bits), "CudaClamp");
+    scale_i8(under, bits), "CudaClamp", "mt_clamp", env);
 }
 
 static AVSValue create_morph(AVSValue args, IScriptEnvironment *env, bool expand)
@@ -156,7 +162,7 @@ static AVSValue create_morph(AVSValue args, IScriptEnvironment *env, bool expand
   if (_stricmp(args[1].AsString("square"), "vertical") != 0)
     m[0] = m[1] = m[2] = 0; // only the vertical mode on the GPU
   return new CudaMtOp(args[0].AsClip(), args[0].AsClip(), args[0].AsClip(), expand ? MVCUDA_MT_VEXPAND : MVCUDA_MT_VINPAND, m, cpu, 0, 0, 0,
-    expand ? "CudaExpand" : "CudaInpand");
+    expand ? "CudaExpand" : "CudaInpand", expand ? "mt_expand" : "mt_inpand", env);
 }
 
 AVSValue __cdecl Create_CudaExpand(AVSValue args, void *, IScriptEnvironment *env)
@@ -178,5 +184,5 @@ AVSValue __cdecl Create_CudaLutxy(AVSValue args, void *, IScriptEnvironment *env
   plane_modes(args[4], args[5], args[6], m);
   const int bits = cpu->GetVideoInfo().BitsPerComponent();
   const unsigned long long lut = CudaLib::get().ok && bits <= 10 ? lut_from_cpu(args[2].AsString("x"), args[3].AsInt(0), env, bits) : 0;
-  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[1].AsClip(), MVCUDA_MT_LUT, m, cpu, lut, 0, 0, "CudaLutxy");
+  return new CudaMtOp(args[0].AsClip(), args[1].AsClip(), args[1].AsClip(), MVCUDA_MT_LUT, m, cpu, lut, 0, 0, "CudaLutxy", "mt_lutxy", env);
 }

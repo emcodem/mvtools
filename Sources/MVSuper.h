@@ -123,7 +123,7 @@ protected:
   bool           isPelClipPadded;
 
   bool           _mt_flag; // PF maybe 2.6.0.5
-  bool           _lite;    // MSuper(gpu=true): only the picture (level 0, no padding / pyramid / sub-pel planes)
+  bool           _lite;    // CudaMSuper: only the picture (level 0, no padding / pyramid / sub-pel planes)
 
 public:
 
@@ -134,7 +134,7 @@ public:
   );
   ~MVSuper();
 
-  // Turns a frame of a "lite" super clip (MSuper(gpu=true): picture plus padding rows only) into the frame the normal
+  // Turns a frame of a "lite" super clip (CudaMSuper: picture plus padding rows only) into the frame the normal
   // MSuper would have made, bit for bit. lite_vi is the video info of the lite super clip.
   static PVideoFrame CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env);
   // A lite frame whose picture is a token (GPU search clip, see GpuBackend::read_token) with the picture downloaded into

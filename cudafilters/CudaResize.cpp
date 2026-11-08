@@ -72,7 +72,10 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      return static_cast<CudaGaussResize *>(user)->make(frame, static_cast<IScriptEnvironment *>(env), *out);
+      CudaGaussResize *self = static_cast<CudaGaussResize *>(user);
+      if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
+        return 0;
+      return cpu_regen(self->_cpu, frame, self->vi, self->_out_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
@@ -97,9 +100,15 @@ namespace
       vi = _cpu->GetVideoInfo();
 
       CudaLib &lib = CudaLib::get();
+      const char *const gpu_name = kind ? "CudaBilinearResize" : "CudaGaussResize";
+      const char *const cpu_name = kind ? "BilinearResize" : "GaussResize";
+      const char *const fmt_why = "only planar Y / YUV 8 to 16 bit, 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4, at least 68 bytes wide";
       _ok = lib.ok && make_format(_src_vi, _src_fmt) && make_format(vi, _out_fmt);
       if (!_ok)
+      {
+        gpu_decide(gpu_name, cpu_name, false, fmt_why, env);
         return;
+      }
       // ---- FilteredResize::CreateResize
       const int target_w = args[1].AsInt(), target_h = args[2].AsInt();
       const double sub_left = args[3].AsFloat(0), sub_top = args[4].AsFloat(0);
@@ -157,10 +166,9 @@ namespace
           _ok = _pv[p] != 0;
         }
       }
+      _ok = gpu_decide(gpu_name, cpu_name, _ok, "a resampling program could not be made on the GPU", env);
       if (_ok)
         _producer = lib.producer_register(&CudaGaussResize::regen, this);
-      if (log_enabled())
-        std::fprintf(stderr, "%s: %s\n", kind ? "CudaBilinearResize" : "CudaGaussResize", _ok ? "GPU" : "GPU or format not usable, using the CPU filter");
     }
 
     ~CudaGaussResize()
@@ -183,7 +191,7 @@ namespace
         return _cpu->GetFrame(n, env);
       MvCudaTokenHeader h;
       if (make(n, env, h) != 0)
-        return _cpu->GetFrame(n, env);
+        return cpu_token(_cpu->GetFrame(n, env), vi, _out_fmt, _producer, n, env); // exact CPU result, uploaded
       PVideoFrame src = child->GetFrame(n, env);
       PVideoFrame dst = env->NewVideoFrameP(vi, &src);
       write_token(dst, h);

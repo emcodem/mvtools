@@ -5,7 +5,8 @@ Supporting Y, YUV 4:2:0, 4:2:2, 4:4:4 (also 4:1:0, 4:1:1, 4:4:0, with or without
 Upstream (pinterf/mvtools) also builds Windows XP (v141_xp), x86 and ARM64 versions with its Visual Studio solution.\
 From December 20, 2020: Linux port; since 2.7.48 also Linux aarch64 (ARM64) with NEON optimizations.
 
-This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 and Linux (`gpu=true`, the `cudafilters` plugin and
+This branch (gpu_work): NVIDIA GPU paths for AviSynth+ on Windows x64 and Linux (the `Cuda*` functions such as
+`CudaMAnalyse`, the `cudafilters` plugin and
 QTGMC on the GPU, see "GPU" below); VapourSynth support for mvtools2 and cudafilters through `mvtools_vsbridge`
 (namespaces `mvpf` and `cuda`, output bit-identical with AviSynth+; Linux and Windows; see "VapourSynth" below). It is
 built with CMake only (see "Build Instructions").
@@ -125,9 +126,10 @@ or by hand:
         cmake -B build -S . -DMVTOOLS_CUDA_ARCH=120-real           # development: local RTX 50xx only, faster
 
   `libmvtools_cuda.so` must sit in the same folder as `libmvtools2.so` / `libcudafilters.so`; it needs only the NVIDIA
-  driver at run time (static CUDA runtime). Without the library, the driver or a usable GPU, the filters use the CPU.
+  driver at run time (static CUDA runtime). Without the library, the driver or a usable GPU, the `Cuda*` functions stop
+  with an error at creation, or run on the CPU with `cuda_cpu_fallback` (`Documentation/gpu.md`).
   CudaNNEDI3 reads `nnedi3_weights.bin` from the folder of `libcudafilters.so`. Without avstp (Windows only) the CPU
-  search runs single-sliced and `gpu=true` follows it, which is slow on the GPU: use `meander=false` for the fast
+  search runs single-sliced and CudaMAnalyse follows it, which is slow on the GPU: use `meander=false` for the fast
   wavefront search (identical to the CPU with `meander=false`, `Documentation/gpu.md`).
 * Find binaries in `build/bin` (copied there after each build), or at
 
@@ -207,13 +209,25 @@ From the 'build' folder under project root:
 
 ## GPU (this branch)
 
-CUDA paths for MSuper / MAnalyse / MRecalculate / MCompensate / MDegrain1..6 / MFlowFps (`gpu=true`, default false),
-bit-exact with the CPU result; settings, formats or machines the GPU does not cover run the CPU code with the same
-output. Needs an NVIDIA GPU with compute capability 6.0+ (GTX 10xx and newer) and `mvtools_cuda.dll` next to
+GPU versions of MSuper / MAnalyse / MRecalculate / MCompensate / MDegrain1..6 / MDegrainN / MFlowFps under their own
+names (`CudaMSuper`, `CudaMAnalyse`, `CudaMRecalculate`, `CudaMCompensate`, `CudaMDegrain1..6`, `CudaMDegrainN`,
+`CudaMFlowFps`; same parameters as the CPU filter), bit-exact with the CPU result. The M* functions stay pure CPU, as
+upstream. The `Cuda*` functions return frames that stay on the GPU (token frames): end the GPU part with `CudaDownload`
+of `cudafilters`. Vector clips are normal clips.
+
+    sup = CudaMSuper(c, pel=2)
+    bv = CudaMAnalyse(sup, isb=true, blksize=16, overlap=8)
+    fv = CudaMAnalyse(sup, isb=false, blksize=16, overlap=8)
+    CudaMDegrain1(c, sup, bv, fv, thSAD=400).CudaDownload()
+
+A `Cuda*` function that cannot run on the GPU (no device or library, settings or format not covered) stops with an error
+that names the reason; with `global cuda_cpu_fallback = true` (or the environment variable `CUDA_CPU_FALLBACK=1`) it runs
+the CPU filter instead, with the same output. Needs an NVIDIA GPU with compute capability 6.0+ (GTX 10xx and newer) and `mvtools_cuda.dll` next to
 `mvtools2.dll` (built with CUDA 12.9, "Build Instructions"). Pascal / Volta are verified only as PTX 6.1 on an RTX 50xx,
 not yet on real 6.x / 7.0 hardware.
 
-* Reference of every GPU parameter, the `cudafilters` plugin and the environment variables: `Documentation/gpu.md`.
+* Reference of every `Cuda*` function, the `cudafilters` plugin, the CPU fallback and the environment variables:
+  `Documentation/gpu.md`.
 * `cudafilters/`: GPU versions of the AviSynth core, MaskTools2, RgTools and NNEDI3 stages QTGMC uses, plus
   `CudaNVOFAnalyse` (vectors from NVIDIA's optical flow accelerator).
 * `qtgmc/`: `make_qtgmc_gpu.py` makes `QTGMC_gpu.avsi` from an unmodified QTGMC.avsi; `qtgmc/bundle/` holds the loader
@@ -238,7 +252,7 @@ Put these files into one folder (VapourSynth's plugin folder for autoloading, or
 |---|---|
 | `libmvtools2.so` / `mvtools2.dll` | mvtools2 (`core.mvpf`) |
 | `libmvtools_vsbridge.so` / `mvtools_vsbridge.dll` | always: the bridge both plugins load from their own folder |
-| `libmvtools_cuda.so` / `mvtools_cuda.dll` | optional: `gpu=true` and the cudafilters' GPU paths (without it: CPU, see below) |
+| `libmvtools_cuda.so` / `mvtools_cuda.dll` | optional: the `Cuda*` functions of mvtools2 and cudafilters (without it: see below) |
 | `libcudafilters.so` / `cudafilters.dll` | optional: cudafilters (`core.cuda`) |
 | `nnedi3_weights.bin` | optional: CudaNNEDI3 (always needed under VapourSynth, also on Windows) |
 
@@ -256,25 +270,25 @@ Denoising on the CPU (the AviSynth function and parameter names, `Documentation/
     fv2 = core.mvpf.MAnalyse(sup, isb=False, delta=2, blksize=16, overlap=8)
     core.mvpf.MDegrain2(clip, sup, bv1, fv1, bv2, fv2, thSAD=400).set_output()
 
-The same on the GPU (`Documentation/gpu.md`): add `gpu=True` to MSuper, MAnalyse and MDegrain2. Under VapourSynth there
-is no avstp thread pool, so the CPU search runs in one slice and `gpu=True` follows it to stay identical: that is slow
-on the GPU. Add `meander=False` to MAnalyse for the fast GPU search (wavefront; MRecalculate is fast either way); its result is
-identical to the CPU with `meander=False`, slightly different from the default `meander=True`. To keep the frames on
-the GPU between filters, wrap the chain in cudafilters' upload / download:
+The same on the GPU (`Documentation/gpu.md`): the `Cuda*` functions of `mvpf` (same parameters), and
+`core.cuda.CudaDownload` of cudafilters at the end, because their output stays on the GPU. Under VapourSynth there is
+no avstp thread pool, so the CPU search runs in one slice and CudaMAnalyse follows it to stay identical: that is slow on
+the GPU. Add `meander=False` to CudaMAnalyse for the fast GPU search (wavefront; CudaMRecalculate is fast either way);
+its result is identical to the CPU with `meander=False`, slightly different from the default `meander=True`:
 
-    core.std.LoadPlugin('/path/to/plugins/libcudafilters.so')
-    u = core.cuda.CudaUpload(clip)
-    sup = core.mvpf.MSuper(u, pel=2, gpu=True)
-    bv = core.mvpf.MAnalyse(sup, isb=True, blksize=16, overlap=8, meander=False, gpu=True)
-    fv = core.mvpf.MAnalyse(sup, isb=False, blksize=16, overlap=8, meander=False, gpu=True)
-    out = core.mvpf.MDegrain1(u, sup, bv, fv, thSAD=400, gpu=True)
+    core.std.LoadPlugin('/path/to/plugins/libcudafilters.so')   # not needed when autoloaded
+    sup = core.mvpf.CudaMSuper(clip, pel=2)
+    bv = core.mvpf.CudaMAnalyse(sup, isb=True, blksize=16, overlap=8, meander=False)
+    fv = core.mvpf.CudaMAnalyse(sup, isb=False, blksize=16, overlap=8, meander=False)
+    out = core.mvpf.CudaMDegrain1(clip, sup, bv, fv, thSAD=400)
     core.cuda.CudaDownload(out).set_output()
 
-Frame-rate conversion works the same way: `core.mvpf.MFlowFps(clip, sup, bv, fv, num=60000, den=1001, gpu=True)`.
-Check stderr on the first run: a missing bridge or GPU library is reported there, never as a crash. Without
-`libmvtools_cuda.so`, mvtools2 computes `gpu=True` on the CPU with the same output; a cudafilter whose CPU fallback is an
-AviSynth-only filter stops with an error instead (set `MVBRIDGE_FALLBACK=nearest` to accept a close, not bit-identical,
-VapourSynth replacement; details below).
+Frame-rate conversion works the same way: `core.mvpf.CudaMFlowFps(clip, sup, bv, fv, num=60000, den=1001)`, then
+`core.cuda.CudaDownload`. Check stderr on the first run: a missing bridge or GPU library is reported there, never as a
+crash. Without `libmvtools_cuda.so` (or a usable GPU) a `Cuda*` function stops with an error at creation; with the
+environment variable `CUDA_CPU_FALLBACK=1` (VapourSynth has no script globals) the mvtools2 `Cuda*` functions run on the
+CPU with the same output, while a cudafilter whose CPU fallback is an AviSynth-only filter still stops with an error
+(set `MVBRIDGE_FALLBACK=nearest` to accept a close, not bit-identical, VapourSynth replacement; details below).
 
 * Build: on by default (`-DMVTOOLS_VAPOURSYNTH=OFF` to skip); no VapourSynth installation needed (`VapourSynth4.h` is
   in `Sources/include`). Status: Linux and Windows (CMake build: `build_linux.sh` / `build_windows.ps1`;
@@ -302,11 +316,12 @@ VapourSynth replacement; details below).
 
 * Output is bit-identical with AviSynth+ on the same system (17 CPU, 8 GPU and 17 cudafilters test chains,
   `vsbridge/test/compare.py`; further cudafilters tests against AviSynth+ on Windows in `vsbridge/test/`).
-  `gpu=true` works as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder; without
-  it, or with a damaged one, the GPU filters run on the CPU. Not verified yet: MDepan.
+  The `Cuda*` functions work as under AviSynth+ (`Documentation/gpu.md`): `libmvtools_cuda.so` goes into the same folder;
+  without it, or with a damaged one, they stop at creation, or run on the CPU with `CUDA_CPU_FALLBACK=1`. Not verified
+  yet: MDepan.
 * cudafilters: namespace `cuda` (`core.cuda.CudaUpload`, ...), `libcudafilters.so` next to the bridge. All filters work
   and give AviSynth+'s output bit for bit (tested against AviSynth+ with the original masktools2 / RgTools / nnedi3 /
-  QTGMC.avsi, with mvtools2 `gpu=true` chains on token frames, and CudaNVOFAnalyse with NVOFA or its MAnalyse
+  QTGMC.avsi, with mvtools2 `Cuda*` chains on token frames, and CudaNVOFAnalyse with NVOFA or its MAnalyse
   fallback, which needs `libmvtools2.so` loaded too). CudaNNEDI3 needs `nnedi3_weights.bin` (the standard
   13574928-byte file) next to `libcudafilters.so` on Linux. Planar RGB passes through, but has no GPU path.
   A cudafilter's CPU fallback (AviSynth filters such as `Merge`, `Bob`, `RemoveGrain`, `nnedi3`, masktools) does not exist

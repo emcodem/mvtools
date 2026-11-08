@@ -90,7 +90,7 @@ Drawbacks / risks:
 MRecalculate downstream (recommended): it accepts the clip like any MAnalyse output (`MVRecalculate.cpp:124-208`),
 rescales the vectors to its own pel (`PlaneOfBlocks.cpp:3328`), searches a small radius around each one and recomputes
 the SAD (`:3358`). It fixes the 1/4-px rounding, the 8x8 coarseness and the SADs; it cannot recover vectors the NVENC
-search missed beyond its radius. On Pascal it runs on the CPU, on Ampere+ with `gpu=true`.
+search missed beyond its radius. On Pascal it runs on the CPU, on Ampere+ as CudaMRecalculate.
 
 ## Prototype results (2026-10-31) and next step
 

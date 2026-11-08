@@ -51,6 +51,7 @@ public:
   int (*flow_token_host)(const MvCudaSuperParams *, const MvCudaFlowParams *, unsigned long long, unsigned long long, const int *,
     const int *, const int *, const int *, void *const[3], const int[3]);
   int (*frame_upload_keyed)(const MvCudaFrameFormat *, const void *const[3], const int[3], unsigned long long, MvCudaTokenHeader *);
+  int (*frame_upload)(const MvCudaFrameFormat *, const void *const[3], const int[3], unsigned long long, int, MvCudaTokenHeader *);
   int (*frame_download)(unsigned long long, void *const[3], const int[3]);
   void (*frame_stats)(MvCudaFrameStats *);
   int (*token_regenerate)(unsigned long long, int, void *, MvCudaTokenHeader *);
@@ -71,7 +72,7 @@ public:
   // its producer makes it again (env: the caller's IScriptEnvironment). False when that fails.
   bool download_token(const MvCudaTokenHeader &h, void *const dst[3], const int dst_pitch[3], void *env);
 
-  // the token of a frame of a lite super clip (MSuper(gpu=true) of a token clip: the header at the picture position)
+  // the token of a frame of a lite super clip (CudaMSuper of a token clip: the header at the picture position)
   static bool lite_token(const PVideoFrame &f, const VideoInfo &super_vi, MvCudaTokenHeader &h);
   // the token of an ordinary token frame (the header at the start of the luma plane)
   static bool frame_token(const PVideoFrame &f, const VideoInfo &vi, MvCudaTokenHeader &h);
@@ -94,7 +95,7 @@ public:
     MvCudaFrameFormat fmt = {};
     unsigned long long key = 0;
   };
-  // The picture of frame f of the super clip `clip` (MSuper with or without gpu=true: level 0 inside the padding; a token
+  // The picture of frame f of the super clip `clip` (CudaMSuper or MSuper: level 0 inside the padding; a token
   // frame's header at the picture position) as the input of frame n. False for formats the device cannot take.
   static bool super_input(const PVideoFrame &f, const VideoInfo &super_vi, const void *clip, int n, Input &in);
   // the same for frame n of an ordinary clip (a token frame's header at the start of the luma plane)
@@ -161,6 +162,13 @@ public:
   // copies the device frame h (made by this thread a moment ago, so still reachable) into the planes of dst; false on failure
   bool download_frame(const MvCudaTokenHeader &h, PVideoFrame &dst, const VideoInfo &vi);
 
+  // A frame a Cuda* filter computed on the CPU (per-frame fallback) as a device frame of producer / frame n, so that the
+  // filter's output stays a token clip and a consumer that finds it evicted asks the producer again. f is a normal frame
+  // of format vi. 0 and h on success.
+  int upload_cpu_result(const PVideoFrame &f, const VideoInfo &vi, unsigned long long producer, int n, MvCudaTokenHeader &h);
+  // the same, returned as a token frame (frame properties from f); throws when the upload fails
+  PVideoFrame cpu_result_token(const PVideoFrame &f, const VideoInfo &vi, unsigned long long producer, int n, IScriptEnvironment *env);
+
   // number of block-row slices to use: the CPU thread count when mt is on (so the result equals the CPU result with
   // that many threads), 1 without mt; 1 when mt is on but no thread pool is available (avstp missing, VapourSynth,
   // Linux), because the CPU then runs one slice too
@@ -197,10 +205,50 @@ public:
     return true;
   }
 
+  // why usable() is false (library missing, API mismatch, no device, disabled); "" when usable
+  const char *unusable_reason() const { return _why; }
+
+  // Whether a Cuda* filter that cannot run on the GPU may run its CPU code instead: the script global
+  // cuda_cpu_fallback (AviSynth+; must be set before the filter is created), else the environment variable
+  // CUDA_CPU_FALLBACK (0 / 1, true / false). Default false: such a filter stops with an error at creation.
+  static bool cpu_fallback_allowed(IScriptEnvironment *env);
+
 private:
   GpuBackend();
   bool _usable;
+  const char *_why;
   std::atomic<long> _users;
+};
+
+// The creation-time decision of a Cuda* filter: collects the first reason why the GPU path cannot be used, then either
+// accepts the CPU path (cuda_cpu_fallback) or stops with an error naming the reason and the alternatives.
+//   GpuCheck c("CudaMAnalyse", "MAnalyse");
+//   c.need(pel == 1 || pel == 2, "pel must be 1 or 2");
+//   _gpu_ok = c.decide(env);
+class GpuCheck
+{
+public:
+  GpuCheck(const char *name, const char *cpu_name) : _name(name), _cpu_name(cpu_name), _why(nullptr)
+  {
+    const GpuBackend &g = GpuBackend::instance();
+    if (!g.usable())
+      _why = g.unusable_reason();
+  }
+  GpuCheck &need(bool cond, const char *why)
+  {
+    if (!cond && _why == nullptr)
+      _why = why;
+    return *this;
+  }
+  bool ok() const { return _why == nullptr; }
+  const char *why() const { return _why ? _why : ""; }
+  // true: the GPU path is used; false: the CPU path (fallback allowed); throws otherwise
+  bool decide(IScriptEnvironment *env) const;
+
+private:
+  const char *_name;
+  const char *_cpu_name;
+  const char *_why;
 };
 
 #endif

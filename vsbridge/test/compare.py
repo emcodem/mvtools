@@ -142,9 +142,55 @@ CHAINS = {
 }
 
 
+_CUDA_CALL = re.compile(r'(?<![\w])(MSuper|MAnalyse|MRecalculate|MFlowFps|MCompensate|MDegrain[1-6N])\(')
+_GPU_ARG = re.compile(r'(^|,)\s*gpu\s*=\s*(true|false)\s*(?=,|$)')
+
+
+def cuda_names(text):
+    """The chains below are written with the gpu=true / gpu=false argument of the mvtools2 filters before 2026-11-02
+    (one text for the GPU chain and its CPU twin); this gives the current form: a call with gpu=true becomes the Cuda*
+    filter (CudaMSuper, CudaMAnalyse, ...), gpu=false is dropped."""
+    out, pos = [], 0
+    while True:
+        m = _CUDA_CALL.search(text, pos)
+        if not m:
+            break
+        depth, close = 0, -1
+        for i in range(m.end() - 1, len(text)):
+            if text[i] == '(':
+                depth += 1
+            elif text[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        args = cuda_names(text[m.end():close])  # calls nested in the arguments first
+        out.append(text[pos:m.start()])
+        g = _GPU_ARG.search(args)
+        if g:
+            args = args[:g.start()] + args[g.end():]
+            if g.group(1) == '':
+                args = re.sub(r'^\s*,\s*', '', args)
+            out.append('%s%s(%s)' % ('Cuda' if g.group(2) == 'true' else '', m.group(1), args))
+        else:
+            out.append(m.group(0) + args + ')')
+        pos = close + 1
+    out.append(text[pos:])
+    return ''.join(out)
+
+
+def gpu_avs(body):
+    """A GPU chain in its current form: Cuda* names; the Cuda* filters return token frames, so the result goes through
+    CudaDownload (which passes normal frames, e.g. a vector clip, through)."""
+    body = cuda_names(body)
+    return body + 'out = CudaDownload(out)\n' if 'Cuda' in body else body
+
+
 def vs_body(avs):
-    """The VapourSynth form of an AviSynth chain body in the subset used below: M* calls -> mv.M*, true / false."""
-    vs = re.sub(r'\b(M[A-Z]\w*)\(', r'mv.\1(', avs)
+    """The VapourSynth form of an AviSynth chain body in the subset used below: M* and CudaM* (mvtools2) calls -> mv.*,
+    true / false."""
+    vs = re.sub(r'\b(CudaM[A-Z]\w*)\(', r'mv.\1(', avs)
+    vs = re.sub(r'\b(M[A-Z]\w*)\(', r'mv.\1(', vs)
     return re.sub(r'\bfalse\b', 'False', re.sub(r'\btrue\b', 'True', vs))
 
 
@@ -178,8 +224,11 @@ GPU_CHAINS = {
     'lin_gpu': ('uhd422p10', None),  # the stored Linux GPU reference chain (lin_gpu.avs / lin_gpu.vpy)
 }
 CPU_NAMES = list(CHAINS)
+# the chain texts as written (gpu= form), for baseline.py's CPU twins
+RAW_BODIES = {}
 for _name, (_src, _body) in GPU_CHAINS.items():
-    CHAINS[_name] = (_src, _body, None if _body is None else vs_body(_body))
+    RAW_BODIES[_name] = _body
+    CHAINS[_name] = (_src, _body, None)  # bodies set below, after cf_vs_body
 
 # cudafilters chains (libcudafilters.so next to libmvtools2.so; namespace cuda as `cf`): token frames from CudaUpload
 # through GPU filters to CudaDownload. Under VapourSynth the CPU fallbacks that are AviSynth core filters are strict
@@ -229,18 +278,38 @@ CF_CHAINS = {
                                    'fv = CudaNVOFAnalyse(u, isb=false, blksize=16, overlap=8, pel=2)\n'
                                    'out = MDegrain1(c, sup, bv, fv, thSAD=400)\n'),
     # planar RGB: the bridge maps AviSynth's G, B, R planes to VS's R, G, B
-    'cf_rgb_roundtrip': ('hdrgbp10', 'out = CudaDownload(CudaUpload(c))\n'),
+    # (CudaDownload passes normal frames of any format through; CudaUpload has no RGB format and stops at creation)
+    'cf_rgb_roundtrip': ('hdrgbp10', 'out = CudaDownload(c)\n'),
     'cf_rgb_super': ('hdrgbp10', 'out = MSuper(c, pel=2)\n'),
 }
 
 
 def cf_vs_body(avs):
+    """vs_body, plus the cudafilters calls (Cuda* other than mvtools2's CudaM*) -> cf.*"""
     vs = re.sub(r'\bBFF\(', '(', re.sub(r'\bREV\(', 'core.std.Reverse(', vs_body(avs)))
-    return re.sub(r'\b(Cuda\w*)\(', r'cf.\1(', vs)
+    return re.sub(r'(?<![\w.])(Cuda\w*)\(', r'cf.\1(', vs)
 
 
+for _name, (_src, _body) in GPU_CHAINS.items():
+    if _body is not None:
+        _avs = gpu_avs(_body)
+        CHAINS[_name] = (_src, _avs, cf_vs_body(_avs))
 for _name, (_src, _body) in CF_CHAINS.items():
-    CHAINS[_name] = (_src, _body.replace('REV(', 'Reverse(').replace('BFF(', 'AssumeBFF('), cf_vs_body(_body))
+    RAW_BODIES[_name] = _body
+    _avs = cuda_names(_body)
+    CHAINS[_name] = (_src, _avs.replace('REV(', 'Reverse(').replace('BFF(', 'AssumeBFF('), cf_vs_body(_avs))
+
+
+def needs_cudafilters(name):
+    """cudafilters must be loaded: a cudafilters chain, or a GPU chain that ends with CudaDownload"""
+    body = CHAINS[name][1]
+    return name in CF_CHAINS or (body is not None and re.search(r'(?<![\w])Cuda(?!M[A-Z])\w*\(', body) is not None)
+
+
+def lin_avs(plugins, src, gpu):
+    """the Linux reference chain (LIN_AVS) in its current form"""
+    return cuda_names(LIN_AVS.format(plugins=plugins, mvtools2=lib_name('mvtools2'), src=src,
+                                     gpu='true' if gpu else 'false'))
 
 
 def write(path, text):
@@ -257,14 +326,13 @@ def run_chain(name):
     if avs_body is None:
         stored = os.path.expanduser('~/build/test/%s.avs' % name)
         if not WIN and os.path.exists(stored):
-            avs_text = open(stored).read().replace('/home/emcodem/build/test/plugins', PLUGINS)
+            avs_text = cuda_names(open(stored).read().replace('/home/emcodem/build/test/plugins', PLUGINS))
         else:
-            avs_text = pre + LIN_AVS.format(plugins=PLUGINS, mvtools2=lib_name('mvtools2'), src=avs_src,
-                                            gpu='true' if name == 'lin_gpu' else 'false')
+            avs_text = pre + lin_avs(PLUGINS, avs_src, name == 'lin_gpu')
         write(avs, avs_text)
         vpy = os.path.join(HERE, '%s.vpy' % name)
     else:
-        cf = name in CF_CHAINS
+        cf = needs_cudafilters(name)
         write(avs, '%sLoadPlugin("%s/%s")\n%sc = %s\n%sreturn out\n'
               % (pre, PLUGINS, lib_name('mvtools2'),
                  'LoadPlugin("%s/%s")\n' % (PLUGINS, lib_name('cudafilters')) if cf else '', avs_src, avs_body))
@@ -275,6 +343,8 @@ def run_chain(name):
     if avs_body is None:
         v_md5 = os.path.join(TMP, 'vsb_%s.vs.md5' % name)
     env = dict(os.environ, MVPF_PLUGIN_DIR=PLUGINS, MVPF_RAW=os.environ.get('MVPF_RAW', '%s/%s' % (CLIPS, RAW['uhd422p10'][0])))
+    if not os.path.exists(os.path.join(PLUGINS, lib_name('mvtools_cuda'))):
+        env['CUDA_CPU_FALLBACK'] = '1'  # no GPU library: the Cuda* filters run their CPU code in both hosts
     t0 = time.time()
     acmd = [sys.executable, AVSMD5] if AVSMD5.endswith('.py') else [AVSMD5]
     if WIN:  # AviSynth+ on Windows leaves the unused vector-header bytes uninitialised (avsmd5.py)

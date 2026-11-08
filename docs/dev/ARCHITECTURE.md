@@ -8,10 +8,12 @@ reference .md files (links to online resources are fine).
 
 ## Components
 
-- `mvtools2.dll` / `libmvtools2.so`: the mvtools filters; GPU per call with `gpu=true` (default false).
+- `mvtools2.dll` / `libmvtools2.so`: the mvtools filters; the GPU versions are separate names (CudaMSuper, CudaMAnalyse,
+  CudaMRecalculate, CudaMCompensate, CudaMDegrain1..6 / N, CudaMFlowFps; same parameters, D8); M* are pure CPU.
 - `mvtools_cuda.dll` / `libmvtools_cuda.so`: every CUDA kernel, the device frame registry, NVOFA. C API in
   `Sources/cuda/mvcuda.h` (no CUDA types in the plugins), static CUDA runtime (only the driver is needed). Loaded at run
-  time; missing library, no device (cc < 6) or an API mismatch = CPU path.
+  time; missing library, no device (cc < 6) or an API mismatch = the Cuda* filters cannot run (creation error, or the
+  CPU path with `cuda_cpu_fallback`).
 - `cudafilters.dll` (GPL): every GPU filter that is not mvtools (CudaUpload / CudaDownload, Bob, TemporalSoften, Merge*,
   resizers, RemoveGrain, a mt_* subset, CudaNNEDI3, fused QTGMC stages, CudaNVOFAnalyse). Loads mvtools_cuda the same
   way, so mvtools2 stays a drop-in without it. All three must sit in one folder: one registry per library instance.
@@ -25,9 +27,14 @@ reference .md files (links to online resources are fine).
 - Integer stages are bit-exact against the CPU filter as it runs on SSE4.1 / AVX2 machines (not its C reference).
   CudaNNEDI3 is bit-exact too (the CPU's rcpps / rsqrtps results are measured at load into tables). FFT stages stay on
   the CPU; a GPU port would be non-exact and needs the user's decision.
-- Every GPU filter keeps an exact CPU fallback, silently and per frame (library missing, no device, unsupported
-  parameters, CUDA error, `MVCUDA_NEEDS_CPU`). cudafilters build the original CPU filter in the constructor
-  (`env->Invoke`) and feed its inputs through CudaDownload. Per-frame fallback is only safe because both agree bit for bit.
+- Every GPU filter keeps an exact CPU path. At creation (D8): a Cuda* filter that cannot run on the GPU at all (library,
+  device, settings, format) stops with an error naming the reason (`GpuCheck` in GpuBackend.h, `cf::gpu_decide` in
+  cudafilters), unless `cuda_cpu_fallback` (script global, else env `CUDA_CPU_FALLBACK`) allows the CPU filter, which
+  then returns normal frames. Per frame (CUDA error, `MVCUDA_NEEDS_CPU`, field-based, unusable vectors, forced fallback):
+  the CPU result is uploaded under the filter's producer id (`GpuBackend::cpu_result_token`, `cf::cpu_token`), and the
+  regeneration repeats GPU-or-CPU, so the output stays a token clip. cudafilters build the original CPU filter in the
+  constructor (`env->Invoke`) and feed its inputs through CudaDownload. Per-frame fallback is only safe because both
+  agree bit for bit.
 - MAnalyse reference: the CPU with the same slice count. meander=true = the multi-threaded CPU result (slice kernel);
   meander=false = CPU `meander=false, mt=false` (wavefront kernel; vectors differ from stock).
 - Non-exact output only behind its own switch, default off (CudaNVOFAnalyse is a separate filter; MAnalyse stays exact).
@@ -40,8 +47,10 @@ reference .md files (links to online resources are fine).
 - A GPU filter with token output returns an ordinary frame whose luma row 0 holds `MvCudaTokenHeader` (magic `MVCUDATK`,
   version, token, producer, frame number, format) and every 8th luma row black (a CPU filter shows stripes). Consumers
   detect the magic; there is no `cuda_in` parameter.
-- **Usage rule:** token frames in -> token frames out; normal frames in -> normal frames out (uploaded inside the filter).
-  The last GPU stage before a CPU filter is `CudaDownload`.
+- **Usage rule (D8):** every Cuda* filter takes token or normal frames (normal ones uploaded inside) and returns token
+  frames; the last GPU stage before a CPU filter is `CudaDownload` (passes normal frames through). Vector clips stay
+  normal frames. CudaDownload is a copy-engine D2H copy waiting for the producing op; a UVA-writing kernel instead was
+  measured slower for QTGMC (2026-11-02).
 - Registry: LRU with a byte budget; holders keep a `shared_ptr`, so eviction never frees a buffer in use; each thread
   holds its last 8 frames. Budget: `MVCUDA_CACHE_MB` fixes it, else auto: start max(256 MB, 128 frames) capped at 1 GB,
   grows on reuse near the LRU end and on misses of evicted frames, cap min(free / 3, 4 GB).
@@ -86,9 +95,9 @@ reference .md files (links to online resources are fine).
 
 ## MSuper lite / CompleteLite
 
-- `MSuper(gpu=true)` (pel 1 / 2, sharp 2, rfilter 2 / 4, no pelclip) stores only the picture (or the token header) and
-  sets the lite bit; every CPU reader rebuilds the real frame through `MVSuper::CompleteLite` / `ResolveToken`. Off at
-  pel 4 (MCompensate / MDegrain have no pel-4 path).
+- `CudaMSuper` (pel 1 / 2 / 4, sharp 2, rfilter 2 / 4, no pelclip) stores only the picture (or the token header) and
+  sets the lite bit; every CPU reader rebuilds the real frame through `MVSuper::CompleteLite` / `ResolveToken`. At pel 4
+  the CPU MCompensate / MDegrain complete it (CudaMCompensate / CudaMDegrain have no pel-4 path yet).
 - `SuperParams64Bits::param`: bit 0 upstream's YUY2 flag, bits 1-4 rfilter * 3 + sharp, bit 5 pelclip, bit 6 lite, bit 7
   our marker (valid only with bit 7 set); use the `super_*` helpers.
 - CPU quirks the GPU reproduces: rfilter only for the first reduction (bilinear below); level 0 reduced before padding.

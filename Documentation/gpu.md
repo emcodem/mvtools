@@ -2,10 +2,14 @@
 
 This page covers the CUDA part of this mvtools build:
 
-- the `gpu` parameter of the mvtools2 functions
+- the `Cuda*` functions of mvtools2 (`CudaMSuper`, `CudaMAnalyse`, `CudaMRecalculate`, `CudaMCompensate`,
+  `CudaMDegrain1..6`, `CudaMDegrainN`, `CudaMFlowFps`)
 - the `cudafilters` plugin, with GPU versions of the AviSynth core, MaskTools2, RgTools and NNEDI3 filters that QTGMC uses,
   plus fused QTGMC stages
-- the environment variables
+- the CPU fallback switch `cuda_cpu_fallback` and the environment variables
+
+Until 2026-11-02 the mvtools2 GPU paths were switched on with a `gpu=true` parameter on MSuper, MAnalyse, ...; that
+parameter is gone. MSuper, MAnalyse and the other M* functions are the CPU filters, as upstream.
 
 This page describes what the functions do now (library API version 19). Design notes for developers:
 `docs/dev/ARCHITECTURE.md`.
@@ -17,11 +21,15 @@ This page describes what the functions do now (library API version 19). Design n
   2026-11-02 that is the CPU code of upstream mvtools 2.7.48, whose symmetric rounding of luma vectors to the chroma
   grid (#59) changes the results of subsampled clips (4:2:0, 4:2:2, 4:1:1) with chroma; the GPU paths follow it, so
   their output there differs from builds of this branch before that date.
-- **Silent fallback.** `gpu=true` is a request. When the GPU library or device is missing, or the format or settings are
-  not covered, the filter runs its CPU code and returns the same output. Single frames can fall back too, for example
-  when a device frame was evicted and cannot be made again. Nothing in the script has to change.
+- **Explicit names.** A `Cuda*` function runs on the GPU; the function without the prefix is the CPU filter. A `Cuda*`
+  function takes the same parameters and defaults as its CPU filter.
+- **Token frames out.** Every `Cuda*` function (mvtools2 and cudafilters) accepts normal or token frames and returns
+  token frames (normal input is uploaded inside the filter). End the GPU part of a script with `CudaDownload`. Vector
+  clips are the exception: they stay normal frames.
+- **Explicit fallback.** A `Cuda*` function that cannot run on the GPU at all stops with an error at creation, unless
+  `cuda_cpu_fallback` is set (see "CPU fallback" below). Single frames that need the CPU during a run are computed on the
+  CPU and uploaded; the result is the same either way.
   Set `MVTOOLS_GPU_LOG=1` (mvtools2) or `CUDAFILTERS_LOG=1` (cudafilters) to see on stderr which path every filter takes.
-- **Default off.** All `gpu` parameters default to `false`.
 - **One exception: `CudaNVOFAnalyse`.** It is not a GPU version of a CPU filter but another motion search (NVIDIA's
   optical flow accelerator), so its vectors match no CPU result. Use it only where that is wanted (see below).
 
@@ -37,16 +45,17 @@ Build with `build_windows.ps1` or `build_linux.sh` (README "Build Instructions")
 `libmvtools2.so`, `libmvtools_cuda.so`, `libcudafilters.so`. Upstream's `mvtools.sln` / vcxproj files have no GPU or
 VapourSynth parts.
 
-All three files must come from one build: the plugins check the library API version and run on the CPU when it does not
-match.
+All three files must come from one build: the plugins check the library API version; a library of another build counts
+as "GPU not usable" (creation error of every `Cuda*` function, or the CPU with `cuda_cpu_fallback`).
 
 Requirements:
 
 - x64 AviSynth+ (Windows or Linux). cudafilters needs AviSynth+ 3.6 or newer (interface V8) and refuses to load on older
   versions; 3.7.5 is the tested version.
 - VapourSynth (Windows and Linux): mvtools2 runs under VapourSynth through `mvtools_vsbridge` (namespace `mvpf`, README
-  "VapourSynth"), `gpu=true` included, with the same output as AviSynth+ (the GPU library next to the plugin). Every
-  cudafilter is available in namespace `cuda`; for the limits of their CPU fallbacks under VapourSynth and
+  "VapourSynth"), the `Cuda*` functions included (`core.mvpf.CudaMSuper`, ...), with the same output as AviSynth+ (the
+  GPU library next to the plugin). Every cudafilter is available in namespace `cuda` (`core.cuda.CudaDownload`, ...).
+  VapourSynth has no script globals: the CPU fallback is switched with the environment variable `CUDA_CPU_FALLBACK`; for the limits of their CPU fallbacks under VapourSynth and
   `MVBRIDGE_FALLBACK` see README "VapourSynth".
 - An NVIDIA GPU with compute capability 6.0 or newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx); older cards count as
   "no usable device". The first usable device is used; `MVCUDA_DEVICE=n` picks another. Pascal / Volta are verified
@@ -62,19 +71,19 @@ declared format whose first luma bytes hold a `MvCudaTokenHeader` (magic `MVCUDA
 filter and frame number that produced it, the format). Every 8th luma row of a token frame is black, so a filter that
 does not understand tokens shows obvious stripes, not a plausible picture.
 
-- **Readers.** Every `Cuda*` filter, `MSuper`, `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept
-  token frames as input and use the device frame directly; when one of them runs on the CPU, it downloads the picture.
-  Any other filter needs `CudaDownload` in front of it.
-- **Usage rule.** The two plugins differ here:
-  - mvtools2 (`gpu=true`): token frames in, token frames out; normal frames in, normal frames out. Given normal frames,
-    the filter uploads the pictures itself, computes on the GPU and returns normal frames, so a chain of mvtools2 filters
-    alone needs neither `CudaUpload` nor `CudaDownload`. The mvtools2 filters upload each picture of a super clip once,
-    shared by every GPU filter that reads that super clip (both MAnalyse directions, MRecalculate, MFlowFps, MCompensate,
-    MDegrain).
-  - cudafilters (`Cuda*`): token frames out whenever the filter runs on the GPU, also when its input is normal frames
-    (it uploads them itself). A script that uses any `Cuda*` filter needs `CudaDownload` at the end and in front of
-    every filter that does not read token frames.
-  Token frames therefore only appear after a `Cuda*` filter (including `CudaUpload`); the mvtools2 filters pass them on.
+- **Readers.** Every `Cuda*` function reads token frames and uses the device frame directly. Of the CPU filters, `MSuper`,
+  `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept token frames too and download the
+  picture. Any other filter needs `CudaDownload` in front of it.
+- **Usage rule.** One rule for mvtools2 and cudafilters: a `Cuda*` function accepts normal or token frames and always
+  returns token frames; given normal frames, it uploads them itself (`CudaUpload` is not needed). End the GPU part with
+  `CudaDownload` (it passes normal frames of any format through unchanged), and put it in front of every filter that
+  does not read token frames. The mvtools2 functions upload each picture of a super clip once, shared by every GPU
+  filter that reads that super clip (both CudaMAnalyse directions, CudaMRecalculate, CudaMFlowFps, CudaMCompensate,
+  CudaMDegrain).
+- **Vector clips** (CudaMAnalyse, CudaMRecalculate, CudaNVOFAnalyse) are normal frames: small host data that the CPU
+  consumers (MMask, MFlowBlur, MBlockFps, MDepan, MStoreVect, ...) read directly.
+- **Super clips.** CudaMSuper returns a "lite" super clip (the picture, or the token header; see CudaMSuper below), made
+  for the `Cuda*` functions.
 - **Eviction.** The device frames live in a registry with a memory budget (`MVCUDA_CACHE_MB`). When a frame is evicted
   before it is read, the filter that produced it makes it again (an uploaded picture is uploaded again), so evictions cost
   time but never change the result. The super pyramids that MAnalyse, MRecalculate and MFlowFps make on the device are
@@ -82,79 +91,98 @@ does not understand tokens shows obvious stripes, not a plausible picture.
 - **Supported formats.** Device frames are planar Y or YUV (no RGB, no alpha), 8 to 16 bit integer, chroma subsampling 1
   or 2 in each direction (4:2:0, 4:2:2, 4:4:4, Y only), and at least 72 bytes per luma row (the header must fit). Filters
   that work through a lookup table (CudaLutxy, CudaKeepOnlyBobShimmerFixes, CudaQtgmcSharpLimit with `smode` 1 / 2,
-  CudaQtgmcAddNoise) and CudaNNEDI3 cover 8 and 10 bit; see each filter below. In any other format a filter runs
-  on the CPU.
+  CudaQtgmcAddNoise) and CudaNNEDI3 cover 8 and 10 bit; see each filter below. Any other format is a creation error
+  (or the CPU filter with `cuda_cpu_fallback`).
 
-A typical chain:
+A typical chain (mvtools2.dll, mvtools_cuda.dll and cudafilters.dll in one folder, from one build):
 
 ```
-CudaUpload()                         # or start with a Cuda* filter: either way token frames from here on
-...Cuda* filters...
-sup = MSuper(pel=2, gpu=true)        # "lite" super of the token clip
-...MAnalyse / MDegrain / MCompensate with gpu=true...
-CudaDownload()                       # pixels again for the rest of the script
+sup = CudaMSuper(c, pel=2)
+bv = CudaMAnalyse(sup, isb=true, blksize=16, overlap=8)
+fv = CudaMAnalyse(sup, isb=false, blksize=16, overlap=8)
+CudaMDegrain1(c, sup, bv, fv, thSAD=400).CudaDownload()   # pixels again for the rest of the script
 ```
 
-Without `CudaUpload` and without `Cuda*` filters, the mvtools2 part of this chain still runs on the GPU and returns normal
-frames; `CudaDownload` is then not needed (it passes normal frames through unchanged).
+The same chain under VapourSynth: `core.mvpf.CudaMSuper`, `core.mvpf.CudaMAnalyse`, `core.mvpf.CudaMDegrain1`, then
+`core.cuda.CudaDownload`.
+
+Speed: the switch from `gpu=true` to the `Cuda*` names (token output plus CudaDownload) measured the same as before
+(uc_FRC UHD 5.61 s vs 5.65 s, QTGMC Fast PAL 1500 frames 3.62 s vs 3.64 s, identical output).
+
+## CPU fallback
+
+| Setting | Where | Effect |
+|---|---|---|
+| `global cuda_cpu_fallback = true` / `false` | AviSynth+ script | Read when a `Cuda*` filter is created: set it before the first `Cuda*` call. Wins over the environment variable |
+| `CUDA_CPU_FALLBACK=1` / `0` (also `true` / `false` / `yes` / `no`) | environment | Used when the script global is not set; the only switch under VapourSynth (no script globals) |
+
+Default false. Then a `Cuda*` function that cannot run on the GPU at all (no usable device, `mvtools_cuda.dll` missing or
+of another build, `MVTOOLS_GPU_DISABLE`, a format or setting without a GPU path) stops with an error at creation that
+names the reason and the alternatives, for example:
+
+```
+CudaMSuper: cannot run on the GPU: only sharp=2.
+Use MSuper for the CPU, or set global cuda_cpu_fallback = true (environment variable CUDA_CPU_FALLBACK=1) to run it on the CPU when the GPU cannot.
+```
+
+With fallback true, such a function runs its CPU filter and returns normal frames (CudaDownload passes them through),
+so one script runs on machines with and without a GPU, with the same output.
+
+Either way, single frames that need the CPU during a run (for example a field-based clip with pel > 1 in CudaMAnalyse,
+`delta` 0 or less, frames with unusable vectors in CudaMFlowFps, a frame that cannot be made again after eviction, or
+every frame with `MVTOOLS_GPU_FORCE_FALLBACK`) are computed on the CPU and uploaded: the output stays a token clip and
+the result does not change. There is no per-call fallback parameter.
 
 ---
 
-## mvtools2: the `gpu` parameter
+## mvtools2: the `Cuda*` functions
 
-| Function | What runs on the GPU | Output |
-|---|---|---|
-| `MSuper(gpu=true)` | Nothing: it makes a "lite" super clip that holds only the picture, so the GPU filters build the pyramid themselves | lite super clip |
-| `MAnalyse(gpu=true)` | Hierarchical search, all levels, with its own super pyramid | normal vector clip |
-| `MRecalculate(gpu=true)` | Refinement search | normal vector clip |
-| `MCompensate(gpu=true)` | Block compensation | token frames for a token clip, else normal frames |
-| `MDegrain1..6(gpu=true)` | Degraining | token frames for a token clip, else normal frames |
-| `MFlowFps(gpu=true)` | Flow interpolation (`mask=2`) | token frames for a token clip, else normal frames |
+| Function | CPU filter | What runs on the GPU | Output |
+|---|---|---|---|
+| `CudaMSuper` | `MSuper` | Nothing: it makes a "lite" super clip that holds only the picture, so the GPU filters build the pyramid themselves | lite super clip |
+| `CudaMAnalyse` | `MAnalyse` | Hierarchical search, all levels, with its own super pyramid | normal vector clip |
+| `CudaMRecalculate` | `MRecalculate` | Refinement search | normal vector clip |
+| `CudaMCompensate` | `MCompensate` | Block compensation | token frames |
+| `CudaMDegrain1..6` | `MDegrain1..6` | Degraining | token frames |
+| `CudaMDegrainN` | `MDegrainN` | as CudaMDegrain1..6, for `tr` 1 to 6 with `thSAD2` = `thSAD` and `thSADC2` = `thSADC` (the cases MDegrainN hands to MDegrain1..6) | token frames |
+| `CudaMFlowFps` | `MFlowFps` | Flow interpolation (`mask=2`) | token frames |
 
-`MDegrainN`, `MFlow`, `MFlowInter`, `MFlowBlur`, `MBlockFps`, `MMask`, `MSCDetection`, `MShow`, `MDepan`, `MScaleVect`,
-`MStoreVect` and `MRestoreVect` have no GPU path.
+Each takes exactly the parameters and defaults of its CPU filter. `MFlow`, `MFlowInter`, `MFlowBlur`, `MBlockFps`,
+`MMask`, `MSCDetection`, `MShow`, `MDepan`, `MScaleVect`, `MStoreVect` and `MRestoreVect` have no GPU version.
 
-Unless noted otherwise, the GPU paths need the super clip to come from `MSuper` of this build with `sharp=2` and without
-`pelclip`. The super clip can be a lite super or a normal one.
+The conditions below are the GPU paths' limits; outside them the function stops at creation with the reason (or runs
+the CPU filter with `cuda_cpu_fallback`). Errors that the CPU filter raises at creation stay errors, e.g. since 2.7.48
+`dct` 5 to 10 (SATD) with a block size not divisible by 4.
 
-### MSuper
+### CudaMSuper
 
-`gpu` (bool, default false)
+Skips the CPU pyramid and the sub-pel planes: each frame holds only the picture inside its padding rows. Conditions:
 
-With `gpu=true`, MSuper skips the CPU pyramid and the sub-pel planes. When all of the following hold, each frame holds
-only the picture inside its padding rows:
-
-- the GPU library is usable
-- `pel` 1 or 2, `sharp=2`, `rfilter` 2 or 4, no `pelclip` (with `pel=4` it makes the normal super: MCompensate and MDegrain
-  have no pel-4 GPU path yet, and a lite super would make them rebuild it on the CPU for every frame they read; MAnalyse,
-  MRecalculate and MFlowFps take the normal pel-4 super on the GPU)
-- planar YUV (not Y only), 8-bit or 16-bit container. YUY2 counts as 4:2:2: since upstream 2.7.48 every filter converts
-  a YUY2 clip to YV16 at its input (and its output back), so the GPU paths see YV16
-- chroma subsampling 1 or 2 in each direction
+- `pel` 1, 2 or 4, `sharp=2`, `rfilter` 2 or 4, no `pelclip`
+- planar YUV (not Y only), 8 to 16 bit integer. YUY2 counts as 4:2:2: since upstream 2.7.48 every filter converts a YUY2
+  clip to YV16 at its input (and its output back), so the GPU paths see YV16
+- chroma subsampling 1 or 2 in each direction (4:2:0, 4:2:2, 4:4:0, 4:4:4)
 - `hpad` divisible by the horizontal chroma ratio, `vpad` by the vertical one, height divisible by the vertical one
 
-Otherwise it makes the normal super clip. When the input frame is a token frame, the lite frame carries the token header
-at the picture position instead of the pixels; the picture stays on the device.
+When the input frame is a token frame, the lite frame carries the token header at the picture position instead of the
+pixels; the picture stays on the device.
 
 Which filters accept a lite super:
 
-- `MAnalyse`, `MRecalculate`, `MFlowFps`, `MCompensate` and `MDegrain1..6` use it. Wherever they run on the CPU, they
-  complete the frame themselves, bit-identical to the normal super.
-- `MFlow`, `MFlowInter`, `MFlowBlur`, `MBlockFps`, `MShow` and `MDegrainN` stop with an error. Give them a super made
-  without `gpu=true`.
+- `CudaMAnalyse`, `CudaMRecalculate`, `CudaMFlowFps`, `CudaMCompensate`, `CudaMDegrain1..6` and the CPU filters
+  `MAnalyse`, `MRecalculate`, `MFlowFps`, `MCompensate`, `MDegrain1..6`. Wherever they run on the CPU, they complete the
+  frame themselves (pel 4 included), bit-identical to the normal super.
+- `MFlow`, `MFlowInter`, `MFlowBlur`, `MBlockFps`, `MShow`, `MDegrainN` (the CPU class, i.e. `tr` above 6 or different
+  `thSAD2`) and `MFinest` stop with an error. Give them a super made with `MSuper`.
 
-Lite super frames cost almost nothing on the CPU. Use one wherever all consumers are on the list above.
-
-### MAnalyse
-
-`gpu` (bool, default false)
+### CudaMAnalyse
 
 The GPU path is used when all of these hold:
 
 | Setting | Supported on the GPU |
 |---|---|
-| super clip | from this build's `MSuper`, `sharp=2`, `rfilter` 2 or 4, no `pelclip`, `pel` 1, 2 or 4 |
-| format | planar, 8-bit or 16-bit container; with `chroma=true` chroma subsampling 1 or 2 |
+| super clip | from `CudaMSuper` or this build's `MSuper`, `sharp=2`, `rfilter` 2 or 4, no `pelclip`, `pel` 1, 2 or 4 |
+| format | planar, 8 to 16 bit integer; with `chroma=true` chroma subsampling 1 or 2 |
 | `blksize` | up to 32 |
 | `levels` | up to 12 (counted levels) |
 | `search` | 0 to 7 |
@@ -165,9 +193,7 @@ The GPU path is used when all of these hold:
 | `divide`, `dct`, `temporal`, `multi` | 0 / false only |
 | `outfile` | not set |
 
-Settings outside the table give the CPU result, not an error (`MVTOOLS_GPU_LOG=1` prints "not supported here, using
-the CPU"). Errors that the CPU filter raises at creation stay errors with `gpu=true`, e.g. since 2.7.48 `dct` 5 to 10
-(SATD) with a block size not divisible by 4 (MAnalyse and MRecalculate).
+Settings outside the table are a creation error (or the CPU filter with `cuda_cpu_fallback`).
 
 Single frames run on the CPU when the clip is field-based (a field shift is needed), when `delta` is 0 or less (static
 reference), or, with `meander=true`, when the GPU reports that the frame needs the CPU's bad-vector wide search
@@ -182,9 +208,9 @@ result depends on the number of slices. The GPU reproduces that:
   on Linux use `meander=false` for speed. `MVTOOLS_GPU_SLICES=n` overrides the count, which gives a different vector
   field from the CPU default. (Before 2026-11-01c the GPU used 24 slices without a thread pool and so differed from
   the CPU and from its own CPU fallback.)
-- `meander=false` together with `gpu=true`: the GPU runs a wavefront search over the whole frame in one slice. This is the
+- `meander=false` with CudaMAnalyse: the GPU runs a wavefront search over the whole frame in one slice. This is the
   faster GPU mode. To keep the output independent of where a frame was searched, the CPU fallback of such a filter
-  searches in one slice too, whatever `mt` says.
+  (per frame, or the whole filter with `cuda_cpu_fallback`) searches in one slice too, whatever `mt` says.
 
 Before 2026-11-01b the slice search (`meander=true`) was serialised for frames larger than about 736x576: its result
 buffer went through the GPU's copy engine, whose queue held every later upload. HD
@@ -207,11 +233,9 @@ CPU threads; the GPU gains at HD / UHD and in whole GPU chains.
 
 The output is a normal vector clip; every consumer of vectors works unchanged.
 
-### MRecalculate
+### CudaMRecalculate
 
-`gpu` (bool, default false)
-
-The same super, format, `blksize` and `divide` / `dct` / `outfile` conditions as MAnalyse, and:
+The same super, format, `blksize` and `divide` / `dct` / `outfile` conditions as CudaMAnalyse, and:
 
 - `search` 0 to 7, with `searchparam` 1 to 24 (1 to 64 for `search=3`)
 - `smooth` 0 or 1
@@ -220,81 +244,74 @@ The same super, format, `blksize` and `divide` / `dct` / `outfile` conditions as
 Single frames of a field-based clip run on the CPU. Slicing follows `mt` as for MAnalyse with `meander=true`. The output is
 a normal vector clip.
 
-### MCompensate
-
-`gpu` (bool, default false)
+### CudaMCompensate
 
 The GPU path is used when all of these hold:
 
-- `super` is a lite super (`MSuper(gpu=true)`)
-- 8 to 16 bit, planar Y or YUV
+- `super` comes from `CudaMSuper`
+- 8 to 16 bit, planar Y or YUV, at least 68 pixels wide (the token header must fit)
 - `pel` 1 or 2
 - `recursion=0`, `fields=false`, `tr=0`
 
-The output is token frames when the super clip is a lite super of a token clip, otherwise normal frames (the pictures are
-uploaded). Frames without a usable vector field (scene change) come out as the source or reference picture, as on the
-CPU. When a frame cannot be made on the GPU, it is made on the CPU and returned as a normal frame.
+The output is token frames. Frames without a usable vector field (scene change) come out as the source or reference
+picture, as on the CPU. A frame that cannot be made on the GPU is made on the CPU and uploaded.
 
-### MDegrain1 .. MDegrain6
-
-`gpu` (bool, default false)
+### CudaMDegrain1 .. CudaMDegrain6, CudaMDegrainN
 
 The GPU path is used when all of these hold:
 
-- `super` is a lite super (`MSuper(gpu=true)`)
+- `super` comes from `CudaMSuper`
 - 8 to 16 bit, planar Y or YUV
 - `pel` 1 or 2
 - `limit` and `limitC` 255 (the default)
-- `lsb` and `out16` false. Since upstream 2.7.48 `lsb=true` is `out16=true` plus a conversion to stacked 8-bit, so it
-  runs on the CPU as well; `out32` no longer exists
+- `lsb` and `out16` false. Since upstream 2.7.48 `lsb=true` is `out16=true` plus a conversion to stacked 8-bit, so it has
+  no GPU path either; `out32` no longer exists
+- CudaMDegrainN: `tr` 1 to 6, `thSAD2` = `thSAD`, `thSADC2` = `thSADC`
 
-The output is token frames when the source clip is a token clip, otherwise normal frames (the pictures are uploaded), and
-normal frames for frames made on the CPU. MDegrainN has no `gpu` parameter.
+The output is token frames; frames made on the CPU are uploaded.
 
-### MFlowFps
-
-`gpu` (bool, default false)
+### CudaMFlowFps
 
 The GPU path is used when all of these hold:
 
 - `mask=2` (the default)
-- super from this build's `MSuper` with `sharp=2`, no `pelclip`, `pel` 1, 2 or 4
-- planar YUV with three planes (not Y only, not RGB), 8-bit or 16-bit container, chroma subsampling 1 or 2
+- super from `CudaMSuper` or this build's `MSuper` with `sharp=2`, no `pelclip`, `pel` 1, 2 or 4
+- planar YUV with three planes (not Y only, not RGB), 8 to 16 bit integer, chroma subsampling 1 or 2
 
-The output is token frames when the source clip is a token clip (they are made again after eviction), otherwise normal
-frames. Single frames go to the CPU whenever the GPU cannot make them, for example frames whose vectors are not usable
-(scene change; see `thSCD1` / `thSCD2`); those come out as normal frames.
+The output is token frames (made again after eviction). Single frames go to the CPU whenever the GPU cannot make them,
+for example frames whose vectors are not usable (scene change; see `thSCD1` / `thSCD2`) and frames at time 0 (the
+source frame); those are uploaded.
 
 ---
 
 ## cudafilters
 
 Every filter in `cudafilters.dll` builds the CPU filter or filter chain it replaces, with the same arguments, behind
-`CudaDownload`. That CPU chain decides the output VideoInfo and parity and makes every frame the GPU cannot make. So each
-filter takes **the same parameters and defaults as its CPU counterpart**, and the CPU plugin must be loaded. The tables
-below list the parameters and what part runs on the GPU. For the meaning of each parameter, see the documentation of the
-CPU filter.
+`CudaDownload`. That CPU chain decides the output VideoInfo and parity and makes every frame the GPU cannot make (uploaded
+again, so the output stays token frames). So each filter takes **the same parameters and defaults as its CPU
+counterpart**, and the CPU plugin must be loaded. The tables below list the parameters and what part runs on the GPU
+("On the GPU"); outside that the filter stops at creation with the reason, or runs the CPU chain with
+`cuda_cpu_fallback` (see "CPU fallback"). For the meaning of each parameter, see the documentation of the CPU filter.
 
-All filters return token frames when they run on the GPU, also when their input is normal frames (unlike the mvtools2
-filters, which return normal frames for normal input), and are `MT_NICE_FILTER`. End a chain of them with `CudaDownload`.
+All filters return token frames, also when their input is normal frames, and are `MT_NICE_FILTER`. End a chain of them
+with `CudaDownload`.
 
 ### Transfer
 
 #### CudaUpload(clip)
 
-Uploads every frame to the device and returns token frames. Token frames pass through unchanged. If the GPU or the format
-is not usable, the frames pass through as normal frames; every consumer accepts those.
+Uploads every frame to the device and returns token frames. Token frames pass through unchanged. Planar Y / YUV, 8 to 16
+bit, chroma subsampling 1 or 2 (no RGB); other formats, or no usable GPU, are a creation error (with
+`cuda_cpu_fallback` the frames pass through as normal frames).
 
-Upload is not needed in front of a GPU filter, because they all upload normal frames themselves. Use it in front of
-mvtools2 filters when their output should stay on the device: after it, MSuper / MCompensate / MDegrain / MFlowFps
-return token frames instead of normal frames. (Cuda* filters return token frames with or without it.) Frames uploaded by
-`CudaUpload` can be made again after eviction (it reads its input again); a filter that uploads normal frames itself
-uploads them again when needed.
+Upload is not needed: every `Cuda*` function uploads normal frames itself. Frames uploaded by `CudaUpload` can be made
+again after eviction (it reads its input again); a filter that uploads normal frames itself uploads them again when
+needed.
 
 #### CudaDownload(clip)
 
-Turns token frames into normal frames and lets normal frames pass through. An evicted frame is made again by its
-producer. It stops with an error when a token is of another format than the clip, or when the GPU library is not loaded.
+Turns token frames into normal frames and lets normal frames of any format pass through (it never stops at creation).
+An evicted frame is made again by its producer. It stops with an error when a token is of another format than the clip, or when the GPU library is not loaded.
 
 ### AviSynth+ core
 
@@ -308,7 +325,9 @@ producer. It stops with an error when a token is of another format than the clip
 | `CudaGaussResize(clip, int width, int height, float src_left, float src_top, float src_width, float src_height, float p, float b, float s, int force, bool keep_center, string placement)` | `GaussResize` | `src_left`/`src_top` 0, `src_width`/`src_height` = source size, `p` 30, `b` 2, `s` 4, `force` 0, `keep_center` true, `placement` "auto" | any device frame format |
 | `CudaBilinearResize(clip, int width, int height, float src_left, float src_top, float src_width, float src_height, int force, bool keep_center, string placement)` | `BilinearResize` | as CudaGaussResize, without `p` / `b` / `s` | any device frame format |
 
-`radius`, `luma_threshold` and `chroma_threshold` of CudaTemporalSoften are required, as in TemporalSoften. The Merge
+`radius`, `luma_threshold` and `chroma_threshold` of CudaTemporalSoften are required, as in TemporalSoften. With
+`radius` 0 or both thresholds 0 TemporalSoften returns the clip unchanged; CudaTemporalSoften stops with an error
+there: leave the filter out. The Merge
 filters follow the AviSynth+ 3.7.5 arithmetic of its SSE2 / AVX2 code (including its scalar row tails), and return a
 source frame unchanged where the CPU filter does (weight near 0, or near 1 for Merge). The resizers follow the
 AviSynth+ 3.7.5 `FilteredResize` and read `_ChromaLocation` from frame 0 when `placement` is "auto".
@@ -325,7 +344,8 @@ AviSynth+ 3.7.5 `FilteredResize` and read `_ChromaLocation` from frame 0 when `p
 | `CudaLutxy(clip x, clip y, string expr, int use_expr, int Y, int U, int V)` | `mt_lutxy` | `expr` "x", `use_expr` 0, `Y` 3, `U` 1, `V` 1 | any expression |
 
 For the MaskTools2 filters, the GPU covers the plane modes 3 (process) and 2 (copy the first clip); any other plane mode
-(such as the default `U=1, V=1`) means the CPU filter. In practice, pass `U=3, V=3` or `U=2, V=2` to stay on the GPU.
+(such as the default `U=1, V=1`) has no GPU path (creation error, or the CPU filter with `cuda_cpu_fallback`). Pass
+`U=3, V=3` or `U=2, V=2`.
 CudaLutxy does not parse the expression: at creation it runs the installed `mt_lutxy` once over all (x, y) pairs (256 x
 256 at 8 bit, 1024 x 1024 at 10 bit, in a 4:4:4 clip) and uses the result as two tables, one for luma and one for chroma
 (with `use_expr` masktools hands the expression to `Expr`, whose chroma results can differ from luma), so it computes
@@ -352,7 +372,8 @@ The GPU reproduces the plugin's AVX2 + FMA code path (its `opt` 6 / 7). It runs 
 - `qual` 1 or 2; any `nsize`, `nns`, `etype`
 - this CPU's `rcpps` / `rsqrtps` lookup tables have the structure the GPU emulates (checked once per process)
 
-`CUDAFILTERS_LOG=1` prints the reason when it stays on the CPU.
+Outside these conditions it stops at creation with the reason. Above 10 bit, and on CPUs where nnedi3 does not take
+its AVX2 + FMA path (AVX-512 or older CPUs), set `cuda_cpu_fallback = true` to run nnedi3 itself.
 
 ### QTGMC
 
@@ -439,9 +460,10 @@ Defaults: `isb` false, `delta` 1, `blksize` 16, `blksizeV` = blksize (MAnalyse's
 overlap, `pel` 2 (1 or 2), `hpad` / `vpad` 16 (must be those of the MSuper used downstream), `chroma` true, `preset` 2
 (1 fast, 2 medium, 3 slow). Planar YUV or Y, 8 to 16 bit. Frames without a reference get invalid vectors, as MAnalyse.
 
-Fallback: without NVOFA (or with `MVTOOLS_GPU_DISABLE`) the function returns
-`MAnalyse(MSuper(c, pel, hpad, vpad, chroma), isb, delta, blksize, blksizeV, overlap, overlapV, truemotion=true, chroma)`
-(mvtools2.dll must be loaded); a single frame NVOFA fails on gets that MAnalyse's level-0 vectors.
+Fallback: without NVOFA (or with `MVTOOLS_GPU_DISABLE`) the function stops at creation; with `cuda_cpu_fallback` it
+returns `MAnalyse(MSuper(c, pel, hpad, vpad, chroma), isb, delta, blksize, blksizeV, overlap, overlapV, truemotion=true,
+chroma)` (mvtools2.dll must be loaded). Use `CudaNVOFAvailable()` to choose a branch in the script instead. A single
+frame NVOFA fails on gets that MAnalyse's level-0 vectors.
 
 #### CudaNVOFAvailable()
 
@@ -451,10 +473,14 @@ in a script, as uconvert's `uc_frc_nvof` does.
 ### Using cudafilters with QTGMC
 
 `qtgmc\make_qtgmc_gpu.py` makes a patched copy of `QTGMC.avsi` (`QTGMC_gpu.avsi`) that uses these filters and the
-mvtools2 `gpu` parameters. Run it with `python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]`. The source file is only
-read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false).
-`QTGMC_gpu_meander` (default true) keeps MAnalyse on the slice search, so the result is byte-identical to the stock CPU
-QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (faster, slightly different vectors).
+mvtools2 `Cuda*` functions. Run it with `python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]`. The source file is only
+read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false). The motion
+analysis goes through the wrappers `QTGMC_MSuper` / `QTGMC_MAnalyse` / `QTGMC_MRecalculate` (the `Cuda*` function with
+`QTGMC_gpu`, the CPU filter otherwise); the GPU output side calls CudaMSuper / CudaMCompensate / CudaMDegrain directly.
+`QTGMC_gpu_meander` (default true) keeps CudaMAnalyse on the slice search, so the result is byte-identical to the stock
+CPU QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (faster, slightly different vectors).
+A stage without a GPU path (above 10 bit: lookup tables and NNEDI3; NNEDI3 also on CPUs without its AVX2 + FMA path)
+stops the script at creation; set `global cuda_cpu_fallback = true` before QTGMC to run such stages on the CPU.
 
 The Windows release bundle wraps this: `QTGMC_gpu_load.avsi` (source: `qtgmc\bundle\`) loads every DLL and script from
 its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all the QTGMC GPU switches (`QTGMC_gpu`,
@@ -471,9 +497,10 @@ Read once per process.
 
 | Variable | Effect |
 |---|---|
-| `MVTOOLS_GPU_DISABLE` | Do not load `mvtools_cuda.dll`; everything runs on the CPU. cudafilters honours it too |
+| `CUDA_CPU_FALLBACK` | `1` / `0`: the CPU fallback switch when the script global `cuda_cpu_fallback` is not set (see "CPU fallback"); read by cudafilters too |
+| `MVTOOLS_GPU_DISABLE` | Do not load `mvtools_cuda.dll`: every `Cuda*` function counts as "GPU not usable" (creation error, or the CPU with the fallback switch). cudafilters honours it too |
 | `MVTOOLS_GPU_LOG` | Print every GPU decision and per-frame fallback to stderr, and the device frame registry statistics when the last GPU filter is destroyed |
-| `MVTOOLS_GPU_FORCE_FALLBACK` | Every GPU call reports "use the CPU" (for testing the fallback paths) |
+| `MVTOOLS_GPU_FORCE_FALLBACK` | Every GPU call reports "use the CPU": every frame is computed on the CPU and uploaded (for testing the fallback paths) |
 | `MVTOOLS_GPU_SLICES=n` | Slice count of MAnalyse (`meander=true`) and MRecalculate on the GPU, only with `mt=true`; changes the vector field compared with the CPU |
 | `MVTOOLS_GPU_PROFILE` | Wall time per named phase, printed to stderr when the process ends |
 

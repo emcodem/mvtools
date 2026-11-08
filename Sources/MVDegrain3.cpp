@@ -339,7 +339,7 @@ MVDegrainX::MVDegrainX(
   // get parameters of prepared super clip - v2.0
   SuperParams64Bits params;
   memcpy(&params, &vi_super.num_audio_samples, 8);
-  // a lite super (MSuper(gpu=true)): the GPU path reads its token pictures, the CPU path completes the frames
+  // a lite super (CudaMSuper): the GPU path reads its token pictures, the CPU path completes the frames
   _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
@@ -478,24 +478,32 @@ MVDegrainX::MVDegrainX(
   }
 
 
-  // GPU path: MDegrain1..6, 8 to 16 bit planar, pel 1 or 2, no limit / out16 (so no lsb either: upstream makes lsb=true an out16 MDegrain plus Stacked16), lite super (MSuper(gpu=true));
-  // token frames out for a token source clip, normal frames out for a normal one (pictures uploaded)
+  // GPU path (CudaMDegrain1..6): 8 to 16 bit planar, pel 1 or 2, no limit / out16 (so no lsb either: upstream makes
+  // lsb=true an out16 MDegrain plus Stacked16), super clip from CudaMSuper; token frames out (the source pictures
+  // uploaded when they are normal frames)
   if (_gpu_flag)
   {
-    GpuBackend &gpu = GpuBackend::instance();
+    static const char *const names[] = { "CudaMDegrainN", "CudaMDegrain1", "CudaMDegrain2", "CudaMDegrain3", "CudaMDegrain4", "CudaMDegrain5", "CudaMDegrain6" };
+    static const char *const cpu_names[] = { "MDegrainN", "MDegrain1", "MDegrain2", "MDegrain3", "MDegrain4", "MDegrain5", "MDegrain6" };
+    const int ni = (level >= 1 && level <= 6) ? level : 0;
     _gpu_hpad = nSuperHPad;
     _gpu_vpad = nSuperVPad;
-    _gpu_ok = gpu.usable() && level >= 1 && level <= MVCUDA_MAX_DEGRAIN && _super_lite && (pixelsize_super == 1 || pixelsize_super == 2) && (nPel == 1 || nPel == 2)
-      && !out16_flag
-      && nLimit >= 255 && nLimitC >= 255 && vi.IsPlanar() && !vi.IsRGB() && (vi.IsY() || vi.NumComponents() >= 3)
-      && vi.width >= (int)sizeof(MvCudaTokenHeader);
+    GpuCheck c(names[ni], cpu_names[ni]);
+    c.need(level >= 1 && level <= MVCUDA_MAX_DEGRAIN, "only radius 1 to 6")
+      .need(_super_lite, "the super clip must come from CudaMSuper")
+      .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")
+      .need(nPel == 1 || nPel == 2, "only pel 1 or 2")
+      .need(!out16_flag, "out16 / lsb are not supported")
+      .need(nLimit >= 255 && nLimitC >= 255, "limit / limitC below 255 are not supported")
+      .need(vi.IsPlanar() && !vi.IsRGB() && (vi.IsY() || vi.NumComponents() >= 3), "only planar Y or YUV formats")
+      .need(vi.width >= (int)sizeof(MvCudaTokenHeader), "the clip is too narrow for a GPU frame header (68 pixels)");
+    _gpu_ok = c.decide(env_ptr);
     if (_gpu_ok)
     {
+      GpuBackend &gpu = GpuBackend::instance();
       _producer = gpu.producer_register(&MVDegrainX::gpu_regen, this);
       gpu.add_user(); // the upload keys name clips: forgotten when the last GPU filter goes
     }
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MDegrain%d gpu requested: %s\n", level, _gpu_ok ? "using the GPU" : "not supported here, CPU");
   }
 
   if (out16_flag) {
@@ -550,14 +558,24 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 int MVDegrainX::gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
 {
   MVDegrainX *self = static_cast<MVDegrainX *>(user);
+  IScriptEnvironment *e = static_cast<IScriptEnvironment *>(env);
   std::lock_guard<std::mutex> lk(self->_gpu_mutex);
-  bool host;
-  return self->gpu_make(frame, static_cast<IScriptEnvironment *>(env), *out, nullptr, host);
+  if (self->gpu_make(frame, e, *out, nullptr) == 0)
+    return 0;
+  // a frame the GPU cannot make (as in GetFrame): the CPU result, uploaded
+  try
+  {
+    return GpuBackend::instance().upload_cpu_result(self->cpu_frame(frame, e), self->vi, self->_producer, frame, *out);
+  }
+  catch (...)
+  {
+    return -2;
+  }
 }
 
 // MDegrain<level> of frame n as a device frame: 0 and the token in h, else the CPU path. props_src: the source frame (the
-// CPU path makes its output frame from it). host: the source frame is a normal frame (uploaded), the result goes back as one.
-int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src, bool &host)
+// CPU path makes its output frame from it).
+int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, PVideoFrame *props_src)
 {
   const int L = level;
   bool usableF[MAX_DEGRAIN] = {}, usableB[MAX_DEGRAIN] = {};
@@ -582,7 +600,6 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
   GpuBackend::Input in[1 + 2 * MAX_DEGRAIN];
   if (!GpuBackend::frame_input(src, child->GetVideoInfo(), (const void *)child.operator->(), n, in[0]))
     return -1;
-  host = in[0].host;
   // the reference frames as the CPU path takes them; their numbers are part of the upload key of a normal super frame
   PVideoFrame refF[MAX_DEGRAIN], refB[MAX_DEGRAIN];
   int nf_ref[MAX_DEGRAIN] = {}, nb_ref[MAX_DEGRAIN] = {};
@@ -684,28 +701,26 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
 PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
 {
   std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
-  if (_gpu_ok)
+  if (!_gpu_ok)
+    return cpu_frame(n, env);
+  MvCudaTokenHeader h;
+  PVideoFrame props;
+  const int rc = gpu_make(n, env, h, &props);
+  if (rc == 0)
   {
-    MvCudaTokenHeader h;
-    PVideoFrame props;
-    bool host = false;
-    int rc = gpu_make(n, env, h, &props, host);
-    if (rc == 0)
-    {
-      PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &props) : env->NewVideoFrame(vi);
-      if (!host)
-      {
-        GpuBackend::write_token(dst, h);
-        return dst;
-      }
-      // normal frames in, normal frames out (the device frame was made by this thread a moment ago)
-      if (GpuBackend::instance().download_frame(h, dst, vi))
-        return dst;
-      rc = -2;
-    }
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MDegrain%d gpu frame %d rc=%d -> CPU\n", level, n, rc);
+    PVideoFrame dst = has_at_least_v8 ? env->NewVideoFrameP(vi, &props) : env->NewVideoFrame(vi);
+    GpuBackend::write_token(dst, h);
+    return dst;
   }
+  if (GpuBackend::log_enabled())
+    std::fprintf(stderr, "CudaMDegrain%d frame %d rc=%d -> CPU\n", level, n, rc);
+  // the CPU result, uploaded: the output stays a token clip
+  return GpuBackend::instance().cpu_result_token(cpu_frame(n, env), vi, _producer, n, env);
+}
+
+// MDegrain's own (CPU) frame n
+PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
+{
   int nWidth_B = nBlkX*(nBlkSizeX - nOverlapX) + nOverlapX;
   int nHeight_B = nBlkY*(nBlkSizeY - nOverlapY) + nOverlapY;
 

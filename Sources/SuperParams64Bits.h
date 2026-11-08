@@ -42,7 +42,7 @@ public:
 // (they rebuild the sub-pel planes themselves, bit-identical only for matching settings) and for lite super clips.
 //   bits 1-4  rfilter * 3 + sharp (rfilter 0..4, sharp 0..2: 15 values, 15 is never written)
 //   bit 5     pelclip used
-//   bit 6     lite (MSuper gpu=true: picture only)
+//   bit 6     lite (CudaMSuper: picture only)
 //   bit 7     written by this MSuper: bits 1-6 are valid. A super clip of another mvtools2 build may carry anything
 //             there (the original MSuper left param uninitialised), so nothing below trusts bits 1-6 without it.
 constexpr unsigned char SUPER_PARAM_FILTER_SHIFT = 1;
@@ -75,11 +75,11 @@ inline bool super_param_gpu_rebuildable(const SuperParams64Bits &p)
   return (rf == 2 || rf == 4) && super_param_sharp(p) == 2 && !super_param_pelclip(p);
 }
 
-// MSuper(gpu=true) "lite" clips hold only the picture (no padding, pyramid or sub-pel planes); only MAnalyse, MRecalculate
-// and MFlowFps know how to use them
+// CudaMSuper "lite" clips hold only the picture (no pyramid or sub-pel planes); MAnalyse, MRecalculate, MFlowFps,
+// MCompensate and MDegrain1..6 (CPU and Cuda*) know how to use them
 #define MV_SUPER_IS_LITE(p) (super_param_valid(p) && ((p).param & SUPER_PARAM_LITE) != 0)
 #define MV_REJECT_LITE_SUPER(p, who, env) \
-  do { if (MV_SUPER_IS_LITE(p)) (env)->ThrowError(who ": the super clip was made with MSuper(gpu=true) (picture only, for MAnalyse / MRecalculate / MFlowFps); make a super clip without gpu=true for this filter"); } while (0)
+  do { if (MV_SUPER_IS_LITE(p)) (env)->ThrowError(who ": the super clip was made with CudaMSuper (picture only, for the Cuda* filters); make a super clip with MSuper for this filter"); } while (0)
 
 
 

@@ -43,7 +43,7 @@ GenericVideoFilter(_super), _lite(false), _mt(true)
   memcpy(&params, &child->GetVideoInfo().num_audio_samples, 8);
   _lite = MV_SUPER_IS_LITE(params);
   if (_lite && !allow_lite)
-    env->ThrowError("MFinest: the super clip was made with MSuper(gpu=true) (picture only, for MAnalyse / MRecalculate / MFlowFps); make a super clip without gpu=true for this filter");
+    env->ThrowError("MFinest: the super clip was made with CudaMSuper (picture only, for the Cuda* filters); make a super clip with MSuper for this filter");
   int nHeightS = params.nHeight;
   nSuperHPad = params.nHPad;
   nSuperVPad = params.nVPad;
@@ -89,7 +89,7 @@ MVFinest::~MVFinest()
 PVideoFrame __stdcall MVFinest::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame	ref	= child->GetFrame(n, env);
-  // a lite super frame (MSuper gpu=true) only holds the picture: nPel 1 just copies its top rows, anything else needs the real thing
+  // a lite super frame (CudaMSuper) only holds the picture: nPel 1 just copies its top rows, anything else needs the real thing
   if (_lite && nPel != 1)
     ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt, env);
   else if (_lite)

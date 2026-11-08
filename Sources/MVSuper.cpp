@@ -138,17 +138,23 @@ MVSuper::MVSuper(
   vi.width = nSuperWidth;
   vi.height = nSuperHeight;
 
-  // gpu=true: when the GPU filters downstream can do all the work from the plain picture (the same configuration check as
-  // MAnalyse / MRecalculate / MFlowFps), skip the CPU pyramid and sub-pel planes: the frame then holds only the picture
-  // with its padding rows. Any filter that needs the full thing completes it itself (CompleteLite), bit-identical.
+  // CudaMSuper: the Cuda* filters downstream build the pyramid and the sub-pel planes on the GPU from the plain picture,
+  // so the CPU skips them: the frame holds only the picture with its padding rows ("lite"; for a token clip only the
+  // token header at the picture position). A CPU filter that needs the full thing completes it itself (CompleteLite),
+  // bit-identical.
   if (gpu_flag)
   {
-    _lite = GpuBackend::instance().usable() && !usePelClip && (nPel == 1 || nPel == 2) && sharp == 2 && (rfilter == 4 || rfilter == 2)
-      && (nModeYUV == YUVPLANES || nModeYUV == YPLANE) && vi.IsPlanar() && vi.IsYUV() && !vi.IsY()
-      && (pixelsize == 1 || pixelsize == 2) && (xRatioUV == 1 || xRatioUV == 2) && (yRatioUV == 1 || yRatioUV == 2)
-      && nHPad % xRatioUV == 0 && nVPad % yRatioUV == 0 && nHeight % yRatioUV == 0;
-    if (GpuBackend::log_enabled())
-      std::fprintf(stderr, "MSuper gpu requested: %s\n", _lite ? "lite (picture only)" : "not supported here, normal CPU super");
+    GpuCheck c("CudaMSuper", "MSuper");
+    c.need(!usePelClip, "pelclip is not supported")
+      .need(sharp == 2, "only sharp=2")
+      .need(rfilter == 4 || rfilter == 2, "only rfilter 2 or 4")
+      .need(vi.IsPlanar() && vi.IsYUV() && !vi.IsY(), "only planar YUV formats")
+      .need(pixelsize == 1 || pixelsize == 2, "only 8 to 16 bit integer formats")
+      .need((xRatioUV == 1 || xRatioUV == 2) && (yRatioUV == 1 || yRatioUV == 2), "only 4:2:0, 4:2:2, 4:4:0 or 4:4:4 chroma")
+      .need(nModeYUV == YUVPLANES || nModeYUV == YPLANE, "unsupported plane selection")
+      .need(nHPad % xRatioUV == 0 && nVPad % yRatioUV == 0 && nHeight % yRatioUV == 0,
+        "hpad, vpad and the height must be multiples of the chroma subsampling");
+    _lite = c.decide(env);
     if (_lite)
       vi.height = nHeight + 2 * nVPad;
   }
