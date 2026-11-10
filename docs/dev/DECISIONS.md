@@ -6,6 +6,31 @@ done, `ARCHITECTURE.md` summarises the design; this file is the short
 list of choices that later work must respect or consciously revisit. Status: **decided**, **open** (needs a decision),
 **superseded** (with a pointer).
 
+## D12. SplatFps in parts: candidate clips between the vector source and the picture build (2026-11-08, agreed)
+
+The user agreed to split SplatFps (agreed order: this split, sizes / formats, fast CPU, CUDA tuning).
+- **Boundary.** The vector source ends at the candidate sets (the output of the phase correlation); refinement, match
+  errors, assignment and the local fallback stay in SplatFps, because they need the source pictures and work the same
+  for every source. So any source with 1..n vectors per pixel (phase correlation: 29 at 1080p with the default set,
+  `block_peaks=[2, 2, 3]` over all covering blocks plus the global candidate; optical flow 1, MVTools blocks 1) gets
+  the same occlusion handling and fallbacks.
+- **Candidate clip.** One frame per source picture c, everything SplatFps needs for c: the forward set (vectors from c
+  into c+1) and the backward set (vectors from c into c-1, or from c-1 into c), each n x (vx, vy) planes of the ME grid
+  ((width + 2 pad_x) / scale x (height + 2 pad_y) / scale, at 1080p (width + 32) / 4 x (height + 40) / 4, units of
+  ME pixels), stacked in one Y32 frame. Frame properties (as built, `splatfps/cand_clip.h`): `SplatCand` (layout
+  version), `SplatN`, `SplatGridW` / `SplatGridH`, `SplatScale`, `SplatPadX` / `SplatPadY`, `SplatFwd`, `SplatBwd`
+  (none, from c, into c, or the forward set of frame c-1), `SplatRefine` (0: take the vectors as they are, only
+  assign), `SplatBias` (n + 1 floats: the per-candidate cost, which belongs to the source). The first picture has no
+  backward set. A Y32 clip can be viewed and checked with ordinary filters.
+- **Filters.** `SplatAnalyse(clip)` (phase correlation, CPU) / `CudaSplatAnalyse` make candidate clips;
+  `SplatFps(clip, num, den, vectors=)` / `CudaSplatFps(..., vectors=)` take one (default: the built-in phase
+  correlation, which stays the fast path: no clip round trip). Stock MVTools vectors: `MSplatVectors(mvbw, mvfw)` (and a
+  Cuda twin) in mvtools2.dll expands block vectors to the ME grid, so MVTools internals stay out of splatfps.dll (D7);
+  default refined as candidates. NVOFA raw grid: `CudaSplatAnalyse(source="nvof")`.
+- **GPU.** Cuda* versions follow D8: candidate clips are token frames (about 32 MB per frame at 1080p with 29
+  candidates, too big for host round trips); normal Y32 frames are uploaded inside the consumer.
+- Open (user): exporting our fields as MVTools vector clips (lossy) for MFlowFps and friends.
+
 ## D11. Hardware target: compute capability 6.0 and newer; mvtools_cuda is built with CUDA 12 only (2026-11-01, decided)
 
 **Decision.** mvtools_cuda runs on compute capability 6.0 and newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx). The

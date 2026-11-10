@@ -10,9 +10,13 @@ set(MVCUDA_SOURCES
   mvcuda.cu mvcuda_core.cu mvcuda_frames.cu mvcuda_resample.cu mvcuda_temporal.cu mvcuda_merge.cu mvcuda_kobs.cu
   mvcuda_nnedi3.cu mvcuda_comp.cu mvcuda_nvofa.cu
   mvcuda_super_8.cu mvcuda_super_16.cu mvcuda_recalc_8.cu mvcuda_recalc_16.cu mvcuda_analyse_8.cu mvcuda_analyse_16.cu
-  mvcuda_flow_8.cu mvcuda_flow_16.cu mvcuda_nvof_vec_8.cu mvcuda_nvof_vec_16.cu)
+  mvcuda_flow_8.cu mvcuda_flow_16.cu mvcuda_nvof_vec_8.cu mvcuda_nvof_vec_16.cu
+  mvcuda_splat.cu mvcuda_splat_exact.cu mvcuda_splat_fast.cu)
 
 add_library(mvtools_cuda SHARED ${MVCUDA_SOURCES})
+# SplatFps exact variant: float arithmetic in source order (no a * b + c contraction), bit-identical with the CPU
+# reference in splatfps/core
+set_source_files_properties(mvcuda_splat_exact.cu PROPERTIES COMPILE_OPTIONS "-fmad=false")
 
 # Release: the device code runs on compute capability 6.0 and newer (cp.async / acquire-release paths for 8.0+ / 7.0+,
 # fallbacks below, mvcuda_internal.h MVC_ARCH_BELOW). Built with CUDA 12 only (12.8+ for 12.0, 12.9 recommended; the

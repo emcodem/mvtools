@@ -677,6 +677,8 @@ AVSValue __cdecl Create_MVFinest(AVSValue args, void*, IScriptEnvironment* env)
   );
 }
 
+AVSValue __cdecl Create_MSplatVectors(AVSValue args, void*, IScriptEnvironment* env); // MSplatVectors.cpp
+
 AVSValue __cdecl Create_MStoreVect(AVSValue args, void*, IScriptEnvironment* env_ptr)
 {
   const int		nbr_clips = args[0].ArraySize();
@@ -773,6 +775,8 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   env->AddFunction("MSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, 0);
   env->AddFunction("CudaMSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, (void *)1);
   env->AddFunction("MStoreVect", "c+[vccs]s", Create_MStoreVect, 0);
+  env->AddFunction("MSplatVectors", "cc[refine]b[thSCD1]i[thSCD2]i[me_scale]i[pad_x]i[pad_y]i[pyramid_levels]i",
+    Create_MSplatVectors, 0);
   env->AddFunction("MRestoreVect", "c[index]i", Create_MRestoreVect, 0);
   env->AddFunction("MScaleVect", "c[scale]f[scaleV]f[mode]i[flip]b[adjustSubPel]b[bits]i", Create_MScaleVect, 0);
   //	env->AddFunction("MVFinest",     "c[isse]b", Create_MVFinest, 0);
