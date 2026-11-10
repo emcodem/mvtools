@@ -482,6 +482,13 @@ CPU QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (
 A stage without a GPU path (above 10 bit: lookup tables and NNEDI3; NNEDI3 also on CPUs without its AVX2 + FMA path)
 stops the script at creation; set `global cuda_cpu_fallback = true` before QTGMC to run such stages on the CPU.
 
+The base is QTGMC 3.393s (A.SONY / Dogway mod, realfinder AVS-Stuff, Community branch, `avs 2.6 and up/QTGMC.avsi`);
+the generator stops if a pattern it patches is not found as often as in that version. Its 3.39x options on the GPU:
+`RefineMotion2`, `RefineMotionAll` / `RefineMotionSearch` / `RefineMotionRadius`, `trymany`, `MEus` (the upsizing
+LanczosResize runs on the CPU, the analysis on the GPU), `pscrn` 2..4. `xflateMaTo` and `PhosphorSoft` keep the stages
+they change on the CPU. No GPU path (creation error unless `cuda_cpu_fallback`): `temporal=true` (MAnalyse) and
+`pscrn` 0 / 1 (NNEDI3). `temporal=true` is not reproducible run to run with stock CPU QTGMC either.
+
 The Windows release bundle wraps this: `QTGMC_gpu_load.avsi` (source: `qtgmc\bundle\`) loads every DLL and script from
 its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all the QTGMC GPU switches (`QTGMC_gpu`,
 `QTGMC_gpu_search`, `QTGMC_gpu_tokens`, `QTGMC_gpu_edi`, `QTGMC_gpu_out`) at once. `qtgmc\bundle\examples\` has example
