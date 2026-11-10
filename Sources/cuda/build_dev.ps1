@@ -31,7 +31,10 @@ $units = [ordered]@{
   'mvcuda_analyse_8.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh'); 'mvcuda_analyse_16.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh')
   'mvcuda_nvof_vec_8.cu' = @('mvcuda_nvof_vec.cu', 'mvcuda_nvofa.h'); 'mvcuda_nvof_vec_16.cu' = @('mvcuda_nvof_vec.cu', 'mvcuda_nvofa.h')
   'mvcuda_flow_8.cu' = @('mvcuda_flow.cu'); 'mvcuda_flow_16.cu' = @('mvcuda_flow.cu')
+  'mvcuda_splat.cu' = @('mvcuda_splat_ctx.h'); 'mvcuda_splat_exact.cu' = @('mvcuda_splat.cuh', 'mvcuda_splat_ctx.cuh', 'mvcuda_splat_ctx.h', 'mvcuda_splat_me.cuh', 'mvcuda_splat_mo.cuh', '..\..\splatfps\core\splat_const.h', '..\..\splatfps\core\splat_phase_pull.h', '..\..\splatfps\third_party\pocketfft\fftp_pow2.h'); 'mvcuda_splat_fast.cu' = @('mvcuda_splat.cuh', 'mvcuda_splat_ctx.cuh', 'mvcuda_splat_ctx.h', 'mvcuda_splat_me.cuh', 'mvcuda_splat_mo.cuh', '..\..\splatfps\core\splat_const.h', '..\..\splatfps\core\splat_phase_pull.h', '..\..\splatfps\third_party\pocketfft\fftp_pow2.h')
 }
+# per-unit nvcc flags (as set_source_files_properties in CMakeLists.txt)
+$unitFlags = @{ 'mvcuda_splat_exact.cu' = '-fmad=false' }
 $stampFile = Join-Path $obj 'flags.txt'
 # the toolkit and the host toolset are part of the stamp: objects of another compiler are rebuilt
 $stamp = "$nvcc$vcArg $common"
@@ -49,7 +52,7 @@ foreach ($u in $units.Keys) {
     'set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"',
     "call `"$vcvars`"$vcArg >nul || exit /b 1",
     "cd /d `"$src`"",
-    "`"$nvcc`" -c -o `"$o`" $u $common > `"$log`" 2>&1")
+    "`"$nvcc`" -c -o `"$o`" $u $common $($unitFlags[$u]) > `"$log`" 2>&1")
   $jobs += [pscustomobject]@{ unit = $u; log = $log; p = (Start-Process cmd -ArgumentList '/c', "`"$bat`"" -NoNewWindow -PassThru) }
 }
 $sw = [Diagnostics.Stopwatch]::StartNew()

@@ -19,7 +19,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 19
+#define MVCUDA_API_VERSION 30
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -451,6 +451,103 @@ MVCUDA_API int mvcuda_compensate(const MvCudaBlockGeom *g, unsigned long long sr
 // (MVDegrainX::use_block_y / use_block_uv + norm_weights). plane_mask bit p: plane p is degrained, else copied from src.
 MVCUDA_API int mvcuda_degrain(const MvCudaBlockGeom *g, int level, unsigned long long src, const unsigned long long *ref_b,
   const unsigned long long *ref_f, const int *blocks, int plane_mask, unsigned long long producer, int frame, MvCudaTokenHeader *out);
+
+// ---- SplatFps picture build (mvcuda_splat.cu) ---------------------------------------------------------------------
+// Motion-compensated in-between picture from its two source pictures P and N (Laplacian-pyramid splatting; the
+// description and the exact CPU path are in splatfps/core/splat_core.h). Samples are float32 in 8-bit units,
+// value = (code - 2^(b-1)) / 2^(b-8). The motion behind it: block phase correlation gives candidate vectors, a
+// Lucas-Kanade step refines them, and a per-pixel choice by minimum filtered displaced frame difference (the match
+// errors) gives a forward and a backward field per source picture, with occlusion handling (the assignment); the
+// local fallback and the pair statistic (scene cut, temporal fallback) guard against unreliable vectors. The exact
+// path is the deterministic scalar path: float32 in a fixed evaluation order, no contraction, IEEE division and sqrt,
+// exp through double; the fast CPU path and CUDA (exact=true) are checked bit for bit against it.
+
+typedef struct
+{
+  int width, height;  // picture size
+  int exact;          // 1: bit-identical with the exact CPU path (slower); 0: fast (FMA, atomic splats in any order)
+  const void *config; // splat::Config (splatfps/core/splat_config.h), resolved and checked, or null: the defaults of
+                      // the picture size (config_for_size). It sets the ME scale, the borders (internal grid
+                      // (width + 2 pad_x) x (height + 2 pad_y), ME grid that / scale), the pyramid and every tuned
+                      // scalar. Copied by the entries (a context keeps its own copy).
+  int bits;           // source / output samples of a context: bits per sample (8: one byte, 9..16: two bytes)
+  int sub_w, sub_h;   // chroma subsampling, log2 (0 0: 4:4:4, 1 0: 4:2:2, 1 1: 4:2:0)
+  int chroma_centre;  // 1: subsampled chroma horizontally half way between two luma samples (centre siting);
+                      // 0: co-sited with the even luma samples (left siting)
+} MvCudaSplatParams;
+
+// Host-memory entry (tests): P, N, out: 3 planes width x height (Y, Cb, Cr 4:4:4, packed); fwd_P / bwd_N: 4 planes
+// (vx, vy, err, local-fallback weight) of the ME grid, the forward field of P and the backward field of N; d: phase of
+// the output between P (0) and N (1) after the temporal fallback. -1 no device, -2 CUDA error, -4 bad arguments.
+MVCUDA_API int mvcuda_splat_build_host(const MvCudaSplatParams *p, const float *P, const float *N, const float *fwd_P,
+  const float *bwd_N, float d, float *out);
+
+// Host-memory entries of the stages around the motion vectors (tests; return codes as mvcuda_splat_build_host).
+// ME grid: mw = (width + 2 pad_x) / scale, mh = (height + 2 pad_y) / scale (1080p defaults: (width + 32) / 4,
+// (height + 40) / 4).
+// ME picture of a luma plane (width x height) -> mw x mh; fir 0 = A, 1 = B.
+MVCUDA_API int mvcuda_splat_me_picture_host(const MvCudaSplatParams *p, const float *y, int fir, float *out);
+// Errors of n candidate vectors plus the zero vector: vecs = n x (vx, vy) planes, errs = n + 1 planes (zero last).
+MVCUDA_API int mvcuda_splat_errors_host(const MvCudaSplatParams *p, const float *cur, const float *other, const float *vecs,
+  int n, float *errs);
+// Local fallback: channel 3 of the fields fv (count fields, each vx, vy planes).
+MVCUDA_API int mvcuda_splat_disorder_weight_host(const MvCudaSplatParams *p, const float *fv, int count, float *ch3);
+// Temporal fallback: the adjusted phase from the forward field of P and the backward field of N (4 planes each);
+// info (or null): m, p, f, g2.
+MVCUDA_API int mvcuda_splat_phase_pull_host(const MvCudaSplatParams *p, const float *fP, const float *fN, double d, double strength,
+  double *d_adj, double *info);
+// Motion estimation (description and exact CPU path: splatfps/core/splat_pcorr.h, splat_motion.h). Vector sets are
+// n x (vx, vy) planes of the ME grid; error sets n + 1 planes (zero vector last); fields 4 planes (vx, vy, err, ch3).
+// Phase correlation of the pair (B_prev, B_cur) (ME pictures B): the candidate fields (cands, 2 planes each; 29 at the
+// 1080p defaults, splat::pcorr_ncand); optional (null): hp of B_cur (the prefiltered picture, 1 plane),
+// glob = dx, dy, height, vx, vy of the global candidate.
+MVCUDA_API int mvcuda_splat_pcorr_host(const MvCudaSplatParams *p, const float *B_prev, const float *B_cur, float *cands,
+  float *hp, float *glob);
+// Refinement of n candidates of cur against other; neg: they point from other into cur (turned around).
+MVCUDA_API int mvcuda_splat_refine_host(const MvCudaSplatParams *p, const float *cur, const float *other, const float *cands,
+  int n, int neg, float *out);
+// Assignment: rf / rb n refined candidates, ef / eb their errors, bias n + 1 values; rb = eb = null: forward side
+// only (lowest cost, bwd = 0, 0, splat::NO_SIDE_ERROR). Channel 3 of fwd / bwd = 0.
+MVCUDA_API int mvcuda_splat_assign_host(const MvCudaSplatParams *p, const float *rf, const float *ef, const float *rb,
+  const float *eb, int n, const float *bias, float *fwd, float *bwd);
+// Refinement (refine != 0), errors, assignment and local fallback of centre picture c from the A pictures of c-1 (null:
+// single side), c, c+1 and the candidates as a source delivers them (toward_b: the backward ones point from c).
+MVCUDA_API int mvcuda_splat_fields_host(const MvCudaSplatParams *p, const float *A_prev, const float *A_cur, const float *A_next,
+  const float *cand_fwd, const float *cand_bwd, int n, int toward_b, int refine, const float *bias, float *fwd, float *bwd);
+// The whole chain from luma (width x height) of c-1 (null: single side), c, c+1 with the phase-correlation source.
+// ms (4 floats or null): GPU time of one picture's ingest (ME pictures, spectra), one pair's candidates, the fields of
+// one centre picture, and their sum (the cost per source picture).
+MVCUDA_API int mvcuda_splat_fields_luma_host(const MvCudaSplatParams *p, const float *y_prev, const float *y_cur,
+  const float *y_next, float *fwd, float *bwd, float *ms);
+
+// ---- SplatFps device pipeline: one context per filter instance (one caller at a time). Source pictures are planar
+// YUV codes in the format of MvCudaSplatParams (bits, sub_w, sub_h) in host memory; they are converted and analysed
+// once on the device and kept while frames near them are made. Output frames have the same format.
+MVCUDA_API void *mvcuda_splat_ctx_create(const MvCudaSplatParams *p); // null: no device, out of memory
+MVCUDA_API void mvcuda_splat_ctx_free(void *ctx);
+MVCUDA_API int mvcuda_splat_ctx_has_source(void *ctx, int q);         // 1 when source picture q is on the device
+MVCUDA_API int mvcuda_splat_ctx_source(void *ctx, int q, const void *const planes[3], const int pitch_bytes[3]); // returns once staged
+// The in-between picture at phase d (0..1) between source pictures p and p + 1, as codes into host planes.
+// Needs the sources p - 1 (when p > 0) .. p + 2 (-4 when one is missing). d_adj (or null): the phase after the temporal
+// fallback (strength: Config::pull_strength, 0 = off by default; at a scene cut it is 0 or 1).
+MVCUDA_API int mvcuda_splat_ctx_frame(void *ctx, int p, double d, double strength, void *const out[3],
+  const int out_pitch_bytes[3], double *d_adj);
+// The same in two halves, so the caller can stage the next source picture while the device builds this frame:
+// frame_start queues the frame (returns after the temporal-fallback formula), frame_finish waits for the oldest started
+// frame and writes it (out null: dropped). mvcuda_splat_ctx_source may be called in between, and a second frame may be
+// started before the first is finished (the device builds it while the caller hands on the first; a third start drops
+// the oldest); frame_finish without a started frame returns -4.
+MVCUDA_API int mvcuda_splat_ctx_frame_start(void *ctx, int p, double d, double strength, double *d_adj);
+MVCUDA_API int mvcuda_splat_ctx_frame_finish(void *ctx, void *const out[3], const int out_pitch_bytes[3]);
+// External vector sources (candidate clips): after mvcuda_splat_ctx_external (before the first source) the context runs
+// no phase correlation; the fields of picture c come from mvcuda_splat_ctx_candidates, which needs the sources c-1
+// (when bwd is given) .. c+1: fwd = 2n planes of the ME grid (vx, vy per candidate, from c into c+1), bwd = 2n planes or
+// null (single side; bwd_toward: from c into c-1, else from c-1 into c), refine: run the refinement on them, bias =
+// n + 1 per-candidate costs (zero vector last); n = 1..31. frame_start returns -4 while a needed field is missing.
+MVCUDA_API int mvcuda_splat_ctx_external(void *ctx);
+MVCUDA_API int mvcuda_splat_ctx_has_fields(void *ctx, int c); // 1 when the fields of picture c are on the device
+MVCUDA_API int mvcuda_splat_ctx_candidates(void *ctx, int c, const float *fwd, int fwd_pitch_bytes, const float *bwd,
+  int bwd_pitch_bytes, int n, int bwd_toward, int refine, const float *bias);
 
 #ifdef __cplusplus
 }

@@ -236,6 +236,19 @@ not yet on real 6.x / 7.0 hardware.
   github.com/emcodem/mvtools.
 * Developer notes: `docs/dev/` (`ARCHITECTURE.md` design and lessons, `DECISIONS.md`, `TODO.md` open work).
 
+## SplatFps (this branch, in development)
+
+`splatfps.dll`: motion-compensated frame-rate conversion between any progressive rates (`SplatFps` on the CPU,
+`CudaSplatFps` on the GPU), with phase-correlation motion measurement, forward / backward vector assignment with
+occlusion handling, and a Laplacian-pyramid splat picture build. The vectors can also come from MVTools (`MAnalyse`,
+`CudaMAnalyse`) or NVOFA through `MSplatVectors` of mvtools2. Planar YUV 4:2:0 / 4:2:2 / 4:4:4, 8-16 bit,
+progressive, SD to UHD (per-size default settings).
+
+    CudaSplatFps(c, 60000, 1001)
+
+* Reference: `Documentation/splatfps.md`. Sources: `splatfps/` (CPU stages in `splatfps/core/`, GPU stages in
+  `Sources/cuda/mvcuda_splat*`).
+
 ## VapourSynth (this branch; Linux and Windows)
 
 Not part of the Windows release bundles yet.

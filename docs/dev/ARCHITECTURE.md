@@ -20,7 +20,7 @@ reference .md files (links to online resources are fine).
 - `avstp.dll`: thread pool. With it the CPU search runs in `min(threads, 64, blkY / 4)` slices, which changes vectors at
   slice borders; the GPU uses the same count. Without a pool (VapourSynth, Linux) CPU and GPU use 1 slice.
 - `mvtools_vsbridge`: AviSynth+ API shim for VapourSynth (below).
-- **Library API version** (`MVCUDA_API_VERSION`, now 19) is checked at load; every bump needs all DLLs from one build.
+- **Library API version** (`MVCUDA_API_VERSION`, now 23) is checked at load; every bump needs all DLLs from one build.
 
 ## Exactness rule
 

@@ -203,9 +203,16 @@ if(MVTOOLS_GPU)
   mv_plugin_exports(cudafilters)
 endif()
 
+# SplatFps (motion-compensated frame-rate conversion), its own plugin; plain C++, device code in mvtools_cuda.
+option(MVTOOLS_SPLATFPS "Build splatfps (SplatFps / CudaSplatFps) and its stage tests" ON)
+if(MVTOOLS_SPLATFPS)
+  add_subdirectory("splatfps")
+  mv_plugin_exports(splatfps)
+endif()
+
 # Everything the plugins load from their own folder, in one place: <build>/bin (copied after each build).
 set(MVTOOLS_DIST_DIR "${CMAKE_BINARY_DIR}/bin" CACHE PATH "Folder that receives all plugin libraries after the build")
-set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda)
+set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda splatfps)
 set(_mv_dist_cmds "")
 set(_mv_dist_deps "")
 foreach(t ${_mv_dist_targets})

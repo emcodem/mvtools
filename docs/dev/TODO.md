@@ -19,16 +19,67 @@ Mark an item done by deleting it here (the commit message says what was done). *
   Prefetch, build `profile\build_d8\bin` (CPU MAnalyse). Chain: Dancers.mxf SelectOdd -> 1920x1080 10-bit 4:2:2,
   RemoveGrain(22), MSuper of the half-size picture (pel 4, hpad/vpad 8, rfilter 4), MAnalyse blksize 8 overlap 4
   search 3 searchparam 2 truemotion=false chroma=true divide=2, MScaleVect(2), MRecalculate 8x8, MFlowFps. Script:
-  `TESTFILES\reach_for_phc\01_mvtools_params\avs\V5_divide2.avs`. Not isolated yet (an MShow-based bisect failed on its own); check
-  whether stock 2.7.48 crashes too, and 8-bit / 4:2:0 / full size.
-- mc FRC fallback is too weak (2026-11-02, `TESTFILES\reach_for_phc`): no MAnalyse / MRecalculate / NVOFA setting keeps
-  Dancers' fast leg whole (frames 15 and 37 at 50p); uc_FRCFallback (nearest source picture where the refined-vector
-  SAD is high) is what keeps the leg today, and that is not good enough either. Design and test a better fallback
-  (detection + replacement), see `TESTFILES\reach_for_phc\README.md`.
+  a local test script (`V5_divide2.avs`, not in the repo). Not isolated yet (an MShow-based bisect failed on its own);
+  check whether stock 2.7.48 crashes too, and 8-bit / 4:2:0 / full size.
+- mc FRC fallback is too weak (2026-11-02, local FRC parameter study): no MAnalyse / MRecalculate / NVOFA setting
+  keeps Dancers' fast leg whole (frames 15 and 37 at 50p); uc_FRCFallback (nearest source picture where the
+  refined-vector SAD is high) is what keeps the leg today, and that is not good enough either. Design and test a
+  better fallback (detection + replacement).
+- CudaMAnalyse with the default `meander=true` is about 6x slower than CPU MAnalyse (1080p 10-bit 4:2:2, pel 2,
+  blksize 16 overlap 8: 60 frames 22 s GPU vs 3.4 s CPU; `meander=false` 2.7 s). Same with CudaMFlowFps. Find where
+  the time goes (per-frame CPU fallback of the bad-vector search?) and make the default path at least as fast as the CPU.
 - D8 left over: vector clips' device copy cache (measure the host round trip with nsys first, DECISIONS.md D8).
 - **User:** should the bundle's `QTGMC_gpu_on()` also set `cuda_cpu_fallback = true`? Today QTGMC above 10 bit, or on a
   CPU where nnedi3 does not take its AVX2 + FMA path (AVX-512, older CPUs), stops with the CudaNNEDI3 / lookup-table
   creation error unless the script sets it.
+
+## SplatFps (branch splatfps, own DLL splatfps.dll)
+
+1. Modular split (D12), left over: the NVOFA raw grid as a vector source; `CudaSplatAnalyse` with token candidate
+   clips (needs float / 4-byte frames in the registry; low value, it duplicates the built-in path); overlap of the
+   vector source with the build; tests in the suites, docs. `MSplatVectors(CudaMAnalyse(...))` works (vector clips are
+   host frames, D8): 42 fps against 73 built-in at 1080p. Open (**User**): export of our fields as MVTools vector
+   clips (lossy).
+2. Fast CPU path: GCC / Clang full build untested; the build (~26 ms at 1080p) is the largest cost (memory-bound
+   level-0 passes: fuse them, overlap source analysis with the build).
+3. CUDA tuning (kernel shapes depend on the frame sizes): the phase-correlation FFTs and peak search are a large
+   share of GPU time; host side still ~7 ms per frame at 1080p fast against ~3.7 ms GPU (profile with nsys), ~2.2 s
+   startup per run.
+- Comparison with stock mvtools (user, 2026-11-08): how much of SplatFps' result MAnalyse / MRecalculate vectors
+  through MSplatVectors, MFlowFps / MBlockFps give on the same clips, stage by stage: which parts are new
+  (phase-correlation candidates, assignment with occlusion switch, pyramid splat build, local / temporal fallbacks)
+  and what each buys in the picture.
+- Token frames per D8, tests in every suite (framemd5 GPU exact == CPU, token / no-token, `MVCUDA_CACHE_MB=1`), docs.
+- Clip end (found 2026-11-09 on Dancers 25p -> 50p): the in-between frame(s) of the last source pair are never built.
+  `plan()` marks them `EosPlaceholder` because the backward field of N needs source N + 1 (`core/splat_me.cpp`
+  `p + 2 <= n - 1`), and `GetFrame` shows the nearest source picture, at phase 0.5 an exact copy of P (Dancers
+  frame 347 == 346: a visible stutter on the last step), at every clip length. Fix: a one-sided field for the last
+  picture (mirror of the `single` path at the clip start, no N + 1), mark the entry `Built`; CPU exact / fast and CUDA
+  alike, plus a parity case on a short clip.
+- CUDA fast is not deterministic run to run (found 2026-11-09): `CudaSplatFps(exact=false)` gives a different md5 for
+  every built frame on each run (Dancers 1080p, 60 source frames, 3 runs). Size: 749 of 120 frames' samples
+  (0.0002 %) differ, each by exactly 1 (10-bit). `exact=true` on the GPU and both CPU versions are identical in every
+  run. Suspect: float atomics / reduction order in a fast kernel (unconfirmed). Fix or document; until then md5 checks
+  of CUDA fast against an earlier run fail without a code change, so parity checks of that path need a tolerance
+  (+-1) instead of md5.
+- **User decision, postponed (2026-11-09):** the quality option `speed_change_cost=0.25, splat_err_scale=30` stays a
+  documented option, not the default. It is better in every case measured so far on the test corpus (all 10 football
+  cases); the HD acceptance encodes use it explicitly.
+- **User decision, postponed (2026-11-09):** the temporal fallback (`pull_strength`, `pull_error_lo`,
+  `pull_error_hi`) is off by default but still in the plugin: keep or remove. Measured against ground truth it costs
+  (judder, frames at the wrong time), though single frames look cleaner with it (fewer artefacts on deforming cloth).
+- Scene cuts: the cuts `scene_cut_error` (15) misses join very similar shots: a relative rule (a pair's error far
+  above that of the pairs before and after) instead of the absolute threshold.
+- UHD ME scale (later; HD first): the auto scale at UHD is 4. On a fast 8K->UHD football graphics scene (corpus
+  `fb_graphics`) scale 4 is clearly worse than scale 8 (more artefacts); on other UHD corpus cases (fine detail,
+  moderate motion) scale 8 is 10-20 % worse than 4. Cost is equal (UHD 300 frames: 6.3 s vs 6.5 s incl. ~2.9 s
+  decode). Plan: `me_scale=-1` = dynamic: two internal engines (auto scale and 2x), the second only analyses where
+  used; the choice from statistics the first engine has anyway (vector reach vs search range, match errors), taken
+  over a window of pairs (independent of access order) and switched only at cuts or after sustained change. First
+  UHD corpus cases from the 8K football source (fast / slow, graphics / players), check that a simple statistic
+  separates "8 better" from "4 better", then CPU + CUDA, parity, corpus run.
+- Prefetch does not help SplatFps / CudaSplatFps (MT_SERIALIZED; measured 2026-11-09, 1080p): Prefetch(4) equal to
+  none, 8 / 24 up to 2x slower (decode threads compete with the CPU version's own 24 threads). Say so in the docs.
 
 ## Tests and release
 

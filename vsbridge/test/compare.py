@@ -55,7 +55,7 @@ def vs_raw(name):
     return "raw_source('%s/%s', %d, %d, %s, 30000, 1001)" % (CLIPS, f, w, h, fmt)
 
 
-# the stored reference chains of the Linux setup (~/build/test/lin_cpu.avs, lin_gpu.avs) where that file is missing
+# the stored test chains of the Linux setup (~/build/test/lin_cpu.avs, lin_gpu.avs) where that file is missing
 LIN_AVS = ('LoadPlugin("{plugins}/{mvtools2}")\n'
            'm = {src}\n'
            'pre = m\n'
@@ -138,7 +138,7 @@ CHAINS = {
                     ANA[1] + 'sup1 = mv.MSuper(c, pel=2, levels=1)\n'
                     'bv = mv.MRecalculate(sup1, bv, blksize=8, overlap=4, thSAD=100)\n'
                     'out = mv.MCompensate(c, sup, bv)\n'),
-    'lin_cpu': ('uhd422p10', None, None),  # the stored Linux reference chain (lin_cpu.avs / lin_cpu.vpy)
+    'lin_cpu': ('uhd422p10', None, None),  # the stored Linux test chain (lin_cpu.avs / lin_cpu.vpy)
 }
 
 
@@ -221,7 +221,7 @@ GPU_CHAINS = {
                     'bv = MAnalyse(sup, isb=true, blksize=32, overlap=16, search=3, truemotion=true, chroma=true, gpu=true)\n'
                     'fv = MAnalyse(sup, isb=false, blksize=32, overlap=16, search=3, truemotion=true, chroma=true, gpu=true)\n'
                     'out = MFlowFps(c, sup, bv, fv, num=60000, den=1001, mask=2, ml=200, gpu=true)\n'),
-    'lin_gpu': ('uhd422p10', None),  # the stored Linux GPU reference chain (lin_gpu.avs / lin_gpu.vpy)
+    'lin_gpu': ('uhd422p10', None),  # the stored Linux GPU test chain (lin_gpu.avs / lin_gpu.vpy)
 }
 CPU_NAMES = list(CHAINS)
 # the chain texts as written (gpu= form), for baseline.py's CPU twins
@@ -307,7 +307,7 @@ def needs_cudafilters(name):
 
 
 def lin_avs(plugins, src, gpu):
-    """the Linux reference chain (LIN_AVS) in its current form"""
+    """the Linux test chain (LIN_AVS) in its current form"""
     return cuda_names(LIN_AVS.format(plugins=plugins, mvtools2=lib_name('mvtools2'), src=src,
                                      gpu='true' if gpu else 'false'))
 
