@@ -1,4 +1,5 @@
-"""Makes QTGMC_gpu.avsi from the FFAStrans QTGMC.avsi: the motion analysis (MSuper of the search clip, MAnalyse,
+"""Makes QTGMC_gpu.avsi from QTGMC.avsi 3.393s (realfinder AVS-Stuff, Community branch, `avs 2.6 and up/QTGMC.avsi`,
+https://github.com/realfinder/AVS-Stuff): the motion analysis (MSuper of the search clip, MAnalyse,
 MRecalculate) goes through wrappers that call the Cuda* filters of mvtools2 with QTGMC_gpu, the CPU filters without.
 
 python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]
@@ -7,11 +8,14 @@ The source is read only. The global QTGMC_gpu (default false) is declared at the
 `global QTGMC_gpu = true` after Import to switch the GPU on. A Cuda* filter that cannot run on the GPU stops with an
 error unless `global cuda_cpu_fallback = true` (then it runs on the CPU). The other mvtools calls of QTGMC are
 untouched; the GPU output side (QTGMC_gpu_out) replaces them as a whole.
+
+Every pattern must match as often as expected, else the script stops: a pattern that misses silently would leave that
+part on the CPU. The line ends of the source (CRLF or LF) are kept.
 """
 import re
 import sys
 
-SRC = r'C:\FFAStrans\Processors\avs_plugins\avsi\QTGMC.avsi'
+SRC = r'C:\dev\mvtools\profile\qtgmc\QTGMC_3.393.avsi'
 DST = r'C:\dev\mvtools\profile\qtgmc\QTGMC_gpu.avsi'
 
 
@@ -20,35 +24,43 @@ def main():
     dst = sys.argv[2] if len(sys.argv) > 2 else DST
     raw = open(src, 'rb').read()
     text = raw.decode('latin-1')
+    crlf = '\r\n' in text
+    text = text.replace('\r\n', '\n')
     n = {}
 
-    def sub(name, pattern, repl, flags=0):
+    def sub(name, pattern, repl, expect, flags=0):
         nonlocal text
         text, k = re.subn(pattern, repl, text, flags=flags)
         n[name] = k
+        if k != expect:
+            sys.exit('pattern %s: %d replacements, expected %d (QTGMC version changed?)' % (name, k, expect))
 
     # the analysis calls go through QTGMC_MSuper / QTGMC_MAnalyse / QTGMC_MRecalculate (defined at the end): CudaMSuper /
     # CudaMAnalyse / CudaMRecalculate with QTGMC_gpu, else the CPU filters; same arguments
     # (MAnalyse with the GPU: meander=QTGMC_gpu_meander; false = wavefront search, true = the slice kernel = stock result)
-    sub('msuper', r'srchClip\.MSuper\(', 'srchClip.QTGMC_MSuper(')
-    sub('manalyse', r'srchSuper\.MAnalyse\(', 'srchSuper.QTGMC_MAnalyse(')
-    sub('mrecalc', r'srchSuper\.MRecalculate\(', 'srchSuper.QTGMC_MRecalculate(')
+    # 3.39x: the calls are on srchClip_us / srchSuper_us (MEus) and MAnalyse / MRecalculate sit inside eval strings, which
+    # run in QTGMC's scope; 1 MSuper line with 2 calls, 12 MAnalyse, 24 MRecalculate (RefineMotion, RefineMotion2) + 2
+    # for ShutterBlur
+    sub('msuper', r'\b(srchClip(?:_us)?)\.MSuper\(', r'\1.QTGMC_MSuper(', 2)
+    sub('manalyse', r'\b(srchSuper(?:_us)?)\.MAnalyse\(', r'\1.QTGMC_MAnalyse(', 12)
+    sub('mrecalc', r'\b(srchSuper(?:_us)?)\.MRecalculate\(', r'\1.QTGMC_MRecalculate(', 26)
 
     # GPU search clip (cudafilters.dll): bob, temporal soften, merges,
     # KeepOnlyBobShimmerFixes, RemoveGrain 12, Gauss / Bilinear resize, the SrchClipPP 3 mt_lutxy pair as Cuda* filters,
     # bit-exact; for every preset's pre-filter (TR0 0..2, SrchClipPP 0..3, with or without chroma motion), 4:2:2 / 4:4:4 /
     # Y input, 4:2:0 without chroma motion (with it, Slower / Very Slow / Placebo differ from the CPU chain; cause not found
     # yet), 8 to 16 bit (stages without a GPU path at a bit depth fall back to their CPU
-    # filters inside)
+    # filters inside). Not with PhosphorSoft (reduceflicker + Overlay) or xflateMaTo with Rep0 (mt_inflate / mt_deflate
+    # in the repair); with MEus the search clip is downloaded (the upsizing LanczosResize runs on the CPU)
     sub('srchclip_gpu', r'(\n\tsrchClip    = srchcheck         \? srchClip : \\\n(?:[^\n]*\\\n)*[^\n]*\n)',
         lambda m: m.group(1) + '\tsrchClip    = (QTGMC_gpu && QTGMC_gpu_search && !srchcheck && InputType == 0 && UseEdiExt == 0 && TR0 >= 0 && TR0 <= 2 \\\n'
         '\t               && SrchClipPP >= 0 && SrchClipPP <= 3 && !yuy2 && !Border && !tv_range \\\n'
-        '\t               && !(Is420(planarClip) && ChromaMotion)) \\\n'
+        '\t               && !(Is420(planarClip) && ChromaMotion) && !CRTSoft && !(xflateMaTo && Rep0 > 0)) \\\n'
         '\t               ? QTGMC_gpu_srchclip( planarClip, TR0, Rep0, SrchClipPP, ChromaMotion, RepChroma, w, h, epsilon, \\\n'
-        '\t               !QTGMC_gpu_tokens || ProgSADMask > 0.0 || (ShutterBlur > 0 && SBlurLimit > 0) || (sbpc > 8 && FastMA) ) : srchClip\n')
+        '\t               !QTGMC_gpu_tokens || MEus || ProgSADMask > 0.0 || (ShutterBlur > 0 && SBlurLimit > 0) || (sbpc > 8 && FastMA) ) : srchClip\n', 1)
     # NNEDI3 interpolation (both calls) through QTGMC_gpu_nnedi3: CudaNNEDI3 (bit-exact port of plugins_JPSDR nnedi3, falls
     # back to the plugin itself where it is not exact) with QTGMC_gpu_edi
-    sub('nnedi3', r'Input\.NNEDI3\(', 'Input.QTGMC_gpu_nnedi3(')
+    sub('nnedi3', r'Input\.NNEDI3\(', 'Input.QTGMC_gpu_nnedi3(', 2)
 
     # GPU output side: with QTGMC_gpu_out, for the structures it reproduces
     # (every preset's defaults: TR1 0..2, TR2 0..3, SMode 0..2 incl. Precise, SLMode 0 / 2 with SLRad 1 / 3, Sbb 0..3,
@@ -59,8 +71,9 @@ def main():
     sub('gpu_out_flag', r'(\n\tedi1 = defined\(EdiExt\))',
         lambda m: '\n\tQTGMC_gpuOut = QTGMC_gpu && QTGMC_gpu_out && !yuy2 && InputType == 0 && !defined(EdiExt) && ChromaEdi == "" \\\n'
         '\t               && TR1 <= 2 && TR2 <= 3 && Rep1 == 0 && SourceMatch == 0 && Lossless == 0 && SMode <= 2 && SVThin <= 0.0 && Sbb <= 3 \\\n'
-        '\t               && (SLMode == 0 || SLMode == 2) && !lsb && !n16 && SubPel <= 2 && SubPelInterp == 2 && ProgSADMask <= 0.0\n'
-        '\tglobal QTGMC_gpu_edi_token = QTGMC_gpuOut && QTGMC_gpu_edi && EdiMode == "NNEDI3"' + m.group(1))
+        '\t               && (SLMode == 0 || SLMode == 2) && !lsb && !n16 && SubPel <= 2 && SubPelInterp == 2 && ProgSADMask <= 0.0 \\\n'
+        '\t               && !(xflateMaTo && Rep2 > 0)\n'
+        '\tglobal QTGMC_gpu_edi_token = QTGMC_gpuOut && QTGMC_gpu_edi && EdiMode == "NNEDI3"' + m.group(1), 1)
     sub('gpu_out_addnoise2', r'(\n\taddNoise2 = \(NoiseRestore <= 0\.0\) \? lossed2 : \\\n[^\n]*\n)',
         lambda m: m.group(1) + '\tglobal QTGMC_gpu_edi_token = false\n'
         '\taddNoise2 = QTGMC_gpuOut ? QTGMC_gpu_outside( edi, bVec1, fVec1, bVec2, fVec2, bVec3, fVec3, SubPel, SubPelInterp, hpad, vpad, \\\n'
@@ -68,7 +81,7 @@ def main():
         '\t                                              "x x y - "+ string(sharpAdj) + " * +", rgBlur, Sovs, Rep2, RepChroma, finalNoise, \\\n'
         '\t                                              "x " + noiseCentre + " scalef - " + string(GrainRestore) + " * range_half +", \\\n'
         '\t                                              "x " + noiseCentre + " scalef - " + string(NoiseRestore) + " * range_half +", \\\n'
-        '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ).CudaDownload() : addNoise2\n')
+        '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ).CudaDownload() : addNoise2\n', 1)
     text = ('global QTGMC_gpu = false # set to true after Import to run the mvtools motion analysis on the GPU (profile\\qtgmc\\make_qtgmc_gpu.py)\n'
             'global QTGMC_gpu_meander = true # with QTGMC_gpu: true = as stock QTGMC (slice search, byte-identical to the CPU-mt result), false = wavefront search (meander=false, single slice: faster on the GPU, slightly different vectors)\n'
             'global QTGMC_gpu_search = false # with QTGMC_gpu: true = the search clip is made by cudafilters.dll (needs LoadPlugin of it)\n'
@@ -127,10 +140,10 @@ def main():
              '\treturn download ? s.CudaDownload() : s\n'
              '}\n'
              '\n# NNEDI3 for QTGMC: the GPU port (its frames downloaded for the CPU filters that follow) or the plugin\n'
-             'function QTGMC_gpu_nnedi3( clip c, int "field", int "nsize", int "nns", int "qual", int "threads", bool "Y", bool "U", bool "V" )\n'
+             'function QTGMC_gpu_nnedi3( clip c, int "field", int "nsize", int "nns", int "qual", int "pscrn", int "threads", bool "Y", bool "U", bool "V" )\n'
              '{\n'
-             '\tg = QTGMC_gpu && QTGMC_gpu_edi ? c.CudaNNEDI3( field=field, nsize=nsize, nns=nns, qual=qual, threads=threads, Y=Y, U=U, V=V ) : NOP()\n'
-             '\treturn !(QTGMC_gpu && QTGMC_gpu_edi) ? c.NNEDI3( field=field, nsize=nsize, nns=nns, qual=qual, threads=threads, Y=Y, U=U, V=V ) : \\\n'
+             '\tg = QTGMC_gpu && QTGMC_gpu_edi ? c.CudaNNEDI3( field=field, nsize=nsize, nns=nns, qual=qual, pscrn=pscrn, threads=threads, Y=Y, U=U, V=V ) : NOP()\n'
+             '\treturn !(QTGMC_gpu && QTGMC_gpu_edi) ? c.NNEDI3( field=field, nsize=nsize, nns=nns, qual=qual, pscrn=pscrn, threads=threads, Y=Y, U=U, V=V ) : \\\n'
              '\t       QTGMC_gpu_edi_token ? g : g.CudaDownload()\n'
              '}\n'
              '\n# The output side of QTGMC on the GPU, on the device frames of edi, from "Get the max/min value" to addNoise2 (lossed2 =\n'
@@ -169,11 +182,12 @@ def main():
              '\trepair2     = (Rep2 == 0) ? stable : CudaKeepOnlyBobShimmerFixes( stable, edi, Rep2, RepChroma )\n'
              '\treturn NoiseRestore > 0.0 ? CudaQtgmcAddNoise( repair2, finalNoise, noiseExpr, use_expr=3, clamp_float=true, lutUV=CNmt1, addUV=CNmt2 ) : repair2\n'
              '}\n')
+    if crlf:
+        text = text.replace('\n', '\r\n')
     open(dst, 'wb').write(text.encode('latin-1'))
     print('wrote', dst)
     for k, v in n.items():
         print('  %-12s %d replacements' % (k, v))
-    # expectations for the 1338-line file of 2026-10-28: 1 MSuper (x2 variants in one line), 12 MAnalyse, 12 MRecalculate, 2 shutter
     return 0
 
 

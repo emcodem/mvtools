@@ -141,8 +141,14 @@ namespace
     CudaKobs(PClip input, PClip ref, int rep, bool chroma, IScriptEnvironment *env)
       : GenericVideoFilter(input), _ref(ref), _rep(rep)
     {
-      AVSValue args[4] = { cpu_input(input, env), cpu_input(ref, env), rep, chroma };
-      _cpu = env->Invoke("QTGMC_KeepOnlyBobShimmerFixes", AVSValue(args, 4)).AsClip();
+      // QTGMC 3.387 and later take a fifth argument (MaTo: mt_inflate / mt_deflate instead of RemoveGrain 20 + mt_logic);
+      // false is the GPU's computation. Older QTGMC versions have only four.
+      AVSValue args[5] = { cpu_input(input, env), cpu_input(ref, env), rep, chroma, false };
+      try {
+        _cpu = env->Invoke("QTGMC_KeepOnlyBobShimmerFixes", AVSValue(args, 5)).AsClip();
+      } catch (const IScriptEnvironment::NotFound &) {
+        _cpu = env->Invoke("QTGMC_KeepOnlyBobShimmerFixes", AVSValue(args, 4)).AsClip();
+      }
       vi = _cpu->GetVideoInfo();
       const int ed = rep < 10 ? rep : rep / 10, od = rep < 10 ? 0 : rep % 10;
       MvCudaFrameFormat f2;

@@ -142,7 +142,8 @@ Mark an item done by deleting it here (the commit message says what was done). *
 - QTGMC 4:2:0 + ChromaMotion: the GPU search clip differs from the CPU (Slower, Very Slow, Placebo); stage not found
   (suspects: CudaBob / GaussResize chroma placement, a chroma lut). Excluded in `qtgmc/make_qtgmc_gpu.py`.
 - QTGMC options not on the GPU: SLMode 1 / 3 / 4, Sbb with SVThin, Rep1 > 0, source match, lossless, lsb / n16, ChromaEdi,
-  EdiExt, the noise branch (FFT3D).
+  EdiExt, the noise branch (FFT3D); from 3.39x: PhosphorSoft (search clip), xflateMaTo with Rep0 / Rep2, MEus's
+  LanczosResize, temporal=true (MAnalyse), pscrn 0 / 1 (NNEDI3).
 - MMask, MFlowBlur, MBlockFps on the GPU (judged not worth it: 3-15% of CPU time); float samples, `divide`, `dct`,
   `temporal`, `outfile`, fieldShift != 0, other rfilter / sharp values.
 - CudaNVOFAnalyse: HD (pel 4) path not verified (uc_FRC's HD branch keeps the normal search); visual defects AB15
