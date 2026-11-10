@@ -251,7 +251,8 @@ progressive, SD to UHD (per-size default settings).
 
 ## VapourSynth (this branch; Linux and Windows)
 
-Not part of the Windows release bundles yet.
+Release bundles: the VapourSynth bundle for Windows and the Linux bundle (VapourSynth and AviSynth+) of this fork's
+GitHub pre-releases.
 
 mvtools2 runs under VapourSynth (API 4.0, so R55 or newer; tested with R81) unchanged: `mvtools_vsbridge` is a small AviSynth+ host on top of
 the VapourSynth API, and `libmvtools2.so` / `mvtools2.dll` only gained a `VapourSynthPluginInit2` entry point that loads
