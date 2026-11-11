@@ -42,7 +42,11 @@ def main():
     # run in QTGMC's scope; 1 MSuper line with 2 calls, 12 MAnalyse, 24 MRecalculate (RefineMotion, RefineMotion2) + 2
     # for ShutterBlur
     sub('msuper', r'\b(srchClip(?:_us)?)\.MSuper\(', r'\1.QTGMC_MSuper(', 2)
-    sub('manalyse', r'\b(srchSuper(?:_us)?)\.MAnalyse\(', r'\1.QTGMC_MAnalyse(', 12)
+    # the MAnalyse calls also pass the plain search clip and the geometry of the super clip (nv_*): QTGMC_gpu_nvof makes
+    # the vectors with CudaNVOFAnalyse, which takes the plain clip, instead of searching the super clip
+    sub('manalyse', r'\b(srchSuper(?:_us)?)\.MAnalyse\(',
+        lambda m: m.group(1) + '.QTGMC_MAnalyse( nv_clip=' + ('srchClip_us' if m.group(1).endswith('_us') else 'srchClip')
+        + ', nv_pel=(MEus) ? 1 : SubPel, nv_hpad=hpad*SubPel_us, nv_vpad=vpad*SubPel_us, ', 12)
     sub('mrecalc', r'\b(srchSuper(?:_us)?)\.MRecalculate\(', r'\1.QTGMC_MRecalculate(', 26)
 
     # GPU search clip (cudafilters.dll): bob, temporal soften, merges,
@@ -84,6 +88,8 @@ def main():
         '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ).CudaDownload() : addNoise2\n', 1)
     text = ('global QTGMC_gpu = false # set to true after Import to run the mvtools motion analysis on the GPU (profile\\qtgmc\\make_qtgmc_gpu.py)\n'
             'global QTGMC_gpu_meander = true # with QTGMC_gpu: true = as stock QTGMC (slice search, byte-identical to the CPU-mt result), false = wavefront search (meander=false, single slice: faster on the GPU, slightly different vectors)\n'
+            'global QTGMC_gpu_nvof = false # with QTGMC_gpu: MAnalyse vectors from the optical flow accelerator (CudaNVOFAnalyse, not bit-exact; MRecalculate refines them); pel 4 and GPUs without NVOFA use the exact search\n'
+            'global QTGMC_gpu_nvof_preset = 2 # with QTGMC_gpu_nvof: 1 fast, 2 medium, 3 slow\n'
             'global QTGMC_gpu_search = false # with QTGMC_gpu: true = the search clip is made by cudafilters.dll (needs LoadPlugin of it)\n'
             'global QTGMC_gpu_tokens = true # with QTGMC_gpu_search: the search clip stays on the device, MSuper / MAnalyse read it there\n'
             'global QTGMC_gpu_edi = false # with QTGMC_gpu: NNEDI3 by cudafilters.dll CudaNNEDI3 (needs LoadPlugin of it)\n'
@@ -102,6 +108,20 @@ def main():
              'scaleCSAD i']
     types = {'i': 'int', 'b': 'bool', 's': 'string', 'c': 'clip'}
 
+    def nvof_wrapper(params):
+        # QTGMC_MAnalyse: as wrapper() plus nv_clip / nv_pel / nv_hpad / nv_vpad, which only the NVOFA branch reads
+        decl = ', '.join('%s "%s"' % (types[p.split()[1]], p.split()[0]) for p in params)
+
+        def call(fn, extra):
+            return 'c.%s( %s )' % (fn, ', '.join('%s=%s' % (p.split()[0], extra.get(p.split()[0], p.split()[0])) for p in params))
+        nv = ('nv_clip.CudaNVOFAnalyse( isb=isb, delta=delta, blksize=blksize, blksizeV=blksizeV, overlap=overlap, overlapV=overlapV, '
+              'pel=nv_pel, hpad=nv_hpad, vpad=nv_vpad, chroma=chroma, preset=QTGMC_gpu_nvof_preset )')
+        return ('function QTGMC_MAnalyse( clip c, clip "nv_clip", int "nv_pel", int "nv_hpad", int "nv_vpad", %s )\n{\n'
+                '\tnvof = QTGMC_gpu && QTGMC_gpu_nvof && IsClip(nv_clip) && nv_pel <= 2 \\\n'
+                '\t       && FunctionExists("CudaNVOFAvailable") && CudaNVOFAvailable()\n'
+                '\treturn nvof ? %s \\\n\t             : QTGMC_gpu ? %s \\\n\t                       : %s\n}\n'
+                % (decl, nv, call('CudaMAnalyse', {'meander': 'Default(meander, QTGMC_gpu_meander)'}), call('MAnalyse', {})))
+
     def wrapper(name, clips, params, gpu_extra=None):
         decl = ', '.join('%s "%s"' % (types[p.split()[1]], p.split()[0]) for p in params)
         def call(fn, extra):
@@ -113,7 +133,7 @@ def main():
     text += ('\n\n# The motion analysis of QTGMC: the Cuda* filters of mvtools2 with QTGMC_gpu, else the CPU filters (same arguments).\n'
              '# With the GPU, MAnalyse searches with meander=QTGMC_gpu_meander unless meander is given.\n'
              + wrapper('MSuper', ['c'], sup_p)
-             + wrapper('MAnalyse', ['c'], ana_p, {'meander': 'Default(meander, QTGMC_gpu_meander)'})
+             + nvof_wrapper(ana_p)
              + wrapper('MRecalculate', ['c', 'vectors'], rec_p))
     text += ('\n\n# GPU version of the search clip pre-filter (QTGMC "Motion Analysis" from bobbed to srchClip), equal to the CPU lines it\n'
              '# replaces; where those leave chroma undefined (masktools U=V=1, RemoveGrain -1 without ChromaMotion) the GPU copies it\n'
