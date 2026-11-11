@@ -257,6 +257,15 @@ namespace SPLAT_NS
   }
 
   // ---- one level ---------------------------------------------------------------------------------------------------
+  // index of value c (0..2 channels, 3 weight) of accumulator cell ai (an cells): planes in the exact variant (the
+  // ordered splats add plane by plane); the fast variant interleaves a cell's four values so one vector atomic adds
+  // them together
+#ifdef SPLAT_EXACT
+  __device__ __forceinline__ size_t acc_ix(int c, size_t ai, size_t an) { return (size_t)c * an + ai; }
+#else
+  __device__ __forceinline__ size_t acc_ix(int c, size_t ai, size_t) { return 4 * ai + (size_t)c; }
+#endif
+
   // accumulator: 4 planes (3 channels, weight) of aw x ah = (w + 1) x (h + 1) (the extra row / column takes the corner
   // splats of targets on the last row / column). k_inplace writes the in-place part P st_P + N st_N: the
   // non-motion-compensated blend that the local fallback asks for
@@ -269,8 +278,8 @@ namespace SPLAT_NS
     const size_t an = (size_t)aw * ah, ai = (size_t)y * aw + x, n = (size_t)w * h, i = (size_t)y * w + x;
     const SideSample a = side_at(fp, x, y), b = side_at(fn, x, y);
     for (int c = 0; c < 3; c++)
-      acc[c * an + ai] = P[c * n + i] * a.st + N[c * n + i] * b.st;
-    acc[3 * an + ai] = a.st + b.st;
+      acc[acc_ix(c, ai, an)] = P[c * n + i] * a.st + N[c * n + i] * b.st;
+    acc[acc_ix(3, ai, an)] = a.st + b.st;
   }
 
   // bilinear forward splats of one side (blockIdx.z: 0 = P, 1 = N): the sample moves to (x + vx, y + vy) and adds
@@ -282,6 +291,22 @@ namespace SPLAT_NS
     if (x >= w || y >= h)
       return;
     const SideSample t = side_at(side ? fn : fp, x, y);
+    const int aw = w + 1, ah = h + 1;
+    const size_t an = (size_t)aw * ah, n = (size_t)w * h, i = (size_t)y * w + x;
+    const float *pic = side ? N : P;
+    // this side's in-place part (k_inplace's term) into the sample's own cell; the accumulator starts at zero
+    if (t.st != 0.0f)
+    {
+      const size_t ai = (size_t)y * aw + x;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, ai, an)]),
+        make_float4(pic[i] * t.st, pic[n + i] * t.st, pic[2 * n + i] * t.st, t.st));
+#else
+      for (int c = 0; c < 3; c++)
+        atomicAdd(&acc[acc_ix(c, ai, an)], pic[c * n + i] * t.st);
+      atomicAdd(&acc[acc_ix(3, ai, an)], t.st);
+#endif
+    }
     if (t.zero)
       return;
     const float px = (float)x + t.vx, py = (float)y + t.vy;
@@ -290,19 +315,21 @@ namespace SPLAT_NS
     const float ix = floorf(px), iy = floorf(py);
     const float fx = px - ix, fy = py - iy;
     const float wa[4] = { (1.0f - fx) * (1.0f - fy), fx * (1.0f - fy), (1.0f - fx) * fy, fx * fy };
-    const int aw = w + 1, ah = h + 1;
-    const size_t an = (size_t)aw * ah, n = (size_t)w * h, i = (size_t)y * w + x;
     const size_t base = (size_t)iy * aw + (size_t)ix;
     const size_t off[4] = { 0, 1, (size_t)aw, (size_t)aw + 1 };
-    const float *pic = side ? N : P;
     float lt[3];
     for (int c = 0; c < 3; c++)
       lt[c] = pic[c * n + i] * t.mc;
     for (int k = 0; k < 4; k++)
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, base + off[k], an)]),
+        make_float4(lt[0] * wa[k], lt[1] * wa[k], lt[2] * wa[k], wa[k] * t.mc));
+#else
       for (int c = 0; c < 3; c++)
-        atomicAdd(&acc[c * an + base + off[k]], lt[c] * wa[k]);
-      atomicAdd(&acc[3 * an + base + off[k]], wa[k] * t.mc);
+        atomicAdd(&acc[acc_ix(c, base + off[k], an)], lt[c] * wa[k]);
+      atomicAdd(&acc[acc_ix(3, base + off[k], an)], wa[k] * t.mc);
+#endif
     }
   }
 
@@ -389,8 +416,8 @@ namespace SPLAT_NS
       return;
     const int aw = w + 1, ah = h + 1;
     const size_t an = (size_t)aw * ah, ai = (size_t)y * aw + x, n = (size_t)w * h, i = (size_t)y * w + x;
-    const float sw = acc[3 * an + ai];
-    float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : acc[c * an + ai] / sw;
+    const float sw = acc[acc_ix(3, ai, an)];
+    float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : acc[acc_ix(c, ai, an)] / sw;
     if (coarser)
     {
       b = b + up_at(coarser + (size_t)c * cw * ch, cw, ch, x, y);
@@ -612,9 +639,9 @@ namespace SPLAT_NS
     for (int i = L; i >= 0; i--)
     {
       const int w = lw[i], h = lh[i];
+#ifdef SPLAT_EXACT
       cudaMemsetAsync(S.acc, 0, sizeof(float) * 4 * (w + 1) * (h + 1), st);
       k_inplace<<<grid(w, h, 1, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
-#ifdef SPLAT_EXACT
       {
         const size_t n = (size_t)w * h;
         const unsigned none = (unsigned)((size_t)(w + 1) * (h + 1));
@@ -635,6 +662,8 @@ namespace SPLAT_NS
           }
       }
 #else
+      // k_splat adds the in-place parts too (side by side, into a zeroed accumulator)
+      cudaMemsetAsync(S.acc, 0, sizeof(float) * 4 * (w + 1) * (h + 1), st);
       k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #endif
       float *o = S.rec[i & 1];
