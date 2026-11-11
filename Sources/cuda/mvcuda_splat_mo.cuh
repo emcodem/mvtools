@@ -851,6 +851,141 @@ namespace SPLAT_NS
     out[(2 * c + 1) * np + i] = (a * b2 - bxy * b1) / det;
   }
 
+#ifndef SPLAT_EXACT
+  // k_terms + refine_box sums + k_solve in one pass per 32 x 16 tile of candidate blockIdx.z (fast variant): the five
+  // weighted terms of the tile and its box apron are computed into shared memory, box-summed there (sliding sums along
+  // rows, then along columns) and solved, so the 5 term planes never travel through device memory. Same zero padding
+  // outside the picture as box_sum.
+  constexpr int REF_TX = 32, REF_TY = 16;
+
+  static size_t refine_fused_smem(int r)
+  {
+    const size_t hh = REF_TY + 2 * r, hw = REF_TX + 2 * r;
+    return sizeof(float) * 5 * hh * (hw + REF_TX);
+  }
+
+  __global__ void __launch_bounds__(256) k_refine_fused(const float *cur, const float *vecs, const float *d, const float *err,
+    int w, int h, int neg, float eps, float wscale, int r, float *out)
+  {
+    extern __shared__ float sm[];
+    const int HH = REF_TY + 2 * r, HW = REF_TX + 2 * r, c = blockIdx.z;
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
+    const int x0 = blockIdx.x * REF_TX - r, y0 = blockIdx.y * REF_TY - r;
+    const size_t np = (size_t)w * h;
+    float *T = sm;                         // [5][HH][HW] terms; later [5][REF_TY][REF_TX] column sums
+    float *Hs = sm + 5 * HH * HW;          // [5][HH][REF_TX] row sums
+    const int tp = HH * HW, hp = HH * REF_TX, vp = REF_TY * REF_TX;
+    // 1. terms (as k_terms), zero outside the picture
+    for (int k = tid; k < tp; k += nt)
+    {
+      const int lx = k % HW, ly = k / HW, x = x0 + lx, y = y0 + ly;
+      float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f, t4 = 0.0f;
+      if (x >= 0 && x < w && y >= 0 && y < h)
+      {
+        const size_t i = (size_t)y * w + x;
+        const float gx = (cur[(size_t)y * w + min(x + 1, w - 1)] - cur[(size_t)y * w + max(x - 1, 0)]) / 2.0f;
+        const float gy = (cur[(size_t)min(y + 1, h - 1) * w + x] - cur[(size_t)max(y - 1, 0) * w + x]) / 2.0f;
+        const float ixx = gx * gx, iyy = gy * gy, ixy = gx * gy;
+        const float wt = exp_ref(-err[c * np + i] / wscale);
+        float vx = vecs[2 * c * np + i], vy = vecs[(2 * c + 1) * np + i];
+        if (neg)
+        {
+          vx = -vx;
+          vy = -vy;
+        }
+        const float dd = d[c * np + i];
+        float b1 = ixx * vx + ixy * vy;
+        b1 = b1 + gx * dd;
+        float b2 = ixy * vx + iyy * vy;
+        b2 = b2 + gy * dd;
+        t0 = b1 * wt;
+        t1 = b2 * wt;
+        t2 = (ixx + eps) * wt;
+        t3 = (iyy + eps) * wt;
+        t4 = ixy * wt;
+      }
+      T[k] = t0;
+      T[tp + k] = t1;
+      T[2 * tp + k] = t2;
+      T[3 * tp + k] = t3;
+      T[4 * tp + k] = t4;
+    }
+    __syncthreads();
+    // 2. row sums: item = (term, apron row, segment of 8 columns)
+    const int size = 2 * r + 1;
+    constexpr int SEG = 8, NSX = REF_TX / SEG, NSY = REF_TY / SEG;
+    for (int it = tid; it < 5 * HH * NSX; it += nt)
+    {
+      const int sg = it % NSX, ly = (it / NSX) % HH, t = it / (NSX * HH), xs = sg * SEG;
+      const float *row = T + t * tp + ly * HW + xs;
+      float *o = Hs + t * hp + ly * REF_TX + xs;
+      float s = 0.0f;
+      for (int i = 0; i < size; i++)
+        s += row[i];
+      o[0] = s;
+#pragma unroll
+      for (int x = 1; x < SEG; x++)
+      {
+        s += row[x + 2 * r] - row[x - 1];
+        o[x] = s;
+      }
+    }
+    __syncthreads();
+    // 3. column sums: item = (term, column, segment of 8 rows) -> T reused as [5][REF_TY][REF_TX]
+    for (int it = tid; it < 5 * REF_TX * NSY; it += nt)
+    {
+      const int lx = it % REF_TX, sg = (it / REF_TX) % NSY, t = it / (REF_TX * NSY), ys = sg * SEG;
+      const float *col = Hs + t * hp + ys * REF_TX + lx;
+      float *o = T + t * vp + ys * REF_TX + lx;
+      float s = 0.0f;
+      for (int i = 0; i < size; i++)
+        s += col[i * REF_TX];
+      o[0] = s;
+#pragma unroll
+      for (int y = 1; y < SEG; y++)
+      {
+        s += col[(y + 2 * r) * REF_TX] - col[(y - 1) * REF_TX];
+        o[y * REF_TX] = s;
+      }
+    }
+    __syncthreads();
+    // 4. solve (as k_solve)
+    for (int k = tid; k < vp; k += nt)
+    {
+      const int x = x0 + r + k % REF_TX, y = y0 + r + k / REF_TX;
+      if (x >= w || y >= h)
+        continue;
+      const float b1 = T[k], b2 = T[vp + k], a = T[2 * vp + k], cc = T[3 * vp + k], bxy = T[4 * vp + k];
+      const float det = a * cc - bxy * bxy;
+      const size_t i = (size_t)y * w + x;
+      out[2 * c * np + i] = (cc * b1 - bxy * b2) / det;
+      out[(2 * c + 1) * np + i] = (a * b2 - bxy * b1) / det;
+    }
+  }
+
+  // true when the fused refinement fits this device's shared memory (else the plane-wise path runs)
+  static bool refine_fused_ready(int r)
+  {
+    static int optin = -1;
+    if (optin < 0)
+    {
+      int dev = 0, v = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+      optin = v;
+      // the kernel is latency-bound: prefer the largest shared-memory carve-out so more tiles fit per SM
+      cudaFuncSetAttribute(k_refine_fused, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+    }
+    const size_t need = refine_fused_smem(r);
+    if (need > (size_t)optin)
+      return false;
+    if (need > 48 * 1024 &&
+        cudaFuncSetAttribute(k_refine_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) != cudaSuccess)
+      return false;
+    return true;
+  }
+#endif
+
   struct RefTmp
   {
     float *d, *t0, *t1, *T, *T2;
@@ -872,12 +1007,19 @@ namespace SPLAT_NS
     const size_t np = (size_t)w * h;
     k_dfd<<<grid(w, h, n, blk), blk, 0, st>>>(cur, other, w, h, vecs, neg ? -1.0f : 1.0f, R.d);
     k_abs<<<nblk(np * n), 256, 0, st>>>(R.d, np * n, R.t0);
-    k_box_v<<<grid(w, h, n, blk), blk, 0, st>>>(R.t0, w, h, cfg.error_box, R.t1);
-    k_box_h<<<grid(w, h, n, blk), blk, 0, st>>>(R.t1, w, h, cfg.error_box, 1, -1.0f, R.t0);
+    box_sum(st, R.t0, R.t1, R.t0, w, h, n, cfg.error_box, 1, -1.0f);
+#ifndef SPLAT_EXACT
+    const int r = (cfg.refine_box - 1) / 2;
+    if (refine_fused_ready(r))
+    {
+      k_refine_fused<<<dim3((w + REF_TX - 1) / REF_TX, (h + REF_TY - 1) / REF_TY, n), blk, refine_fused_smem(r), st>>>(cur,
+        vecs, R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
+      return;
+    }
+#endif
     k_terms<<<grid(w, h, n, blk), blk, 0, st>>>(cur, vecs, R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg,
       cfg.refine_err_scale, R.T);
-    k_box_v<<<grid(w, h, 5 * n, blk), blk, 0, st>>>(R.T, w, h, cfg.refine_box, R.T2);
-    k_box_h<<<grid(w, h, 5 * n, blk), blk, 0, st>>>(R.T2, w, h, cfg.refine_box, 0, -1.0f, R.T);
+    box_sum(st, R.T, R.T2, R.T, w, h, 5 * n, cfg.refine_box, 0, -1.0f);
     k_solve<<<grid(w, h, n, blk), blk, 0, st>>>(R.T, w, h, out);
   }
 
@@ -887,8 +1029,7 @@ namespace SPLAT_NS
   {
     const dim3 blk(32, 8);
     k_absdfd<<<grid(w, h, n + 1, blk), blk, 0, st>>>(cur, other, w, h, vecs, n, R.T);
-    k_box_v<<<grid(w, h, n + 1, blk), blk, 0, st>>>(R.T, w, h, cfg.error_box, R.T2);
-    k_box_h<<<grid(w, h, n + 1, blk), blk, 0, st>>>(R.T2, w, h, cfg.error_box, 1, -1.0f, R.T);
+    box_sum(st, R.T, R.T2, R.T, w, h, n + 1, cfg.error_box, 1, -1.0f);
     k_oppmin<<<grid(w, h, n + 1, blk), blk, 0, st>>>(R.T, w, h, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode,
       errs);
   }
@@ -1006,8 +1147,7 @@ namespace SPLAT_NS
     // disorder and its box sums (2 planes each) in the space of the first smoothing, no longer needed
     float *dd = sm0, *dch = sm0 + 2 * np;
     k_lf_d<<<grid(w, h, 2, blk), blk, 0, st>>>(dv, sm1, w, h, lf_args(cfg), fwd + 2 * np, bwd + 2 * np, dd);
-    k_box_v<<<grid(w, h, 2, blk), blk, 0, st>>>(dd, w, h, cfg.fallback_box, dch);
-    k_box_h<<<grid(w, h, 2, blk), blk, 0, st>>>(dch, w, h, cfg.fallback_box, 1, cfg.fallback_cap, dd);
+    box_sum(st, dd, dch, dd, w, h, 2, cfg.fallback_box, 1, cfg.fallback_cap);
     cudaMemcpyAsync(fwd + 3 * np, dd, sizeof(float) * np, cudaMemcpyDeviceToDevice, st);
     cudaMemcpyAsync(bwd + 3 * np, dd + np, sizeof(float) * np, cudaMemcpyDeviceToDevice, st);
   }
