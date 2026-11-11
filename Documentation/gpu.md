@@ -479,6 +479,10 @@ analysis goes through the wrappers `QTGMC_MSuper` / `QTGMC_MAnalyse` / `QTGMC_MR
 `QTGMC_gpu`, the CPU filter otherwise); the GPU output side calls CudaMSuper / CudaMCompensate / CudaMDegrain directly.
 `QTGMC_gpu_meander` (default true) keeps CudaMAnalyse on the slice search, so the result is byte-identical to the stock
 CPU QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (faster, slightly different vectors).
+`global QTGMC_gpu_nvof = true` takes the MAnalyse vectors from the optical flow accelerator instead (CudaNVOFAnalyse on the
+plain search clip, `QTGMC_gpu_nvof_preset` 1 fast / 2 medium / 3 slow; MRecalculate refines them as usual): not bit-exact. The search
+itself costs about as much as the `meander=false` wavefront search (about 0.2 ms per 1080p frame, against 1.3 ms for
+the exact search); the rest of QTGMC is unchanged. SubPel 4 and GPUs without NVOFA use the exact search.
 A stage without a GPU path (above 10 bit: lookup tables and NNEDI3; NNEDI3 also on CPUs without its AVX2 + FMA path)
 stops the script at creation; set `global cuda_cpu_fallback = true` before QTGMC to run such stages on the CPU.
 
