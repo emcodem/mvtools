@@ -239,6 +239,7 @@ namespace SPLAT_NS
     struct Src
     {
       float *pic = nullptr, *A = nullptr, *B = nullptr; // 3 planes W x H; ME pictures
+      float *pyr = nullptr, *band[MAXL + 1] = {};       // its pyramid (made once, used by every frame built from it)
     };
     struct Fld
     {
@@ -329,6 +330,7 @@ namespace SPLAT_NS
       mvc::dev_free(s.pic, sizeof(float) * 3 * NP);
       mvc::dev_free(s.A, sizeof(float) * np);
       mvc::dev_free(s.B, sizeof(float) * np);
+      mvc::dev_free(s.pyr, sizeof(float) * BS_.pyr_floats());
     }
     void free_fld(Fld &f)
     {
@@ -532,7 +534,8 @@ namespace SPLAT_NS
         s.pic = (float *)mvc::dev_alloc(sizeof(float) * 3 * NP);
         s.A = (float *)mvc::dev_alloc(sizeof(float) * np);
         s.B = (float *)mvc::dev_alloc(sizeof(float) * np);
-        if (!s.pic || !s.A || !s.B)
+        s.pyr = (float *)mvc::dev_alloc(sizeof(float) * BS_.pyr_floats());
+        if (!s.pic || !s.A || !s.B || !s.pyr)
         {
           free_src(s);
           return -2;
@@ -558,6 +561,14 @@ namespace SPLAT_NS
       else
         k_s0<<<grid(W, H, 3, blk), blk, 0, st_>>>((const uint16_t *)codes_, cf_, s.pic);
       me_pics_dev(st_, cfg_, s.pic, W, H, w, h, tmp_, s.A, s.B);
+      {
+        BS_.pyr_ptrs(s.pyr, s.band);
+        float *low[MAXL + 1];
+        for (int i = 0; i < BS_.L; i++)
+          low[i] = BS_.low[0][i];
+        low[BS_.L] = s.band[BS_.L];
+        pyramid_run(st_, BS_, s.pic, low, s.band);
+      }
       trim(src_, q, spare_src_);
       src_[q] = s;
       // the fields of the previous picture as soon as its neighbours are here (the next frames need them)
@@ -597,7 +608,8 @@ namespace SPLAT_NS
       const double dd = splat::phase_pull_from_rows(pull_sums(cfg_, w, h, hr), d, strength, cfg_, nullptr);
       if (d_adj)
         *d_adj = dd;
-      rc = build_run(st_, BS_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout_);
+      rc = build_run(st_, BS_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout_, src_[p].band,
+        src_[p + 1].band);
       if (rc)
         return rc;
       const dim3 blk(32, 8);

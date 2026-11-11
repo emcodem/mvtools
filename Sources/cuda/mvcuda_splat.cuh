@@ -510,35 +510,67 @@ namespace SPLAT_NS
 #endif
       return B.failed ? -2 : 0;
     }
+    // a picture's own pyramid (bands 0 .. L - 1 and the coarsest low-pass level L) in one buffer of pyr_floats()
+    size_t pyr_floats() const
+    {
+      size_t n = 0;
+      for (int i = 0; i <= L; i++)
+        n += (size_t)3 * lw[i] * lh[i];
+      return n;
+    }
+    void pyr_ptrs(float *base, float **band) const
+    {
+      for (int i = 0; i <= L; i++)
+      {
+        band[i] = base;
+        base += (size_t)3 * lw[i] * lh[i];
+      }
+    }
   };
+
+  // pad P (3 planes W x H) and decompose it into a Laplacian pyramid: low[0 .. L] the low-pass levels (low[L] is
+  // band[L], the coarsest level), band[0 .. L - 1] the bands; S.tmp is the reduce scratch
+  static void pyramid_run(cudaStream_t st, const BuildScratch &S, const float *P, float *const *low, float *const *band)
+  {
+    const splat::Config &cfg = S.cfg;
+    const int L = S.L;
+    const int *lw = S.lw, *lh = S.lh;
+    const RTaps rt = { cfg.pyr_reduce[0], cfg.pyr_reduce[1], cfg.pyr_reduce[2], cfg.pyr_reduce[3] };
+    const dim3 blk(32, 8);
+    k_pad<<<grid(S.GW, S.GH, 3, blk), blk, 0, st>>>(P, S.W, S.H, low[0], S.GW, S.GH, cfg.pad_x, cfg.pad_y);
+    for (int i = 0; i < L; i++)
+    {
+      k_reduce_v<<<grid(lw[i], lh[i + 1], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], S.tmp, lh[i + 1], rt);
+      k_reduce_h<<<grid(lw[i + 1], lh[i + 1], 3, blk), blk, 0, st>>>(S.tmp, lw[i], lh[i + 1], low[i + 1], lw[i + 1], rt);
+    }
+    for (int i = 0; i < L; i++)
+      k_band<<<grid(lw[i], lh[i], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], low[i + 1], lw[i + 1], lh[i + 1], band[i]);
+  }
 
   // The picture build on device buffers: P, N 3 planes W x H, fwdP / bwdN 4 planes of the ME grid, dout 3 planes W x H.
   // Steps: pad and decompose both pictures into Laplacian pyramids, projection fields of both sides, per-level fields,
   // then per level from coarse to fine: in-place weights, splats, normalisation plus reconstruction; finally crop.
   // Only queues work on st (S belongs to st until it is done). -2 on a launch failure.
+  // pyrP / pyrN: the pictures' pyramids made by pyramid_run (BuildScratch::pyr_ptrs layout), or null: made here.
   static int build_run(cudaStream_t st, BuildScratch &S, const float *P, const float *N, const float *fwdP,
-    const float *bwdN, float d, float *dout)
+    const float *bwdN, float d, float *dout, float *const *pyrP = nullptr, float *const *pyrN = nullptr)
   {
     const splat::Config &cfg = S.cfg;
     const int W = S.W, H = S.H, L = S.L, GW = S.GW, GH = S.GH, MW = S.MW, MH = S.MH;
     const int *lw = S.lw, *lh = S.lh, sh = splat::ilog2(cfg.scale);
     const PrepArgs pa = { cfg.pad_x / cfg.scale, cfg.pad_y / cfg.scale, cfg.splat_err_scale, cfg.splat_min_weight,
       cfg.splat_gain };
-    const RTaps rt = { cfg.pyr_reduce[0], cfg.pyr_reduce[1], cfg.pyr_reduce[2], cfg.pyr_reduce[3] };
     const dim3 blk(32, 8);
     const float *src[2] = { P, N };
     const float *me[2] = { fwdP, bwdN };
+    float *const *pyr[2] = { pyrP, pyrN };
+    const float *band[2][MAXL + 1];
     for (int s = 0; s < 2; s++)
     {
-      k_pad<<<grid(GW, GH, 3, blk), blk, 0, st>>>(src[s], W, H, S.low[s][0], GW, GH, cfg.pad_x, cfg.pad_y);
-      for (int i = 0; i < L; i++)
-      {
-        k_reduce_v<<<grid(lw[i], lh[i + 1], 3, blk), blk, 0, st>>>(S.low[s][i], lw[i], lh[i], S.tmp, lh[i + 1], rt);
-        k_reduce_h<<<grid(lw[i + 1], lh[i + 1], 3, blk), blk, 0, st>>>(S.tmp, lw[i], lh[i + 1], S.low[s][i + 1], lw[i + 1], rt);
-      }
-      for (int i = 0; i < L; i++)
-        k_band<<<grid(lw[i], lh[i], 3, blk), blk, 0, st>>>(S.low[s][i], lw[i], lh[i], S.low[s][i + 1], lw[i + 1],
-          lh[i + 1], S.band[s][i]);
+      if (!pyr[s])
+        pyramid_run(st, S, src[s], S.low[s], S.band[s]);
+      for (int i = 0; i <= L; i++)
+        band[s][i] = pyr[s] ? pyr[s][i] : S.band[s][i];
       k_splat_prep<<<grid(MW, MH, 1, blk), blk, 0, st>>>(me[s], MW, MH, d, s, pa, S.proj[s]);
     }
     // per-level fields: stride into the full-resolution field, or own coarse fields made by repeated reduction (the
@@ -581,7 +613,7 @@ namespace SPLAT_NS
     {
       const int w = lw[i], h = lh[i];
       cudaMemsetAsync(S.acc, 0, sizeof(float) * 4 * (w + 1) * (h + 1), st);
-      k_inplace<<<grid(w, h, 1, blk), blk, 0, st>>>(S.band[0][i], S.band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
+      k_inplace<<<grid(w, h, 1, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #ifdef SPLAT_EXACT
       {
         const size_t n = (size_t)w * h;
@@ -592,21 +624,21 @@ namespace SPLAT_NS
         for (int side = 0; side < 2; side++)
           for (int corner = 0; corner < 4; corner++)
           {
-            k_keys<<<grid(w, h, 1, blk), blk, 0, st>>>(S.band[side][i], w, h, lf[side][i], corner, none, S.keys[0],
+            k_keys<<<grid(w, h, 1, blk), blk, 0, st>>>(band[side][i], w, h, lf[side][i], corner, none, S.keys[0],
               S.idxs[0]);
             size_t tb = S.sort_bytes;
             if (cub::DeviceRadixSort::SortPairs(S.sort_tmp, tb, S.keys[0], S.keys[1], S.idxs[0], S.idxs[1], (int)n, 0,
                   bits, st) != cudaSuccess)
               return -2;
-            k_ordered<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(S.band[side][i], w, h, lf[side][i], corner, none,
+            k_ordered<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(band[side][i], w, h, lf[side][i], corner, none,
               S.keys[1], S.idxs[1], S.acc);
           }
       }
 #else
-      k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(S.band[0][i], S.band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
+      k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #endif
       float *o = S.rec[i & 1];
-      k_norm<<<grid(w, h, 3, blk), blk, 0, st>>>(S.acc, S.band[0][i], S.band[1][i], w, h, d, prev, pw, ph, i == 0,
+      k_norm<<<grid(w, h, 3, blk), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, i == 0,
         cfg.hole_weight, o);
       prev = o;
       pw = w;
