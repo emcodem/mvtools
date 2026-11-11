@@ -59,7 +59,8 @@ Mark an item done by deleting it here (the commit message says what was done). *
 - CUDA fast is not deterministic run to run (found 2026-11-09): `CudaSplatFps(exact=false)` gives a different md5 for
   every built frame on each run (Dancers 1080p, 60 source frames, 3 runs). Size: 749 of 120 frames' samples
   (0.0002 %) differ, each by exactly 1 (10-bit). `exact=true` on the GPU and both CPU versions are identical in every
-  run. Suspect: float atomics / reduction order in a fast kernel (unconfirmed). Fix or document; until then md5 checks
+  run. Cause (confirmed 2026-11-11): the float atomicAdd splats of `k_splat` add in a varying order; the released
+build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or document; until then md5 checks
   of CUDA fast against an earlier run fail without a code change, so parity checks of that path need a tolerance
   (+-1) instead of md5.
 - **User decision, postponed (2026-11-09):** the quality option `speed_change_cost=0.25, splat_err_scale=30` stays a
