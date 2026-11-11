@@ -257,14 +257,22 @@ namespace SPLAT_NS
   }
 
   // ---- one level ---------------------------------------------------------------------------------------------------
-  // index of value c (0..2 channels, 3 weight) of accumulator cell ai (an cells): planes in the exact variant (the
-  // ordered splats add plane by plane); the fast variant interleaves a cell's four values so one vector atomic adds
-  // them together
-#ifdef SPLAT_EXACT
-  __device__ __forceinline__ size_t acc_ix(int c, size_t ai, size_t an) { return (size_t)c * an + ai; }
-#else
-  __device__ __forceinline__ size_t acc_ix(int c, size_t ai, size_t) { return 4 * ai + (size_t)c; }
+  // Accumulator layout. Vector accumulation (fast variant compiled for compute capability 9.0+, where float4 atomicAdd
+  // exists): a cell's four values (3 channels, weight) interleaved, one vector atomic per contribution, and k_splat adds
+  // the in-place parts itself. Otherwise planes (the exact variant's ordered splats add plane by plane; scalar atomics
+  // on interleaved cells measured several times slower) and k_inplace writes the in-place parts first.
+#if !defined(SPLAT_EXACT) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define SPLAT_VEC_ACC 1
 #endif
+  // index of value c (0..2 channels, 3 weight) of accumulator cell ai (an cells)
+  __device__ __forceinline__ size_t acc_ix(int c, size_t ai, size_t an)
+  {
+#ifdef SPLAT_VEC_ACC
+    return 4 * ai + (size_t)c;
+#else
+    return (size_t)c * an + ai;
+#endif
+  }
 
   // accumulator: 4 planes (3 channels, weight) of aw x ah = (w + 1) x (h + 1) (the extra row / column takes the corner
   // splats of targets on the last row / column). k_inplace writes the in-place part P st_P + N st_N: the
@@ -294,19 +302,12 @@ namespace SPLAT_NS
     const int aw = w + 1, ah = h + 1;
     const size_t an = (size_t)aw * ah, n = (size_t)w * h, i = (size_t)y * w + x;
     const float *pic = side ? N : P;
+#ifdef SPLAT_VEC_ACC
     // this side's in-place part (k_inplace's term) into the sample's own cell; the accumulator starts at zero
     if (t.st != 0.0f)
-    {
-      const size_t ai = (size_t)y * aw + x;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, ai, an)]),
+      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, (size_t)y * aw + x, an)]),
         make_float4(pic[i] * t.st, pic[n + i] * t.st, pic[2 * n + i] * t.st, t.st));
-#else
-      for (int c = 0; c < 3; c++)
-        atomicAdd(&acc[acc_ix(c, ai, an)], pic[c * n + i] * t.st);
-      atomicAdd(&acc[acc_ix(3, ai, an)], t.st);
 #endif
-    }
     if (t.zero)
       return;
     const float px = (float)x + t.vx, py = (float)y + t.vy;
@@ -322,7 +323,7 @@ namespace SPLAT_NS
       lt[c] = pic[c * n + i] * t.mc;
     for (int k = 0; k < 4; k++)
     {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#ifdef SPLAT_VEC_ACC
       atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, base + off[k], an)]),
         make_float4(lt[0] * wa[k], lt[1] * wa[k], lt[2] * wa[k], wa[k] * t.mc));
 #else
@@ -574,6 +575,21 @@ namespace SPLAT_NS
       k_band<<<grid(lw[i], lh[i], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], low[i + 1], lw[i + 1], lh[i + 1], band[i]);
   }
 
+#ifndef SPLAT_EXACT
+  // true when the loaded k_splat was compiled with vector accumulation (SPLAT_VEC_ACC): decided by the PTX version of
+  // the code the driver runs, which can be older than the device (PTX JIT-compiled for a newer GPU)
+  static bool splat_vec_acc()
+  {
+    static int v = -1;
+    if (v < 0)
+    {
+      cudaFuncAttributes a = {};
+      v = cudaFuncGetAttributes(&a, k_splat) == cudaSuccess && a.ptxVersion >= 90 ? 1 : 0;
+    }
+    return v == 1;
+  }
+#endif
+
   // The picture build on device buffers: P, N 3 planes W x H, fwdP / bwdN 4 planes of the ME grid, dout 3 planes W x H.
   // Steps: pad and decompose both pictures into Laplacian pyramids, projection fields of both sides, per-level fields,
   // then per level from coarse to fine: in-place weights, splats, normalisation plus reconstruction; finally crop.
@@ -662,8 +678,10 @@ namespace SPLAT_NS
           }
       }
 #else
-      // k_splat adds the in-place parts too (side by side, into a zeroed accumulator)
+      // with vector accumulation k_splat adds the in-place parts too (side by side, into a zeroed accumulator)
       cudaMemsetAsync(S.acc, 0, sizeof(float) * 4 * (w + 1) * (h + 1), st);
+      if (!splat_vec_acc())
+        k_inplace<<<grid(w, h, 1, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
       k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #endif
       float *o = S.rec[i & 1];
