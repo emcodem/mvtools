@@ -101,6 +101,86 @@ namespace SPLAT_NS
     out[off + x] = s;
   }
 
+#ifndef SPLAT_EXACT
+  // Sliding box sums (fast variant): the same zero-padded separable box, but each thread sums one window directly and
+  // then slides it over a short segment (add the entering sample, drop the leaving one), so the cost per sample no
+  // longer grows with the box size. Short segments keep the rounding of the running sum local (only samples of the
+  // segment's own neighbourhood ever enter it); the result differs from the in-order sums in the last bits only.
+  constexpr int BOX_SEG_V = 16, BOX_SEG_H = 8, BOX_H_THREADS = 64;
+
+  // vertical: thread = (column x, segment of BOX_SEG_V rows); planes along blockIdx.z
+  __global__ void k_boxs_v(const float *in, int w, int h, int size, float *out)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y0 = (blockIdx.y * blockDim.y + threadIdx.y) * BOX_SEG_V;
+    if (x >= w || y0 >= h)
+      return;
+    const size_t off = (size_t)blockIdx.z * w * h + x;
+    const int r = (size - 1) / 2;
+    auto g = [&](int yy) { return (yy < 0 || yy >= h) ? 0.0f : in[off + (size_t)yy * w]; };
+    float s = 0.0f;
+    for (int i = -r; i <= r; i++)
+      s += g(y0 + i);
+    out[off + (size_t)y0 * w] = s;
+    const int y1 = min(y0 + BOX_SEG_V, h);
+    for (int y = y0 + 1; y < y1; y++)
+    {
+      s += g(y + r) - g(y - r - 1);
+      out[off + (size_t)y * w] = s;
+    }
+  }
+
+  // horizontal: block = one row of one plane (blockIdx.x = row, blockIdx.y = plane), the zero-padded row in shared
+  // memory (w + size - 1 floats), thread = segment of BOX_SEG_H columns; average: / size^2, max_val >= 0: cap
+  __global__ void k_boxs_h(const float *in, int w, int h, int size, int average, float max_val, float *out)
+  {
+    extern __shared__ float row[];
+    const int r = (size - 1) / 2, n = w + 2 * r;
+    const size_t off = (size_t)blockIdx.y * w * h + (size_t)blockIdx.x * w;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+      row[i] = (i < r || i >= r + w) ? 0.0f : in[off + i - r];
+    __syncthreads();
+    const float inv = 1.0f / (float)(size * size);
+    auto put = [&](int x, float s) {
+      if (average)
+        s = s * inv;
+      if (max_val >= 0.0f)
+        s = fminf(max_val, s);
+      out[off + x] = s;
+    };
+    for (int x0 = threadIdx.x * BOX_SEG_H; x0 < w; x0 += blockDim.x * BOX_SEG_H)
+    {
+      // row[x + r + i] = sample x + i
+      float s = 0.0f;
+      for (int i = 0; i < size; i++)
+        s += row[x0 + i];
+      put(x0, s);
+      const int x1 = min(x0 + BOX_SEG_H, w);
+      for (int x = x0 + 1; x < x1; x++)
+      {
+        s += row[x + 2 * r] - row[x - 1];
+        put(x, s);
+      }
+    }
+  }
+#endif
+
+  // separable zero-padded box over `planes` planes: in -> tmp (vertical) -> out (horizontal); out may be in
+  static void box_sum(cudaStream_t st, const float *in, float *tmp, float *out, int w, int h, int planes, int size,
+    int average, float max_val)
+  {
+#ifdef SPLAT_EXACT
+    const dim3 blk(32, 8);
+    k_box_v<<<grid(w, h, planes, blk), blk, 0, st>>>(in, w, h, size, tmp);
+    k_box_h<<<grid(w, h, planes, blk), blk, 0, st>>>(tmp, w, h, size, average, max_val, out);
+#else
+    const dim3 bv(32, 4);
+    const int segs = (h + BOX_SEG_V - 1) / BOX_SEG_V;
+    k_boxs_v<<<dim3((w + bv.x - 1) / bv.x, (segs + bv.y - 1) / bv.y, planes), bv, 0, st>>>(in, w, h, size, tmp);
+    k_boxs_h<<<dim3(h, planes), BOX_H_THREADS, sizeof(float) * (w + size - 1), st>>>(tmp, w, h, size, average, max_val,
+      out);
+#endif
+  }
+
   // edge-aware error filter, mode 0: (1 - wq) e + wq / 2 (min of e D px left / right + min of e D px up / down; D =
   // error_edge_dist, 3 by default); next to a motion edge one of each opposite pair lies on the side that owns the vector
   // mode 1: shiftable windows, (1 - wq) e + wq min of e at the four diagonal shifts (+-D, +-D)
@@ -278,8 +358,7 @@ namespace SPLAT_NS
     if (n > 0)
       cudaMemcpyAsync(dv, vecs, sizeof(float) * 2 * np * n, cudaMemcpyHostToDevice, st);
     k_absdfd<<<grid(w, h, n + 1, blk), blk, 0, st>>>(dc, dn, w, h, dv, n, t0);
-    k_box_v<<<grid(w, h, n + 1, blk), blk, 0, st>>>(t0, w, h, cfg.error_box, t1);
-    k_box_h<<<grid(w, h, n + 1, blk), blk, 0, st>>>(t1, w, h, cfg.error_box, 1, -1.0f, t0);
+    box_sum(st, t0, t1, t0, w, h, n + 1, cfg.error_box, 1, -1.0f);
     k_oppmin<<<grid(w, h, n + 1, blk), blk, 0, st>>>(t0, w, h, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode, t1);
     cudaMemcpyAsync(errs, t1, sizeof(float) * np * (n + 1), cudaMemcpyDeviceToHost, st);
     return finish(st);
@@ -305,8 +384,7 @@ namespace SPLAT_NS
     k_g3<<<grid(w, h, 2 * count, blk), blk, 0, st>>>(dv, w, h, 0, h0, h1, sm0);
     k_g3<<<grid(w, h, 2 * count, blk), blk, 0, st>>>(sm0, w, h, 1, h0, h1, sm1);
     k_lf_d<<<grid(w, h, count, blk), blk, 0, st>>>(dv, sm1, w, h, lf_args(cfg), nullptr, nullptr, dd);
-    k_box_v<<<grid(w, h, count, blk), blk, 0, st>>>(dd, w, h, cfg.fallback_box, dch);
-    k_box_h<<<grid(w, h, count, blk), blk, 0, st>>>(dch, w, h, cfg.fallback_box, 1, cfg.fallback_cap, dd);
+    box_sum(st, dd, dch, dd, w, h, count, cfg.fallback_box, 1, cfg.fallback_cap);
     cudaMemcpyAsync(ch3, dd, sizeof(float) * np * count, cudaMemcpyDeviceToHost, st);
     return finish(st);
   }
