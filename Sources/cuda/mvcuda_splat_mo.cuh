@@ -852,18 +852,19 @@ namespace SPLAT_NS
   }
 
 #ifndef SPLAT_EXACT
-  // k_terms + refine_box sums + k_solve in one pass per 32 x 16 tile of candidate blockIdx.z (fast variant): the five
+  // k_terms + refine_box sums + k_solve in one pass per TX x TY tile of candidate blockIdx.z (fast variant): the five
   // weighted terms of the tile and its box apron are computed into shared memory, box-summed there (sliding sums along
   // rows, then along columns) and solved, so the 5 term planes never travel through device memory. Same zero padding
   // outside the picture as box_sum.
-  constexpr int REF_TX = 32, REF_TY = 16;
-
-  static size_t refine_fused_smem(int r)
+  // Tile 16 x 16: about 28 KB of shared memory at the default box, so at least two blocks fit an SM on every supported
+  // GPU (64 KB per SM on Turing; three per SM on 100 KB parts, measured faster there than 32 x 16 tiles).
+  template <int TX, int TY> static size_t refine_fused_smem(int r)
   {
-    const size_t hh = REF_TY + 2 * r, hw = REF_TX + 2 * r;
-    return sizeof(float) * 5 * hh * (hw + REF_TX);
+    const size_t hh = TY + 2 * r, hw = TX + 2 * r;
+    return sizeof(float) * 5 * hh * (hw + TX);
   }
 
+  template <int REF_TX, int REF_TY>
   __global__ void __launch_bounds__(256) k_refine_fused(const float *cur, const float *vecs, const float *d, const float *err,
     int w, int h, int neg, float eps, float wscale, int r, float *out)
   {
@@ -963,26 +964,27 @@ namespace SPLAT_NS
     }
   }
 
-  // true when the fused refinement fits this device's shared memory (else the plane-wise path runs)
+  // true when the fused refinement (16 x 16 tiles) runs on this device for box radius r: its block must fit twice into
+  // an SM's shared memory (one block per SM leaves it latency-bound); else the plane-wise path runs
   static bool refine_fused_ready(int r)
   {
-    static int optin = -1;
+    static int optin = -1, per_sm = 0, reserved = 0;
     if (optin < 0)
     {
       int dev = 0, v = 0;
       cudaGetDevice(&dev);
       cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-      optin = v;
+      cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+      cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
       // the kernel is latency-bound: prefer the largest shared-memory carve-out so more tiles fit per SM
-      cudaFuncSetAttribute(k_refine_fused, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+      cudaFuncSetAttribute(k_refine_fused<16, 16>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+      optin = v;
     }
-    const size_t need = refine_fused_smem(r);
-    if (need > (size_t)optin)
-      return false;
-    if (need > 48 * 1024 &&
-        cudaFuncSetAttribute(k_refine_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) != cudaSuccess)
-      return false;
-    return true;
+    auto fits = [&](size_t need) { return need <= (size_t)optin && 2 * (need + reserved) <= (size_t)per_sm; };
+    auto allow = [&](const void *f, size_t need) {
+      return need <= 48 * 1024 || cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) == cudaSuccess;
+    };
+    return fits(refine_fused_smem<16, 16>(r)) && allow((const void *)k_refine_fused<16, 16>, refine_fused_smem<16, 16>(r));
   }
 #endif
 
@@ -1012,8 +1014,8 @@ namespace SPLAT_NS
     const int r = (cfg.refine_box - 1) / 2;
     if (refine_fused_ready(r))
     {
-      k_refine_fused<<<dim3((w + REF_TX - 1) / REF_TX, (h + REF_TY - 1) / REF_TY, n), blk, refine_fused_smem(r), st>>>(cur,
-        vecs, R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
+      k_refine_fused<16, 16><<<dim3((w + 15) / 16, (h + 15) / 16, n), blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs,
+        R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
       return;
     }
 #endif
