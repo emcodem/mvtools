@@ -26,7 +26,7 @@ CLIPS = os.environ.get('MVPF_CLIPS', os.path.expanduser('~/clips')).replace('\\'
 PLUGINS = os.environ.get('MVPF_PLUGIN_DIR', os.path.expanduser('~/build/test/vsplugins')).replace('\\', '/')
 AVSMD5 = os.environ.get('AVSMD5', os.path.join(HERE, 'avsmd5.py') if WIN else os.path.expanduser('~/opt/bin/avsmd5'))
 TMP = os.environ.get('TMPDIR', os.environ.get('TEMP', '/tmp')).replace('\\', '/')
-LSMASH = os.environ.get('MVPF_LSMASH', 'C:/dev/uconvert/dlls/LSMASHSource.dll').replace('\\', '/')
+LSMASH = os.environ.get('MVPF_LSMASH', '').replace('\\', '/')  # Windows: LSMASHSource.dll, required there
 
 
 def lib_name(name):
@@ -331,11 +331,13 @@ def run_chain(name):
     avs_src, vs_src = SOURCES[src]
     avs = os.path.join(TMP, 'vsb_%s.avs' % name)
     vpy = os.path.join(TMP, 'vsb_%s.vpy' % name)
+    if WIN and not LSMASH:
+        sys.exit('set MVPF_LSMASH (LSMASHSource.dll)')
     pre = 'LoadPlugin("%s")\n' % LSMASH if WIN else ''
     if avs_body is None:
         stored = os.path.expanduser('~/build/test/%s.avs' % name)
         if not WIN and os.path.exists(stored):
-            avs_text = cuda_names(open(stored).read().replace('/home/emcodem/build/test/plugins', PLUGINS))
+            avs_text = cuda_names(open(stored).read().replace(os.path.expanduser('~/build/test/plugins'), PLUGINS))
         else:
             avs_text = pre + lin_avs(PLUGINS, avs_src, name == 'lin_gpu')
         write(avs, avs_text)

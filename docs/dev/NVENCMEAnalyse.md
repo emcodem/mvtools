@@ -287,7 +287,7 @@ it in the same change; its md5 must stay FA834251D140.
 (default 2, env override) because of the GeForce session cap; when a session cannot be opened, the frame uses the
 MAnalyse fallback (stderr message once). `SetCacheHints`: MT_NICE_FILTER.
 
-**uc_FRC** (`C:\dev\uconvert\uconvert.avsi`, not in git: back up first): `global uc_frc_nvencme = 0`; branch order:
+**uc_FRC** (`uconvert/uconvert.avsi`): `global uc_frc_nvencme = 0`; branch order:
 NVOFA if `uc_frc_nvof > 0` and available, else NVENC ME if `uc_frc_nvencme > 0` and
 `FunctionExists("NVENCMEAvailable") ? NVENCMEAvailable() : false`, else the normal branch. Same `pre` input, no `supf`;
 independent of `uc_frc_gpu` (must work where mvtools_cuda refuses the device).

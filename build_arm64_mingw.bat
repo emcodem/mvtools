@@ -6,7 +6,6 @@ rem
 rem   LLVM_MINGW_ROOT  llvm-mingw installation (https://github.com/mstorsjo/llvm-mingw/releases)
 rem   BUILD_DIR        build directory (default: build\arm64_mingw, removed first)
 setlocal
-if not defined LLVM_MINGW_ROOT set "LLVM_MINGW_ROOT=C:\avsplus_build_deps\llvm-mingw-20261020-ucrt-x86_64"
 if not defined BUILD_DIR set "BUILD_DIR=%~dp0build\arm64_mingw"
 set "OUT=%~dp0out\ARM64\llvm-mingw"
 

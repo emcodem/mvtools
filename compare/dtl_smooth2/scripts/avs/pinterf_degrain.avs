@@ -1,7 +1,7 @@
-LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
-LoadPlugin("C:\dev\mvtools\profile\build_m1\mvtools2.dll")
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
+LoadPlugin("C:\path\to\build_m1\mvtools2.dll")
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + ".lwi")
 src = m.Trim(0, 29)
 sup = MSuper(src, pel=2, mt=false)

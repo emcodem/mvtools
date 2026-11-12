@@ -3,7 +3,7 @@
 param([string]$Extra = '', [string]$Tag = 'base', [string[]]$Dlls = @('ours', 'dtl'))
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
-$dll = @{ ours = 'C:\dev\mvtools\profile\build_m1\mvtools2.dll'; dtl = "$here\build\mvtools2.dll" }
+$dll = @{ ours = 'C:\path\to\build_m1\mvtools2.dll'; dtl = "$here\build\mvtools2.dll" }
 $fmt = [ordered]@{
   '10_422' = ''
   '8_422' = '.ConvertBits(8, dither=-1)'
@@ -13,10 +13,10 @@ $fmt = [ordered]@{
 }
 $ex = if ($Extra) { ", $Extra" } else { '' }
 $head = @'
-LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
+LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
 LoadPlugin("{DLL}")
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + ".lwi"){FMT}
 '@
 $frc = @'

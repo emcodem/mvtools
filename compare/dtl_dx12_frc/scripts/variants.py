@@ -20,15 +20,15 @@ import os
 import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OURS = r'C:\dev\mvtools\profile\build_nvofa\mvtools2.dll'
-DTL = os.environ.get('DTL_PLUGIN', r'C:\dev\mvtools\profile\dtl_dx12\mvtools2.dll')
-PROTO = os.environ.get('NVME_PLUGIN', r'C:\dev\mvtools\profile\build_nvme_proto\nvencme_proto.dll')
+OURS = r'C:\path\to\build_nvofa\mvtools2.dll'
+DTL = os.environ.get('DTL_PLUGIN', r'C:\path\to\dtl_dx12\mvtools2.dll')
+PROTO = os.environ.get('NVME_PLUGIN', r'C:\path\to\build_nvme_proto\nvencme_proto.dll')
 TIMEOUT = 900  # seconds for one ffmpeg run; a stalled GPU path must not hang the comparison
 
-SRC = r'''LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
+SRC = r'''LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
 LoadPlugin("%s")
-%sSEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+%sSEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, threads=4, cachefile=SEGFILE + ".lwi").ConvertBits(8).ConvertToYV12()
 pre = m.RemoveGrain(22)
 '''

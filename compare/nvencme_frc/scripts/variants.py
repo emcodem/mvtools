@@ -10,7 +10,7 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 NVOFA_AVS = os.path.normpath(os.path.join(HERE, '..', '..', 'nvofa_frc', 'scripts', 'avs', 'frc_flow.avs'))
 NVME_AVS = os.path.join(HERE, 'avs', 'frc_nvencme.avs')
-PLUGIN = os.environ.get('NVME_PLUGIN', r'C:\dev\mvtools\profile\build_nvme_proto\nvencme_proto.dll')
+PLUGIN = os.environ.get('NVME_PLUGIN', r'C:\path\to\build_nvme_proto\nvencme_proto.dll')
 
 # key, label, NVENC (preset, half) or None, MVCUDA_NVOFA, extra environment (prototype switches)
 ALL = [

@@ -10,7 +10,7 @@
 #  Usage (see build_arm64_mingw.bat):
 #    cmake -S . -B build/arm64_mingw -G Ninja -DCMAKE_BUILD_TYPE=Release ^
 #          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/llvm-mingw-aarch64.cmake ^
-#          -DLLVM_MINGW_ROOT=C:/avsplus_build_deps/llvm-mingw-20261020-ucrt-x86_64
+#          -DLLVM_MINGW_ROOT=C:/path/to/llvm-mingw-<tag>-ucrt-x86_64
 # ---------------------------------------------------------------------------
 
 set(CMAKE_SYSTEM_NAME Windows)

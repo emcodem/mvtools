@@ -40,7 +40,7 @@ if(MSVC)
 
   # NASM (x264 / mvtools asm). nasm.exe: on the PATH, in NASMPATH, or -DCMAKE_ASM_NASM_COMPILER=...
   if(NOT CMAKE_ASM_NASM_COMPILER)
-    find_program(CMAKE_ASM_NASM_COMPILER nasm HINTS ENV NASMPATH "C:/dev/tools/nasm" PATHS "$ENV{VCINSTALLDIR}")
+    find_program(CMAKE_ASM_NASM_COMPILER nasm HINTS ENV NASMPATH PATHS "$ENV{VCINSTALLDIR}")
   endif()
   enable_language(ASM_NASM)
   if(NOT CMAKE_ASM_NASM_COMPILER_LOADED)

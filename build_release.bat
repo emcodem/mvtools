@@ -32,7 +32,6 @@ rem ============================================================
 set "SRC=%~dp0"
 set "SRC=%SRC:~0,-1%"
 if not defined DEST_ROOT set "DEST_ROOT=%SRC%\build\release"
-if not defined LLVM_MINGW_ROOT set "LLVM_MINGW_ROOT=C:\avsplus_build_deps\llvm-mingw-20261020-ucrt-x86_64"
 set "SEVENZIP=%ProgramFiles%\7-Zip\7z.exe"
 
 set "_OVR_XP=%BUILD_XP%"

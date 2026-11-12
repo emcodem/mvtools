@@ -2,7 +2,7 @@
 https://github.com/realfinder/AVS-Stuff): the motion analysis (MSuper of the search clip, MAnalyse,
 MRecalculate) goes through wrappers that call the Cuda* filters of mvtools2 with QTGMC_gpu, the CPU filters without.
 
-python -I make_qtgmc_gpu.py [source.avsi] [dest.avsi]
+python -I make_qtgmc_gpu.py source.avsi dest.avsi
 
 The source is read only. The global QTGMC_gpu (default false) is declared at the top of the copy; set
 `global QTGMC_gpu = true` after Import to switch the GPU on. A Cuda* filter that cannot run on the GPU stops with an
@@ -15,13 +15,10 @@ part on the CPU. The line ends of the source (CRLF or LF) are kept.
 import re
 import sys
 
-SRC = r'C:\dev\mvtools\profile\qtgmc\QTGMC_3.393.avsi'
-DST = r'C:\dev\mvtools\profile\qtgmc\QTGMC_gpu.avsi'
-
-
 def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else SRC
-    dst = sys.argv[2] if len(sys.argv) > 2 else DST
+    if len(sys.argv) != 3:
+        sys.exit('usage: python -I make_qtgmc_gpu.py source.avsi dest.avsi')
+    src, dst = sys.argv[1], sys.argv[2]
     raw = open(src, 'rb').read()
     text = raw.decode('latin-1')
     crlf = '\r\n' in text

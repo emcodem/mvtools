@@ -39,10 +39,10 @@ VARIANTS = [
     ('plevel=0, lambda=4000', 'plevel=0, lambda=4000'),
 ]
 
-AVS = r'''LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
-LoadPlugin("C:\dev\mvtools\profile\build_nvofa\mvtools2.dll")
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+AVS = r'''LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
+LoadPlugin("C:\path\to\build_nvofa\mvtools2.dll")
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, threads=4, cachefile=SEGFILE + ".lwi")
 supf = MSuper(m.RemoveGrain(22), pel=2, hpad=16, vpad=16, rfilter=4, gpu=true)
 ba = MAnalyse(supf, isb=true, %s, gpu=true)

@@ -1,10 +1,10 @@
 # uc_FRC chain, GPU build profile\build_nvofa. The search used by MAnalyse is chosen by the environment of the process:
 #   MVCUDA_NVOFA unset         -> exact GPU search (k_search, md5 = CPU)
 #   MVCUDA_NVOFA=fast|medium|slow -> NVOFA optical flow, MRecalculate refines as usual
-LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
-LoadPlugin("C:\dev\mvtools\profile\build_nvofa\mvtools2.dll")
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
+LoadPlugin("C:\path\to\build_nvofa\mvtools2.dll")
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, threads=4, cachefile=SEGFILE + ".lwi")
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, gpu=true)

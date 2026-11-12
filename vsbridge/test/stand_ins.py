@@ -14,6 +14,14 @@ import re
 import subprocess
 import sys
 
+
+def need(var, what):
+    """Value of a required environment variable (no machine-specific default)."""
+    v = os.environ.get(var)
+    if not v:
+        sys.exit('set %s (%s)' % (var, what))
+    return v
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(HERE, 'stand_ins.ref')
 
@@ -65,7 +73,7 @@ FIELDS = ('width', 'height', 'pixel_type', 'fps_numerator', 'fps_denominator', '
 def make_ref():
     sys.path.insert(0, HERE)
     from avs_info import video_info
-    base = os.environ.get('AVS_PLUGINS', r'C:\FFAStrans\Processors\avs_plugins').replace('\\', '/')
+    base = need('AVS_PLUGINS', 'FFAStrans avs_plugins folder').replace('\\', '/')
     head = ('LoadPlugin("%s/MaskTools/x64/masktools2.dll")\nLoadPlugin("%s/RgTools/x64/RgTools.dll")\n'
             'LoadPlugin("%s/JPSDR/x64/plugins_JPSDR.dll")\nImport("%s/avsi/QTGMC.avsi")\n' % (base, base, base, base))
     lines = []

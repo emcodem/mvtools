@@ -10,7 +10,7 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Next
 
-- uconvert.avsi (`C:\dev\uconvert`, D8 done): switch `uc_frc_gpu` to the Cuda* names (+ CudaDownload at the end of the
+- uconvert.avsi (`uconvert/`, D8 done): switch `uc_frc_gpu` to the Cuda* names (+ CudaDownload at the end of the
   FRC chain, cudafilters.dll loaded), deploy a new all-arch DLL set (replaces its mvtools2.dll too: 2.7.48 CPU result),
   uc_FRC HD branch with the whole pel-4 chain on the GPU (CudaMSuper is lite at pel 4 since D8; `run_frc_pel4.ps1`
   passes), the MxfSource -> LWLibav fallback (wrong frames on random access with Prefetch: use ffms2 or no Prefetch

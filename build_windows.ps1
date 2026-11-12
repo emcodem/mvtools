@@ -12,7 +12,7 @@
              toolset is MSVC 14.4x (v143; -VcvarsVer, default: the newest 14.4x installed): CUDA 12 does not accept the
              VS 2026 STL (14.5x). VS 2026: install the component "MSVC v143 - VS 2022 C++ x64/x86 build tools".
     CMake / Ninja  the copies inside Visual Studio, else the PATH
-    NASM     -Nasm, %NASMPATH%, the PATH, C:\dev\tools\nasm, Visual Studio's VC folder
+    NASM     -Nasm, %NASMPATH%, the PATH, Visual Studio's VC folder, %ProgramFiles%\NASM
     nvcc     CUDA 12.8 .. 12.x only (12.9 recommended; CUDA 13 has no Pascal / Volta targets): -Nvcc, %CUDA_PATH_V12_9%,
              %CUDA_PATH_V12_8%, the newest 12.x under "NVIDIA GPU Computing Toolkit", %CUDA_PATH%, the PATH;
              -NoCuda skips mvtools_cuda
@@ -132,7 +132,7 @@ if (-not $ninja) { throw 'ninja.exe not found' }
 # --- NASM (mvtools2's assembler sources) ----------------------------------------------------------------------------
 if (-not $Nasm) {
   $Nasm = Find-First @($(if ($env:NASMPATH) { Join-Path $env:NASMPATH 'nasm.exe' }), (Find-OnPath 'nasm'),
-    'C:\dev\tools\nasm\nasm.exe', (Join-Path $vsPath 'VC\nasm.exe'), (Join-Path $env:ProgramFiles 'NASM\nasm.exe'))
+    (Join-Path $vsPath 'VC\nasm.exe'), (Join-Path $env:ProgramFiles 'NASM\nasm.exe'))
 }
 if (-not $Nasm) { throw 'nasm.exe not found (-Nasm or NASMPATH); mvtools2 needs it with MSVC' }
 

@@ -17,6 +17,14 @@ import subprocess
 import sys
 import tempfile
 
+
+def need(var, what):
+    """Value of a required environment variable (no machine-specific default)."""
+    v = os.environ.get(var)
+    if not v:
+        sys.exit('set %s (%s)' % (var, what))
+    return v
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(HERE, 'cf_chains.md5')
 
@@ -76,9 +84,9 @@ def avs_body(body):
 
 
 def make_ref():
-    ffmpeg = os.environ.get('FFMPEG', r'C:\FFAStrans\Processors\ffmpeg\x64\ffmpeg.exe')
-    bundle = os.environ.get('BUNDLE', r'C:\dev\mvtools\release\mvtools_gpu_qtgmc_2026-11-01b').replace('\\', '/')
-    base = os.environ.get('AVS_PLUGINS', r'C:\FFAStrans\Processors\avs_plugins').replace('\\', '/')
+    ffmpeg = os.environ.get('FFMPEG', 'ffmpeg')
+    bundle = need('BUNDLE', 'release bundle folder').replace('\\', '/')
+    base = need('AVS_PLUGINS', 'FFAStrans avs_plugins folder').replace('\\', '/')
     head = ''.join('LoadPlugin("%s/plugins/%s")\n' % (bundle, p) for p in
                    ('cudafilters.dll', 'masktools2.dll', 'RgTools.dll', 'plugins_JPSDR.dll'))
     head += 'Import("%s/avsi/QTGMC.avsi")\n' % base

@@ -3,11 +3,11 @@
 # and recomputes the SADs, MFlowFps interpolates, both as in the normal chain. Settings come from the caller:
 #   NVME_PLUGIN (path of nvencme_proto.dll), NVME_PRESET (1..7), NVME_HALF (true/false), NVME_LEVELS (1..4, hinted
 #   NVENC pyramid), NVME_DX12 (0: NVENC SDK, 8 / 16: D3D12 ME block size), set in a generated header.
-LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
-LoadPlugin("C:\dev\mvtools\profile\build_nvofa\mvtools2.dll")
+LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
+LoadPlugin("C:\path\to\build_nvofa\mvtools2.dll")
 LoadPlugin(NVME_PLUGIN)
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, threads=4, cachefile=SEGFILE + ".lwi")
 pre = m.RemoveGrain(22)
 sup = MSuper(m, pel=2, hpad=16, vpad=16, rfilter=4, levels=1, gpu=true)

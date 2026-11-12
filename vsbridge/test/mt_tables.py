@@ -18,6 +18,14 @@ import subprocess
 import sys
 import tempfile
 
+
+def need(var, what):
+    """Value of a required environment variable (no machine-specific default)."""
+    v = os.environ.get(var)
+    if not v:
+        sys.exit('set %s (%s)' % (var, what))
+    return v
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(HERE, 'mt_tables.md5')
 
@@ -166,8 +174,8 @@ def pix_fmt(layout, bits):
 
 
 def make_ref():
-    ffmpeg = os.environ.get('FFMPEG', r'C:\FFAStrans\Processors\ffmpeg\x64\ffmpeg.exe')
-    masktools = os.environ.get('MASKTOOLS', r'C:\FFAStrans\Processors\avs_plugins\MaskTools\x64\masktools2.dll')
+    ffmpeg = os.environ.get('FFMPEG', 'ffmpeg')
+    masktools = need('MASKTOOLS', 'masktools2.dll')
     lines = []
     with tempfile.TemporaryDirectory() as tmp:
         for case in CASES:

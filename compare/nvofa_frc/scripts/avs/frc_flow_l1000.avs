@@ -1,9 +1,9 @@
 # uc_FRC chain with MAnalyse lambda=1000 (cause of the missed pan: truemotion's lambda, README). MRecalculate as in uc_FRC.
 # Exact search (MVCUDA_NVOFA unset).
-LoadPlugin("C:\dev\uconvert\dlls\LSMASHSource.dll")
-LoadPlugin("C:\dev\uconvert\dlls\RgTools.dll")
-LoadPlugin("C:\dev\mvtools\profile\build_nvofa\mvtools2.dll")
-SEGFILE = "C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4"
+LoadPlugin("C:\path\to\plugins\LSMASHSource.dll")
+LoadPlugin("C:\path\to\plugins\RgTools.dll")
+LoadPlugin("C:\path\to\build_nvofa\mvtools2.dll")
+SEGFILE = "C:\path\to\clips\seg1_wires_pole.mp4"
 m = LWLibavVideoSource(SEGFILE, threads=4, cachefile=SEGFILE + ".lwi")
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, gpu=true)

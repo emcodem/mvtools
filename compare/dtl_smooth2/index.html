@@ -224,10 +224,10 @@ a { color: var(--accent); }
     <h2>The AviSynth+ scripts</h2>
     <p class="note">Copied unchanged from the runs, including the local paths. They differ only in the <code>LoadPlugin</code> path of mvtools2.dll, <code>smooth=2,</code> in MRecalculate and the last line. Each section above names the scripts it was made from. The missing line break before <code>out =</code> / <code>return</code> comes from the script generator; AviSynth+ parses it as two statements. The identity check ran the vec, flow and degrain scripts in five formats by appending to the source line: nothing (10-bit 4:2:2), <code>.ConvertBits(8, dither=-1)</code>, <code>.ConvertToYUV420()</code>, <code>.ConvertBits(8, dither=-1).ConvertToYUV420()</code>, <code>.ConvertToYUV444()</code>. Output: <code>ffmpeg -i x_vec.avs -f rawvideo</code> for vectors, <code>-f framemd5</code> or <code>-pix_fmt rgb24 x_%d.png</code> for pictures. All scripts, the ffmpeg commands and the patch: <a href="https://github.com/emcodem/mvtools/tree/gpu_work/compare/dtl_smooth2">github.com/emcodem/mvtools/…/compare/dtl_smooth2</a>.</p>
     <details id="s-pinterf_sm1_vec"><summary><code>pinterf_sm1_vec.avs</code> · A · our build, smooth=1 (default) · vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\build_m1\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -237,10 +237,10 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
     <details id="s-pinterf_sm1_flow"><summary><code>pinterf_sm1_flow.avs</code> · A · our build, smooth=1 · MFlowFps output frames 18–25</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\build_m1\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -251,10 +251,10 @@ bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchpar
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
 return out.Trim(18, 25)</pre></details>
     <details id="s-pinterf_degrain"><summary><code>pinterf_degrain.avs</code> · A · our build · MDegrain2 + MCompensate</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\build_m1\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 src = m.Trim(0, 29)
 sup = MSuper(src, pel=2, mt=false)
@@ -266,10 +266,10 @@ d = MDegrain2(src, sup, bv1, fv1, bv2, fv2, thSAD=400, thSCD1=50000)
 c = MCompensate(src, sup, bv1, thSCD1=50000)
 return StackHorizontal(d, c)</pre></details>
     <details id="s-dtl_sm1_vec"><summary><code>dtl_sm1_vec.avs</code> · B · DTL c688008, smooth=1 · vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -279,10 +279,10 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
     <details id="s-dtl_sm1_flow"><summary><code>dtl_sm1_flow.avs</code> · B · DTL c688008, smooth=1 · MFlowFps</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -293,10 +293,10 @@ bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, search=3, searchpar
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
 return out.Trim(18, 25)</pre></details>
     <details id="s-dtl_degrain"><summary><code>dtl_degrain.avs</code> · B · DTL c688008 · MDegrain2 + MCompensate</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 src = m.Trim(0, 29)
 sup = MSuper(src, pel=2, mt=false)
@@ -308,10 +308,10 @@ d = MDegrain2(src, sup, bv1, fv1, bv2, fv2, thSAD=400, thSCD1=50000)
 c = MCompensate(src, sup, bv1, thSCD1=50000)
 return StackHorizontal(d, c)</pre></details>
     <details id="s-pinterf_sm2_vec"><summary><code>pinterf_sm2_vec.avs</code> · control · our build, smooth=2 · vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\dev\mvtools\profile\build_m1\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\build_m1\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -321,10 +321,10 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
     <details id="s-dtl_sm2_vec"><summary><code>dtl_sm2_vec.avs</code> · B · DTL c688008, smooth=2 as released · vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -334,10 +334,10 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
     <details id="s-dtl_sm2_flow"><summary><code>dtl_sm2_flow.avs</code> · B · DTL c688008, smooth=2 as released · MFlowFps</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\build\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\build\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -348,10 +348,10 @@ bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3,
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)out = MFlowFps(m, sup, bv, fv, num=24000, den=1001, mask=2, ml=200, blend=false)
 return out.Trim(18, 25)</pre></details>
     <details id="s-fix_sm2_vec"><summary><code>fix_sm2_vec.avs</code> · B · DTL c688008 + radius patch, smooth=2 · vector frames</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\buildfix\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
@@ -361,10 +361,10 @@ fv = MAnalyse(supf, isb=false, blksize=32, overlap=16, search=3, searchparam=2, 
 bv = MRecalculate(sup, bv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)
 fv = MRecalculate(sup, fv, blksize=16, overlap=8, thSAD=100, smooth=2, search=3, searchparam=2, truemotion=true, chroma=true, mt=false)return Interleave(bv.Trim(10, -1), fv.Trim(10, -1), bv.Trim(50, -1), fv.Trim(50, -1))</pre></details>
     <details id="s-fix_sm2_flow"><summary><code>fix_sm2_flow.avs</code> · B · DTL c688008 + radius patch, smooth=2 · MFlowFps</summary>
-<pre class="mono src">LoadPlugin(&quot;C:\dev\uconvert\dlls\LSMASHSource.dll&quot;)
-LoadPlugin(&quot;C:\dev\uconvert\dlls\RgTools.dll&quot;)
-LoadPlugin(&quot;C:\Users\User\AppData\Local\Temp\claude\C--dev-mvtools-mvtools\91946ad5-43ab-4a78-8fef-4a9c93d7c949\scratchpad\dtl\buildfix\mvtools2.dll&quot;)
-SEGFILE = &quot;C:\dev\mvtools\profile\clips\seg1_wires_pole.mp4&quot;
+<pre class="mono src">LoadPlugin(&quot;C:\path\to\plugins\LSMASHSource.dll&quot;)
+LoadPlugin(&quot;C:\path\to\plugins\RgTools.dll&quot;)
+LoadPlugin(&quot;C:\path\to\dtl\buildfix\mvtools2.dll&quot;)
+SEGFILE = &quot;C:\path\to\clips\seg1_wires_pole.mp4&quot;
 m = LWLibavVideoSource(SEGFILE, cachefile=SEGFILE + &quot;.lwi&quot;)
 pre = m.RemoveGrain(22)
 supf = MSuper(pre, pel=2, hpad=16, vpad=16, rfilter=4, mt=false)
