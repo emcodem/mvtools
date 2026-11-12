@@ -1,0 +1,29 @@
+{
+  "name": "uc_interlace",
+  "description": "UConvert interlace step for CudaConvolution (same size, progressive at field rate -> interlaced): UConvert's 9-tap vertical low-pass kernel, the same taps as uc_interlace_kernel in uconvert.avsi (integers / 4096). No horizontal filtering.",
+  "target": {
+    "scan": "interlaced",
+    "field_order": "tff"
+  },
+  "profiles": {
+    "uc": {
+      "arith": "round_half_up",
+      "offset_code": 512,
+      "intermediate_clip": null,
+      "border": "replicate"
+    }
+  },
+  "h": {
+    "1": {
+      "profile": "uc",
+      "luma": { "first": 0, "taps": [4096], "divisor": 4096 },
+      "chroma": { "first": 0, "taps": [4096], "divisor": 4096 }
+    }
+  },
+  "v": {
+    "1": {
+      "profile": "uc",
+      "kernel": { "first": -4, "taps": [31, -66, -235, 1075, 2486, 1075, -235, -66, 31], "divisor": 4096 }
+    }
+  }
+}

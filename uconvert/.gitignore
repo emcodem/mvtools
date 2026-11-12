@@ -1,0 +1,4 @@
+dist/
+__pycache__/
+load_plugins.avs
+tests/data_root.txt
