@@ -1618,6 +1618,7 @@ namespace
   // chain -9%).
   // (a 512-thread variant for the exhaustive_fast levels was measured: no gain)
   constexpr int SEARCH_THREADS = 256;
+  constexpr int SEARCH_NL_MAX = 1024; // k_search: longest row whose nLambda values are computed ahead (s_nl)
 
   // one Refine of trymany in one warp (one copy of the mvc_refine code for WarpChecker; two call sites in k_search)
   __device__ __noinline__ void tm_refine_warp(WarpChecker &wk, int type, int radius)
@@ -1963,6 +1964,40 @@ namespace
     return o;
   }
 
+  // Radius of the refine step when it is a single batch of rings around the best vector so far, else 0: exhaustive search
+  // (every coarse level) and Hex2Search with range <= 1, which is only its closing ExpandingSearch(1, 1) (QTGMC's
+  // pelsearch=1 at level 0). Both are CheckMV batches in ExpandingSearch order.
+  __host__ __device__ inline int ring_radius_of(int search_type, int radius)
+  {
+    if (search_type == mvc_refine::S_EXHAUSTIVE)
+      return radius <= 3 ? radius : 0; // larger radii: mvc_refine (batches of MAX_BATCH; the ring tables hold 48)
+    if (search_type == mvc_refine::S_HEX2 && radius <= 1)
+      return 1;
+    return 0;
+  }
+
+  // Refine steps the ring-only kernel (GEN = false) runs as a fixed sequence of batches, else 0 (mvc_refine needed):
+  // WP_RING: the rings of ring_radius_of; WP_HEX: Hex2Search(2..3) = the radius-2 hexagon (CheckMVdir) around the best
+  // vector, the centre moved to the winner, ExpandingSearch(1, 1) around it (the hexagon walk of larger ranges runs
+  // range / 2 - 1 = 0 times); WP_UMH: UMHSearch(2..3) = CrossSearch (+-1 only) and one hex grid ring around the best
+  // vector in one batch, then WP_HEX. QTGMC's pel-search 2 levels (Slow .. Placebo) are WP_HEX / WP_UMH.
+  enum { WP_GEN = 0, WP_RING = 1, WP_HEX = 2, WP_UMH = 3 };
+  __host__ __device__ inline int wave_plan(int search_type, int radius)
+  {
+    if (ring_radius_of(search_type, radius) > 0)
+      return WP_RING;
+    if (search_type == mvc_refine::S_HEX2 && radius >= 2 && radius <= 3)
+      return WP_HEX;
+    if (search_type == mvc_refine::S_UMH && radius >= 2 && radius <= 3)
+      return WP_UMH;
+    return WP_GEN;
+  }
+  // candidate offsets of the fixed batches in the CPU order (mvc_refine::umh with range 2..3, mvc_refine::hex2) and the
+  // values CheckMVdir hands over (the hexagon direction = index)
+  // (copied to shared memory per level: g_ws.fix_dx / fix_dy, UMH first, then the hexagon)
+  __device__ const int g_fix_dx[26] = { -1, 1, 0, 0, -4, -4, -4, -4, -4, 4, 4, 4, 4, 4, 2, 0, -2, -2, 0, 2, -2, -1, 1, 2, 1, -1 };
+  __device__ const int g_fix_dy[26] = { 0, 0, 1, -1, 2, 1, 0, -1, -2, -2, -1, 0, 1, 2, 3, 4, 3, -3, -4, -3, 0, 2, 2, 0, -2, -2 };
+
   // TM: the instance for the trymany levels (LevelArgs::try_many); the other instance has no trymany code (its register
   // allocation, and so the speed of every other search, stays as without it; inlined, the trymany code made the plain search spill)
   template <bool TM>
@@ -1972,12 +2007,19 @@ namespace
     __shared__ BlockShared b;
     __shared__ TmIn s_tmin; // trymany: inputs of trymany_par (TM instance only)
     __shared__ LevelArgs s_args; // copy of the kernel argument for the mvc_refine path: taking the address of the by-value argument would make every field access a slow generic load
+    // nLambda of every block of the current row (levels other than the smallest, see row_nl)
+    __shared__ int s_nl[SEARCH_NL_MAX];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
-    // exhaustive levels with radius <= 3 use the ring fold below, everything else mvc_refine (AnaChecker)
-    const bool ring_fold = a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3 && !TM;
+    // Exhaustive levels with radius <= 3, Hex2Search with range <= 3 and UMHSearch with range 2..3 (wave_plan) use the
+    // inline batches and the ring fold below, everything else mvc_refine (AnaChecker). Hex2 / UMH ranges 2..3 (MAnalyse's
+    // default search=4 at pelsearch 2) through mvc_refine cost about 19k cycles per block, mostly the out-of-line
+    // run_batch with its candidate lists in per-thread local memory; the fixed batches here about half of that.
+    const int plan = TM ? WP_GEN : wave_plan(a.search_type, a.radius);
+    const bool ring_fold = !TM && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || plan != WP_GEN);
     if (!ring_fold && tid == 0)
       s_args = a;
     const int slice = blockIdx.x;
+    const bool row_nl = !a.smallest && a.n_blk_x <= SEARCH_NL_MAX;
 #ifdef MVC_PHASE_PROF
     const int bk = 31 - __clz(a.n_blk_x);
     long long ph_t = 0;
@@ -1985,7 +2027,9 @@ namespace
     const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
     const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
     const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
-    const int ring_radius = ring_fold ? a.radius : 0; // the ring tables are for the exhaustive fold only
+    // the ring tables are for the ring fold only: the exhaustive radius, or radius 1 (Hex2Search's closing
+    // ExpandingSearch(1, 1), also after the fixed UMH / hexagon batches)
+    const int ring_radius = !ring_fold ? 0 : a.search_type == mvc_refine::S_EXHAUSTIVE ? a.radius : 1;
     const int ring_n = 4 * ring_radius * (ring_radius + 1);
     const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
     pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
@@ -2092,6 +2136,13 @@ namespace
       };
       prefetch(0);
       issue_src(s_dyn, start, blky); // the first block of the row (buffer 0); later ones are issued a block ahead
+      // Above the smallest level the predictor is the block's own interpolated vector, so its nLambda (FP64, slow on
+      // GeForce: about 1k cycles on the serial chain when thread 0 computes it per block) does not depend on the block
+      // before: all of the row in parallel here, published by the first block's barrier. The previous row's last
+      // reads of s_nl are behind that row's later barriers.
+      if (row_nl)
+        for (int bx = tid; bx < a.n_blk_x; bx += blockDim.x)
+          s_nl[bx] = calc_nlambda(a.lambda_level, a.lsad, a.vec[3 * (blky * a.n_blk_x + bx) + 2], is_top);
 
       for (int it = 0; it < a.n_blk_x; it++)
       {
@@ -2150,7 +2201,7 @@ namespace
         else
           p0 = p1;
         const Vec pred = a.smallest ? p0 : own_c;
-        if (tid == 0)
+        if (tid == 0 && !row_nl)
         {
           int nlambda = is_top ? 0 : a.lambda_level;
           if (a.lsad == 0)
@@ -2166,7 +2217,7 @@ namespace
         }
         const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel, 0);
         __syncthreads(); // source block and nLambda in shared memory; the previous block's result is visible
-        const int nlambda = b.nlambda;
+        const int nlambda = row_nl ? s_nl[blkx] : b.nlambda;
         PH(0);
 
         // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
@@ -2434,6 +2485,73 @@ namespace
             atomicAdd(&g_prof[bk][5], 1ull);
 #endif
           continue;
+        }
+
+        // ---- fixed batches before the ring (PlaneOfBlocks::UMHSearch / Hex2Search with range 2..3, the CPU order of
+        // mvc_refine::umh / hex2): UMH = CrossSearch +-1 and one hex grid ring around the best vector, 20 CheckMV in one
+        // batch; Hex2 = the radius-2 hexagon around the best vector (CheckMVdir: only the cost and the SAD are taken),
+        // then the centre moves to the winning direction (the hexagon walk runs range / 2 - 1 = 0 times). The closing
+        // ExpandingSearch(1, 1) is the ring below.
+        if (plan == WP_HEX || plan == WP_UMH)
+        {
+          for (int stage = plan == WP_UMH ? 0 : 1; stage < 2; stage++)
+          {
+            const int n = stage == 0 ? 20 : 6, off = stage == 0 ? 0 : 20;
+            for (int c = warp; c < n; c += nwarps)
+            {
+              const int cx = best_x + g_fix_dx[off + c], cy = best_y + g_fix_dy[off + c];
+              if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+                continue; // never read: the fold below skips invalid vectors
+              int sl, sc;
+              eval_dispatch(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+              if (lane == 0)
+              {
+                b.sl[c] = sl;
+                b.sc[c] = sc;
+              }
+            }
+            __syncthreads();
+            // sequential fold in every thread (identical values), CheckMV / CheckMVdir with penaltyNew
+            int nbx = best_x, nby = best_y, dir = -2;
+            for (int c = 0; c < n; c++)
+            {
+              const int cx = best_x + g_fix_dx[off + c], cy = best_y + g_fix_dy[off + c];
+              if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+                continue;
+              const int dxp = pred.x - cx, dyp = pred.y - cy;
+              const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+              int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits);
+              if (cost >= min_cost)
+                continue;
+              const int sl = b.sl[c], sc = b.sc[c];
+              cost += sl + (int)(((long long)a.pnew * sl) >> 8);
+              if (cost >= min_cost)
+                continue;
+              cost += sc + (int)(((long long)a.pnew * sc) >> 8);
+              if (cost >= min_cost)
+                continue;
+              if (stage == 0)
+              {
+                nbx = cx;
+                nby = cy;
+              }
+              else
+                dir = c;
+              min_cost = cost;
+              best_sad = sl + sc;
+            }
+            __syncthreads(); // the next batch (or the ring) overwrites b.sl / b.sc
+            if (stage == 0)
+            {
+              best_x = nbx;
+              best_y = nby;
+            }
+            else if (dir != -2)
+            {
+              best_x += g_fix_dx[20 + dir];
+              best_y += g_fix_dy[20 + dir];
+            }
+          }
         }
 
         // ---- phase B: SADs of the ring candidates around the best vector so far
@@ -3309,40 +3427,6 @@ namespace
 #define WPH_START() do {} while (0)
 #define WPH(i) do {} while (0)
 #endif
-
-  // Radius of the refine step when it is a single batch of rings around the best vector so far, else 0: exhaustive search
-  // (every coarse level) and Hex2Search with range <= 1, which is only its closing ExpandingSearch(1, 1) (QTGMC's
-  // pelsearch=1 at level 0). Both are CheckMV batches in ExpandingSearch order.
-  __host__ __device__ inline int ring_radius_of(int search_type, int radius)
-  {
-    if (search_type == mvc_refine::S_EXHAUSTIVE)
-      return radius <= 3 ? radius : 0; // larger radii: mvc_refine (batches of MAX_BATCH; the ring tables hold 48)
-    if (search_type == mvc_refine::S_HEX2 && radius <= 1)
-      return 1;
-    return 0;
-  }
-
-  // Refine steps the ring-only kernel (GEN = false) runs as a fixed sequence of batches, else 0 (mvc_refine needed):
-  // WP_RING: the rings of ring_radius_of; WP_HEX: Hex2Search(2..3) = the radius-2 hexagon (CheckMVdir) around the best
-  // vector, the centre moved to the winner, ExpandingSearch(1, 1) around it (the hexagon walk of larger ranges runs
-  // range / 2 - 1 = 0 times); WP_UMH: UMHSearch(2..3) = CrossSearch (+-1 only) and one hex grid ring around the best
-  // vector in one batch, then WP_HEX. QTGMC's pel-search 2 levels (Slow .. Placebo) are WP_HEX / WP_UMH.
-  enum { WP_GEN = 0, WP_RING = 1, WP_HEX = 2, WP_UMH = 3 };
-  __host__ __device__ inline int wave_plan(int search_type, int radius)
-  {
-    if (ring_radius_of(search_type, radius) > 0)
-      return WP_RING;
-    if (search_type == mvc_refine::S_HEX2 && radius >= 2 && radius <= 3)
-      return WP_HEX;
-    if (search_type == mvc_refine::S_UMH && radius >= 2 && radius <= 3)
-      return WP_UMH;
-    return WP_GEN;
-  }
-  // candidate offsets of the fixed batches in the CPU order (mvc_refine::umh with range 2..3, mvc_refine::hex2) and the
-  // values CheckMVdir hands over (the hexagon direction = index)
-  // (copied to shared memory per level: g_ws.fix_dx / fix_dy, UMH first, then the hexagon)
-  __device__ const int g_fix_dx[26] = { -1, 1, 0, 0, -4, -4, -4, -4, -4, 4, 4, 4, 4, 4, 2, 0, -2, -2, 0, 2, -2, -1, 1, 2, 1, -1 };
-  __device__ const int g_fix_dy[26] = { 0, 0, 1, -1, 2, 1, 0, -1, -2, -2, -1, 0, 1, 2, 3, 4, 3, -3, -4, -3, 0, 2, 2, 0, -2, -2 };
 
   // GEN = false: only the fixed batches of wave_plan (no mvc_refine code: small and fast to compile);
   // GEN = true: every search type through mvc_refine.

@@ -75,7 +75,10 @@ reference .md files (links to online resources are fine).
   around a fixed centre are evaluated in parallel and folded in CPU order. nLambda math IEEE-exact, no FMA contraction.
 - **k_search** (meander=true): one CTA per CPU slice. A meander row starts where the row above ended, so each slice is a
   serial chain whose length the CPU slice count fixes; this is the main exact-mode limit. 256 threads (768 spilled).
-  `k_search<TM>`: the plain instance has no trymany code (0 spills).
+  `k_search<TM>`: the plain instance has no trymany code (0 spills). Exhaustive radius <= 3, Hex2 range <= 3 and UMH
+  range 2..3 (`wave_plan`) run as inline batches + the ring fold; other refines through mvc_refine (AnaChecker), whose
+  out-of-line run_batch with local-memory candidate lists cost ~19k cycles per block for the default hex search vs ~6k
+  inline. nLambda is computed per row in parallel above the smallest level (`s_nl`).
 - **k_wave** (meander=false): one CTA of 4 warps per block row, rows by atomic ticket, per-row progress counters
   (release / acquire), all levels in one launch. Fixed plans for small Hex2 / UMH in the fast kernel, GEN kernel
   (mvc_refine) otherwise; register cap 96. Runs the bad-vector wide search itself (k_search sends such frames to the
