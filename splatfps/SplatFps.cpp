@@ -95,6 +95,7 @@ namespace
     };
     std::map<int, std::shared_ptr<Source>> src_;
     std::map<int, std::shared_ptr<Fields>> fields_;
+    std::map<int, PVideoFrame> held_; // source frames near the last request (src_frame)
     // fast path (exact = false): the engine, and the phase-correlation candidates of the pair (q, q + 1) by q
     std::unique_ptr<FastEngine> fast_;
     std::map<int, std::shared_ptr<VecSet>> pairs_;
@@ -151,11 +152,19 @@ namespace
       return cachehints == CACHE_GET_MTMODE ? MT_SERIALIZED : 0;
     }
 
-    // source picture q, its chroma siting checked
+    // source picture q, its chroma siting checked. The pictures near q are held here, so a picture is asked from the
+    // child only once even when the requests step back (the GPU path reads p-1 .. p+3 and then p again; copy frames
+    // follow built ones): a source in linear mode (ffms2 seekmode=0) decodes from the start of the file on every step
+    // back the frame cache does not catch, and the cache can be small (SetMemoryMax, big frames, many filters).
     PVideoFrame src_frame(int q, IScriptEnvironment *env)
     {
+      auto it = held_.find(q);
+      if (it != held_.end())
+        return it->second;
       PVideoFrame f = child->GetFrame(q, env);
       check_siting(f, fmt_, q, env, name_);
+      held_[q] = f;
+      trim(held_, q);
       return f;
     }
 
