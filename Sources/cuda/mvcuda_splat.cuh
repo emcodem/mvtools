@@ -49,9 +49,10 @@ namespace SPLAT_NS
 
   __device__ __forceinline__ int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+  // edge-clamped sample of plane p (int offsets: a plane has fewer than 2^31 samples)
   __device__ __forceinline__ float ldc(const float *p, int w, int h, int x, int y)
   {
-    return p[(size_t)clampi(y, 0, h - 1) * w + clampi(x, 0, w - 1)];
+    return p[clampi(y, 0, h - 1) * w + clampi(x, 0, w - 1)];
   }
 
   __device__ __forceinline__ float exp_ref(float x)
@@ -147,14 +148,59 @@ namespace SPLAT_NS
     return r;
   }
 
+#ifndef SPLAT_EXACT
+  // Fast variant of up_at for a 32 x 8 thread block: the expand kernel is separable, taps (1/8, 3/4, 1/8) around an
+  // even output sample and (1/2, 1/2) at an odd one, so each output reads only its 3 x 3 (or fewer) low samples, from a
+  // shared tile the block loads once (edge clamp as ldc). The exact variant keeps up_at's full evaluation order.
+  constexpr int UP_BW = 32, UP_BH = 8;
+  constexpr int UPT_W = UP_BW / 2 + 2, UPT_H = UP_BH / 2 + 2;
+  constexpr float UP_E0 = 0.75f, UP_E1 = 0.125f, UP_O = 0.5f;
+  static_assert(EA0 == UP_E0 * UP_E0 && EA1 == UP_E0 * UP_E1 && EA2 == UP_E1 * UP_E1, "expand kernel A not separable");
+  static_assert(EB0 == UP_E0 * UP_O && EB1 == 0.0f && EB2 == UP_E1 * UP_O && EB3 == 0.0f, "expand kernel B not separable");
+  static_assert(EC0 == UP_O * UP_O && EC1 == 0.0f && EC2 == 0.0f, "expand kernel C not separable");
+
+  // the block's low samples: tile [ty][tx] = l(clamp(bx + tx), clamp(by + ty)), bx / by one left of / above the
+  // block's first centre sample
+  __device__ __forceinline__ void up_tile_load(float (&t)[UPT_H][UPT_W], const float *l, int lw, int lh)
+  {
+    const int bx = (int)(blockIdx.x * UP_BW / 2) - 1, by = (int)(blockIdx.y * UP_BH / 2) - 1;
+    for (int k = threadIdx.y * UP_BW + threadIdx.x; k < UPT_H * UPT_W; k += UP_BW * UP_BH)
+    {
+      const int ty = k / UPT_W, tx = k - ty * UPT_W;
+      t[ty][tx] = l[clampi(by + ty, 0, lh - 1) * lw + clampi(bx + tx, 0, lw - 1)];
+    }
+  }
+
+  // the up-sampling at this thread's sample (X, Y) = (blockIdx.x * 32 + threadIdx.x, blockIdx.y * 8 + threadIdx.y)
+  __device__ __forceinline__ float up_tile_at(const float (&t)[UPT_H][UPT_W])
+  {
+    const int cx = (threadIdx.x >> 1) + 1, cy = (threadIdx.y >> 1) + 1;
+    const bool ox = threadIdx.x & 1, oy = threadIdx.y & 1;
+    const float x0 = ox ? 0.0f : UP_E1, x1 = ox ? UP_O : UP_E0, x2 = ox ? UP_O : UP_E1;
+    const float y0 = oy ? 0.0f : UP_E1, y1 = oy ? UP_O : UP_E0, y2 = oy ? UP_O : UP_E1;
+    auto row = [&](int r) { return x0 * t[r][cx - 1] + x1 * t[r][cx] + x2 * t[r][cx + 1]; };
+    return y0 * row(cy - 1) + y1 * row(cy) + y2 * row(cy + 1);
+  }
+#endif
+
   // Laplacian band = low - up(low1), low1 the next coarser low-pass level
   __global__ void k_band(const float *low, int w, int h, const float *low1, int lw, int lh, float *band)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+#ifdef SPLAT_EXACT
     if (x >= w || y >= h)
       return;
     const size_t i = (size_t)c * w * h + (size_t)y * w + x;
     band[i] = low[i] - up_at(low1 + (size_t)c * lw * lh, lw, lh, x, y);
+#else
+    __shared__ float t[UPT_H][UPT_W];
+    up_tile_load(t, low1 + (size_t)c * lw * lh, lw, lh);
+    __syncthreads();
+    if (x >= w || y >= h)
+      return;
+    const size_t i = (size_t)c * w * h + (size_t)y * w + x;
+    band[i] = low[i] - up_tile_at(t);
+#endif
   }
 
   // ---- fields ----------------------------------------------------------------------------------------------------
@@ -413,6 +459,14 @@ namespace SPLAT_NS
     int cw, int ch, int clamp, float hole, float *out)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+#ifndef SPLAT_EXACT
+    __shared__ float t[UPT_H][UPT_W];
+    if (coarser) // uniform over the launch
+    {
+      up_tile_load(t, coarser + (size_t)c * cw * ch, cw, ch);
+      __syncthreads();
+    }
+#endif
     if (x >= w || y >= h)
       return;
     const int aw = w + 1, ah = h + 1;
@@ -421,7 +475,11 @@ namespace SPLAT_NS
     float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : acc[acc_ix(c, ai, an)] / sw;
     if (coarser)
     {
+#ifdef SPLAT_EXACT
       b = b + up_at(coarser + (size_t)c * cw * ch, cw, ch, x, y);
+#else
+      b = b + up_tile_at(t);
+#endif
       if (clamp)
         b = fminf(fmaxf(b, VMIN), VMAX);
     }

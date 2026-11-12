@@ -636,31 +636,43 @@ namespace SPLAT_NS
 
   // block vectors -> per-pixel candidate fields (block_cover: c & 1 the far block column, c >= 2 the far row); the
   // candidates from nbc on are the global vector (blockIdx.z = candidate)
+  // one thread per pixel, all g.nc candidates; the covering blocks are worked out once per block grid (the groups of a
+  // stage share it: they differ only in the peak, g.off)
   __global__ void k_pc_cands(const float *bv, B2P g, int nbc, const float *glob, int w, int h, float *cands)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
-    const size_t np = (size_t)w * h, i = (size_t)y * w + x;
-    float vx, vy;
-    if (c >= nbc)
+    const size_t np = (size_t)w * h;
+    float *o = cands + (size_t)y * w + x;
+    int last = -1, nxb = 0, fxb = 0, nyb = 0, fyb = 0;
+    for (int c = 0; c < g.nc; c++, o += 2 * np)
     {
-      vx = glob[3];
-      vy = glob[4];
+      float vx, vy;
+      if (c >= nbc)
+      {
+        vx = glob[3];
+        vy = glob[4];
+      }
+      else
+      {
+        const int gi = g.cg[c], combo = g.cc[c];
+        if (last < 0 || g.S[gi] != g.S[last] || g.fx[gi] != g.fx[last] || g.nx[gi] != g.nx[last] ||
+            g.fy[gi] != g.fy[last] || g.ny[gi] != g.ny[last])
+        {
+          const int hs = g.S[gi] / 2;
+          splat::block_cover(x, g.fx[gi], g.nx[gi], hs, nxb, fxb);
+          splat::block_cover(y, g.fy[gi], g.ny[gi], hs, nyb, fyb);
+        }
+        last = gi;
+        const int bx = (combo & 1) ? fxb : nxb, by = combo >= 2 ? fyb : nyb;
+        const float *v = bv + g.off[gi] + 2 * (by * g.nx[gi] + bx);
+        vx = v[0];
+        vy = v[1];
+      }
+      o[0] = vx;
+      o[np] = vy;
     }
-    else
-    {
-      const int gi = g.cg[c], combo = g.cc[c], hs = g.S[gi] / 2;
-      int nxb, fxb, nyb, fyb;
-      splat::block_cover(x, g.fx[gi], g.nx[gi], hs, nxb, fxb);
-      splat::block_cover(y, g.fy[gi], g.ny[gi], hs, nyb, fyb);
-      const int bx = (combo & 1) ? fxb : nxb, by = combo >= 2 ? fyb : nyb;
-      const float *v = bv + g.off[gi] + 2 * ((size_t)by * g.nx[gi] + bx);
-      vx = v[0];
-      vy = v[1];
-    }
-    cands[2 * c * np + i] = vx;
-    cands[(2 * c + 1) * np + i] = vy;
   }
 
   static void pcorr_ingest_dev(cudaStream_t st, const splat::Config &cfg, const PcorrConst &K, PcorrTmp &T, const float *B,
@@ -738,7 +750,7 @@ namespace SPLAT_NS
       k_pc_glob<<<1, PC_GLOB_THREADS, 0, st>>>(T.vkey, T.vsum, nv, glob);
     }
     g.nc = c + splat::pcorr_has_global(cfg);
-    k_pc_cands<<<grid(w, h, g.nc, blk), blk, 0, st>>>(T.bv, g, c, glob, w, h, cands);
+    k_pc_cands<<<grid(w, h, 1, blk), blk, 0, st>>>(T.bv, g, c, glob, w, h, cands);
   }
 
   struct PcorrState
@@ -787,21 +799,23 @@ namespace SPLAT_NS
   // ---- refinement --------------------------------------------------------------------------------------------------
   // Refinement: one weighted Lucas-Kanade (Gauss-Newton) step per candidate, B. D. Lucas, T. Kanade, IJCAI 1981.
   // signed difference d = cur - other(x + s v) of candidate blockIdx.z (s = -1: the candidate points into cur)
-  __global__ void k_dfd(const float *cur, const float *other, int w, int h, const float *vecs, float s, float *d)
+  // one thread per pixel, all n candidates; ad = |d|
+  __global__ void k_dfd(const float *__restrict__ cur, const float *__restrict__ other, int w, int h,
+    const float *__restrict__ vecs, int n, float s, float *__restrict__ d, float *__restrict__ ad)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
     const size_t np = (size_t)w * h, i = (size_t)y * w + x;
-    const float vx = vecs[2 * c * np + i], vy = vecs[(2 * c + 1) * np + i];
-    d[c * np + i] = cur[i] - tex_bilinear(other, w, h, (float)x + s * vx, (float)y + s * vy);
-  }
-
-  __global__ void k_abs(const float *in, size_t n, float *out)
-  {
-    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n)
-      out[i] = fabsf(in[i]);
+    const float cv = cur[i], fx = (float)x, fy = (float)y;
+    const float *v = vecs + i;
+#pragma unroll 4
+    for (int c = 0; c < n; c++, v += 2 * np)
+    {
+      const float r = cv - tex_bilinear(other, w, h, fx + s * v[0], fy + s * v[np]);
+      d[c * np + i] = r;
+      ad[c * np + i] = fabsf(r);
+    }
   }
 
   // weighted Lucas-Kanade terms of candidate blockIdx.z: T[(5 c + k) planes] = b1, b2, a, c, bxy, from the central
@@ -858,43 +872,50 @@ namespace SPLAT_NS
   // outside the picture as box_sum.
   // Tile 16 x 16: about 28 KB of shared memory at the default box, so at least two blocks fit an SM on every supported
   // GPU (64 KB per SM on Turing; three per SM on 100 KB parts, measured faster there than 32 x 16 tiles).
+  constexpr int REFINE_R_FIXED = 7; // radius of the default refine_box (15), compiled with fixed geometry
   template <int TX, int TY> static size_t refine_fused_smem(int r)
   {
     const size_t hh = TY + 2 * r, hw = TX + 2 * r;
     return sizeof(float) * 5 * hh * (hw + TX);
   }
 
-  template <int REF_TX, int REF_TY>
+  // RR > 0: the box radius as a compile-time constant (the default box), so the tile geometry and the loops are fixed;
+  // RR == 0: radius r at run time. Block 32 x 8 (refine_dev). Plane offsets in int: a plane has fewer than 2^31 samples.
+  template <int REF_TX, int REF_TY, int RR = 0>
   __global__ void __launch_bounds__(256) k_refine_fused(const float *cur, const float *vecs, const float *d, const float *err,
-    int w, int h, int neg, float eps, float wscale, int r, float *out)
+    int w, int h, int neg, float eps, float wscale, int r_arg, float *out)
   {
     extern __shared__ float sm[];
+    const int r = RR > 0 ? RR : r_arg;
     const int HH = REF_TY + 2 * r, HW = REF_TX + 2 * r, c = blockIdx.z;
-    const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
+    constexpr int nt = 256;
+    const int tid = threadIdx.y * 32 + threadIdx.x;
     const int x0 = blockIdx.x * REF_TX - r, y0 = blockIdx.y * REF_TY - r;
     const size_t np = (size_t)w * h;
     float *T = sm;                         // [5][HH][HW] terms; later [5][REF_TY][REF_TX] column sums
     float *Hs = sm + 5 * HH * HW;          // [5][HH][REF_TX] row sums
     const int tp = HH * HW, hp = HH * REF_TX, vp = REF_TY * REF_TX;
+    const float *errc = err + c * np, *dc = d + c * np, *vxc = vecs + 2 * c * np, *vyc = vxc + np;
+    const float nis = __fdividef(-1.0f, wscale);
     // 1. terms (as k_terms), zero outside the picture
     for (int k = tid; k < tp; k += nt)
     {
-      const int lx = k % HW, ly = k / HW, x = x0 + lx, y = y0 + ly;
+      const int ly = k / HW, lx = k - ly * HW, x = x0 + lx, y = y0 + ly;
       float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f, t4 = 0.0f;
       if (x >= 0 && x < w && y >= 0 && y < h)
       {
-        const size_t i = (size_t)y * w + x;
-        const float gx = (cur[(size_t)y * w + min(x + 1, w - 1)] - cur[(size_t)y * w + max(x - 1, 0)]) / 2.0f;
-        const float gy = (cur[(size_t)min(y + 1, h - 1) * w + x] - cur[(size_t)max(y - 1, 0) * w + x]) / 2.0f;
+        const int i = y * w + x;
+        const float gx = (cur[i - x + min(x + 1, w - 1)] - cur[i - x + max(x - 1, 0)]) * 0.5f;
+        const float gy = (cur[min(y + 1, h - 1) * w + x] - cur[max(y - 1, 0) * w + x]) * 0.5f;
         const float ixx = gx * gx, iyy = gy * gy, ixy = gx * gy;
-        const float wt = exp_ref(-err[c * np + i] / wscale);
-        float vx = vecs[2 * c * np + i], vy = vecs[(2 * c + 1) * np + i];
+        const float wt = __expf(errc[i] * nis);
+        float vx = vxc[i], vy = vyc[i];
         if (neg)
         {
           vx = -vx;
           vy = -vy;
         }
-        const float dd = d[c * np + i];
+        const float dd = dc[i];
         float b1 = ixx * vx + ixy * vy;
         b1 = b1 + gx * dd;
         float b2 = ixy * vx + iyy * vy;
@@ -950,17 +971,18 @@ namespace SPLAT_NS
       }
     }
     __syncthreads();
-    // 4. solve (as k_solve)
+    // 4. solve (as k_solve, one reciprocal of the determinant)
+    float *oxc = out + 2 * c * np, *oyc = oxc + np;
     for (int k = tid; k < vp; k += nt)
     {
       const int x = x0 + r + k % REF_TX, y = y0 + r + k / REF_TX;
       if (x >= w || y >= h)
         continue;
       const float b1 = T[k], b2 = T[vp + k], a = T[2 * vp + k], cc = T[3 * vp + k], bxy = T[4 * vp + k];
-      const float det = a * cc - bxy * bxy;
-      const size_t i = (size_t)y * w + x;
-      out[2 * c * np + i] = (cc * b1 - bxy * b2) / det;
-      out[(2 * c + 1) * np + i] = (a * b2 - bxy * b1) / det;
+      const float id = 1.0f / (a * cc - bxy * bxy);
+      const int i = y * w + x;
+      oxc[i] = (cc * b1 - bxy * b2) * id;
+      oyc[i] = (a * b2 - bxy * b1) * id;
     }
   }
 
@@ -978,13 +1000,16 @@ namespace SPLAT_NS
       cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
       // the kernel is latency-bound: prefer the largest shared-memory carve-out so more tiles fit per SM
       cudaFuncSetAttribute(k_refine_fused<16, 16>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+      cudaFuncSetAttribute(k_refine_fused<16, 16, REFINE_R_FIXED>, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared);
       optin = v;
     }
     auto fits = [&](size_t need) { return need <= (size_t)optin && 2 * (need + reserved) <= (size_t)per_sm; };
     auto allow = [&](const void *f, size_t need) {
       return need <= 48 * 1024 || cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) == cudaSuccess;
     };
-    return fits(refine_fused_smem<16, 16>(r)) && allow((const void *)k_refine_fused<16, 16>, refine_fused_smem<16, 16>(r));
+    const void *f = r == REFINE_R_FIXED ? (const void *)k_refine_fused<16, 16, REFINE_R_FIXED> : (const void *)k_refine_fused<16, 16>;
+    return fits(refine_fused_smem<16, 16>(r)) && allow(f, refine_fused_smem<16, 16>(r));
   }
 #endif
 
@@ -1007,15 +1032,19 @@ namespace SPLAT_NS
   {
     const dim3 blk(32, 8);
     const size_t np = (size_t)w * h;
-    k_dfd<<<grid(w, h, n, blk), blk, 0, st>>>(cur, other, w, h, vecs, neg ? -1.0f : 1.0f, R.d);
-    k_abs<<<nblk(np * n), 256, 0, st>>>(R.d, np * n, R.t0);
+    k_dfd<<<grid(w, h, 1, blk), blk, 0, st>>>(cur, other, w, h, vecs, n, neg ? -1.0f : 1.0f, R.d, R.t0);
     box_sum(st, R.t0, R.t1, R.t0, w, h, n, cfg.error_box, 1, -1.0f);
 #ifndef SPLAT_EXACT
     const int r = (cfg.refine_box - 1) / 2;
     if (refine_fused_ready(r))
     {
-      k_refine_fused<16, 16><<<dim3((w + 15) / 16, (h + 15) / 16, n), blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs,
-        R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
+      const dim3 g((w + 15) / 16, (h + 15) / 16, n);
+      if (r == REFINE_R_FIXED)
+        k_refine_fused<16, 16, REFINE_R_FIXED><<<g, blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs, R.d, R.t0, w, h,
+          neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
+      else
+        k_refine_fused<16, 16><<<g, blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs, R.d, R.t0, w, h, neg ? 1 : 0,
+          cfg.refine_reg, cfg.refine_err_scale, r, out);
       return;
     }
 #endif
@@ -1030,9 +1059,9 @@ namespace SPLAT_NS
     int h, const float *vecs, int n, float *errs)
   {
     const dim3 blk(32, 8);
-    k_absdfd<<<grid(w, h, n + 1, blk), blk, 0, st>>>(cur, other, w, h, vecs, n, R.T);
+    k_absdfd<<<grid(w, h, 1, blk), blk, 0, st>>>(cur, other, w, h, vecs, n, R.T);
     box_sum(st, R.T, R.T2, R.T, w, h, n + 1, cfg.error_box, 1, -1.0f);
-    k_oppmin<<<grid(w, h, n + 1, blk), blk, 0, st>>>(R.T, w, h, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode,
+    k_oppmin<<<grid(w, h, 1, blk), blk, 0, st>>>(R.T, w, h, n + 1, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode,
       errs);
   }
 

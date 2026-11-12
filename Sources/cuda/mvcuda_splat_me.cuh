@@ -47,8 +47,9 @@ namespace SPLAT_NS
     const float i0f = floorf(x), j0f = floorf(y);
     const float a = x - i0f, b = y - j0f;
     const int i0 = (int)i0f, j0 = (int)j0f;
-    const float t00 = ldc(img, w, h, i0, j0), t10 = ldc(img, w, h, i0 + 1, j0);
-    const float t01 = ldc(img, w, h, i0, j0 + 1), t11 = ldc(img, w, h, i0 + 1, j0 + 1);
+    const int xa = clampi(i0, 0, w - 1), xb = clampi(i0 + 1, 0, w - 1);
+    const float *ra = img + clampi(j0, 0, h - 1) * w, *rb = img + clampi(j0 + 1, 0, h - 1) * w;
+    const float t00 = ra[xa], t10 = ra[xb], t01 = rb[xa], t11 = rb[xb];
     float r = ((1.0f - a) * (1.0f - b)) * t00;
     r = r + (a * (1.0f - b)) * t10;
     r = r + ((1.0f - a) * b) * t01;
@@ -57,14 +58,21 @@ namespace SPLAT_NS
   }
 
   // |dfd| of candidate blockIdx.z (vecs: n x (vx, vy) planes; z == n: the zero vector)
-  __global__ void k_absdfd(const float *cur, const float *other, int w, int h, const float *vecs, int n, float *out)
+  // one thread per pixel, all n + 1 vectors (the last one zero)
+  __global__ void k_absdfd(const float *__restrict__ cur, const float *__restrict__ other, int w, int h,
+    const float *__restrict__ vecs, int n, float *__restrict__ out)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
     const size_t np = (size_t)w * h, i = (size_t)y * w + x;
-    const float vx = c < n ? vecs[(size_t)2 * c * np + i] : 0.0f, vy = c < n ? vecs[(size_t)(2 * c + 1) * np + i] : 0.0f;
-    out[c * np + i] = fabsf(cur[i] - tex_bilinear(other, w, h, (float)x + vx, (float)y + vy));
+    const float cv = cur[i], fx = (float)x, fy = (float)y;
+    const float *v = vecs + i;
+    float *o = out + i;
+#pragma unroll 4
+    for (int c = 0; c < n; c++, v += 2 * np, o += np)
+      *o = fabsf(cv - tex_bilinear(other, w, h, fx + v[0], fy + v[np]));
+    *o = fabsf(cv - tex_bilinear(other, w, h, fx + 0.0f, fy + 0.0f));
   }
 
   // zero-padded box: vertical sums (rows y - r .. y + r in order), then horizontal sums; planes along blockIdx.z
@@ -184,24 +192,30 @@ namespace SPLAT_NS
   // edge-aware error filter, mode 0: (1 - wq) e + wq / 2 (min of e D px left / right + min of e D px up / down; D =
   // error_edge_dist, 3 by default); next to a motion edge one of each opposite pair lies on the side that owns the vector
   // mode 1: shiftable windows, (1 - wq) e + wq min of e at the four diagonal shifts (+-D, +-D)
-  __global__ void k_oppmin(const float *e, int w, int h, float wq, int D, int mode, float *out)
+  // one thread per pixel, all nplanes planes
+  __global__ void k_oppmin(const float *__restrict__ e, int w, int h, int nplanes, float wq, int D, int mode,
+    float *__restrict__ out)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
-    const float *p = e + (size_t)blockIdx.z * w * h;
-    const float l = p[(size_t)y * w + max(x - D, 0)], r = p[(size_t)y * w + min(x + D, w - 1)];
-    const float u = p[(size_t)max(y - D, 0) * w + x], d = p[(size_t)min(y + D, h - 1) * w + x];
+    const size_t np = (size_t)w * h;
+    const int xl = max(x - D, 0), xr = min(x + D, w - 1), ry = y * w, ru = max(y - D, 0) * w, rd = min(y + D, h - 1) * w;
     const float half = wq * 0.5f, keep = 1.0f - wq;
-    if (mode == 1)
+#pragma unroll 4
+    for (int z = 0; z < nplanes; z++)
     {
-      const int xl = max(x - D, 0), xr = min(x + D, w - 1);
-      const size_t ru = (size_t)max(y - D, 0) * w, rd = (size_t)min(y + D, h - 1) * w;
-      const float m = fminf(fminf(p[ru + xl], p[ru + xr]), fminf(p[rd + xl], p[rd + xr]));
-      out[(size_t)blockIdx.z * w * h + (size_t)y * w + x] = keep * p[(size_t)y * w + x] + wq * m;
-      return;
+      const float *p = e + z * np;
+      float *o = out + z * np;
+      if (mode == 1)
+      {
+        const float m = fminf(fminf(p[ru + xl], p[ru + xr]), fminf(p[rd + xl], p[rd + xr]));
+        o[ry + x] = keep * p[ry + x] + wq * m;
+        continue;
+      }
+      const float l = p[ry + xl], r = p[ry + xr], u = p[ru + x], d = p[rd + x];
+      o[ry + x] = keep * p[ry + x] + half * (fminf(l, r) + fminf(u, d));
     }
-    out[(size_t)blockIdx.z * w * h + (size_t)y * w + x] = keep * p[(size_t)y * w + x] + half * (fminf(l, r) + fminf(u, d));
   }
 
   // ---- local fallback (splat::disorder_weight): per field the inconsistency of the vectors against their 3x3
@@ -357,9 +371,9 @@ namespace SPLAT_NS
     cudaMemcpyAsync(dn, other, sizeof(float) * np, cudaMemcpyHostToDevice, st);
     if (n > 0)
       cudaMemcpyAsync(dv, vecs, sizeof(float) * 2 * np * n, cudaMemcpyHostToDevice, st);
-    k_absdfd<<<grid(w, h, n + 1, blk), blk, 0, st>>>(dc, dn, w, h, dv, n, t0);
+    k_absdfd<<<grid(w, h, 1, blk), blk, 0, st>>>(dc, dn, w, h, dv, n, t0);
     box_sum(st, t0, t1, t0, w, h, n + 1, cfg.error_box, 1, -1.0f);
-    k_oppmin<<<grid(w, h, n + 1, blk), blk, 0, st>>>(t0, w, h, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode, t1);
+    k_oppmin<<<grid(w, h, 1, blk), blk, 0, st>>>(t0, w, h, n + 1, cfg.error_edge_weight, cfg.error_edge_dist, cfg.error_edge_mode, t1);
     cudaMemcpyAsync(errs, t1, sizeof(float) * np * (n + 1), cudaMemcpyDeviceToHost, st);
     return finish(st);
   }
