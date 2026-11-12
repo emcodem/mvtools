@@ -107,7 +107,7 @@ unsigned long long cf::lut_from_cpu(const char *expr, int use_expr, IScriptEnvir
   PClip px = new PatternClip(false, bits), py = new PatternClip(true, bits);
   AVSValue args[6] = { px, py, expr, use_expr, 3, 3 };
   const char *names[6] = { nullptr, nullptr, "expr", "use_expr", "U", "V" };
-  PClip lut = env->Invoke("mt_lutxy", AVSValue(args, 6), names).AsClip();
+  PClip lut = invoke_cpu(env, "CudaKeepOnlyBobShimmerFixes", "mt_lutxy", "masktools2", AVSValue(args, 6), names).AsClip();
   return lut_from_frame(lut->GetFrame(0, env), bits);
 }
 
@@ -147,7 +147,8 @@ namespace
       try {
         _cpu = env->Invoke("QTGMC_KeepOnlyBobShimmerFixes", AVSValue(args, 5)).AsClip();
       } catch (const IScriptEnvironment::NotFound &) {
-        _cpu = env->Invoke("QTGMC_KeepOnlyBobShimmerFixes", AVSValue(args, 4)).AsClip();
+        _cpu = invoke_cpu(env, "CudaKeepOnlyBobShimmerFixes", "QTGMC_KeepOnlyBobShimmerFixes", "the QTGMC script",
+          AVSValue(args, 4)).AsClip();
       }
       vi = _cpu->GetVideoInfo();
       const int ed = rep < 10 ? rep : rep / 10, od = rep < 10 ? 0 : rep % 10;
@@ -230,7 +231,7 @@ namespace
     {
       AVSValue args[4] = { cpu_input(c, env), mode, modeU, modeV };
       const char *names[4] = { nullptr, "mode", "modeU", "modeV" };
-      _cpu = env->Invoke("RemoveGrain", AVSValue(args, 4), names).AsClip();
+      _cpu = invoke_cpu(env, "CudaRemoveGrain", "RemoveGrain", "RgTools", AVSValue(args, 4), names).AsClip();
       vi = _cpu->GetVideoInfo();
       _mode[0] = mode;
       _mode[1] = modeU;

@@ -321,7 +321,7 @@ namespace
           cargs[na] = args[i];
           cnames[na++] = names[i];
         }
-      _cpu = env->Invoke("nnedi3", AVSValue(cargs, na), cnames).AsClip();
+      _cpu = invoke_cpu(env, "CudaNNEDI3", "nnedi3", "an nnedi3 plugin (e.g. plugins_JPSDR)", AVSValue(cargs, na), cnames).AsClip();
       vi = _cpu->GetVideoInfo();
 
       const VideoInfo &svi = child->GetVideoInfo();
