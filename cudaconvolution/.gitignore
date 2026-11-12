@@ -1,0 +1,6 @@
+/build*/
+/out/
+*.yuv
+__pycache__/
+.vs/
+/dist/

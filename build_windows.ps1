@@ -4,7 +4,8 @@
 
 .DESCRIPTION
   Output (-Out, default <repo>\build\win-x64\bin): mvtools2.dll, DePan.dll, DePanEstimate.dll, mvtools_vsbridge.dll,
-  cudafilters.dll, mvtools_cuda.dll (when a CUDA 12 toolkit and the MSVC 14.4x toolset are found).
+  cudafilters.dll, splatfps.dll, CudaConvolution.dll, mvtools_cuda.dll (when a CUDA 12 toolkit and the MSVC 14.4x
+  toolset are found; without it CudaConvolution.dll is the CPU-only build).
 
   Tools are taken from the parameters, else from the environment, else from the usual install locations:
     MSVC     newest Visual Studio / Build Tools with the C++ workload (vswhere); vcvars64.bat is run here. With CUDA the

@@ -249,6 +249,16 @@ progressive, SD to UHD (per-size default settings).
 * Reference: `Documentation/splatfps.md`. Sources: `splatfps/` (CPU stages in `splatfps/core/`, GPU stages in
   `Sources/cuda/mvcuda_splat*`).
 
+## CudaConvolution (this branch; Windows x64)
+
+`CudaConvolution.dll`: progressive -> interlaced (R p -> R/2 i) for any size, with optional integer downscale 1..8 per
+axis (e.g. UHD 50p -> 1080i25), CPU and GPU engines with bit-identical output. Its own CUDA engine (GPUs from Pascal,
+compute capability 6.0); reads and writes the GPU token frames of `mvtools_cuda.dll` when that is loaded.
+
+    CudaConvolution(width=1920, height=1080)
+
+* Reference: `cudaconvolution/docs/usage.md`. Sources and its own build / tests: `cudaconvolution/` (README.md).
+
 ## VapourSynth (this branch; Linux and Windows)
 
 Release bundles: the VapourSynth bundle for Windows and the Linux bundle (VapourSynth and AviSynth+) of this fork's

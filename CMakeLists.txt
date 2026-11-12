@@ -14,6 +14,8 @@
 #   depanestimate   DePanEstimate.dll / libdepanestimate.so
 #   mvtools_vsbridge  VapourSynth host for the plugins above (MVTOOLS_VAPOURSYNTH)
 #   mvtools_cuda, cudafilters   GPU part (MVTOOLS_GPU; mvtools_cuda needs CUDA 12, on Windows with MSVC 14.4x)
+#   splatfps        splatfps.dll (MVTOOLS_SPLATFPS)
+#   CudaConvolution CudaConvolution.dll (MVTOOLS_CUDACONVOLUTION, MSVC only; cudaconvolution/README.md)
 # This CMake build is the one we maintain and test. The Visual Studio solution (mvtools.sln / .slnx) is upstream's,
 # unchanged: it builds upstream's CPU plugins only (without the GPU and VapourSynth parts).
 cmake_minimum_required(VERSION 3.18...3.31)
@@ -210,9 +212,20 @@ if(MVTOOLS_SPLATFPS)
   mv_plugin_exports(splatfps)
 endif()
 
+# CudaConvolution (progressive -> interlaced with integer downscale), its own plugin with its own CUDA engine
+# (cudart_static); built with the CUDA engine when mvtools_cuda is built, else CPU-only. Windows x64 + MSVC only.
+option(MVTOOLS_CUDACONVOLUTION "Build CudaConvolution (MSVC only)" ON)
+if(MVTOOLS_CUDACONVOLUTION)
+  if(MSVC)
+    add_subdirectory("cudaconvolution")
+  else()
+    message(STATUS "MVTOOLS_CUDACONVOLUTION: CudaConvolution is built with MSVC only (Windows API), skipped")
+  endif()
+endif()
+
 # Everything the plugins load from their own folder, in one place: <build>/bin (copied after each build).
 set(MVTOOLS_DIST_DIR "${CMAKE_BINARY_DIR}/bin" CACHE PATH "Folder that receives all plugin libraries after the build")
-set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda splatfps)
+set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda splatfps CudaConvolution)
 set(_mv_dist_cmds "")
 set(_mv_dist_deps "")
 foreach(t ${_mv_dist_targets})
