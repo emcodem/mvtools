@@ -83,6 +83,12 @@ namespace cf
   // A CPU filter reading a token frame directly would compute on the header bytes.
   PClip cpu_input(PClip c, IScriptEnvironment *env);
 
+  // env->Invoke of a CPU filter a Cuda* filter builds on (its CPU path, fallback or tables), from another plugin. A
+  // missing function (or one that does not take these arguments) is reported naming that function and its plugin; a
+  // plain Invoke surfaces as "Invalid arguments to function '<the Cuda* filter>'", which points at the wrong call.
+  AVSValue invoke_cpu(IScriptEnvironment *env, const char *filter, const char *fn, const char *plugin, const AVSValue &args,
+    const char *const *names = nullptr);
+
   // the table of mt_lutxy(x, y, expr, use_expr=...) as the installed masktools computes it for bits 8 or 10 (an n x n
   // pattern through the CPU filter, n = 1 << bits), uploaded; 0 on failure or for other bit depths
   unsigned long long lut_from_cpu(const char *expr, int use_expr, IScriptEnvironment *env, int bits = 8);

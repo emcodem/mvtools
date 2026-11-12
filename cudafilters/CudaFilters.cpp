@@ -420,6 +420,23 @@ PClip cf::cpu_input(PClip c, IScriptEnvironment *env)
   return new CudaDownload(c, env);
 }
 
+AVSValue cf::invoke_cpu(IScriptEnvironment *env, const char *filter, const char *fn, const char *plugin, const AVSValue &args,
+  const char *const *names)
+{
+  try
+  {
+    return env->Invoke(fn, args, names);
+  }
+  catch (const IScriptEnvironment::NotFound &)
+  {
+    if (env->FunctionExists(fn))
+      env->ThrowError("%s: %s() does not take the arguments %s passes to it: an incompatible version of %s is loaded.", filter,
+        fn, filter, plugin);
+    env->ThrowError("%s needs %s() from %s, also on the GPU (it is the CPU fallback): load %s.", filter, fn, plugin, plugin);
+    return AVSValue();
+  }
+}
+
 AVSValue __cdecl Create_CudaBob(AVSValue args, void *, IScriptEnvironment *env); // CudaBob.cpp
 AVSValue __cdecl Create_CudaTemporalSoften(AVSValue args, void *, IScriptEnvironment *env); // CudaTemporal.cpp
 AVSValue __cdecl Create_CudaMerge(AVSValue args, void *, IScriptEnvironment *env); // CudaMerge.cpp
