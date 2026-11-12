@@ -93,8 +93,15 @@ namespace SPLAT_NS
       return;
     const float *s = src + (size_t)c * w * h;
     const int y = 2 * j;
-    dst[(size_t)c * w * oh + (size_t)j * w + x] = dn_tap(D, ldc(s, w, h, x, y), ldc(s, w, h, x, y - 1), ldc(s, w, h, x, y + 1),
-      ldc(s, w, h, x, y - 2), ldc(s, w, h, x, y + 2), ldc(s, w, h, x, y - 3), ldc(s, w, h, x, y + 3));
+    float *o = dst + (size_t)c * w * oh + (size_t)j * w + x;
+    if (y >= 3 && y + 3 <= h - 1)
+    {
+      const float *p = s + y * w + x; // all taps inside: no clamps
+      *o = dn_tap(D, p[0], p[-w], p[w], p[-2 * w], p[2 * w], p[-3 * w], p[3 * w]);
+      return;
+    }
+    *o = dn_tap(D, ldc(s, w, h, x, y), ldc(s, w, h, x, y - 1), ldc(s, w, h, x, y + 1), ldc(s, w, h, x, y - 2),
+      ldc(s, w, h, x, y + 2), ldc(s, w, h, x, y - 3), ldc(s, w, h, x, y + 3));
   }
 
   // horizontal pass: src w x oh -> dst ow x oh (even columns)
@@ -105,9 +112,15 @@ namespace SPLAT_NS
       return;
     const float *s = src + (size_t)c * w * oh;
     const int x = 2 * i;
-    dst[(size_t)c * ow * oh + (size_t)y * ow + i] = dn_tap(D, ldc(s, w, oh, x, y), ldc(s, w, oh, x - 1, y),
-      ldc(s, w, oh, x + 1, y), ldc(s, w, oh, x - 2, y), ldc(s, w, oh, x + 2, y), ldc(s, w, oh, x - 3, y),
-      ldc(s, w, oh, x + 3, y));
+    float *o = dst + (size_t)c * ow * oh + (size_t)y * ow + i;
+    if (x >= 3 && x + 3 <= w - 1)
+    {
+      const float *p = s + y * w + x; // all taps inside: no clamps
+      *o = dn_tap(D, p[0], p[-1], p[1], p[-2], p[2], p[-3], p[3]);
+      return;
+    }
+    *o = dn_tap(D, ldc(s, w, oh, x, y), ldc(s, w, oh, x - 1, y), ldc(s, w, oh, x + 1, y), ldc(s, w, oh, x - 2, y),
+      ldc(s, w, oh, x + 2, y), ldc(s, w, oh, x - 3, y), ldc(s, w, oh, x + 3, y));
   }
 
   // sample (X, Y) of the 2x up-sampling of l (lw x lh, edge clamp): pyramid expand, one 2-D kernel per output phase
@@ -149,10 +162,11 @@ namespace SPLAT_NS
   }
 
 #ifndef SPLAT_EXACT
-  // Fast variant of up_at for a 32 x 8 thread block: the expand kernel is separable, taps (1/8, 3/4, 1/8) around an
-  // even output sample and (1/2, 1/2) at an odd one, so each output reads only its 3 x 3 (or fewer) low samples, from a
-  // shared tile the block loads once (edge clamp as ldc). The exact variant keeps up_at's full evaluation order.
-  constexpr int UP_BW = 32, UP_BH = 8;
+  // Fast variant of up_at for a 32 x 8 thread block covering 32 x 16 outputs (each thread rows y and y + 8): the expand
+  // kernel is separable, taps (1/8, 3/4, 1/8) around an even output sample and (1/2, 1/2) at an odd one, so each
+  // output reads only its 3 x 3 (or fewer) low samples, from a shared tile the block loads once (edge clamp as ldc).
+  // The exact variant keeps up_at's full evaluation order.
+  constexpr int UP_BW = 32, UP_TH = 8, UP_BH = 2 * UP_TH;
   constexpr int UPT_W = UP_BW / 2 + 2, UPT_H = UP_BH / 2 + 2;
   constexpr float UP_E0 = 0.75f, UP_E1 = 0.125f, UP_O = 0.5f;
   static_assert(EA0 == UP_E0 * UP_E0 && EA1 == UP_E0 * UP_E1 && EA2 == UP_E1 * UP_E1, "expand kernel A not separable");
@@ -164,17 +178,17 @@ namespace SPLAT_NS
   __device__ __forceinline__ void up_tile_load(float (&t)[UPT_H][UPT_W], const float *l, int lw, int lh)
   {
     const int bx = (int)(blockIdx.x * UP_BW / 2) - 1, by = (int)(blockIdx.y * UP_BH / 2) - 1;
-    for (int k = threadIdx.y * UP_BW + threadIdx.x; k < UPT_H * UPT_W; k += UP_BW * UP_BH)
+    for (int k = threadIdx.y * UP_BW + threadIdx.x; k < UPT_H * UPT_W; k += UP_BW * UP_TH)
     {
       const int ty = k / UPT_W, tx = k - ty * UPT_W;
       t[ty][tx] = l[clampi(by + ty, 0, lh - 1) * lw + clampi(bx + tx, 0, lw - 1)];
     }
   }
 
-  // the up-sampling at this thread's sample (X, Y) = (blockIdx.x * 32 + threadIdx.x, blockIdx.y * 8 + threadIdx.y)
-  __device__ __forceinline__ float up_tile_at(const float (&t)[UPT_H][UPT_W])
+  // the up-sampling at this thread's sample (X, Y) = (blockIdx.x * 32 + threadIdx.x, blockIdx.y * 16 + threadIdx.y + 8 u)
+  __device__ __forceinline__ float up_tile_at(const float (&t)[UPT_H][UPT_W], int u)
   {
-    const int cx = (threadIdx.x >> 1) + 1, cy = (threadIdx.y >> 1) + 1;
+    const int cx = (threadIdx.x >> 1) + 1, cy = (threadIdx.y >> 1) + 1 + u * (UP_TH / 2);
     const bool ox = threadIdx.x & 1, oy = threadIdx.y & 1;
     const float x0 = ox ? 0.0f : UP_E1, x1 = ox ? UP_O : UP_E0, x2 = ox ? UP_O : UP_E1;
     const float y0 = oy ? 0.0f : UP_E1, y1 = oy ? UP_O : UP_E0, y2 = oy ? UP_O : UP_E1;
@@ -184,10 +198,12 @@ namespace SPLAT_NS
 #endif
 
   // Laplacian band = low - up(low1), low1 the next coarser low-pass level
+  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at)
   __global__ void k_band(const float *low, int w, int h, const float *low1, int lw, int lh, float *band)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.z;
 #ifdef SPLAT_EXACT
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
     const size_t i = (size_t)c * w * h + (size_t)y * w + x;
@@ -196,10 +212,16 @@ namespace SPLAT_NS
     __shared__ float t[UPT_H][UPT_W];
     up_tile_load(t, low1 + (size_t)c * lw * lh, lw, lh);
     __syncthreads();
-    if (x >= w || y >= h)
+    if (x >= w)
       return;
-    const size_t i = (size_t)c * w * h + (size_t)y * w + x;
-    band[i] = low[i] - up_tile_at(t);
+    for (int u = 0; u < 2; u++)
+    {
+      const int yy = blockIdx.y * UP_BH + threadIdx.y + u * UP_TH;
+      if (yy >= h)
+        break;
+      const size_t i = (size_t)c * w * h + (size_t)yy * w + x;
+      band[i] = low[i] - up_tile_at(t, u);
+    }
 #endif
   }
 
@@ -465,35 +487,53 @@ namespace SPLAT_NS
 
   // normalisation (or cross-fade where nothing landed) plus the reconstruction step: out = built + up(coarser out);
   // coarser == nullptr at the coarsest level; clamp at the finest; hole: total weight below this (Config::hole_weight)
+  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at)
   __global__ void k_norm(const float *acc, const float *P, const float *N, int w, int h, float d, const float *coarser,
     int cw, int ch, int clamp, float hole, float *out)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
-#ifndef SPLAT_EXACT
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.z;
+    const int aw = w + 1, ah = h + 1;
+    const size_t an = (size_t)aw * ah, n = (size_t)w * h;
+#ifdef SPLAT_EXACT
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+      return;
+    const size_t ai = (size_t)y * aw + x, i = (size_t)y * w + x;
+    const float sw = acc[acc_ix(3, ai, an)];
+    float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : acc[acc_ix(c, ai, an)] / sw;
+    if (coarser)
+    {
+      b = b + up_at(coarser + (size_t)c * cw * ch, cw, ch, x, y);
+      if (clamp)
+        b = fminf(fmaxf(b, VMIN), VMAX);
+    }
+    out[c * n + i] = b;
+#else
     __shared__ float t[UPT_H][UPT_W];
     if (coarser) // uniform over the launch
     {
       up_tile_load(t, coarser + (size_t)c * cw * ch, cw, ch);
       __syncthreads();
     }
-#endif
-    if (x >= w || y >= h)
+    if (x >= w)
       return;
-    const int aw = w + 1, ah = h + 1;
-    const size_t an = (size_t)aw * ah, ai = (size_t)y * aw + x, n = (size_t)w * h, i = (size_t)y * w + x;
-    const float sw = acc[acc_ix(3, ai, an)];
-    float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : acc[acc_ix(c, ai, an)] / sw;
-    if (coarser)
+    for (int u = 0; u < 2; u++)
     {
-#ifdef SPLAT_EXACT
-      b = b + up_at(coarser + (size_t)c * cw * ch, cw, ch, x, y);
-#else
-      b = b + up_tile_at(t);
-#endif
-      if (clamp)
-        b = fminf(fmaxf(b, VMIN), VMAX);
+      const int y = blockIdx.y * UP_BH + threadIdx.y + u * UP_TH;
+      if (y >= h)
+        break;
+      const size_t ai = (size_t)y * aw + x, i = (size_t)y * w + x;
+      const float sw = acc[acc_ix(3, ai, an)];
+      float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : __fdividef(acc[acc_ix(c, ai, an)], sw);
+      if (coarser)
+      {
+        b = b + up_tile_at(t, u);
+        if (clamp)
+          b = fminf(fmaxf(b, VMIN), VMAX);
+      }
+      out[c * n + i] = b;
     }
-    out[c * n + i] = b;
+#endif
   }
 
   // internal grid -> picture: drop the px / py border
@@ -527,6 +567,15 @@ namespace SPLAT_NS
   };
 
   static dim3 grid(int w, int h, int z, dim3 b) { return dim3((w + b.x - 1) / b.x, (h + b.y - 1) / b.y, z); }
+  // the samples one 32 x 8 block of k_band / k_norm covers (for grid())
+  static dim3 up_cover()
+  {
+#ifdef SPLAT_EXACT
+    return dim3(32, 8);
+#else
+    return dim3(UP_BW, UP_BH);
+#endif
+  }
 
   // Scratch of the picture build for one parameter set. A device context keeps one for its lifetime (no pool traffic and
   // no wait per frame); build_dev makes one per call.
@@ -632,7 +681,7 @@ namespace SPLAT_NS
     const int L = S.L;
     const int *lw = S.lw, *lh = S.lh;
     const RTaps rt = { cfg.pyr_reduce[0], cfg.pyr_reduce[1], cfg.pyr_reduce[2], cfg.pyr_reduce[3] };
-    const dim3 blk(32, 8);
+    const dim3 blk(32, 8), blk_up = up_cover();
     k_pad<<<grid(S.GW, S.GH, 3, blk), blk, 0, st>>>(P, S.W, S.H, low[0], S.GW, S.GH, cfg.pad_x, cfg.pad_y);
     for (int i = 0; i < L; i++)
     {
@@ -640,7 +689,7 @@ namespace SPLAT_NS
       k_reduce_h<<<grid(lw[i + 1], lh[i + 1], 3, blk), blk, 0, st>>>(S.tmp, lw[i], lh[i + 1], low[i + 1], lw[i + 1], rt);
     }
     for (int i = 0; i < L; i++)
-      k_band<<<grid(lw[i], lh[i], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], low[i + 1], lw[i + 1], lh[i + 1], band[i]);
+      k_band<<<grid(lw[i], lh[i], 3, blk_up), blk, 0, st>>>(low[i], lw[i], lh[i], low[i + 1], lw[i + 1], lh[i + 1], band[i]);
   }
 
 #ifndef SPLAT_EXACT
@@ -671,7 +720,7 @@ namespace SPLAT_NS
     const int *lw = S.lw, *lh = S.lh, sh = splat::ilog2(cfg.scale);
     const PrepArgs pa = { cfg.pad_x / cfg.scale, cfg.pad_y / cfg.scale, cfg.splat_err_scale, cfg.splat_min_weight,
       cfg.splat_gain };
-    const dim3 blk(32, 8);
+    const dim3 blk(32, 8), blk_up = up_cover();
     const float *src[2] = { P, N };
     const float *me[2] = { fwdP, bwdN };
     float *const *pyr[2] = { pyrP, pyrN };
@@ -753,7 +802,7 @@ namespace SPLAT_NS
       k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #endif
       float *o = S.rec[i & 1];
-      k_norm<<<grid(w, h, 3, blk), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, i == 0,
+      k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, i == 0,
         cfg.hole_weight, o);
       prev = o;
       pw = w;

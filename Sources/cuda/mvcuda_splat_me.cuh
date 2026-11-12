@@ -19,10 +19,22 @@ namespace SPLAT_NS
       return;
     const float *s = y + (size_t)row * W;
     const int pos = j * sc - px;
-    auto g = [&](int x) { return s[clampi(x, 0, W - 1)]; };
-    float acc = t.h[0] * g(pos);
-    for (int i = 1; i < t.n; i++)
-      acc = acc + t.h[i] * (g(pos - i) + g(pos + i));
+    float acc;
+    if (pos - (t.n - 1) >= 0 && pos + (t.n - 1) <= W - 1)
+    {
+      // all taps inside the row: no clamps
+      const float *c = s + pos;
+      acc = t.h[0] * c[0];
+      for (int i = 1; i < t.n; i++)
+        acc = acc + t.h[i] * (c[-i] + c[i]);
+    }
+    else
+    {
+      auto g = [&](int x) { return s[clampi(x, 0, W - 1)]; };
+      acc = t.h[0] * g(pos);
+      for (int i = 1; i < t.n; i++)
+        acc = acc + t.h[i] * (g(pos - i) + g(pos + i));
+    }
     out[(size_t)row * mw + j] = acc;
   }
 
@@ -32,10 +44,22 @@ namespace SPLAT_NS
     if (x >= mw || j >= mh)
       return;
     const int pos = j * sc - py;
-    auto g = [&](int y) { return in[(size_t)clampi(y, 0, H - 1) * mw + x]; };
-    float acc = t.h[0] * g(pos);
-    for (int i = 1; i < t.n; i++)
-      acc = acc + t.h[i] * (g(pos - i) + g(pos + i));
+    float acc;
+    if (pos - (t.n - 1) >= 0 && pos + (t.n - 1) <= H - 1)
+    {
+      // all taps inside the column: no clamps
+      const float *c = in + pos * mw + x;
+      acc = t.h[0] * c[0];
+      for (int i = 1; i < t.n; i++)
+        acc = acc + t.h[i] * (c[-i * mw] + c[i * mw]);
+    }
+    else
+    {
+      auto g = [&](int y) { return in[(size_t)clampi(y, 0, H - 1) * mw + x]; };
+      acc = t.h[0] * g(pos);
+      for (int i = 1; i < t.n; i++)
+        acc = acc + t.h[i] * (g(pos - i) + g(pos + i));
+    }
     out[(size_t)j * mw + x] = acc;
   }
 
