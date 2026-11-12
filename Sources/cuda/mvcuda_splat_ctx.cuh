@@ -54,36 +54,49 @@ namespace SPLAT_NS
     return acc;
   }
 
+  // block 32 x 8 (blockDim.x == S0_BW); chroma with horizontal subsampling: thread x = input sample j makes outputs 2 j
+  // and 2 j + 1 from the block's 4:2:2-stage samples, converted once into shared memory (edge clamp)
+  constexpr int S0_BW = 32, S0_TH = 8, S0_L = splat::CHROMA_HB_TAPS - 1, S0_R = splat::CHROMA_HB_TAPS;
+  constexpr int S0_SPAN = S0_BW + S0_L + S0_R;
+
   template <class T> __global__ void k_s0(const T *codes, CodeFmt f, float *out)
   {
     const int W = f.W, H = f.H;
     const int x = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
-    if (x >= W || row >= H)
-      return;
     const size_t NP = (size_t)W * H;
     if (c == 0)
     {
-      out[(size_t)row * W + x] = to_val(codes[(size_t)row * W + x], f.bits);
+      if (x < W && row < H)
+        out[(size_t)row * W + x] = to_val(codes[(size_t)row * W + x], f.bits);
       return;
     }
     const T *s = codes + NP + (size_t)(c - 1) * f.cw * f.ch;
     float *o = out + c * NP + (size_t)row * W;
     if (!f.sub_w)
     {
-      o[x] = chroma422(s, f, x, row);
+      if (x < W && row < H)
+        o[x] = chroma422(s, f, x, row);
       return;
     }
-    // horizontal chroma up-sampling: thread j makes outputs 2 j and 2 j + 1 (the threads from cw on have nothing to do)
-    const int j = x, w2 = f.cw;
-    if (j >= w2)
+    // horizontal chroma up-sampling: thread j makes outputs 2 j and 2 j + 1
+    const int w2 = f.cw, jb = blockIdx.x * S0_BW;
+    if (jb >= w2)
+      return; // the whole block (blocks from cw / 32 on have nothing to do)
+    __shared__ float cs[S0_TH][S0_SPAN]; // cs[ty][k] = 4:2:2-stage sample clamp(jb - S0_L + k) of this row
+    const bool row_ok = row < H;
+    for (int k = threadIdx.x; k < S0_SPAN; k += S0_BW)
+      cs[threadIdx.y][k] = row_ok ? chroma422(s, f, clampi(jb - S0_L + k, 0, w2 - 1), row) : 0.0f;
+    __syncthreads();
+    const int j = x;
+    if (j >= w2 || !row_ok)
       return;
+    const float *cr = &cs[threadIdx.y][j - jb + S0_L]; // cr[k] = sample clamp(j + k)
     const bool odd_out = 2 * j + 1 < W;
     if (f.centre)
     {
       // centre siting (splat_core.cpp chroma_upsample_row_centre): input j, the neighbour on the side of the output,
       // the one on the other side
-      const float c0 = chroma422(s, f, j, row), l = chroma422(s, f, max(j - 1, 0), row),
-                  rr = chroma422(s, f, min(j + 1, w2 - 1), row);
+      const float c0 = cr[0], l = cr[-1], rr = cr[1];
       float a = C420_0 * c0;
       a = a + C420_1 * l;
       a = a + C420_2 * rr;
@@ -98,7 +111,7 @@ namespace SPLAT_NS
       return;
     }
     // left siting: the even output is the input sample, the odd one the half-band taps of splat_const.h (CHROMA_HB)
-    o[2 * j] = chroma422(s, f, j, row);
+    o[2 * j] = cr[0];
     if (!odd_out)
       return;
     const float HB[splat::CHROMA_HB_TAPS] = { HB0, HB1, HB2, HB3, HB4, HB5, HB6 };
@@ -106,7 +119,7 @@ namespace SPLAT_NS
 #pragma unroll
     for (int k = 0; k < splat::CHROMA_HB_TAPS; k++)
     {
-      const float sum = chroma422(s, f, clampi(j - k, 0, w2 - 1), row) + chroma422(s, f, clampi(j + 1 + k, 0, w2 - 1), row);
+      const float sum = cr[-k] + cr[1 + k];
       acc = acc + HB[k] * sum;
     }
     o[2 * j + 1] = acc;

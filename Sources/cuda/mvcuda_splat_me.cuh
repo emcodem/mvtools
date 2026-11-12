@@ -71,9 +71,25 @@ namespace SPLAT_NS
     const float i0f = floorf(x), j0f = floorf(y);
     const float a = x - i0f, b = y - j0f;
     const int i0 = (int)i0f, j0 = (int)j0f;
-    const int xa = clampi(i0, 0, w - 1), xb = clampi(i0 + 1, 0, w - 1);
-    const float *ra = img + clampi(j0, 0, h - 1) * w, *rb = img + clampi(j0 + 1, 0, h - 1) * w;
-    const float t00 = ra[xa], t10 = ra[xb], t01 = rb[xa], t11 = rb[xb];
+    float t00, t10, t01, t11;
+    if ((unsigned)i0 < (unsigned)(w - 1) && (unsigned)j0 < (unsigned)(h - 1))
+    {
+      // all four samples inside: no clamps
+      const float *p = img + j0 * w + i0;
+      t00 = p[0];
+      t10 = p[1];
+      t01 = p[w];
+      t11 = p[w + 1];
+    }
+    else
+    {
+      const int xa = clampi(i0, 0, w - 1), xb = clampi(i0 + 1, 0, w - 1);
+      const float *ra = img + clampi(j0, 0, h - 1) * w, *rb = img + clampi(j0 + 1, 0, h - 1) * w;
+      t00 = ra[xa];
+      t10 = ra[xb];
+      t01 = rb[xa];
+      t11 = rb[xb];
+    }
     float r = ((1.0f - a) * (1.0f - b)) * t00;
     r = r + (a * (1.0f - b)) * t10;
     r = r + ((1.0f - a) * b) * t01;

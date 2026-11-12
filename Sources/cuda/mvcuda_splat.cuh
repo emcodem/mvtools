@@ -487,16 +487,17 @@ namespace SPLAT_NS
 
   // normalisation (or cross-fade where nothing landed) plus the reconstruction step: out = built + up(coarser out);
   // coarser == nullptr at the coarsest level; clamp at the finest; hole: total weight below this (Config::hole_weight)
-  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at)
+  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at). out: ow x oh planes holding sample (ox + x', oy + y')
+  // at (x', y'); the finest level writes the cropped picture this way, the others their whole level (ow = w, ox = 0)
   __global__ void k_norm(const float *acc, const float *P, const float *N, int w, int h, float d, const float *coarser,
-    int cw, int ch, int clamp, float hole, float *out)
+    int cw, int ch, int clamp, float hole, float *out, int ow, int oh, int ox, int oy)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.z;
     const int aw = w + 1, ah = h + 1;
     const size_t an = (size_t)aw * ah, n = (size_t)w * h;
 #ifdef SPLAT_EXACT
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h)
+    if (x >= w || y >= h || x < ox || x >= ox + ow || y < oy || y >= oy + oh)
       return;
     const size_t ai = (size_t)y * aw + x, i = (size_t)y * w + x;
     const float sw = acc[acc_ix(3, ai, an)];
@@ -507,7 +508,7 @@ namespace SPLAT_NS
       if (clamp)
         b = fminf(fmaxf(b, VMIN), VMAX);
     }
-    out[c * n + i] = b;
+    out[c * (size_t)ow * oh + (size_t)(y - oy) * ow + (x - ox)] = b;
 #else
     __shared__ float t[UPT_H][UPT_W];
     if (coarser) // uniform over the launch
@@ -515,34 +516,30 @@ namespace SPLAT_NS
       up_tile_load(t, coarser + (size_t)c * cw * ch, cw, ch);
       __syncthreads();
     }
-    if (x >= w)
+    // the output window lies inside the level (ox + ow <= w, oy + oh <= h)
+    if ((unsigned)(x - ox) >= (unsigned)ow)
       return;
+    const float *Pc = P + c * n, *Nc = N + c * n;
+    float *oc = out + c * (size_t)ow * oh + (x - ox);
+#pragma unroll
     for (int u = 0; u < 2; u++)
     {
       const int y = blockIdx.y * UP_BH + threadIdx.y + u * UP_TH;
-      if (y >= h)
-        break;
-      const size_t ai = (size_t)y * aw + x, i = (size_t)y * w + x;
-      const float sw = acc[acc_ix(3, ai, an)];
-      float b = sw < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : __fdividef(acc[acc_ix(c, ai, an)], sw);
-      if (coarser)
+      if ((unsigned)(y - oy) < (unsigned)oh)
       {
-        b = b + up_tile_at(t, u);
-        if (clamp)
-          b = fminf(fmaxf(b, VMIN), VMAX);
+        const int ai = y * aw + x, i = y * w + x;
+        const float sw = acc[acc_ix(3, ai, an)];
+        float b = sw < hole ? Pc[i] * (1.0f - d) + Nc[i] * d : __fdividef(acc[acc_ix(c, ai, an)], sw);
+        if (coarser)
+        {
+          b = b + up_tile_at(t, u);
+          if (clamp)
+            b = fminf(fmaxf(b, VMIN), VMAX);
+        }
+        oc[(y - oy) * ow] = b;
       }
-      out[c * n + i] = b;
     }
 #endif
-  }
-
-  // internal grid -> picture: drop the px / py border
-  __global__ void k_crop(const float *src, int GW, int GH, float *dst, int W, int H, int px, int py)
-  {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
-    if (x >= W || y >= H)
-      return;
-    dst[(size_t)c * W * H + (size_t)y * W + x] = src[(size_t)c * GW * GH + (size_t)(y + py) * GW + x + px];
   }
 
   // ---- host driver -------------------------------------------------------------------------------------------------
@@ -623,8 +620,9 @@ namespace SPLAT_NS
       }
       tmp = B.get((size_t)3 * GW * ((GH + 1) / 2));
       acc = B.get((size_t)4 * (GW + 1) * (GH + 1));
-      rec[0] = B.get((size_t)3 * GW * GH);
-      rec[1] = B.get((size_t)3 * GW * GH);
+      // reconstruction of the levels above 0 (level 0 goes straight to the output): rec[i & 1], largest i = 2 / 1
+      rec[0] = B.get((size_t)3 * (L >= 2 ? lw[2] * lh[2] : 1));
+      rec[1] = B.get((size_t)3 * (L >= 1 ? lw[1] * lh[1] : 1));
       // the reductions build_run makes (same walk over the levels)
       const int log2max = splat::ilog2(c.scale);
       bool have = false;
@@ -716,7 +714,7 @@ namespace SPLAT_NS
     const float *bwdN, float d, float *dout, float *const *pyrP = nullptr, float *const *pyrN = nullptr)
   {
     const splat::Config &cfg = S.cfg;
-    const int W = S.W, H = S.H, L = S.L, GW = S.GW, GH = S.GH, MW = S.MW, MH = S.MH;
+    const int W = S.W, H = S.H, L = S.L, MW = S.MW, MH = S.MH;
     const int *lw = S.lw, *lh = S.lh, sh = splat::ilog2(cfg.scale);
     const PrepArgs pa = { cfg.pad_x / cfg.scale, cfg.pad_y / cfg.scale, cfg.splat_err_scale, cfg.splat_min_weight,
       cfg.splat_gain };
@@ -801,14 +799,20 @@ namespace SPLAT_NS
         k_inplace<<<grid(w, h, 1, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
       k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][i], band[1][i], w, h, lf[0][i], lf[1][i], S.acc);
 #endif
-      float *o = S.rec[i & 1];
-      k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, i == 0,
-        cfg.hole_weight, o);
-      prev = o;
-      pw = w;
-      ph = h;
+      // the finest level goes straight into dout without the border (W x H at pad_x, pad_y)
+      if (i == 0)
+        k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 1,
+          cfg.hole_weight, dout, W, H, cfg.pad_x, cfg.pad_y);
+      else
+      {
+        float *o = S.rec[i & 1];
+        k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 0,
+          cfg.hole_weight, o, w, h, 0, 0);
+        prev = o;
+        pw = w;
+        ph = h;
+      }
     }
-    k_crop<<<grid(W, H, 3, blk), blk, 0, st>>>(prev, GW, GH, dout, W, H, cfg.pad_x, cfg.pad_y);
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -2;
   }
 
