@@ -349,8 +349,8 @@ namespace
         _why = "only 8 or 10-bit planar YUV / Y (above 10 bit the plugin takes its C extract; 9 bit untested)";
       else if (dh || field < 0 || field > 3)
         _why = "dh not supported";
-      else if (eff_opt != 6 && eff_opt != 7)
-        _why = "the plugin does not take its AVX2 + FMA path on this CPU (AVX-512 or older CPU)";
+      else if (eff_opt != 6 && eff_opt != 7 && eff_opt != 8)
+        _why = "the plugin does not take its AVX2 / AVX-512 path on this CPU (older CPU)";
       else if (pscrn < 2 || pscrn > 4 || !(fapprox & 2) || (fapprox & 12) < 8 || qual < 1 || qual > 2 || etype < 0 || etype > 1
         || nsize < 0 || nsize > 6 || nns < 0 || nns > 4)
         _why = "parameters not supported (pscrn 2..4, fapprox int16 predictor + fastest exp, qual 1 / 2)";
