@@ -19,7 +19,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 30
+#define MVCUDA_API_VERSION 31
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -275,6 +275,34 @@ MVCUDA_API int mvcuda_token_pin(unsigned long long token);
 MVCUDA_API void mvcuda_token_unpin(unsigned long long token);
 
 MVCUDA_API void mvcuda_frame_stats(MvCudaFrameStats *s);
+
+// ---- device frames for other plugins (API 31) ------------------------------------------------------------------------
+// The token interface (MvCudaTokenHeader, the frame upload / download, producer and pin functions above, and the three
+// below) has its own version: a plugin outside this repository checks mvcuda_token_abi() instead of the API version,
+// which changes with every other export too. It changes only when one of those signatures or the header changes.
+#define MVCUDA_TOKEN_ABI 1
+MVCUDA_API int mvcuda_token_abi();
+
+// mvcuda_frame_download, but only when the device frame has the format *expect (-4 otherwise): the caller's buffers
+// are sized for that format.
+MVCUDA_API int mvcuda_frame_download_checked(unsigned long long token, const MvCudaFrameFormat *expect, void *const dst[3],
+  const int dst_pitch_bytes[3]);
+
+// Runs a caller's GPU work on device frames without copies. The registry keeps the inputs alive, leases a stream ordered
+// after the work that made them, calls fn on its submitter thread with that stream, waits for the stream, and registers
+// the output frame (if out_fmt) as producer / frame (out receives its header).
+// fn(user, stream, n_in, in_planes[i * 3 + p], in_pitch[i * 3 + p] (bytes), in_fmt[i] (the frames' real formats),
+//    out_planes[p], out_pitch[p]); planes are packed (pitch = width * bytes per sample), one buffer per frame.
+// fn runs on the submitter thread and must only queue work on `stream` (kernel launches, async copies with pinned host
+// memory): no host waits, no cudaMalloc / cudaFree / cudaHostAlloc (they synchronise the device), no calls into this
+// library (the submitter would wait for itself), no other stream, no device change, no exceptions. It returns 0 or an
+// error code, which mvcuda_frame_run returns. Returns 0, -1 no device, -2 CUDA error, -4 bad arguments,
+// MVCUDA_TOKEN_GONE when an input token was evicted (make it again and retry, or read it another way).
+#define MVCUDA_RUN_MAX_INPUTS 8
+typedef int (*MvCudaRunFn)(void *user, void *stream, int n_in, const void *const *in_planes, const int *in_pitch,
+  const MvCudaFrameFormat *in_fmt, void *const *out_planes, const int *out_pitch);
+MVCUDA_API int mvcuda_frame_run(const unsigned long long *in_tokens, int n_in, const MvCudaFrameFormat *out_fmt,
+  unsigned long long producer, int frame, MvCudaRunFn fn, void *user, MvCudaTokenHeader *out);
 
 // ---- MFlowFps on device frames (see mvcuda_flow.cu and mvcuda_flow_host above) -----------------------------------------
 // The same with the left / right pictures as device frames (tokens); the result is a new device frame (the pictures'

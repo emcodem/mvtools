@@ -58,6 +58,14 @@ reference .md files (links to online resources are fine).
   inputs alive; the registry redirects an evicted token to the newest live token of the same (producer, frame).
 - Uploads keyed by content (`mvcuda_frame_upload_keyed`, `GpuBackend::frame_key(clip, n)`): one upload per picture.
 - Super pyramids (`DevSuper`) and sub-pel planes hang off the `DevFrame`, count in the budget and are dropped on eviction.
+- Plugins outside this repo (API 31): they check `mvcuda_token_abi()` (the token interface only), not the API version.
+  `mvcuda_frame_run` runs their GPU work on device frames without copies: inputs held, a leased stream ordered after
+  their producers (`leased_call`), the callback on the submitter thread (only stream work: no allocation, no host
+  waits, no library calls, no device change), host wait, then the output (an upload-pool frame: written by another
+  stream) is registered with `frame_put`. Raw device pointers are never handed out: ordering, pool reuse and `seq`
+  stay inside the registry. `mvcuda_frame_download_checked` refuses a frame of another format than the caller's buffers.
+- `mvcuda_producer_unregister` waits for regenerations of that producer still running on other threads (a filter's
+  destructor would otherwise race a regeneration of one of its frames).
 
 ## Submission model
 

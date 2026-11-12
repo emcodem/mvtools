@@ -51,6 +51,11 @@ namespace mvc
     };
     std::mutex g_prod_mutex;
     std::unordered_map<unsigned long long, Producer> g_producers;
+    // regenerations running per producer (guarded by g_prod_mutex): mvcuda_producer_unregister waits for them, so a
+    // filter can unregister in its destructor while another thread is still inside its regeneration function
+    std::unordered_map<unsigned long long, int> g_prod_running;
+    std::condition_variable g_prod_cv;
+    thread_local std::vector<unsigned long long> t_regen_producers; // producers this thread is regenerating for
     std::atomic<unsigned long long> g_next_producer{ 1 };
 
     // The last frames each thread created stay reachable for that thread even when other threads evict them from the
@@ -1250,6 +1255,84 @@ extern "C" int mvcuda_frame_download(unsigned long long token, void *const dst[3
   return rc;
 }
 
+extern "C" int mvcuda_token_abi()
+{
+  return MVCUDA_TOKEN_ABI;
+}
+
+extern "C" int mvcuda_frame_download_checked(unsigned long long token, const MvCudaFrameFormat *expect, void *const dst[3],
+  const int dst_pitch_bytes[3])
+{
+  if (!expect)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  auto fr = mvc::frame_get(token);
+  if (!fr)
+    return MVCUDA_TOKEN_GONE;
+  const MvCudaFrameFormat &f = fr->f;
+  if (f.width != expect->width || f.height != expect->height || f.planes != expect->planes
+    || f.bytes_per_sample != expect->bytes_per_sample || f.bits_per_sample != expect->bits_per_sample
+    || (f.planes == 3 && (f.x_ratio_uv != expect->x_ratio_uv || f.y_ratio_uv != expect->y_ratio_uv)))
+    return -4;
+  return mvcuda_frame_download(token, dst, dst_pitch_bytes);
+}
+
+extern "C" int mvcuda_frame_run(const unsigned long long *in_tokens, int n_in, const MvCudaFrameFormat *out_fmt,
+  unsigned long long producer, int frame, MvCudaRunFn fn, void *user, MvCudaTokenHeader *out)
+{
+  if (!fn || n_in < 0 || n_in > MVCUDA_RUN_MAX_INPUTS || (n_in > 0 && !in_tokens) || (out_fmt && !out))
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  // the inputs stay alive (and their buffers out of the pools) until the leased stream has finished
+  std::shared_ptr<mvc::DevFrame> in[MVCUDA_RUN_MAX_INPUTS];
+  const mvc::DevFrame *raw[MVCUDA_RUN_MAX_INPUTS] = {};
+  const void *planes[MVCUDA_RUN_MAX_INPUTS * 3] = {};
+  int pitch[MVCUDA_RUN_MAX_INPUTS * 3] = {};
+  MvCudaFrameFormat fmts[MVCUDA_RUN_MAX_INPUTS] = {};
+  for (int i = 0; i < n_in; i++)
+  {
+    in[i] = mvc::frame_get(in_tokens[i]);
+    if (!in[i])
+      return MVCUDA_TOKEN_GONE;
+    raw[i] = in[i].get();
+    fmts[i] = in[i]->f;
+    for (int p = 0; p < in[i]->f.planes; p++)
+    {
+      planes[i * 3 + p] = in[i]->plane[p];
+      pitch[i * 3 + p] = (int)in[i]->pitch[p];
+    }
+  }
+  // the output from the upload pool: no queued pipeline work uses its buffer, so another stream may write it
+  std::shared_ptr<mvc::DevFrame> dst;
+  void *out_planes[3] = {};
+  int out_pitch[3] = {};
+  if (out_fmt)
+  {
+    dst = mvc::frame_alloc(*out_fmt, true);
+    if (!dst)
+      return -4;
+    for (int p = 0; p < out_fmt->planes; p++)
+    {
+      out_planes[p] = dst->plane[p];
+      out_pitch[p] = (int)dst->pitch[p];
+    }
+  }
+  bool ran = false; // false: the op was cancelled at process exit and fn never ran
+  int rc = mvc::leased_call(raw, n_in, [&](cudaStream_t st) {
+    ran = true;
+    return fn(user, st, n_in, planes, pitch, fmts, out_planes, out_pitch);
+  });
+  if (rc == 0 && !ran)
+    rc = -2;
+  if (rc != 0)
+    return rc;
+  if (dst)
+    mvc::frame_put(dst, producer, frame, *out); // fn's work has finished (leased_call waited for the stream)
+  return 0;
+}
+
 extern "C" unsigned long long mvcuda_producer_register(MvCudaRegenFn fn, void *user)
 {
   if (!fn)
@@ -1262,8 +1345,13 @@ extern "C" unsigned long long mvcuda_producer_register(MvCudaRegenFn fn, void *u
 
 extern "C" void mvcuda_producer_unregister(unsigned long long producer)
 {
-  std::lock_guard<std::mutex> lk(mvc::g_prod_mutex);
+  std::unique_lock<std::mutex> lk(mvc::g_prod_mutex);
   mvc::g_producers.erase(producer);
+  // wait for regenerations already running on other threads (not for one this thread is inside: it would wait for itself)
+  for (unsigned long long p : mvc::t_regen_producers)
+    if (p == producer)
+      return;
+  mvc::g_prod_cv.wait(lk, [&] { return mvc::g_prod_running.find(producer) == mvc::g_prod_running.end(); });
 }
 
 extern "C" int mvcuda_token_regenerate(unsigned long long producer, int frame, void *env, MvCudaTokenHeader *out)
@@ -1277,12 +1365,24 @@ extern "C" int mvcuda_token_regenerate(unsigned long long producer, int frame, v
     if (it == mvc::g_producers.end())
       return -7;
     pr = it->second;
+    mvc::g_prod_running[producer]++;
   }
-  // called outside the lock: the producer makes the frame through the normal upload / kernel paths. A filter is not
-  // destroyed while frames of its clip are still being requested, so the entry stays valid for the call.
+  // called outside the lock: the producer makes the frame through the normal upload / kernel paths. The running count
+  // keeps mvcuda_producer_unregister (the filter's destructor) waiting until the call has returned.
   mvc::t_regen_depth++; // lookups inside a regeneration do not count for the budget (budget_on_miss)
+  mvc::t_regen_producers.push_back(producer);
   const int rc = pr.fn(pr.user, frame, env, out);
+  mvc::t_regen_producers.pop_back();
   mvc::t_regen_depth--;
+  {
+    std::lock_guard<std::mutex> lk(mvc::g_prod_mutex);
+    auto it = mvc::g_prod_running.find(producer);
+    if (--it->second == 0)
+    {
+      mvc::g_prod_running.erase(it);
+      mvc::g_prod_cv.notify_all();
+    }
+  }
   if (rc == 0)
   {
     std::lock_guard<std::mutex> lk(mvc::g_mutex);
