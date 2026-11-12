@@ -15,20 +15,26 @@ Mark an item done by deleting it here (the commit message says what was done). *
   uc_FRC HD branch with the whole pel-4 chain on the GPU (CudaMSuper is lite at pel 4 since D8; `run_frc_pel4.ps1`
   passes), the MxfSource -> LWLibav fallback (wrong frames on random access with Prefetch: use ffms2 or no Prefetch
   there). The `profile\avs\m\frc_ucdep_*` / `frc_uc_*` templates use uconvert.avsi and follow it.
-- Crash: `MAnalyse(..., divide=2)` dies with an access violation (exit -1073741819) after a few frames, with and without
-  Prefetch, build `profile\build_d8\bin` (CPU MAnalyse). Chain: Dancers.mxf SelectOdd -> 1920x1080 10-bit 4:2:2,
-  RemoveGrain(22), MSuper of the half-size picture (pel 4, hpad/vpad 8, rfilter 4), MAnalyse blksize 8 overlap 4
-  search 3 searchparam 2 truemotion=false chroma=true divide=2, MScaleVect(2), MRecalculate 8x8, MFlowFps. Script:
-  a local test script (`V5_divide2.avs`, not in the repo). Not isolated yet (an MShow-based bisect failed on its own);
-  check whether stock 2.7.48 crashes too, and 8-bit / 4:2:0 / full size.
-- mc FRC fallback is too weak (2026-11-02, local FRC parameter study): no MAnalyse / MRecalculate / NVOFA setting
-  keeps Dancers' fast leg whole (frames 15 and 37 at 50p); uc_FRCFallback (nearest source picture where the
-  refined-vector SAD is high) is what keeps the leg today, and that is not good enough either. Design and test a
-  better fallback (detection + replacement).
-- CudaMAnalyse with the default `meander=true` is about 6x slower than CPU MAnalyse (1080p 10-bit 4:2:2, pel 2,
-  blksize 16 overlap 8: 60 frames 22 s GPU vs 3.4 s CPU; `meander=false` 2.7 s). Same with CudaMFlowFps. Find where
-  the time goes (per-frame CPU fallback of the bad-vector search?) and make the default path at least as fast as the CPU.
-- D8 left over: vector clips' device copy cache (measure the host round trip with nsys first, DECISIONS.md D8).
+- **User:** report upstream (pinterf/mvtools) that MScaleVect crashes on `divide > 0` vector clips (stock 2.7.48 too):
+  it added the 0xFFFFFFFF length marker of the divided level as a plane length. Fixed in this fork (074321e).
+- mc FRC fallback is too weak: no MAnalyse / MRecalculate / NVOFA setting keeps Dancers' fast leg whole (frames 15 and
+  37 at 50p). Detection: `TESTFILES\reach_for_phc\03_detection` D9 covers the limbs (open: false positives on pans,
+  seams, cost of the CPU MFlowInter / MFlow at pel 4). Replacement: SplatFps inside the mask was tried
+  (`20_mc_fallback_splat`, 2026-11-12) and does not help: SplatFps ghosts the same fast limbs. **User:** judge D9 +
+  nearest picture (solid, 25p judder) against the production soft mask in motion.
+- CudaMAnalyse `meander=true` (slice kernel) is still slower than the CPU at 1080p: 300 frames 10-bit 4:2:2, pel 2,
+  blksize 16 overlap 8, MShow chain incl. 2.6 s decode: CPU 5.5 s, GPU meander=false 6.3 s, meander=true 10.5 s
+  (release) -> 7.9 s (2026-11-12: hex / UMH ranges 2..3 and hex range <= 1 as fixed inline batches + the ring
+  fold instead of mvc_refine, nLambda per row). The bad-vector CPU frames are not the cause (3 of 300). Per block at
+  level 0 now ~11k cycles (was 24k); left: three dependent SAD rounds (phase A, hexagon, ring) plus barriers. Coarse
+  levels cost ~45 % because they have fewer slices. The slice kernel uses ~32 of 170 SMs: the remaining lever is
+  overlapping frames (an analysis lookahead of frame n+1 while n is consumed, exact, needs a design decision: async
+  results per instance, token pins across threads, Prefetch behaviour) - **User**.
+- D8 vector-clip device cache: measured 2026-11-12, recommend not doing it. uc_FRC-like 1080p chain (blksize 8 overlap
+  4 refine, 4 vector fields per interpolated frame = 6.2 MB): staging + H2D 0.3 ms, host extraction (`grab` in
+  MVFlowFps::gpu_flow) ~1.1 ms per interpolated frame, of ~22 ms per frame without Prefetch (~6 %), mostly hidden with
+  Prefetch. (nsys 2026.3 traced only cudafilters' calls in that run, not mvtools_cuda's: per-call timers
+  `MVTOOLS_GPU_PROFILE=1` + a micro-benchmark instead.)
 - **User:** should the bundle's `QTGMC_gpu_on()` also set `cuda_cpu_fallback = true`? Today QTGMC above 10 bit, or on a
   CPU where nnedi3 does not take its AVX2 + FMA path (AVX-512, older CPUs), stops with the CudaNNEDI3 / lookup-table
   creation error unless the script sets it.
