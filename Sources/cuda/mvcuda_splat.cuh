@@ -226,24 +226,6 @@ namespace SPLAT_NS
     G[3 * n + i] = F[3 * n + s] * pr;
   }
 
-  // the x (1 << sh) bilinear up-sampling of G (vectors * scale) at full-resolution sample (X, Y), channel c
-  __device__ __forceinline__ float full_at(const float *G, int mw, int mh, int X, int Y, int c, int sh)
-  {
-    const float *p = G + (size_t)c * mw * mh;
-    const int x = X >> sh, y = Y >> sh, msk = (1 << sh) - 1;
-    const float fs = (float)(1 << sh);
-    float a = ldc(p, mw, mh, x, y), b = ldc(p, mw, mh, x + 1, y), cc = ldc(p, mw, mh, x, y + 1),
-      e = ldc(p, mw, mh, x + 1, y + 1);
-    if (c < 2)
-    {
-      a = a * fs; b = b * fs; cc = cc * fs; e = e * fs;
-    }
-    const float tx = (float)(X & msk) / fs, ty = (float)(Y & msk) / fs;
-    const float l6 = a * (1.0f - tx) + b * tx;
-    const float l18 = cc * (1.0f - tx) + e * tx;
-    return l6 * (1.0f - ty) + l18 * ty;
-  }
-
   // 3x3 [1 2 1] reduction (edge clamp), vectors / 2
   __global__ void k_field_reduce2(const float *F, int w, int h, float *o, int ow, int oh)
   {
@@ -275,13 +257,38 @@ namespace SPLAT_NS
   struct SideSample { float vx, vy, mc, st; bool zero; };
 
   // vectors / stride; a vector of length <= still (Config::still_vector) is not splatted, its splat weight joins the in-place weight
+  // 2^-k for 0 <= k < 127: x / 2^k and x * 2^-k round the same exact value, so they are the same float
+  __device__ __forceinline__ float pow2_recip(int k) { return __int_as_float((127 - k) << 23); }
+
   __device__ __forceinline__ SideSample side_at(const LevelField &f, int x, int y)
   {
     float v[4];
+    float is = 1.0f; // 1 / stride (a power of two)
     if (f.stride)
     {
+      // the x (1 << sh) bilinear up-sampling of G (vectors * scale) at full-resolution sample (X, Y), edge clamp; the
+      // sample geometry once for the 4 channels
+      const int X = x * f.stride, Y = y * f.stride, sh = f.sh, msk = (1 << sh) - 1;
+      const float fs = (float)(1 << sh), ifs = pow2_recip(sh);
+      const int ix = X >> sh, iy = Y >> sh;
+      const int c0 = clampi(ix, 0, f.gw - 1), c1 = clampi(ix + 1, 0, f.gw - 1);
+      const int r0 = clampi(iy, 0, f.gh - 1) * f.gw, r1 = clampi(iy + 1, 0, f.gh - 1) * f.gw;
+      const float tx = (float)(X & msk) * ifs, ty = (float)(Y & msk) * ifs;
+      const int n = f.gw * f.gh;
+#pragma unroll
       for (int c = 0; c < 4; c++)
-        v[c] = full_at(f.G, f.gw, f.gh, x * f.stride, y * f.stride, c, f.sh);
+      {
+        const float *p = f.G + c * n;
+        float a = p[r0 + c0], b = p[r0 + c1], cc = p[r1 + c0], e = p[r1 + c1];
+        if (c < 2)
+        {
+          a = a * fs; b = b * fs; cc = cc * fs; e = e * fs;
+        }
+        const float l6 = a * (1.0f - tx) + b * tx;
+        const float l18 = cc * (1.0f - tx) + e * tx;
+        v[c] = l6 * (1.0f - ty) + l18 * ty;
+      }
+      is = pow2_recip(__ffs(f.stride) - 1);
     }
     else
     {
@@ -290,13 +297,16 @@ namespace SPLAT_NS
       for (int c = 0; c < 4; c++)
         v[c] = f.G[c * n + i];
     }
-    const float s = (float)(f.stride ? f.stride : 1);
     SideSample r;
-    r.vx = v[0] / s;
-    r.vy = v[1] / s;
+    r.vx = v[0] * is;
+    r.vy = v[1] * is;
     r.mc = v[2];
     r.st = v[3];
+#ifdef SPLAT_EXACT
     r.zero = sqrtf(r.vx * r.vx + r.vy * r.vy) <= f.still;
+#else
+    r.zero = f.still >= 0.0f && r.vx * r.vx + r.vy * r.vy <= f.still * f.still;
+#endif
     if (r.zero)
       r.st = r.st + r.mc;
     return r;

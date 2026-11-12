@@ -123,17 +123,37 @@ namespace SPLAT_NS
     if (x >= w || y0 >= h)
       return;
     const size_t off = (size_t)blockIdx.z * w * h + x;
-    const int r = (size - 1) / 2;
-    auto g = [&](int yy) { return (yy < 0 || yy >= h) ? 0.0f : in[off + (size_t)yy * w]; };
+    const int r = (size - 1) / 2, y1 = min(y0 + BOX_SEG_V, h);
+    const float *col = in + off;
+    float *o = out + off + (size_t)y0 * w;
+    if (y0 - r >= 0 && y1 + r <= h)
+    {
+      // the whole window inside the picture: pointer walk, no checks
+      const float *p = col + (size_t)(y0 - r) * w;
+      float s = 0.0f;
+      for (int i = 0; i <= 2 * r; i++, p += w)
+        s += p[0];
+      *o = s;
+      const float *q = col + (size_t)(y0 - r) * w; // the row that leaves
+#pragma unroll 4
+      for (int y = y0 + 1; y < y1; y++, p += w, q += w)
+      {
+        o += w;
+        s += p[0] - q[0];
+        *o = s;
+      }
+      return;
+    }
+    auto g = [&](int yy) { return (yy < 0 || yy >= h) ? 0.0f : col[(size_t)yy * w]; };
     float s = 0.0f;
     for (int i = -r; i <= r; i++)
       s += g(y0 + i);
-    out[off + (size_t)y0 * w] = s;
-    const int y1 = min(y0 + BOX_SEG_V, h);
+    *o = s;
     for (int y = y0 + 1; y < y1; y++)
     {
+      o += w;
       s += g(y + r) - g(y - r - 1);
-      out[off + (size_t)y * w] = s;
+      *o = s;
     }
   }
 
@@ -142,18 +162,26 @@ namespace SPLAT_NS
   __global__ void k_boxs_h(const float *in, int w, int h, int size, int average, float max_val, float *out)
   {
     extern __shared__ float row[];
-    const int r = (size - 1) / 2, n = w + 2 * r;
+    const int r = (size - 1) / 2;
     const size_t off = (size_t)blockIdx.y * w * h + (size_t)blockIdx.x * w;
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
-      row[i] = (i < r || i >= r + w) ? 0.0f : in[off + i - r];
+    const float *src = in + off;
+    for (int i = threadIdx.x; i < r; i += blockDim.x)
+    {
+      row[i] = 0.0f;
+      row[r + w + i] = 0.0f;
+    }
+#pragma unroll 4
+    for (int i = threadIdx.x; i < w; i += blockDim.x)
+      row[r + i] = src[i];
     __syncthreads();
     const float inv = 1.0f / (float)(size * size);
+    float *o = out + off;
     auto put = [&](int x, float s) {
       if (average)
         s = s * inv;
       if (max_val >= 0.0f)
         s = fminf(max_val, s);
-      out[off + x] = s;
+      o[x] = s;
     };
     for (int x0 = threadIdx.x * BOX_SEG_H; x0 < w; x0 += blockDim.x * BOX_SEG_H)
     {
@@ -162,8 +190,17 @@ namespace SPLAT_NS
       for (int i = 0; i < size; i++)
         s += row[x0 + i];
       put(x0, s);
-      const int x1 = min(x0 + BOX_SEG_H, w);
-      for (int x = x0 + 1; x < x1; x++)
+      if (x0 + BOX_SEG_H <= w)
+      {
+#pragma unroll
+        for (int k = 1; k < BOX_SEG_H; k++)
+        {
+          s += row[x0 + k + 2 * r] - row[x0 + k - 1];
+          put(x0 + k, s);
+        }
+        continue;
+      }
+      for (int x = x0 + 1; x < w; x++)
       {
         s += row[x + 2 * r] - row[x - 1];
         put(x, s);

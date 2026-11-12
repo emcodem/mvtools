@@ -71,37 +71,68 @@ namespace SPLAT_NS
       out[i] = a[i] - b[i];
   }
 
-  // 1-D transforms of every row (cols = 0) or column (cols = 1) of the S x S tiles: line blockIdx.x of tile blockIdx.y.
-  // The line is loaded into shared memory and run through the plan's mixed-radix passes (ping-pong between a and b),
-  // the work items of each pass spread over the threads; fct scales the result (1 / S per axis for the inverse)
+  // 1-D transforms of every row (cols = 0) or column (cols = 1) of the S x S tiles: lines blockIdx.x * L .. + L - 1 of
+  // tile blockIdx.y (L divides S, both powers of two). The lines are loaded into shared memory and run through the
+  // plan's mixed-radix passes (ping-pong between a and b), the work items of each pass of all L lines spread over the
+  // threads (each item as fftp::pass_item, its indices by shifts); fct scales the result (1 / S per axis for the inverse)
   template <bool fwd, typename T>
-  __global__ void k_fft(fftp::cpx<T> *x, int S, int cols, fftp::Plan p, const fftp::cpx<T> *tw, T fct)
+  __global__ void k_fft(fftp::cpx<T> *x, int S, int cols, int L, fftp::Plan p, const fftp::cpx<T> *tw, T fct)
   {
     extern __shared__ unsigned char smem_fft[];
-    fftp::cpx<T> *a = (fftp::cpx<T> *)smem_fft, *b = a + S;
+    fftp::cpx<T> *a = (fftp::cpx<T> *)smem_fft, *b = a + (size_t)L * S; // line l at + l S
     fftp::cpx<T> *base = x + (size_t)blockIdx.y * S * S;
-    const int line = blockIdx.x;
-    const size_t st = cols ? (size_t)S : 1, off = cols ? (size_t)line : (size_t)line * S;
-    for (int j = threadIdx.x; j < S; j += blockDim.x)
-      a[j] = base[off + j * st];
+    const int l0 = blockIdx.x * L, n = L * S, lgS = __ffs(S) - 1, lgL = __ffs(L) - 1;
+    // element q: columns with consecutive q in consecutive lines, rows along the line (contiguous either way)
+    auto at = [&](int q, int &l, int &j) {
+      if (cols)
+      {
+        j = q >> lgL;
+        l = q & (L - 1);
+      }
+      else
+      {
+        l = q >> lgS;
+        j = q & (S - 1);
+      }
+      return cols ? (size_t)j * S + l0 + l : (size_t)(l0 + l) * S + j;
+    };
+    for (int q = threadIdx.x; q < n; q += blockDim.x)
+    {
+      int l, j;
+      const size_t g = at(q, l, j);
+      a[l * S + j] = base[g];
+    }
     __syncthreads();
     fftp::cpx<T> *p1 = a, *p2 = b;
     for (int s = 0; s < p.npass; s++)
     {
-      const int items = p.l1[s] * p.ido[s];
-      for (int it = threadIdx.x; it < items; it += blockDim.x)
-        fftp::pass_item<fwd>(p, s, it, p1, p2, tw);
+      const int ido = p.ido[s], l1 = p.l1[s], ip = p.ip[s], lgI = __ffs(l1 * ido) - 1, lgIdo = __ffs(ido) - 1;
+      const fftp::cpx<T> *wa = tw + p.twofs[s];
+      for (int it = threadIdx.x; it < (L << lgI); it += blockDim.x)
+      {
+        const int l = it >> lgI, item = it & ((1 << lgI) - 1), k = item >> lgIdo, i = item & (ido - 1);
+        const fftp::cpx<T> *cc = p1 + l * S;
+        fftp::cpx<T> *ch = p2 + l * S;
+        if (ip == 8)
+          fftp::pass8_item<fwd>(ido, l1, k, i, cc, ch, wa);
+        else if (ip == 4)
+          fftp::pass4_item<fwd>(ido, l1, k, i, cc, ch, wa);
+        else
+          fftp::pass2_item<fwd>(ido, l1, k, i, cc, ch, wa);
+      }
       __syncthreads();
       fftp::cpx<T> *t = p1;
       p1 = p2;
       p2 = t;
     }
-    for (int j = threadIdx.x; j < S; j += blockDim.x)
+    for (int q = threadIdx.x; q < n; q += blockDim.x)
     {
-      fftp::cpx<T> v = p1[j];
+      int l, j;
+      const size_t g = at(q, l, j);
+      fftp::cpx<T> v = p1[l * S + j];
       if (fct != T(1))
         v = { v.r * fct, v.i * fct };
-      base[off + j * st] = v;
+      base[g] = v;
     }
   }
 
@@ -243,10 +274,11 @@ namespace SPLAT_NS
   template <bool fwd, typename T>
   static void fft2_dev(cudaStream_t st, fftp::cpx<T> *x, int S, int tiles, const fftp::Plan &p, const fftp::cpx<T> *tw, T fct)
   {
-    const int thr = std::min(S / 2, 128);
-    const size_t sm = 2 * (size_t)S * sizeof(fftp::cpx<T>);
-    k_fft<fwd, T><<<dim3(S, tiles), thr, sm, st>>>(x, S, 0, p, tw, fct);
-    k_fft<fwd, T><<<dim3(S, tiles), thr, sm, st>>>(x, S, 1, p, tw, fct);
+    // L lines per block, about 1024 samples: a radix-8 pass has 128 work items, one per thread
+    const int L = std::max(1, std::min(S, 1024 / S)), thr = 128;
+    const size_t sm = 2 * (size_t)L * S * sizeof(fftp::cpx<T>);
+    k_fft<fwd, T><<<dim3(S / L, tiles), thr, sm, st>>>(x, S, 0, L, p, tw, fct);
+    k_fft<fwd, T><<<dim3(S / L, tiles), thr, sm, st>>>(x, S, 1, L, p, tw, fct);
   }
 
 

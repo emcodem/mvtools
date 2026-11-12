@@ -36,7 +36,8 @@ namespace SPLAT_NS
   // input samples, the odd ones lie half way between two of them
   __device__ __forceinline__ float to_val(int code, int bits)
   {
-    const float mid = (float)(1 << (bits - 1)), inv = 1.0f / (float)(1 << (bits - 8));
+    // 1 / 2^(bits-8) exactly (pow2_recip: the same float as the division)
+    const float mid = (float)(1 << (bits - 1)), inv = pow2_recip(bits - 8);
     return ((float)code - mid) * inv;
   }
 
@@ -66,37 +67,49 @@ namespace SPLAT_NS
       return;
     }
     const T *s = codes + NP + (size_t)(c - 1) * f.cw * f.ch;
-    float r;
+    float *o = out + c * NP + (size_t)row * W;
     if (!f.sub_w)
-      r = chroma422(s, f, x, row);
-    else if (f.centre)
     {
-      // centre siting (splat_core.cpp chroma_upsample_row_centre): input j, the neighbour on the side of output x,
+      o[x] = chroma422(s, f, x, row);
+      return;
+    }
+    // horizontal chroma up-sampling: thread j makes outputs 2 j and 2 j + 1 (the threads from cw on have nothing to do)
+    const int j = x, w2 = f.cw;
+    if (j >= w2)
+      return;
+    const bool odd_out = 2 * j + 1 < W;
+    if (f.centre)
+    {
+      // centre siting (splat_core.cpp chroma_upsample_row_centre): input j, the neighbour on the side of the output,
       // the one on the other side
-      const int j = x >> 1, w2 = f.cw;
       const float c0 = chroma422(s, f, j, row), l = chroma422(s, f, max(j - 1, 0), row),
                   rr = chroma422(s, f, min(j + 1, w2 - 1), row);
       float a = C420_0 * c0;
-      a = a + C420_1 * ((x & 1) ? rr : l);
-      a = a + C420_2 * ((x & 1) ? l : rr);
-      r = a;
-    }
-    else if (!(x & 1))
-      r = chroma422(s, f, x >> 1, row);
-    else
-    {
-      // half-band taps of splat_const.h (CHROMA_HB)
-      const float HB[splat::CHROMA_HB_TAPS] = { HB0, HB1, HB2, HB3, HB4, HB5, HB6 };
-      const int j = x >> 1, w2 = f.cw;
-      float acc = 0.0f;
-      for (int k = 0; k < splat::CHROMA_HB_TAPS; k++)
+      a = a + C420_1 * l;
+      a = a + C420_2 * rr;
+      o[2 * j] = a;
+      if (odd_out)
       {
-        const float sum = chroma422(s, f, clampi(j - k, 0, w2 - 1), row) + chroma422(s, f, clampi(j + 1 + k, 0, w2 - 1), row);
-        acc = acc + HB[k] * sum;
+        float b = C420_0 * c0;
+        b = b + C420_1 * rr;
+        b = b + C420_2 * l;
+        o[2 * j + 1] = b;
       }
-      r = acc;
+      return;
     }
-    out[c * NP + (size_t)row * W + x] = r;
+    // left siting: the even output is the input sample, the odd one the half-band taps of splat_const.h (CHROMA_HB)
+    o[2 * j] = chroma422(s, f, j, row);
+    if (!odd_out)
+      return;
+    const float HB[splat::CHROMA_HB_TAPS] = { HB0, HB1, HB2, HB3, HB4, HB5, HB6 };
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < splat::CHROMA_HB_TAPS; k++)
+    {
+      const float sum = chroma422(s, f, clampi(j - k, 0, w2 - 1), row) + chroma422(s, f, clampi(j + 1 + k, 0, w2 - 1), row);
+      acc = acc + HB[k] * sum;
+    }
+    o[2 * j + 1] = acc;
   }
 
   // ---- output: 4:4:4 samples -> codes: 2^(b-1) + round(v 2^(b-8)), clamped, round half up; chroma: even samples (left
