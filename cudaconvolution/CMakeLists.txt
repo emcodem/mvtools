@@ -48,18 +48,31 @@ if(CUDACONVOLUTION_HAVE_CUDA)
   find_package(CUDAToolkit 12.8 REQUIRED)
   # SASS for Pascal (6.0 P100, 6.1 GTX 10xx / Quadro P), Volta, Turing, Ampere (A4000), Ada, Hopper, Blackwell (RTX 50xx)
   # + PTX for newer GPUs. CUDA 13 has no Pascal / Volta targets: there the list starts at 7.5.
-  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+  # MVTOOLS_CUDA_ARCH_SET nightly (root CMakeLists.txt): one per generation, a GPU runs the nearest lower version of its
+  # generation (6.1 -> 6.0, 7.5 -> 7.0, 8.6 / 8.9 -> 8.0); CUDA 13 keeps 7.5 (no 7.0 target there)
+  if(MVTOOLS_CUDA_ARCH_SET STREQUAL "nightly")
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+      set(_cc_default_arch "75-real;80-real;90-real;120-real;120-virtual")
+    else()
+      set(_cc_default_arch "60-real;70-real;80-real;90-real;120-real;120-virtual")
+    endif()
+  elseif(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
     set(_cc_default_arch "75-real;80-real;86-real;89-real;90-real;120-real;120-virtual")
   else()
     set(_cc_default_arch "60-real;61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real;120-virtual")
   endif()
   # Development: 61-virtual / 70-virtual builds only the Pascal / Volta PTX, which the driver JIT-compiles for the local
   # GPU (runs the code of those targets on a newer GPU); 120-real only the local RTX 50xx
-  set(CUDACONVOLUTION_CUDA_ARCH "${_cc_default_arch}" CACHE STRING "CUDA architectures of CudaConvolution")
+  set(CUDACONVOLUTION_CUDA_ARCH "" CACHE STRING "CUDA architectures of CudaConvolution (empty: MVTOOLS_CUDA_ARCH_SET)")
+  if(CUDACONVOLUTION_CUDA_ARCH)
+    set(_cc_arch "${CUDACONVOLUTION_CUDA_ARCH}")
+  else()
+    set(_cc_arch "${_cc_default_arch}")
+  endif()
   # oldest architecture of the build and a readable list, for the run-time device check (src/cuda/device.cu)
   set(_cc_min 9999)
   set(_cc_text "")
-  foreach(a IN LISTS CUDACONVOLUTION_CUDA_ARCH)
+  foreach(a IN LISTS _cc_arch)
     if(a MATCHES "^([0-9]+)(-real|-virtual)?$")
       set(_n ${CMAKE_MATCH_1})
       if(_n LESS _cc_min)
@@ -124,7 +137,7 @@ if(CUDACONVOLUTION_HAVE_CUDA)
   add_library(cudaconvolution_cuda STATIC src/cuda/device.cu src/cuda/engine_cuda.cu)
   target_link_libraries(cudaconvolution_cuda PUBLIC cudaconvolution_core CUDA::cudart_static version)
   set_target_properties(cudaconvolution_cuda PROPERTIES
-    CUDA_ARCHITECTURES "${CUDACONVOLUTION_CUDA_ARCH}"
+    CUDA_ARCHITECTURES "${_cc_arch}"
     CUDA_RUNTIME_LIBRARY Static)
   # --fmad=false: nvcc must not contract a*b+c on its own; FMA only where written as __fmaf_rn.
   # CUDA 12 warns about every target below 7.5 (deprecated, still supported).
@@ -157,7 +170,7 @@ if(CUDACONVOLUTION_TESTS)
   if(CUDACONVOLUTION_HAVE_CUDA)
     target_sources(cudaconvolution_tests PRIVATE tests/test_cuda.cpp tests/bench_cuda.cu)
     set_target_properties(cudaconvolution_tests PROPERTIES CUDA_RUNTIME_LIBRARY Static
-                          CUDA_ARCHITECTURES "${CUDACONVOLUTION_CUDA_ARCH}")
+                          CUDA_ARCHITECTURES "${_cc_arch}")
     target_compile_options(cudaconvolution_tests PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>")
     target_link_libraries(cudaconvolution_tests PRIVATE cudaconvolution_cuda)
   endif()

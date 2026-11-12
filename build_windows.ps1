@@ -20,7 +20,9 @@
 .EXAMPLE
   .\build_windows.ps1
   .\build_windows.ps1 -BuildDir C:\tmp\b -CudaArch 120-real           # mvtools_cuda for the local RTX 50xx only, faster
-  .\build_windows.ps1 -CudaArch 61-virtual       # Pascal code only, JIT-compiled for the local GPU (tests those paths)
+  .\build_windows.ps1 -CudaArchSet full       # releases: machine code for every architecture (default nightly:
+                                                # one per GPU generation, ~30 % less build time)
+  .\build_windows.ps1 -CudaArch 61-virtual      # Pascal code only, JIT-compiled for the local GPU (tests those paths)
   .\build_windows.ps1 -NoCuda                    # CPU plugins + bridge + cudafilters only, about 1 minute
 #>
 [CmdletBinding()]
@@ -31,6 +33,7 @@ param(
   [string]$Nasm = '',
   [string]$Nvcc = '',
   [string]$CudaArch = '',
+  [ValidateSet('nightly', 'full')][string]$CudaArchSet = 'nightly',
   [string]$VcvarsVer = '',
   [switch]$NoCuda,
   [switch]$NoVapourSynth,
@@ -107,6 +110,7 @@ if ($NoCuda) {
     $cudaArgs += '-DMVTOOLS_CUDA=ON'
     $cudaArgs += "-DCMAKE_CUDA_COMPILER=$($Nvcc -replace '\\','/')"
     if ($CudaArch) { $cudaArgs += "-DMVTOOLS_CUDA_ARCH=$CudaArch" }
+    $cudaArgs += "-DMVTOOLS_CUDA_ARCH_SET=$CudaArchSet"
   }
 }
 

@@ -36,8 +36,11 @@ The user agreed to split SplatFps (agreed order: this split, sizes / formats, fa
 **Decision.** mvtools_cuda runs on compute capability 6.0 and newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx). The
 instructions that need newer devices (cp.async: 8.0; ld.acquire / st.release, `__nanosleep`, `__grid_constant__`: 7.0)
 have fallbacks that compute the same results (`MVC_ARCH_BELOW`, `mvcuda_internal.h`). The library is built with CUDA
-12 only, 12.8 or newer (12.9 recommended): machine code for 6.1 .. 12.0 plus PTX 6.0 and 8.0. On Windows that means the
-MSVC 14.4x host toolset (v143); `build_windows.ps1` selects it, CMake refuses other toolkits.
+12 only, 12.8 or newer (12.9 recommended): machine code for 6.1 .. 12.0 plus PTX 6.0 and 8.0 (`MVTOOLS_CUDA_ARCH_SET
+full`, releases). The default `nightly` set builds machine code for 6.0, 7.0, 8.0, 9.0 and 12.0 plus PTX 8.0 only: the
+other GPUs run the code of the nearest lower version of their generation (the source branches only at 7.0, 8.0 and
+9.0, so the code paths are the same; measured 273 -> 192 s build time, the shared cubins identical). On Windows that
+means the MSVC 14.4x host toolset (v143); `build_windows.ps1` selects it, CMake refuses other toolkits.
 
 **Why.** CUDA 13 no longer compiles for Pascal or Volta, so one toolkit for every build keeps one DLL for every card;
 two release variants (CUDA 13 for 7.5+, CUDA 12 for older cards) would double the testing. The sm_80+ code is the same

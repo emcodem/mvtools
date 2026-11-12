@@ -10,7 +10,8 @@
 #                         /usr/local/cuda-12.8, the PATH, /usr/local/cuda, ~/opt/cuda. NVCC=none skips it
 #   CUDA_HOST_CXX         host compiler for nvcc when the default g++ is newer than CUDA 12 accepts (12.9: GCC 14 and
 #                         older), e.g. CUDA_HOST_CXX=g++-14
-#   CUDA_ARCH             e.g. "120-real" (local GPU only, much faster); default: the release list of Sources/cuda
+#   CUDA_ARCH             e.g. "120-real" (local GPU only, much faster); default: the list of CUDA_ARCH_SET
+#   CUDA_ARCH_SET         nightly (default: one machine code per GPU generation, ~30 % less build time) or full (releases)
 #   BUILD_TYPE            Release (default), RelWithDebInfo, Debug
 #   CMAKE_EXTRA           further CMake arguments, e.g. "-DMVTOOLS_VAPOURSYNTH=OFF"
 set -euo pipefail
@@ -50,6 +51,7 @@ else
     args+=(-DCMAKE_CUDA_COMPILER="$nvcc")
     [ -n "${CUDA_HOST_CXX:-}" ] && args+=(-DCMAKE_CUDA_HOST_COMPILER="$CUDA_HOST_CXX")
     [ -n "${CUDA_ARCH:-}" ] && args+=(-DMVTOOLS_CUDA_ARCH="$CUDA_ARCH")
+    args+=(-DMVTOOLS_CUDA_ARCH_SET="${CUDA_ARCH_SET:-nightly}")
   else
     echo "build_linux.sh: no CUDA 12.8 .. 12.x nvcc found, libmvtools_cuda.so is not built (install CUDA 12.9 or set NVCC)" >&2
     args+=(-DMVTOOLS_CUDA=OFF)

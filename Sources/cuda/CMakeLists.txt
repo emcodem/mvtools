@@ -24,18 +24,29 @@ set_source_files_properties(mvcuda_splat_exact.cu PROPERTIES COMPILE_OPTIONS "-f
 
 # Release: the device code runs on compute capability 6.0 and newer (cp.async / acquire-release paths for 8.0+ / 7.0+,
 # fallbacks below, mvcuda_internal.h MVC_ARCH_BELOW). Built with CUDA 12 only (12.8+ for 12.0, 12.9 recommended; the
-# root CMakeLists.txt checks it): machine code for 6.1 (GTX 10xx), 7.0, 7.5, 8.0, 8.6, 8.9, 9.0, 12.0, PTX 6.0 (P100,
-# JIT) and PTX 8.0 (newer architectures get the 8.0 code JIT-compiled). On Windows, CUDA 12 needs the MSVC 14.4x (v143)
-# host toolset; the VS 2026 STL (14.5x) does not compile with it.
+# root CMakeLists.txt checks it). MVTOOLS_CUDA_ARCH_SET full (releases): machine code for 6.1 (GTX 10xx), 7.0, 7.5,
+# 8.0, 8.6, 8.9, 9.0, 12.0, PTX 6.0 (P100, JIT) and PTX 8.0 (newer architectures get the 8.0 code JIT-compiled).
+# nightly: machine code for 6.0, 7.0, 8.0, 9.0, 12.0 and PTX 8.0; a GPU runs the code of the nearest lower version of
+# its generation (7.5 runs 7.0, 8.6 / 8.9 run 8.0, 6.1 runs 6.0). The source only branches at 7.0, 8.0 and 9.0, so the
+# results are the same, only the instruction scheduling is not tuned for 6.1 / 7.5 / 8.6 / 8.9. 12.0 keeps its own code
+# (9.0+ float4 atomics; 9.0 code does not run on 12.0). On Windows, CUDA 12 needs the MSVC 14.4x (v143) host toolset;
+# the VS 2026 STL (14.5x) does not compile with it.
 # Development: -DMVTOOLS_CUDA_ARCH=120-real builds for the local RTX 50xx only, several times faster; 61-virtual builds
 # only the Pascal code, which the driver JIT-compiles for the local GPU (tests of the MVC_ARCH_BELOW paths).
-set(MVTOOLS_CUDA_ARCH "61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real;60-virtual;80-virtual"
-  CACHE STRING "CUDA architectures of mvtools_cuda")
+set(MVTOOLS_CUDA_ARCH "" CACHE STRING "CUDA architectures of mvtools_cuda (empty: from MVTOOLS_CUDA_ARCH_SET)")
+if(MVTOOLS_CUDA_ARCH)
+  set(_mvc_arch "${MVTOOLS_CUDA_ARCH}")
+elseif(MVTOOLS_CUDA_ARCH_SET STREQUAL "nightly")
+  set(_mvc_arch "60-real;70-real;80-real;90-real;120-real;80-virtual")
+else()
+  set(_mvc_arch "61-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real;60-virtual;80-virtual")
+endif()
+message(STATUS "mvtools_cuda: CUDA architectures ${_mvc_arch}")
 # Extra nvcc flags, e.g. -DMVC_PHASE_PROF (k_search phase timing, was build_prof.bat)
 set(MVTOOLS_CUDA_FLAGS "" CACHE STRING "extra nvcc flags for mvtools_cuda")
 
 set_target_properties(mvtools_cuda PROPERTIES
-  CUDA_ARCHITECTURES "${MVTOOLS_CUDA_ARCH}"
+  CUDA_ARCHITECTURES "${_mvc_arch}"
   CUDA_STANDARD 17
   CUDA_STANDARD_REQUIRED ON
   CUDA_RUNTIME_LIBRARY Static

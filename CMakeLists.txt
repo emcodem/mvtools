@@ -170,6 +170,16 @@ endif()
 # the build goes on without mvtools_cuda.
 option(MVTOOLS_GPU "Build cudafilters and (MVTOOLS_CUDA) mvtools_cuda" ON)
 option(MVTOOLS_CUDA "Build mvtools_cuda (needs CUDA 12.8 .. 12.x: CMAKE_CUDA_COMPILER)" ON)
+# Which GPU architectures get their own machine code (mvtools_cuda and CudaConvolution). nightly (default): one per GPU
+# generation (Turing runs the Volta code, Ampere RTX 30xx and Ada the A100 code, Pascal the P100 code; same source
+# paths, only the instruction scheduling is not tuned for them), about 30 % less build time. full: one per
+# architecture, for releases.
+# MVTOOLS_CUDA_ARCH / CUDACONVOLUTION_CUDA_ARCH, when set, override it.
+set(MVTOOLS_CUDA_ARCH_SET "nightly" CACHE STRING "CUDA architecture set: nightly (default, faster build) or full (releases)")
+set_property(CACHE MVTOOLS_CUDA_ARCH_SET PROPERTY STRINGS nightly full)
+if(NOT MVTOOLS_CUDA_ARCH_SET MATCHES "^(full|nightly)$")
+  message(FATAL_ERROR "MVTOOLS_CUDA_ARCH_SET: '${MVTOOLS_CUDA_ARCH_SET}' is not full or nightly")
+endif()
 if(MVTOOLS_GPU)
   set(_mv_cuda_ok OFF)
   if(MVTOOLS_CUDA AND MINGW)

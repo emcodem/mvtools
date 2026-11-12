@@ -57,8 +57,11 @@ toolkit (and on Windows the MSVC version) and builds everything else without mvt
 not fit.
 
 Options: `MVTOOLS_CUDA_ARCH` (CUDA architectures, e.g. `120-real` for a fast build for the local RTX 50xx only,
-`61-virtual` for the Pascal code paths only, JIT-compiled by the driver for the local GPU; default: the release list in
-`Sources/cuda/CMakeLists.txt`, machine code for compute capability 6.1 .. 12.0 plus PTX for 6.0 and newer GPUs), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
+`61-virtual` for the Pascal code paths only, JIT-compiled by the driver for the local GPU; default: the list of
+`MVTOOLS_CUDA_ARCH_SET`), `MVTOOLS_CUDA_ARCH_SET` (`nightly`, the default: machine code for compute capability 6.0,
+7.0, 8.0, 9.0 and 12.0 plus PTX for newer GPUs, the other GPUs run the code of the nearest lower version of their
+generation, about 30 % less build time; `full` for releases: machine code for 6.1 .. 12.0 plus PTX for 6.0 and newer
+GPUs, `build_windows.ps1 -CudaArchSet full`, `CUDA_ARCH_SET=full ./build_linux.sh`), `MVTOOLS_CUDA_FLAGS` (extra nvcc flags), `MVTOOLS_STATIC_CRT` (MSVC,
 default ON: `/MT`, no Visual C++ redistributable needed), `MVTOOLS_DIST_DIR` (the collect folder), `ENABLE_INTEL_SIMD` /
 `ENABLE_NEON_SIMD` (set from the target processor; both OFF gives a C-only build for testing).
 
