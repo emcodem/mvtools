@@ -872,21 +872,19 @@ namespace SPLAT_NS
   // outside the picture as box_sum.
   // Tile 16 x 16: about 28 KB of shared memory at the default box, so at least two blocks fit an SM on every supported
   // GPU (64 KB per SM on Turing; three per SM on 100 KB parts, measured faster there than 32 x 16 tiles).
-  constexpr int REFINE_R_FIXED = 7; // radius of the default refine_box (15), compiled with fixed geometry
+  constexpr int REFINE_R_FIXED = 7; // radius of the default refine_box (15): k_refine_strip<7>
   template <int TX, int TY> static size_t refine_fused_smem(int r)
   {
     const size_t hh = TY + 2 * r, hw = TX + 2 * r;
     return sizeof(float) * 5 * hh * (hw + TX);
   }
 
-  // RR > 0: the box radius as a compile-time constant (the default box), so the tile geometry and the loops are fixed;
-  // RR == 0: radius r at run time. Block 32 x 8 (refine_dev). Plane offsets in int: a plane has fewer than 2^31 samples.
-  template <int REF_TX, int REF_TY, int RR = 0>
+  // Block 32 x 8 (refine_dev). Plane offsets in int: a plane has fewer than 2^31 samples.
+  template <int REF_TX, int REF_TY>
   __global__ void __launch_bounds__(256) k_refine_fused(const float *cur, const float *vecs, const float *d, const float *err,
-    int w, int h, int neg, float eps, float wscale, int r_arg, float *out)
+    int w, int h, int neg, float eps, float wscale, int r, float *out)
   {
     extern __shared__ float sm[];
-    const int r = RR > 0 ? RR : r_arg;
     const int HH = REF_TY + 2 * r, HW = REF_TX + 2 * r, c = blockIdx.z;
     constexpr int nt = 256;
     const int tid = threadIdx.y * 32 + threadIdx.x;
@@ -986,6 +984,131 @@ namespace SPLAT_NS
     }
   }
 
+  // The same refinement for a box radius R fixed at compile time, one block per strip of RS_W x RS_H output pixels
+  // (block 32 x 8): the block walks down the strip's rows plus apron in chunks of RS_CH rows. Per chunk: the five terms
+  // of the chunk's rows over the strip's columns plus apron (zero outside the picture), their row sums into a ring of
+  // the last RS_RING rows, the column sums of the output rows the chunk completes, and the solve of those rows. Each
+  // term is computed (RS_W + 2 R) / RS_W x (RS_H + 2 R) / RS_H times per output instead of the square of the
+  // tile's apron ratio. Row and column sums slide over at most RS_CH (or 8) outputs from a fresh sum, as the tile kernel.
+  constexpr int RS_W = 32, RS_H = 64, RS_CH = 8, RS_RING = 32;
+
+  template <int R>
+  __global__ void __launch_bounds__(256) k_refine_strip(const float *__restrict__ cur, const float *__restrict__ vecs,
+    const float *__restrict__ d, const float *__restrict__ err, int w, int h, int neg, float eps, float wscale,
+    float *__restrict__ out)
+  {
+    constexpr int AW = RS_W + 2 * R, AH = RS_H + 2 * R, NCH = (AH + RS_CH - 1) / RS_CH, SEG = 8, NSEG = RS_W / SEG;
+    constexpr int BOX = 2 * R + 1;
+    static_assert(RS_RING >= BOX + RS_CH - 1 && (RS_RING & (RS_RING - 1)) == 0, "ring too short or not a power of two");
+    static_assert(RS_CH * AW <= 512 && 5 * RS_CH * RS_W <= 5 * RS_CH * AW, "term items per thread / V in the term buffer");
+    static_assert(5 * RS_CH * NSEG <= 256 && 5 * RS_W <= 256 && RS_CH * 32 == 256, "work items per phase exceed the block");
+    __shared__ float Tt[5][RS_CH][AW];     // terms of the chunk's rows; then V
+    __shared__ float Hr[5][RS_RING][RS_W]; // row sums, apron row a in slot a % RS_RING
+    float (*V)[RS_CH][RS_W] = reinterpret_cast<float (*)[RS_CH][RS_W]>(&Tt[0][0][0]); // box sums of the completed rows
+    const int tid = threadIdx.y * 32 + threadIdx.x, c = blockIdx.z;
+    const int x0 = blockIdx.x * RS_W, y0 = blockIdx.y * RS_H; // first output pixel; apron row a = picture row y0 - R + a
+    const size_t np = (size_t)w * h;
+    const float *errc = err + c * np, *dc = d + c * np, *vxc = vecs + 2 * c * np, *vyc = vxc + np;
+    const float nis = __fdividef(-1.0f, wscale);
+    float *oxc = out + 2 * c * np, *oyc = oxc + np;
+    // this thread's term items (chunk row, apron column): q = tid and tid + 256, the same in every chunk
+    int qj[2], qx[2];
+    for (int u = 0; u < 2; u++)
+    {
+      const int q = tid + 256 * u;
+      qj[u] = q / AW;
+      qx[u] = q - qj[u] * AW;
+    }
+    for (int k = 0; k < NCH; k++)
+    {
+      const int a0 = k * RS_CH;
+      // 1. terms (as k_terms) of rows a0 .. a0 + RS_CH - 1
+#pragma unroll
+      for (int u = 0; u < 2; u++)
+      {
+        if (tid + 256 * u >= RS_CH * AW)
+          break;
+        const int j = qj[u], lx = qx[u], x = x0 - R + lx, y = y0 - R + a0 + j;
+        float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f, t4 = 0.0f;
+        if (x >= 0 && x < w && y >= 0 && y < h)
+        {
+          const int i = y * w + x;
+          const float gx = (cur[i - x + min(x + 1, w - 1)] - cur[i - x + max(x - 1, 0)]) * 0.5f;
+          const float gy = (cur[min(y + 1, h - 1) * w + x] - cur[max(y - 1, 0) * w + x]) * 0.5f;
+          const float ixx = gx * gx, iyy = gy * gy, ixy = gx * gy;
+          const float wt = __expf(errc[i] * nis);
+          float vx = vxc[i], vy = vyc[i];
+          if (neg)
+          {
+            vx = -vx;
+            vy = -vy;
+          }
+          const float dd = dc[i];
+          t0 = (ixx * vx + ixy * vy + gx * dd) * wt;
+          t1 = (ixy * vx + iyy * vy + gy * dd) * wt;
+          t2 = (ixx + eps) * wt;
+          t3 = (iyy + eps) * wt;
+          t4 = ixy * wt;
+        }
+        Tt[0][j][lx] = t0;
+        Tt[1][j][lx] = t1;
+        Tt[2][j][lx] = t2;
+        Tt[3][j][lx] = t3;
+        Tt[4][j][lx] = t4;
+      }
+      __syncthreads();
+      // 2. row sums: item = (term, chunk row, segment of SEG columns)
+      if (tid < 5 * RS_CH * NSEG)
+      {
+        const int sg = tid % NSEG, j = (tid / NSEG) % RS_CH, t = tid / (NSEG * RS_CH);
+        const float *row = &Tt[t][j][sg * SEG];
+        float *o = &Hr[t][(a0 + j) & (RS_RING - 1)][sg * SEG];
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < BOX; i++)
+          s += row[i];
+        o[0] = s;
+#pragma unroll
+        for (int x = 1; x < SEG; x++)
+        {
+          s += row[x + 2 * R] - row[x - 1];
+          o[x] = s;
+        }
+      }
+      __syncthreads();
+      // 3. column sums: item = (term, column); apron row a completes output row a - 2 R
+      if (tid < 5 * RS_W && a0 + RS_CH > 2 * R)
+      {
+        const int t = tid / RS_W, col = tid % RS_W;
+        const int j0 = a0 >= 2 * R ? 0 : 2 * R - a0;
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < BOX; i++)
+          s += Hr[t][(a0 + j0 - 2 * R + i) & (RS_RING - 1)][col];
+        V[t][j0][col] = s;
+        for (int j = j0 + 1; j < RS_CH; j++)
+        {
+          s += Hr[t][(a0 + j) & (RS_RING - 1)][col] - Hr[t][(a0 + j - BOX) & (RS_RING - 1)][col];
+          V[t][j][col] = s;
+        }
+      }
+      __syncthreads();
+      // 4. solve (as k_solve) the completed output rows: item = (chunk row, column)
+      {
+        const int col = tid % 32, j = tid / 32, o = a0 + j - 2 * R, x = x0 + col, y = y0 + o;
+        if (o >= 0 && o < RS_H && x < w && y < h)
+        {
+          const float b1 = V[0][j][col], b2 = V[1][j][col], a = V[2][j][col], cc = V[3][j][col], bxy = V[4][j][col];
+          const float id = 1.0f / (a * cc - bxy * bxy);
+          const int i = y * w + x;
+          oxc[i] = (cc * b1 - bxy * b2) * id;
+          oyc[i] = (a * b2 - bxy * b1) * id;
+        }
+      }
+      __syncthreads(); // V lives in the term buffer of the next chunk
+    }
+  }
+
   // true when the fused refinement (16 x 16 tiles) runs on this device for box radius r: its block must fit twice into
   // an SM's shared memory (one block per SM leaves it latency-bound); else the plane-wise path runs
   static bool refine_fused_ready(int r)
@@ -1000,16 +1123,13 @@ namespace SPLAT_NS
       cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
       // the kernel is latency-bound: prefer the largest shared-memory carve-out so more tiles fit per SM
       cudaFuncSetAttribute(k_refine_fused<16, 16>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-      cudaFuncSetAttribute(k_refine_fused<16, 16, REFINE_R_FIXED>, cudaFuncAttributePreferredSharedMemoryCarveout,
-        cudaSharedmemCarveoutMaxShared);
       optin = v;
     }
     auto fits = [&](size_t need) { return need <= (size_t)optin && 2 * (need + reserved) <= (size_t)per_sm; };
     auto allow = [&](const void *f, size_t need) {
       return need <= 48 * 1024 || cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need) == cudaSuccess;
     };
-    const void *f = r == REFINE_R_FIXED ? (const void *)k_refine_fused<16, 16, REFINE_R_FIXED> : (const void *)k_refine_fused<16, 16>;
-    return fits(refine_fused_smem<16, 16>(r)) && allow(f, refine_fused_smem<16, 16>(r));
+    return fits(refine_fused_smem<16, 16>(r)) && allow((const void *)k_refine_fused<16, 16>, refine_fused_smem<16, 16>(r));
   }
 #endif
 
@@ -1031,20 +1151,20 @@ namespace SPLAT_NS
     int h, const float *vecs, int n, bool neg, float *out)
   {
     const dim3 blk(32, 8);
-    const size_t np = (size_t)w * h;
     k_dfd<<<grid(w, h, 1, blk), blk, 0, st>>>(cur, other, w, h, vecs, n, neg ? -1.0f : 1.0f, R.d, R.t0);
     box_sum(st, R.t0, R.t1, R.t0, w, h, n, cfg.error_box, 1, -1.0f);
 #ifndef SPLAT_EXACT
     const int r = (cfg.refine_box - 1) / 2;
+    if (r == REFINE_R_FIXED)
+    {
+      k_refine_strip<REFINE_R_FIXED><<<dim3((w + RS_W - 1) / RS_W, (h + RS_H - 1) / RS_H, n), blk, 0, st>>>(cur, vecs, R.d,
+        R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, out);
+      return;
+    }
     if (refine_fused_ready(r))
     {
-      const dim3 g((w + 15) / 16, (h + 15) / 16, n);
-      if (r == REFINE_R_FIXED)
-        k_refine_fused<16, 16, REFINE_R_FIXED><<<g, blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs, R.d, R.t0, w, h,
-          neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
-      else
-        k_refine_fused<16, 16><<<g, blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs, R.d, R.t0, w, h, neg ? 1 : 0,
-          cfg.refine_reg, cfg.refine_err_scale, r, out);
+      k_refine_fused<16, 16><<<dim3((w + 15) / 16, (h + 15) / 16, n), blk, refine_fused_smem<16, 16>(r), st>>>(cur, vecs,
+        R.d, R.t0, w, h, neg ? 1 : 0, cfg.refine_reg, cfg.refine_err_scale, r, out);
       return;
     }
 #endif
