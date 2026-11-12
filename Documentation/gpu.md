@@ -498,6 +498,14 @@ its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all t
 `QTGMC_gpu_search`, `QTGMC_gpu_tokens`, `QTGMC_gpu_edi`, `QTGMC_gpu_out`) at once. `qtgmc\bundle\examples\` has example
 scripts for QTGMC, a GPU / CPU comparison and frame-rate conversion (exact search and CudaNVOFAnalyse).
 
+**Reported on Ampere (open).** With the `gpu-2026-11-01c` bundle (commit 0288391) on an RTX 3090 Ti (compute 8.6,
+driver 616.56) the whole SD QTGMC chain is slower on the GPU than the stock CPU QTGMC, not faster: 720x480, 1500
+interlaced frames, `Prefetch(12)`, against a Ryzen 9 9950X3D (16C/32T), Fast 26.96 s on the GPU against 4.44 s on the
+CPU, Slower 74.67 s against 7.23 s. `global QTGMC_gpu_meander = false` recovers about 3x (Fast 8.68 s) but stays about
+2x slower than the CPU. The same script with `MVTOOLS_GPU_FORCE_FALLBACK=1` takes 3.66 s, so the GPU compute is the
+cause and not the script path; the output is bit-exact either way. Not seen on the RTX 5090 the bundle was tested on,
+where SD Fast is 1.9 s on the GPU against 3.4 s on the CPU.
+
 ---
 
 ## Environment variables
