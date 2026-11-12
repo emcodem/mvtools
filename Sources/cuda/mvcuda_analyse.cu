@@ -30,6 +30,37 @@
 #include <type_traits>
 #include <vector>
 
+// Build split. The heaviest kernel instances take most of the compile time (ptxas, for every architecture), so they are
+// compiled in units of their own that run in parallel: mvcuda_analyse_<8|16>_p1.cu (MVC_ANALYSE_PART 1) has
+// k_search<true> (trymany), _p2 / _p3 the general k_wave (mvc_refine inlined) of GW 4 / 8 and 16 / 32. The main unit
+// (_8.cu / _16.cu, part 0) has everything else and reaches those instances through the functions below (plain
+// argument types: the kernels and their argument structs are local to each unit, the same code). With MVC_PHASE_PROF
+// (device-side counters, one copy per unit) the main unit keeps every instance and the parts are empty.
+#ifndef MVC_ANALYSE_PART
+#define MVC_ANALYSE_PART 0
+#endif
+#ifdef MVC_PHASE_PROF
+#define MVC_ANALYSE_SPLIT 0
+#else
+#define MVC_ANALYSE_SPLIT 1
+#endif
+#ifdef MVC_PIX8
+#define MVC_AN_PARTS mvc_analyse8_parts
+#else
+#define MVC_AN_PARTS mvc_analyse16_parts
+#endif
+namespace MVC_AN_PARTS
+{
+  // part 1: k_search<true>: its static shared memory, set its dynamic shared memory limit, launch (args: a LevelArgs)
+  int search_tm_static_smem();
+  void search_tm_set_dyn(int dyn);
+  void search_tm_launch(const void *args, unsigned grid, size_t shm, cudaStream_t st);
+  // parts 2 / 3: the general k_wave of GW 4 / 8 (small) and 16 / 32 (large), as launch_wave_k<GW, 0, 0, true> (call: a
+  // WaveCall; dcall: the call in device memory or null)
+  void wave_gen_small(int gw, const void *call, const void *dcall, int grid, cudaStream_t st);
+  void wave_gen_large(int gw, const void *call, const void *dcall, int grid, cudaStream_t st);
+}
+
 namespace
 {
   typedef mvc_pix pix;
@@ -4002,6 +4033,7 @@ namespace
 #endif
   }
 
+#if MVC_ANALYSE_PART == 0
   // true when the device runs code compiled for an architecture below 7.0 (a Pascal card, or a PTX-only build for 6.x
   // JIT-compiled for a newer one): then the wavefront call goes through k_wave_p
   bool wave_by_pointer()
@@ -4014,6 +4046,7 @@ namespace
     }();
     return v;
   }
+#endif
 
   // dc: the call in device memory (k_wave_p), or nullptr (k_wave)
   template <int GW, int BSY, int CHH, bool GEN>
@@ -4032,6 +4065,21 @@ namespace
       k_wave<GW, BSY, CHH, GEN><<<grid, WAVE_NT, 0, st>>>(WaveArg{});
 #endif
     }
+  }
+
+#if MVC_ANALYSE_PART == 0
+  // the general k_wave of GW: in this unit, or in part 2 / 3 (build split)
+  template <int GW>
+  void launch_wave_gen(const WaveCall &c, const WaveCall *dc, int grid, cudaStream_t st)
+  {
+#if MVC_ANALYSE_SPLIT
+    if constexpr (GW < 16)
+      MVC_AN_PARTS::wave_gen_small(GW, &c, dc, grid, st);
+    else
+      MVC_AN_PARTS::wave_gen_large(GW, &c, dc, grid, st);
+#else
+    launch_wave_k<GW, 0, 0, true>(c, dc, grid, st);
+#endif
   }
 
   // Picks the k_wave instance: the ring-only kernels (no mvc_refine) with compile-time row counts for the square 16 and
@@ -4053,12 +4101,12 @@ namespace
     if constexpr (GW < 16)
     {
       if (gen)
-        launch_wave_k<GW, 0, 0, true>(c, dc, grid, st);
+        launch_wave_gen<GW>(c, dc, grid, st);
       else
         launch_wave_k<GW, 0, 0, false>(c, dc, grid, st);
     }
     else if (gen)
-      launch_wave_k<GW, 0, 0, true>(c, dc, grid, st);
+      launch_wave_gen<GW>(c, dc, grid, st);
 #endif
     else if (a.bs_y == GW && a.ch == 0)
       launch_wave_k<GW, GW, 0, false>(c, dc, grid, st);
@@ -4077,7 +4125,10 @@ namespace
       l++;
     return l;
   }
+#endif
 }
+
+#if MVC_ANALYSE_PART == 0
 
 // Payload + wave-state buffers whose state part is zero (k_wave clears it at the end of every completed call), by size.
 // fresh: a new buffer, its state still to be cleared once.
@@ -4412,11 +4463,17 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
             int dev = 0, v = 0;
             cudaGetDevice(&dev);
             cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+#if MVC_ANALYSE_SPLIT
+            const int dyn = v - MVC_AN_PARTS::search_tm_static_smem() - 256;
+            cudaFuncSetAttribute(k_search<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+            MVC_AN_PARTS::search_tm_set_dyn(dyn);
+#else
             cudaFuncAttributes fa = {};
             cudaFuncGetAttributes(&fa, k_search<true>);
             const int dyn = v - (int)fa.sharedSizeBytes - 256;
             cudaFuncSetAttribute(k_search<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
             cudaFuncSetAttribute(k_search<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+#endif
             return dyn;
           }();
           const int r = a.radius, nsub = a.pel * a.pel;
@@ -4431,7 +4488,11 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
           }
         }
         if (a.try_many)
+#if MVC_ANALYSE_SPLIT
+          MVC_AN_PARTS::search_tm_launch(&a, a.n_slices, shm, st);
+#else
           k_search<true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
+#endif
         else
           k_search<false><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
       }
@@ -4646,3 +4707,48 @@ extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const 
     return -4;
   return analyse_dev(sp, ap, fs, fr, payload, payload_words);
 }
+#endif // MVC_ANALYSE_PART == 0
+
+// ---- build-split parts (see the top of this file) ----
+#if MVC_ANALYSE_SPLIT && MVC_ANALYSE_PART == 1
+namespace MVC_AN_PARTS
+{
+  int search_tm_static_smem()
+  {
+    cudaFuncAttributes fa = {};
+    cudaFuncGetAttributes(&fa, k_search<true>);
+    return (int)fa.sharedSizeBytes;
+  }
+  void search_tm_set_dyn(int dyn) { cudaFuncSetAttribute(k_search<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn); }
+  void search_tm_launch(const void *args, unsigned grid, size_t shm, cudaStream_t st)
+  {
+    k_search<true><<<grid, SEARCH_THREADS, shm, st>>>(*static_cast<const LevelArgs *>(args));
+  }
+}
+#endif
+#if MVC_ANALYSE_SPLIT && (MVC_ANALYSE_PART == 2 || MVC_ANALYSE_PART == 3) && !defined(MVC_DEV_FASTONLY)
+namespace MVC_AN_PARTS
+{
+#if MVC_ANALYSE_PART == 2
+  void wave_gen_small(int gw, const void *call, const void *dcall, int grid, cudaStream_t st)
+  {
+    const WaveCall &c = *static_cast<const WaveCall *>(call);
+    const WaveCall *dc = static_cast<const WaveCall *>(dcall);
+    if (gw == 4)
+      launch_wave_k<4, 0, 0, true>(c, dc, grid, st);
+    else
+      launch_wave_k<8, 0, 0, true>(c, dc, grid, st);
+  }
+#else
+  void wave_gen_large(int gw, const void *call, const void *dcall, int grid, cudaStream_t st)
+  {
+    const WaveCall &c = *static_cast<const WaveCall *>(call);
+    const WaveCall *dc = static_cast<const WaveCall *>(dcall);
+    if (gw == 16)
+      launch_wave_k<16, 0, 0, true>(c, dc, grid, st);
+    else
+      launch_wave_k<32, 0, 0, true>(c, dc, grid, st);
+  }
+#endif
+}
+#endif

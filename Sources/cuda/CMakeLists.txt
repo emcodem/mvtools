@@ -5,11 +5,15 @@
 #
 # The _8 / _16 units include the shared sources (mvcuda_analyse.cu etc.) with the sample size defined; the shared sources
 # are not compiled on their own.
+# mvcuda_analyse_*_p1 .. p3: the heaviest kernel instances of the search in units of their own, so they compile in
+# parallel (top of mvcuda_analyse.cu); they come first in the list so the build starts them first.
 
 set(MVCUDA_SOURCES
   mvcuda.cu mvcuda_core.cu mvcuda_frames.cu mvcuda_resample.cu mvcuda_temporal.cu mvcuda_merge.cu mvcuda_kobs.cu
   mvcuda_nnedi3.cu mvcuda_comp.cu mvcuda_nvofa.cu
-  mvcuda_super_8.cu mvcuda_super_16.cu mvcuda_recalc_8.cu mvcuda_recalc_16.cu mvcuda_analyse_8.cu mvcuda_analyse_16.cu
+  mvcuda_analyse_16.cu mvcuda_analyse_8.cu mvcuda_analyse_16_p1.cu mvcuda_analyse_8_p1.cu mvcuda_analyse_16_p2.cu
+  mvcuda_analyse_8_p2.cu mvcuda_analyse_16_p3.cu mvcuda_analyse_8_p3.cu
+  mvcuda_super_8.cu mvcuda_super_16.cu mvcuda_recalc_8.cu mvcuda_recalc_16.cu
   mvcuda_flow_8.cu mvcuda_flow_16.cu mvcuda_nvof_vec_8.cu mvcuda_nvof_vec_16.cu
   mvcuda_splat.cu mvcuda_splat_exact.cu mvcuda_splat_fast.cu)
 
@@ -41,7 +45,7 @@ set_target_properties(mvtools_cuda PROPERTIES
 target_compile_definitions(mvtools_cuda PRIVATE MVCUDA_EXPORTS)
 separate_arguments(_mvcuda_extra NATIVE_COMMAND "${MVTOOLS_CUDA_FLAGS}")
 # --threads 0: one nvcc compiles the architectures of a file in parallel (as build.bat does). Without it they run one
-# after another, and mvcuda_analyse_8 / _16 (every k_wave instance, for each architecture) are the build's critical path.
+# after another, and the search units (mvcuda_analyse_*, for each architecture) are the build's critical path.
 target_compile_options(mvtools_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --threads=0 ${_mvcuda_extra}>)
 # CUDA 12 warns about every target below 7.5 (deprecated, still supported)
 target_compile_options(mvtools_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>)
