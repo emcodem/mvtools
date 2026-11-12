@@ -5,9 +5,9 @@
 > switched on in uconvert with `uc_frc_nvof`. `CudaNVOFAnalyse(pre, blksize=32, overlap=16, pel=2, preset=2)` ->
 > MRecalculate -> MFlowFps gives the medium md5 FA834251D140 below, and its vectors and SADs equal level 0 of the hook's
 > MAnalyse output in all 300 vector frames. The scripts here that set `MVCUDA_NVOFA` need the experiment's build
-> (`profile\build_nvofa`, source: commit 574cd22).
+> (`profile\build_nvofa`, source: commit a652f46).
 
-Experiment (plan file opticalflow.md, removed; in git at 5675824): MAnalyse's GPU block search (k_search) replaced by NVOFA vectors
+Experiment (plan file opticalflow.md, removed; in git at 8b9d9d5): MAnalyse's GPU block search (k_search) replaced by NVOFA vectors
 (Optical Flow SDK, `nvofapi64.dll` of the driver). MRecalculate refines them and MFlowFps interpolates, both unchanged.
 Switched by the environment of the process: `MVCUDA_NVOFA=fast|medium|slow`, off when unset. **Not bit-exact** with the
 CPU search (another algorithm); with the variable unset the output is unchanged (md5 BFE44775F811 = CPU fallback).

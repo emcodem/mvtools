@@ -7,7 +7,7 @@
 // then per block the median (x and y separately) of the grid cells under the block, rounded to 1/pel pixel and clamped
 // to the area MAnalyse's search can reach, and its SAD (luma + scaled chroma) against the sub-pel planes of the super
 // frame (MSuper(pel, hpad, vpad, levels=1, sharp=2) of the reference, kept with the device frame like MAnalyse's).
-// The same computation as level 0 of the MVCUDA_NVOFA experiment in MAnalyse (commit 574cd22), which it replaces.
+// The same computation as level 0 of the MVCUDA_NVOFA experiment in MAnalyse (commit a652f46), which it replaces.
 
 #include "mvcuda_internal.h"
 #include "mvcuda_nvofa.h"

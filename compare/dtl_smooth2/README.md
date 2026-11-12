@@ -8,7 +8,7 @@ MFlowFps 24000/1001 `mask=2, ml=200`.
 
 ## Exact script
 
-[scripts/avs/pinterf_sm1_flow.avs](scripts/avs/pinterf_sm1_flow.avs), as run (smooth=1, our build = pinterf cdf04a5,
+[scripts/avs/pinterf_sm1_flow.avs](scripts/avs/pinterf_sm1_flow.avs), as run (smooth=1, our build = pinterf 3ae60cc,
 CPU path):
 
 ```
@@ -47,7 +47,7 @@ its MDegrain2 + MCompensate script: [scripts/avs/pinterf_degrain.avs](scripts/av
 
 ## 1. Same parameters: identical
 
-DTL2020 `post_2.7.47_822` (c688008, built from source) and pinterf `cdf04a5` produce byte-identical output in 5 formats
+DTL2020 `post_2.7.47_822` (c688008, built from source) and pinterf `3ae60cc` produce byte-identical output in 5 formats
 (10/8 bit 4:2:2, 4:2:0, 10 bit 4:4:4) × 3 chains (MAnalyse+MRecalculate vectors, MFlowFps, MDegrain2+MCompensate).
 
 ## 2. smooth=2: search radius is never reset

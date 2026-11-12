@@ -1,6 +1,6 @@
 # The commands that produced the report images and numbers, in the order they were run.
 # $S = working folder with avs\ (the scripts next to this file), viz\ and vizfix\ for the output.
-#   pinterf_sm1_*.avs : our mvtools2.dll (pinterf cdf04a5 + MT patches, CPU), smooth=1 (default)
+#   pinterf_sm1_*.avs : our mvtools2.dll (pinterf 3ae60cc + MT patches, CPU), smooth=1 (default)
 #   dtl_sm1_flow.avs  : DTL2020 post_2.7.47_822 (c688008) built from source, smooth=1
 #   dtl_sm2_*.avs     : same DLL, smooth=2
 #   fix_sm2_*.avs     : DTL c688008 + ../smooth2_radius_fix.patch, smooth=2

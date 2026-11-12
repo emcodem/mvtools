@@ -1,7 +1,7 @@
 # Example plugin set for UConvert (FFAStrans 1.4.2 bundle + tools + MxfSource + GPU plugins). Copy it to
 # load_plugins.avs (not tracked: one machine's paths), which the tests and build_dist.py read, and set the paths.
 # FFAStrans jobs load the same plugins from their own bundle; adjust the paths there.
-# GPU set (G): mvtools2 / mvtools_cuda / cudafilters / splatfps from the mvtools fork, branch gpu_work, commit e895f6a
+# GPU set (G): mvtools2 / mvtools_cuda / cudafilters / splatfps from the mvtools fork, branch gpu_work, commit df02cdd
 # (API 31), as in the A4000 bench package; they must come from one build and sit in one folder. mvtools2 loads
 # mvtools_cuda.dll and avstp.dll from its own folder at run time (build_dist.py copies them along).
 # QTGMC_gpu.avsi = QTGMC 3.393s patched by make_qtgmc_gpu.py; with its GPU switches off it is the stock CPU QTGMC.

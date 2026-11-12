@@ -106,8 +106,8 @@ def make_ref():
             lines.append('%s %d %s' % (case, len(md5s), hashlib.md5(''.join(md5s).encode()).hexdigest()))
             print(lines[-1], '|', '; '.join(paths), flush=True)
     with open(REF, 'w', newline='\n') as f:
-        f.write('# AviSynth+ 3.7.5 (Windows), release bundle 2026-11-01b (cudafilters.dll 530b06a, mvtools_cuda.dll '
-                '15811aa), masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by cf_chains.py ref\n'
+        f.write('# AviSynth+ 3.7.5 (Windows), release bundle 2026-11-01b (cudafilters.dll 54a11fe, mvtools_cuda.dll '
+                '3db5d84), masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by cf_chains.py ref\n'
                 '# case frames md5(concatenated per-frame md5s)\n' + '\n'.join(lines) + '\n')
 
 

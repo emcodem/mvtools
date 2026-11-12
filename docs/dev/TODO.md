@@ -1,7 +1,7 @@
 # Open work
 
 All open items of the GPU fork in one place (collected 2026-11-02 from the former plan files, whose last versions are in
-git history at commit af2e51e: GPU_PIPELINE_PLAN.md, GPU_PLAN.md, GPU_QTGMC_PLAN.md, REBASE_PLAN.md, VAPOURSYNTH_PLAN.md,
+git history at commit 4c58b6f: GPU_PIPELINE_PLAN.md, GPU_PLAN.md, GPU_QTGMC_PLAN.md, REBASE_PLAN.md, VAPOURSYNTH_PLAN.md,
 NVOF_FILTER_PLAN.md). Items from DTL's doom9 comments (MRecalculate trymany, UMH / hex radius above 24, parent
 predictors, sub-pel / chroma precision, area mode, hardware ME, the reference quality test) are in
 [DTL_COMMENTS_TODO.md](DTL_COMMENTS_TODO.md). Design background: [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -16,7 +16,7 @@ Mark an item done by deleting it here (the commit message says what was done). *
   passes), the MxfSource -> LWLibav fallback (wrong frames on random access with Prefetch: use ffms2 or no Prefetch
   there). The `profile\avs\m\frc_ucdep_*` / `frc_uc_*` templates use uconvert.avsi and follow it.
 - **User:** report upstream (pinterf/mvtools) that MScaleVect crashes on `divide > 0` vector clips (stock 2.7.48 too):
-  it added the 0xFFFFFFFF length marker of the divided level as a plane length. Fixed in this fork (074321e).
+  it added the 0xFFFFFFFF length marker of the divided level as a plane length. Fixed in this fork (73af318).
 - mc FRC fallback is too weak: no MAnalyse / MRecalculate / NVOFA setting keeps Dancers' fast leg whole (frames 15 and
   37 at 50p). Detection: `TESTFILES\reach_for_phc\03_detection` D9 covers the limbs (open: false positives on pans,
   seams, cost of the CPU MFlowInter / MFlow at pel 4). Replacement: SplatFps inside the mask was tried

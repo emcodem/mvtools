@@ -3,7 +3,7 @@
 How the GPU paths are built and why. User-facing docs: `../../README.md`, `../../Documentation/gpu.md`. Decisions:
 [DECISIONS.md](DECISIONS.md). Open work: [TODO.md](TODO.md). The detailed design logs with all measurements were
 GPU_PLAN.md, GPU_QTGMC_PLAN.md, GPU_PIPELINE_PLAN.md, VAPOURSYNTH_PLAN.md, REBASE_PLAN.md and NVOF_FILTER_PLAN.md;
-their last versions are in git at commit af2e51e (`git show af2e51e:GPU_PIPELINE_PLAN.md`). Code comments are self-contained and do not
+their last versions are in git at commit 4c58b6f (`git show 4c58b6f:GPU_PIPELINE_PLAN.md`). Code comments are self-contained and do not
 reference .md files (links to online resources are fine).
 
 ## Components

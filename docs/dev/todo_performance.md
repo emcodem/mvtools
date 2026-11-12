@@ -10,10 +10,10 @@ RTX 5090. Quality gate: the 68-case ground-truth corpus (local block error, wors
 ### Done (commits on `splatfps-perf`)
 | commit | change | kernel time (nsys sum) |
 |---|---|---|
-| 08ab0b3 | sliding box sums (fast variant); weighted Lucas-Kanade terms + refine_box sums + 2x2 solve fused per tile (`k_refine_fused`, the 5 term planes per candidate stay in shared memory) | 2.21 -> 1.84 s |
-| 7be4df1 | band pyramid built once per source in the device pipeline (was per output frame and side); exact=true output identical | -> 1.69 s |
-| 3f6ca78 | float4 atomicAdd splats on an interleaved accumulator (cc >= 9.0), in-place part added by `k_splat` (no `k_inplace`), 16 x 16 refinement tiles | -> 1.58 s |
-| 0abaf4f | below cc 9.0 the planar accumulator and `k_inplace` stay (scalar atomics on interleaved cells were 2x slower) | sm_75 code: 2.45 -> 1.85 s |
+| 50379ba | sliding box sums (fast variant); weighted Lucas-Kanade terms + refine_box sums + 2x2 solve fused per tile (`k_refine_fused`, the 5 term planes per candidate stay in shared memory) | 2.21 -> 1.84 s |
+| 82e22c9 | band pyramid built once per source in the device pipeline (was per output frame and side); exact=true output identical | -> 1.69 s |
+| 5a743a7 | float4 atomicAdd splats on an interleaved accumulator (cc >= 9.0), in-place part added by `k_splat` (no `k_inplace`), 16 x 16 refinement tiles | -> 1.58 s |
+| f7e040b | below cc 9.0 the planar accumulator and `k_inplace` stay (scalar atomics on interleaved cells were 2x slower) | sm_75 code: 2.45 -> 1.85 s |
 
 Also: GPU energy above idle 0.80 -> ~0.61 J per output frame, DRAM traffic 1.81 -> ~1.0 GB per output frame,
 instructions issued -37 %. Corpus 68/68 equal, suite 27/27 for sm_120 and 75-virtual builds. Wall time of the
@@ -91,7 +91,7 @@ GPU UHD fast 49.7 -> 60.4 (before item 7), 43.5 -> 55.1 with item 7 (noisy sessi
    (the phase as device memory or a node parameter update), or fused small kernels.
 3. Copy stream: uploads / downloads on their own stream with events, overlapping the kernels (mostly UHD). Checked
    2026-11-11: staging is already pinned; overlap would lower GPU busy time only, not GPU work or energy.
-4. ~~Band pyramids cached per source on the device~~: done 2026-11-11 (7be4df1), -8 % kernel time.
+4. ~~Band pyramids cached per source on the device~~: done 2026-11-11 (82e22c9), -8 % kernel time.
 5. k_tf_rows: h / 64 blocks of 64 threads, ~87 us per frame (5.6 %); exact mode needs the sequential double sums
    (a parallel version for fast mode only).
 

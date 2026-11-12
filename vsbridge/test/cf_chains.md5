@@ -1,4 +1,4 @@
-# AviSynth+ 3.7.5 (Windows), release bundle 2026-11-01b (cudafilters.dll 530b06a, mvtools_cuda.dll 15811aa), masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by cf_chains.py ref
+# AviSynth+ 3.7.5 (Windows), release bundle 2026-11-01b (cudafilters.dll 54a11fe, mvtools_cuda.dll 3db5d84), masktools2 2.2.30, RgTools, plugins_JPSDR, QTGMC.avsi; made by cf_chains.py ref
 # case frames md5(concatenated per-frame md5s)
 removegrain12 10 f554a2d8978b7077b32b4439c91c816a
 removegrain20 10 ef970a22547e37d3b94f304a9f8c00ff
