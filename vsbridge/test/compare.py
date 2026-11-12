@@ -131,6 +131,15 @@ CHAINS = {
     'show': ('hd420p8', ANA[0] + 'out = MShow(sup, fv)\n', ANA[1] + 'out = mv.MShow(sup, fv)\n'),
     'scalevect': ('hd420p8', ANA[0] + 'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0))\n',
                   ANA[1] + 'out = mv.MCompensate(c, sup, mv.MScaleVect(fv, scale=1.0))\n'),
+    # MScaleVect on divide > 0 vectors (divided level stored with the length marker 0xFFFFFFFF: crashed before the fix)
+    'scalevect_divide': ('hd420p8', 'sup = MSuper(c, pel=2)\nfv = MAnalyse(sup, isb=false, blksize=16, overlap=8, divide=2)\n'
+                         'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0))\n',
+                         'sup = mv.MSuper(c, pel=2)\nfv = mv.MAnalyse(sup, isb=False, blksize=16, overlap=8, divide=2)\n'
+                         'out = mv.MCompensate(c, sup, mv.MScaleVect(fv, scale=1.0))\n'),
+    'scalevect_divide_vo': ('hd420p8', 'sup = MSuper(c, pel=2)\nfv = MAnalyse(sup, isb=false, blksize=16, overlap=8, divide=2)\n'
+                            'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0, mode=2))\n',
+                            'sup = mv.MSuper(c, pel=2)\nfv = mv.MAnalyse(sup, isb=False, blksize=16, overlap=8, divide=2)\n'
+                            'out = mv.MCompensate(c, sup, mv.MScaleVect(fv, scale=1.0, mode=2))\n'),
     'recalculate': ('hd420p8',
                     ANA[0] + 'sup1 = MSuper(c, pel=2, levels=1)\n'
                     'bv = MRecalculate(sup1, bv, blksize=8, overlap=4, thSAD=100)\n'
