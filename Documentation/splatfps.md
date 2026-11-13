@@ -179,16 +179,19 @@ absolute sample differences in 8-bit units (0 .. 255, whatever the bit depth of 
 
 | setting | rule | 720 x 576 | 1280 x 720 | 1920 x 1080 | 3840 x 2160 |
 | --- | --- | --- | --- | --- | --- |
-| `me_scale` | 2 below 900 rows, else 4 (the width does not matter; 8 only when set) | 2 | 2 | 4 | 4 |
-| `pyramid_levels` | log2(me_scale) + 2 | 3 | 3 | 4 | 4 |
-| `pad_x`, `pad_y` | per axis the smallest value >= 16 that makes size + 2 pad a multiple of 2^pyramid_levels (16 for an odd size) | 16, 16 | 16, 16 | 16, 20 | 16, 16 |
-| ME grid | (size + 2 pad) / me_scale | 376 x 304 | 656 x 376 | 488 x 280 | 968 x 548 |
+| `me_scale` | 2 below 900 rows, 4 below 1800 rows, else 8 (the width does not matter) | 2 | 2 | 4 | 8 |
+| `pyramid_levels` | log2(me_scale) + 2 | 3 | 3 | 4 | 5 |
+| `pad_x`, `pad_y` | per axis the smallest value >= 16 that makes size + 2 pad a multiple of 2^pyramid_levels (16 for an odd size) | 16, 16 | 16, 16 | 16, 20 | 16, 24 |
+| ME grid | (size + 2 pad) / me_scale | 376 x 304 | 656 x 376 | 488 x 280 | 484 x 276 |
 | `block_size` | 32 | 32 | 32 | 32 | 32 |
 | `nearest_block` | auto: a stage whose block grid has one block on an axis | - | - | - | - |
-| `field_stride_max` | = me_scale | 2 | 2 | 4 | 4 |
-| ME filters | derived from me_scale (below) | 2:1 | 2:1 | 4:1 | 4:1 |
+| `field_stride_max` | = me_scale | 2 | 2 | 4 | 8 |
+| ME filters | derived from me_scale (below) | 2:1 | 2:1 | 4:1 | 8:1 |
 
-At UHD scale 4 measured clearly better than 8 (about 12 % on the test corpus) for about 7 % of speed. When you set
+The largest phase-correlation block is 128 ME pixels, so the ME scale sets the motion range in picture pixels: a
+block measures motions up to about a quarter of its size reliably (half in theory). At UHD, scale 4 (blocks up to 512
+pixels) missed pans of a few hundred pixels per frame, and the picture came apart into speckle there; scale 8 (blocks
+up to 1024 pixels) follows them. On UHD clips with modest motion scale 4 was a few per cent more precise. When you set
 `me_scale` or `pyramid_levels`, the borders, block size, stride limit and filters that you do not set follow the
 rules for your values.
 

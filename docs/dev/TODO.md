@@ -77,10 +77,14 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   (judder, frames at the wrong time), though single frames look cleaner with it (fewer artefacts on deforming cloth).
 - Scene cuts: the cuts `scene_cut_error` (15) misses join very similar shots: a relative rule (a pair's error far
   above that of the pairs before and after) instead of the absolute threshold.
-- UHD ME scale (later; HD first): the auto scale at UHD is 4. On a fast 8K->UHD football graphics scene (corpus
-  `fb_graphics`) scale 4 is clearly worse than scale 8 (more artefacts); on other UHD corpus cases (fine detail,
-  moderate motion) scale 8 is 10-20 % worse than 4. Cost is equal (UHD 300 frames: 6.3 s vs 6.5 s incl. ~2.9 s
-  decode). Plan: `me_scale=-1` = dynamic: two internal engines (auto scale and 2x), the second only analyses where
+- UHD ME scale: the auto scale from 1800 rows on is 8 again (2026-11-13; was 4). Scale 4 (phase-correlation blocks
+  up to 512 pixels) missed pans of 200 - 500 pixels per frame and the picture came apart into speckle (user's
+  C0263 drum pans, 29.97p -> 23.976p; corpus cases `uhd_c0263end`, `uhd_c0263start`, `uhd_parkdancers`, `uhd_f1`
+  added): uhd_c0263end_k2 mae_act 10.2 -> 2.5. On the modest-motion UHD cases scale 8 is a few per cent less precise
+  (composite 1.106 over uhd_crosswalk / boxing / aerial / f1; mae_act +0..6 %). Same-range alternatives measured on
+  uhd_c0263end_k2: block_size 64 at scale 4: 3.7 (with scale-8-sized windows 3.3); scale 8 with block_size 16
+  (blocks up to 512 px): 10.0, i.e. the block range in pixels is what matters. Cost is equal (UHD 300 frames: 6.3 s
+  vs 6.5 s incl. ~2.9 s decode). To win back the modest-motion precision: `me_scale=-1` = dynamic: two internal engines (auto scale and 2x), the second only analyses where
   used; the choice from statistics the first engine has anyway (vector reach vs search range, match errors), taken
   over a window of pairs (independent of access order) and switched only at cuts or after sustained change. First
   UHD corpus cases from the 8K football source (fast / slow, graphics / players), check that a simple statistic

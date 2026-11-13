@@ -311,16 +311,19 @@ namespace splat
     return c;
   }
 
-  // ---- the per-size rules (the auto defaults): ME scale 2 below 900 rows, else 4; the pyramid has log2(scale) + 2
-  // levels; the border is at least 16 pixels; change them here.
-  // ME scale by the height only (the width does not matter): 2 below 900 rows (SD, 720p), 4 from 900 rows on (1080p,
-  // UHD). Measured on a ground-truth corpus: at UHD scale 4 instead of 8 cut the error composite by about 12 % for
-  // about 7 % of speed; at 1080p scale 2 instead of 4 was mixed (better on average, worse on low-quality sources and
-  // in flicker). Scale 8 stays available as a setting.
+  // ---- the per-size rules (the auto defaults): ME scale 2 below 900 rows, 4 below 1800 rows, else 8; the pyramid
+  // has log2(scale) + 2 levels; the border is at least 16 pixels; change them here.
+  // ME scale by the height only (the width does not matter). The phase-correlation blocks are at most 128 ME pixels
+  // (block_size 32, three stages), so the scale sets the motion range in picture pixels: a block measures motions up
+  // to about a quarter of its size reliably. 2 below 900 rows (SD, 720p); 4 from 900 rows on (1080p: blocks up to
+  // 512 pixels); 8 from 1800 rows on (UHD: blocks up to 1024 pixels). Measured on a ground-truth corpus: at UHD,
+  // scale 4 was a few per cent more precise on modest motion but missed pans of 200 - 500 pixels per frame (the
+  // picture came apart into speckle, errors 3 - 4 times those of scale 8); at 1080p scale 2 instead of 4 was mixed
+  // (better on average, worse on low-quality sources and in flicker).
   inline int auto_scale(int w, int h)
   {
     (void)w;
-    return h < 900 ? 2 : 4;
+    return h < 900 ? 2 : h < 1800 ? 4 : 8;
   }
   // pyramid levels below the full-resolution band: log2(scale) + 2 (3 / 4 / 5 for scale 2 / 4 / 8)
   inline int auto_levels(int scale, int w, int h)

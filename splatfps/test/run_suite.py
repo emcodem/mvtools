@@ -25,8 +25,8 @@ Cases:
 - sequential: framemd5 of SplatFps (fast) == CudaSplatFps(exact=true), built-in vectors and MSplatVectors (the device
   pipeline's look-ahead path)
 - sizes: framemd5 of SplatFps (fast) == CudaSplatFps(exact=true) at other frame sizes (scaled source),
-  each with its per-size default settings (ME scale 2 for 720 x 576, 1280 x 720 and 1006 x 542, 4 for 1442 x 1082
-  and 3840 x 2160)
+  each with its per-size default settings (ME scale 2 for 720 x 576, 1280 x 720 and 1006 x 542, 4 for 1442 x 1082,
+  8 for 3840 x 2160)
 - parameters: the same identity with non-default named arguments at the source size (ME scale 2, other borders, a
   forced nearest-block stage, other candidate costs / peaks / boxes, the phase-correlation settings, block size 16
   with a stage off, the generated ME filters), which must also differ from the defaults
