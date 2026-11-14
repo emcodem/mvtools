@@ -19,7 +19,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 31
+#define MVCUDA_API_VERSION 32
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -510,6 +510,26 @@ typedef struct
 MVCUDA_API int mvcuda_splat_build_host(const MvCudaSplatParams *p, const float *P, const float *N, const float *fwd_P,
   const float *bwd_N, float d, float *out);
 
+// With blend_sigma > 0 the build is the two-build blend (splat::build): the main build, the second build with
+// splat::blend_config, mixed per pixel by the local match error. The stages of the build (tests; return codes as
+// mvcuda_splat_build_host):
+// one build without the mix: part 0 the main build, 1 the second build;
+MVCUDA_API int mvcuda_splat_build_part_host(const MvCudaSplatParams *p, const float *P, const float *N,
+  const float *fwd_P, const float *bwd_N, float d, int part, float *out);
+// one pyramid reduce step of a plane (w x h -> (w + 1) / 2 x (h + 1) / 2) with the main taps or (second) the second
+// build's;
+MVCUDA_API int mvcuda_splat_pyr_reduce_host(const MvCudaSplatParams *p, const float *src, int w, int h, int second,
+  float *dst);
+// the projection field of one side (splat::border_weight; n_side 0 P, 1 N), F and G 4 planes w x h;
+MVCUDA_API int mvcuda_splat_border_weight_host(const MvCudaSplatParams *p, const float *F, int w, int h, float d,
+  int n_side, float *G);
+// the error map of the blend (splat::blend_error_map) on the ME grid;
+MVCUDA_API int mvcuda_splat_blend_error_map_host(const MvCudaSplatParams *p, const float *fwd_P, const float *bwd_N,
+  float *e);
+// the mix (splat::blend_mix_rows): main, second, out 3 planes width x height, e the error map.
+MVCUDA_API int mvcuda_splat_blend_mix_host(const MvCudaSplatParams *p, const float *main, const float *second,
+  const float *e, float *out);
+
 // Host-memory entries of the stages around the motion vectors (tests; return codes as mvcuda_splat_build_host).
 // ME grid: mw = (width + 2 pad_x) / scale, mh = (height + 2 pad_y) / scale (1080p defaults: (width + 32) / 4,
 // (height + 40) / 4).
@@ -531,6 +551,11 @@ MVCUDA_API int mvcuda_splat_phase_pull_host(const MvCudaSplatParams *p, const fl
 // glob = dx, dy, height, vx, vy of the global candidate.
 MVCUDA_API int mvcuda_splat_pcorr_host(const MvCudaSplatParams *p, const float *B_prev, const float *B_cur, float *cands,
   float *hp, float *glob);
+// Whole-picture phase correlation of the pair (global_candidate 2 / 3; splat::pcorr_whole_peak): out = gx, gy,
+// height of the strongest peak; surface (or null): the T x T surface (T the power of two >= both ME sides); *T = 0
+// (nothing written) when the ME picture is larger than 1024.
+MVCUDA_API int mvcuda_splat_whole_peak_host(const MvCudaSplatParams *p, const float *B_prev, const float *B_cur,
+  float *out, float *surface, int *T);
 // Refinement of n candidates of cur against other; neg: they point from other into cur (turned around).
 MVCUDA_API int mvcuda_splat_refine_host(const MvCudaSplatParams *p, const float *cur, const float *other, const float *cands,
   int n, int neg, float *out);
@@ -557,7 +582,7 @@ MVCUDA_API int mvcuda_splat_ctx_has_source(void *ctx, int q);         // 1 when 
 MVCUDA_API int mvcuda_splat_ctx_source(void *ctx, int q, const void *const planes[3], const int pitch_bytes[3]); // returns once staged
 // The in-between picture at phase d (0..1) between source pictures p and p + 1, as codes into host planes.
 // Needs the sources p - 1 (when p > 0) .. p + 2 (-4 when one is missing). d_adj (or null): the phase after the temporal
-// fallback (strength: Config::pull_strength, 0 = off by default; at a scene cut it is 0 or 1).
+// fallback (strength: Config::pull_strength, 0 = off; at a scene cut it is 0 or 1).
 MVCUDA_API int mvcuda_splat_ctx_frame(void *ctx, int p, double d, double strength, void *const out[3],
   const int out_pitch_bytes[3], double *d_adj);
 // The same in two halves, so the caller can stage the next source picture while the device builds this frame:

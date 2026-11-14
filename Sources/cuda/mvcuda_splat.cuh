@@ -104,6 +104,32 @@ namespace SPLAT_NS
       ldc(s, w, h, x, y + 2), ldc(s, w, h, x, y - 3), ldc(s, w, h, x, y + 3));
   }
 
+  // the vertical pass of two pyramids with different taps from the same level (the two-build blend's level 0): each
+  // source sample read once, both results as k_reduce_v computes them
+  __global__ void k_reduce_v2(const float *src, int w, int h, float *dst, float *dst2, int oh, RTaps D, RTaps D2)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
+    if (x >= w || j >= oh)
+      return;
+    const float *s = src + (size_t)c * w * h;
+    const int y = 2 * j;
+    const size_t oi = (size_t)c * w * oh + (size_t)j * w + x;
+    float g0, gm1, gp1, gm2, gp2, gm3, gp3;
+    if (y >= 3 && y + 3 <= h - 1)
+    {
+      const float *p = s + y * w + x; // all taps inside: no clamps
+      g0 = p[0]; gm1 = p[-w]; gp1 = p[w]; gm2 = p[-2 * w]; gp2 = p[2 * w]; gm3 = p[-3 * w]; gp3 = p[3 * w];
+    }
+    else
+    {
+      g0 = ldc(s, w, h, x, y); gm1 = ldc(s, w, h, x, y - 1); gp1 = ldc(s, w, h, x, y + 1);
+      gm2 = ldc(s, w, h, x, y - 2); gp2 = ldc(s, w, h, x, y + 2); gm3 = ldc(s, w, h, x, y - 3);
+      gp3 = ldc(s, w, h, x, y + 3);
+    }
+    dst[oi] = dn_tap(D, g0, gm1, gp1, gm2, gp2, gm3, gp3);
+    dst2[oi] = dn_tap(D2, g0, gm1, gp1, gm2, gp2, gm3, gp3);
+  }
+
   // horizontal pass: src w x oh -> dst ow x oh (even columns)
   __global__ void k_reduce_h(const float *src, int w, int oh, float *dst, int ow, RTaps D)
   {
@@ -225,12 +251,49 @@ namespace SPLAT_NS
 #endif
   }
 
+  // the bands of two pyramids of the same picture at the same level (the two-build blend's level 0): each sample of
+  // low read once, both bands as k_band computes them (low1 / low1b the two next coarser levels)
+  __global__ void k_band2(const float *low, int w, int h, const float *low1, const float *low1b, int lw, int lh, float *band,
+    float *bandb)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, c = blockIdx.z;
+    const size_t cl = (size_t)c * lw * lh;
+#ifdef SPLAT_EXACT
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h)
+      return;
+    const size_t i = (size_t)c * w * h + (size_t)y * w + x;
+    const float v = low[i];
+    band[i] = v - up_at(low1 + cl, lw, lh, x, y);
+    bandb[i] = v - up_at(low1b + cl, lw, lh, x, y);
+#else
+    __shared__ float t[UPT_H][UPT_W], tb[UPT_H][UPT_W];
+    up_tile_load(t, low1 + cl, lw, lh);
+    up_tile_load(tb, low1b + cl, lw, lh);
+    __syncthreads();
+    if (x >= w)
+      return;
+    for (int u = 0; u < 2; u++)
+    {
+      const int yy = blockIdx.y * UP_BH + threadIdx.y + u * UP_TH;
+      if (yy >= h)
+        break;
+      const size_t i = (size_t)c * w * h + (size_t)yy * w + x;
+      const float v = low[i];
+      band[i] = v - up_tile_at(t, u);
+      bandb[i] = v - up_tile_at(tb, u);
+    }
+#endif
+  }
+
   // ---- fields ----------------------------------------------------------------------------------------------------
   // projection field of one side at ME resolution (vectors scaled to the output time, weights, border): P (n_side 0)
   // moves by d of its forward vector, N by 1 - d of its backward vector; pr = 1 - that fraction is the side's temporal
   // proximity. Splat weight gain * pr, or gain * max(min_w, exp(-err / err_scale)) * pr with err_scale > 0; fallback
-  // weight * pr. The border xb x yb ME pixels (the padding area) takes the nearest cell inside the picture.
-  struct PrepArgs { int xb, yb; float err_scale, min_w, gain; };
+  // weight * pr. The border xb x yb ME pixels (the padding area) takes the nearest cell inside the picture. edge: the
+  // fallback weight is dropped where the cell's own vector carries it out of the picture (splat::fallback_edge_keep_at,
+  // margin edge_margin).
+  struct PrepArgs { int xb, yb; float err_scale, min_w, gain; int edge; float edge_margin; };
   __global__ void k_splat_prep(const float *F, int mw, int mh, float d, int n_side, PrepArgs a, float *G)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -245,7 +308,15 @@ namespace SPLAT_NS
     G[n + i] = F[n + s] * g;
     const float m = fmaxf(a.min_w, a.err_scale > 0.0f ? exp_ref(-F[2 * n + s] / a.err_scale) : 1.0f);
     G[2 * n + i] = (a.gain * m) * pr;
-    G[3 * n + i] = F[3 * n + s] * pr;
+    const float keep = a.edge ? splat::fallback_edge_keep_at(a.xb, a.yb, a.edge_margin, sx, sy, F[s], F[n + s], mw, mh)
+                              : 1.0f;
+    G[3 * n + i] = F[3 * n + s] * pr * keep;
+  }
+
+  static PrepArgs prep_args(const splat::Config &c)
+  {
+    return { c.pad_x / c.scale, c.pad_y / c.scale, c.splat_err_scale, c.splat_min_weight, c.splat_gain, c.fallback_edge,
+      c.fallback_edge_margin };
   }
 
   // 3x3 [1 2 1] reduction (edge clamp), vectors / 2
@@ -371,6 +442,133 @@ namespace SPLAT_NS
   // bilinear forward splats of one side (blockIdx.z: 0 = P, 1 = N): the sample moves to (x + vx, y + vy) and adds
   // sample * mc and mc to the 4 surrounding cells with the bilinear weights; targets outside the band are dropped.
   // Fast variant only (atomic adds, any order)
+#ifdef SPLAT_VEC_ACC
+  // Vector accumulation (fast variant, compute capability 9.0+): one float4 atomic per cell contribution, the in-place
+  // part (k_inplace's term) added here too (the accumulator starts at zero). A block row is one warp (32 x 8 blocks).
+  // When all 32 samples of the warp move by the same whole-pixel offset (pans, and smooth motion in general), lane k's
+  // right-hand corners are lane k + 1's left-hand cells: each lane adds its left neighbour's right-hand corners to its
+  // own left-hand ones (warp shuffles) and only lane 31 adds right-hand corners, so a sample costs 2 atomics instead of
+  // 4 (plus the in-place part, folded in when the offset is zero). When the next block row has the same offset, the
+  // bottom-row cells are handed to it through shared memory: about 1 atomic per sample. Otherwise each sample adds its
+  // 4 corners. Launch with 32 x SPLAT_BH blocks.
+  constexpr int SPLAT_BH = 8;
+  __device__ __forceinline__ float4 add4(float4 a, float4 b) { return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w); }
+  __device__ __forceinline__ float4 shfl_up4(float4 v)
+  {
+    return make_float4(__shfl_up_sync(0xffffffffu, v.x, 1), __shfl_up_sync(0xffffffffu, v.y, 1),
+      __shfl_up_sync(0xffffffffu, v.z, 1), __shfl_up_sync(0xffffffffu, v.w, 1));
+  }
+  __global__ void k_splat(const float *P, const float *N, int w, int h, LevelField fp, LevelField fn, float *acc)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, side = blockIdx.z;
+    const int lane = threadIdx.x; // blockDim.x == 32
+    const bool in = x < w && y < h;
+    const int aw = w + 1, ah = h + 1;
+    const size_t an = (size_t)aw * ah, n = (size_t)w * h, i = (size_t)y * w + x;
+    const float *pic = side ? N : P;
+    SideSample t = {};
+    bool mv = false;
+    int ix = 0, iy = 0;
+    float fx = 0.0f, fy = 0.0f;
+    if (in)
+    {
+      t = side_at(side ? fn : fp, x, y);
+      if (!t.zero)
+      {
+        const float px = (float)x + t.vx, py = (float)y + t.vy;
+        if (px >= 0.0f && px <= (float)(w - 1) && py >= 0.0f && py <= (float)(h - 1))
+        {
+          const float fix = floorf(px), fiy = floorf(py);
+          ix = (int)fix;
+          iy = (int)fiy;
+          fx = px - fix;
+          fy = py - fiy;
+          mv = true;
+        }
+      }
+    }
+    // every lane takes part in both shuffles and the vote (a short-circuited shuffle would leave lanes out)
+    const int dx = ix - x, dy = iy - y;
+    const int dx0 = __shfl_sync(0xffffffffu, dx, 0), dy0 = __shfl_sync(0xffffffffu, dy, 0);
+    const bool uni = __all_sync(0xffffffffu, mv && dx == dx0 && dy == dy0);
+    float4 inpl = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (in && t.st != 0.0f)
+      inpl = make_float4(pic[i] * t.st, pic[n + i] * t.st, pic[2 * n + i] * t.st, t.st);
+    float4 c[4] = {};
+    if (mv)
+    {
+      const float wa[4] = { (1.0f - fx) * (1.0f - fy), fx * (1.0f - fy), (1.0f - fx) * fy, fx * fy };
+      float lt[3];
+      for (int k = 0; k < 3; k++)
+        lt[k] = pic[k * n + i] * t.mc;
+      for (int k = 0; k < 4; k++)
+        c[k] = make_float4(lt[0] * wa[k], lt[1] * wa[k], lt[2] * wa[k], wa[k] * t.mc);
+    }
+    auto put = [&](int cx, int cy, float4 v) {
+      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, (size_t)cy * aw + cx, an)]), v);
+    };
+    // per warp of the block: its whole-pixel offset when uniform; the bottom-row cells handed to the warp below
+    __shared__ int2 offs[SPLAT_BH];
+    __shared__ float4 bot[SPLAT_BH][33];
+    const int wy = threadIdx.y;
+    const bool fold = dx == 0 && dy == 0; // uniform and offset zero: the sample's own cell is its top-left target
+    if (uni)
+    {
+      // the left neighbour's top-right / bottom-right corners land on this lane's top-left / bottom-left cells
+      const float4 l1 = shfl_up4(c[1]), l3 = shfl_up4(c[3]);
+      if (lane > 0)
+      {
+        c[0] = add4(c[0], l1);
+        c[2] = add4(c[2], l3);
+      }
+      if (fold)
+        c[0] = add4(c[0], inpl);
+    }
+    if (lane == 0)
+      offs[wy] = uni ? make_int2(dx, dy) : make_int2(INT_MIN, INT_MIN);
+    __syncthreads();
+    // with the same offset in the next block row, this warp's bottom-row cells are that warp's top-row cells: hand
+    // them over (one atomic per cell instead of two)
+    const int2 me = offs[wy];
+    const bool up = uni && wy > 0 && offs[wy - 1].x == me.x && offs[wy - 1].y == me.y;
+    const bool down = uni && wy < SPLAT_BH - 1 && offs[wy + 1].x == me.x && offs[wy + 1].y == me.y;
+    if (down)
+    {
+      bot[wy][lane] = c[2];
+      if (lane == 31)
+        bot[wy][32] = c[3];
+    }
+    __syncthreads();
+    if (uni)
+    {
+      if (up)
+      {
+        c[0] = add4(c[0], bot[wy - 1][lane]);
+        if (lane == 31)
+          c[1] = add4(c[1], bot[wy - 1][32]);
+      }
+      if (!fold && t.st != 0.0f)
+        put(x, y, inpl);
+      put(ix, iy, c[0]);
+      if (lane == 31)
+        put(ix + 1, iy, c[1]);
+      if (!down)
+      {
+        put(ix, iy + 1, c[2]);
+        if (lane == 31)
+          put(ix + 1, iy + 1, c[3]);
+      }
+      return;
+    }
+    if (!in)
+      return;
+    if (t.st != 0.0f)
+      put(x, y, inpl);
+    if (mv)
+      for (int k = 0; k < 4; k++)
+        put(ix + (k & 1), iy + (k >> 1), c[k]);
+  }
+#else
   __global__ void k_splat(const float *P, const float *N, int w, int h, LevelField fp, LevelField fn, float *acc)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y, side = blockIdx.z;
@@ -380,12 +578,6 @@ namespace SPLAT_NS
     const int aw = w + 1, ah = h + 1;
     const size_t an = (size_t)aw * ah, n = (size_t)w * h, i = (size_t)y * w + x;
     const float *pic = side ? N : P;
-#ifdef SPLAT_VEC_ACC
-    // this side's in-place part (k_inplace's term) into the sample's own cell; the accumulator starts at zero
-    if (t.st != 0.0f)
-      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, (size_t)y * aw + x, an)]),
-        make_float4(pic[i] * t.st, pic[n + i] * t.st, pic[2 * n + i] * t.st, t.st));
-#endif
     if (t.zero)
       return;
     const float px = (float)x + t.vx, py = (float)y + t.vy;
@@ -401,16 +593,12 @@ namespace SPLAT_NS
       lt[c] = pic[c * n + i] * t.mc;
     for (int k = 0; k < 4; k++)
     {
-#ifdef SPLAT_VEC_ACC
-      atomicAdd(reinterpret_cast<float4 *>(&acc[acc_ix(0, base + off[k], an)]),
-        make_float4(lt[0] * wa[k], lt[1] * wa[k], lt[2] * wa[k], wa[k] * t.mc));
-#else
       for (int c = 0; c < 3; c++)
         atomicAdd(&acc[acc_ix(c, base + off[k], an)], lt[c] * wa[k]);
       atomicAdd(&acc[acc_ix(3, base + off[k], an)], wa[k] * t.mc);
-#endif
     }
   }
+#endif
 
 #ifdef SPLAT_EXACT
   // Ordered splats (exact variant): the exact path adds the contributions side by side, corner by corner, source pixels
@@ -485,10 +673,27 @@ namespace SPLAT_NS
   }
 #endif
 
+  // a whole accumulator cell (3 channels, weight)
+  __device__ __forceinline__ float4 acc_cell(const float *acc, int ai, size_t an)
+  {
+#ifdef SPLAT_VEC_ACC
+    return *reinterpret_cast<const float4 *>(&acc[acc_ix(0, ai, an)]);
+#else
+    return make_float4(acc[acc_ix(0, ai, an)], acc[acc_ix(1, ai, an)], acc[acc_ix(2, ai, an)], acc[acc_ix(3, ai, an)]);
+#endif
+  }
+#ifdef SPLAT_EXACT
+  constexpr int NORM_Z = 3;
+#else
+  constexpr int NORM_Z = 1;
+#endif
+
   // normalisation (or cross-fade where nothing landed) plus the reconstruction step: out = built + up(coarser out);
   // coarser == nullptr at the coarsest level; clamp at the finest; hole: total weight below this (Config::hole_weight)
-  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at). out: ow x oh planes holding sample (ox + x', oy + y')
-  // at (x', y'); the finest level writes the cropped picture this way, the others their whole level (ow = w, ox = 0)
+  // fast variant: block 32 x 8 over 32 x 16 samples (up_tile_at), all 3 channels per thread (one launch with
+  // NORM_Z = 1: each accumulator cell read once); the exact variant one channel per blockIdx.z (NORM_Z = 3).
+  // out: ow x oh planes holding sample (ox + x', oy + y') at (x', y'); the finest level writes the cropped picture
+  // this way, the others their whole level (ow = w, ox = 0)
   __global__ void k_norm(const float *acc, const float *P, const float *N, int w, int h, float d, const float *coarser,
     int cw, int ch, int clamp, float hole, float *out, int ow, int oh, int ox, int oy)
   {
@@ -510,17 +715,18 @@ namespace SPLAT_NS
     }
     out[c * (size_t)ow * oh + (size_t)(y - oy) * ow + (x - ox)] = b;
 #else
-    __shared__ float t[UPT_H][UPT_W];
+    (void)c;
+    __shared__ float t[3][UPT_H][UPT_W];
+    const size_t cn = (size_t)cw * ch, on = (size_t)ow * oh;
     if (coarser) // uniform over the launch
     {
-      up_tile_load(t, coarser + (size_t)c * cw * ch, cw, ch);
+      for (int k = 0; k < 3; k++)
+        up_tile_load(t[k], coarser + k * cn, cw, ch);
       __syncthreads();
     }
     // the output window lies inside the level (ox + ow <= w, oy + oh <= h)
     if ((unsigned)(x - ox) >= (unsigned)ow)
       return;
-    const float *Pc = P + c * n, *Nc = N + c * n;
-    float *oc = out + c * (size_t)ow * oh + (x - ox);
 #pragma unroll
     for (int u = 0; u < 2; u++)
     {
@@ -528,19 +734,142 @@ namespace SPLAT_NS
       if ((unsigned)(y - oy) < (unsigned)oh)
       {
         const int ai = y * aw + x, i = y * w + x;
-        const float sw = acc[acc_ix(3, ai, an)];
-        float b = sw < hole ? Pc[i] * (1.0f - d) + Nc[i] * d : __fdividef(acc[acc_ix(c, ai, an)], sw);
-        if (coarser)
+        const float4 A = acc_cell(acc, ai, an);
+        const float av[3] = { A.x, A.y, A.z };
+        float *o = out + (size_t)(y - oy) * ow + (x - ox);
+#pragma unroll
+        for (int k = 0; k < 3; k++)
         {
-          b = b + up_tile_at(t, u);
-          if (clamp)
-            b = fminf(fmaxf(b, VMIN), VMAX);
+          float b = A.w < hole ? P[k * n + i] * (1.0f - d) + N[k * n + i] * d : __fdividef(av[k], A.w);
+          if (coarser)
+          {
+            b = b + up_tile_at(t[k], u);
+            if (clamp)
+              b = fminf(fmaxf(b, VMIN), VMAX);
+          }
+          o[k * on] = b;
         }
-        oc[(y - oy) * ow] = b;
       }
     }
 #endif
   }
+
+  // ---- two-build blend -----------------------------------------------------------------------------------------
+  // The operations and their order of splat::blend_error_map and splat::blend_mix_rows (splat_core.h).
+  __device__ __forceinline__ float max_ref(float a, float b) { return a < b ? b : a; } // std::max
+
+  // error map on the ME grid: e = (3 x 3 sum of max(errP, errN), edge clamp, dy outer, dx inner) / 9
+  __global__ void k_blend_err(const float *fP, const float *fN, int mw, int mh, float *e)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= mw || y >= mh)
+      return;
+    const size_t n = (size_t)mw * mh;
+    const float *eP = fP + 2 * n, *eN = fN + 2 * n;
+    float s = 0.0f;
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++)
+      {
+        const size_t k = (size_t)clampi(y + dy, 0, mh - 1) * mw + clampi(x + dx, 0, mw - 1);
+        s = s + max_ref(eP[k], eN[k]);
+      }
+    e[(size_t)y * mw + x] = s / 9.0f;
+  }
+
+  // the mix, in place on main (3 planes W x H): w = smoothstep of the bilinear error at the pixel, out = w main +
+  // (1 - w) second
+  struct BlendArgs { int sc, off_x, off_y; float elo, einv; };
+  static BlendArgs blend_args(const splat::Config &c)
+  {
+    return { c.scale, c.pad_x, c.pad_y, (float)c.blend_err_lo, (float)(1.0 / (c.blend_err_hi - c.blend_err_lo)) };
+  }
+  __device__ __forceinline__ float clampf_ref(float v, float lo, float hi) // std::min(std::max(v, lo), hi)
+  {
+    const float m = v < lo ? lo : v;
+    return hi < m ? hi : m;
+  }
+  __global__ void k_blend_mix(float *main, const float *second, int W, int H, const float *e, int mw, int mh,
+    BlendArgs a)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H)
+      return;
+    const float my = clampf_ref((y + a.off_y + 0.5f) / a.sc - 0.5f, 0.0f, (float)(mh - 1));
+    const int ya = (int)my, yb = min(ya + 1, mh - 1);
+    const float fy = my - ya;
+    const float mx = clampf_ref((x + a.off_x + 0.5f) / a.sc - 0.5f, 0.0f, (float)(mw - 1));
+    const int xa = (int)mx, xb = min(xa + 1, mw - 1);
+    const float fx = mx - xa;
+    const float *r0 = e + (size_t)ya * mw, *r1 = e + (size_t)yb * mw;
+    const float ev = (1 - fy) * ((1 - fx) * r0[xa] + fx * r0[xb]) + fy * ((1 - fx) * r1[xa] + fx * r1[xb]);
+    float t = (ev - a.elo) * a.einv;
+    t = clampf_ref(t, 0.0f, 1.0f);
+    const float w = t * t * (3.0f - 2.0f * t);
+    const size_t n = (size_t)W * H, i = (size_t)y * W + x;
+    for (int c = 0; c < 3; c++)
+    {
+      const float av = main[c * n + i];
+      main[c * n + i] = w * av + (1.0f - w) * second[c * n + i];
+    }
+  }
+
+#ifndef SPLAT_EXACT
+  // ---- two-build blend, fast variant ----------------------------------------------------------------------------
+  // the finest level of both builds and the mix in one pass: each build's normalisation plus reconstruction (k_norm's
+  // operations, clamped), then w main + (1 - w) second with w from the error map (k_blend_mix's operations); the
+  // second build's picture never goes to memory. All 3 channels per thread: each accumulator cell (interleaved with
+  // vector accumulation) and the mix weight once per sample. Block 32 x 8 over 32 x 16 samples; out W x H at (ox, oy).
+  __global__ void k_norm_mix(const float *acc, const float *P, const float *N, const float *coarser, const float *acc2,
+    const float *P2, const float *N2, const float *coarser2, int w, int h, float d, int cw, int ch, float hole, float *out,
+    int ow, int oh, int ox, int oy, const float *e, int mw, int mh, BlendArgs a)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int aw = w + 1, ah = h + 1;
+    const size_t an = (size_t)aw * ah, n = (size_t)w * h, cn = (size_t)cw * ch, on = (size_t)ow * oh;
+    __shared__ float t[3][UPT_H][UPT_W], t2[3][UPT_H][UPT_W];
+    for (int c = 0; c < 3; c++)
+    {
+      up_tile_load(t[c], coarser + c * cn, cw, ch);
+      up_tile_load(t2[c], coarser2 + c * cn, cw, ch);
+    }
+    __syncthreads();
+    if ((unsigned)(x - ox) >= (unsigned)ow)
+      return;
+    // the error map's horizontal sample position of this output column
+    const float mx = clampf_ref((x - ox + a.off_x + 0.5f) / a.sc - 0.5f, 0.0f, (float)(mw - 1));
+    const int xa = (int)mx, xb = min(xa + 1, mw - 1);
+    const float fx = mx - xa;
+#pragma unroll
+    for (int u = 0; u < 2; u++)
+    {
+      const int y = blockIdx.y * UP_BH + threadIdx.y + u * UP_TH;
+      if ((unsigned)(y - oy) < (unsigned)oh)
+      {
+        const int ai = y * aw + x, i = y * w + x;
+        const float my = clampf_ref((y - oy + a.off_y + 0.5f) / a.sc - 0.5f, 0.0f, (float)(mh - 1));
+        const int ya = (int)my, yb = min(ya + 1, mh - 1);
+        const float fy = my - ya;
+        const float *r0 = e + (size_t)ya * mw, *r1 = e + (size_t)yb * mw;
+        const float ev = (1 - fy) * ((1 - fx) * r0[xa] + fx * r0[xb]) + fy * ((1 - fx) * r1[xa] + fx * r1[xb]);
+        float tt = (ev - a.elo) * a.einv;
+        tt = clampf_ref(tt, 0.0f, 1.0f);
+        const float wm = tt * tt * (3.0f - 2.0f * tt);
+        const float4 A = acc_cell(acc, ai, an), A2 = acc_cell(acc2, ai, an);
+        const float av[3] = { A.x, A.y, A.z }, av2[3] = { A2.x, A2.y, A2.z };
+        float *o = out + (size_t)(y - oy) * ow + (x - ox);
+#pragma unroll
+        for (int c = 0; c < 3; c++)
+        {
+          float b = A.w < hole ? P[c * n + i] * (1.0f - d) + N[c * n + i] * d : __fdividef(av[c], A.w);
+          b = fminf(fmaxf(b + up_tile_at(t[c], u), VMIN), VMAX);
+          float b2 = A2.w < hole ? P2[c * n + i] * (1.0f - d) + N2[c * n + i] * d : __fdividef(av2[c], A2.w);
+          b2 = fminf(fmaxf(b2 + up_tile_at(t2[c], u), VMIN), VMAX);
+          o[c * on] = wm * b + (1.0f - wm) * b2;
+        }
+      }
+    }
+  }
+#endif
 
   // ---- host driver -------------------------------------------------------------------------------------------------
   struct Bufs
@@ -671,22 +1000,44 @@ namespace SPLAT_NS
     }
   };
 
+  // L2 cache size of the current device in bytes (queried once)
+  static size_t l2_bytes()
+  {
+    static size_t v = 0;
+    if (!v)
+    {
+      int dev = 0, b = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&b, cudaDevAttrL2CacheSize, dev);
+      v = b > 0 ? (size_t)b : (size_t)1 << 20;
+    }
+    return v;
+  }
+
   // pad P (3 planes W x H) and decompose it into a Laplacian pyramid: low[0 .. L] the low-pass levels (low[L] is
-  // band[L], the coarsest level), band[0 .. L - 1] the bands; S.tmp is the reduce scratch
-  static void pyramid_run(cudaStream_t st, const BuildScratch &S, const float *P, float *const *low, float *const *band)
+  // band[L], the coarsest level), band[0 .. L - 1] the bands; S.tmp is the reduce scratch. padded: low[0] already
+  // holds P padded with S's border (another pyramid of the same picture made it), so P is not read. v0: the vertical
+  // pass of level 0 is already there (k_reduce_v2, made together with another pyramid of the picture).
+  // band0 false: the level-0 band is left out (k_band2 makes it together with another pyramid's).
+  static void pyramid_run(cudaStream_t st, const BuildScratch &S, const float *P, float *const *low, float *const *band,
+    bool padded = false, const float *v0 = nullptr, bool band0 = true)
   {
     const splat::Config &cfg = S.cfg;
     const int L = S.L;
     const int *lw = S.lw, *lh = S.lh;
     const RTaps rt = { cfg.pyr_reduce[0], cfg.pyr_reduce[1], cfg.pyr_reduce[2], cfg.pyr_reduce[3] };
     const dim3 blk(32, 8), blk_up = up_cover();
-    k_pad<<<grid(S.GW, S.GH, 3, blk), blk, 0, st>>>(P, S.W, S.H, low[0], S.GW, S.GH, cfg.pad_x, cfg.pad_y);
+    if (!padded)
+      k_pad<<<grid(S.GW, S.GH, 3, blk), blk, 0, st>>>(P, S.W, S.H, low[0], S.GW, S.GH, cfg.pad_x, cfg.pad_y);
     for (int i = 0; i < L; i++)
     {
-      k_reduce_v<<<grid(lw[i], lh[i + 1], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], S.tmp, lh[i + 1], rt);
-      k_reduce_h<<<grid(lw[i + 1], lh[i + 1], 3, blk), blk, 0, st>>>(S.tmp, lw[i], lh[i + 1], low[i + 1], lw[i + 1], rt);
+      const bool have = i == 0 && v0;
+      const float *v = have ? v0 : S.tmp;
+      if (!have)
+        k_reduce_v<<<grid(lw[i], lh[i + 1], 3, blk), blk, 0, st>>>(low[i], lw[i], lh[i], S.tmp, lh[i + 1], rt);
+      k_reduce_h<<<grid(lw[i + 1], lh[i + 1], 3, blk), blk, 0, st>>>(v, lw[i], lh[i + 1], low[i + 1], lw[i + 1], rt);
     }
-    for (int i = 0; i < L; i++)
+    for (int i = band0 ? 0 : 1; i < L; i++)
       k_band<<<grid(lw[i], lh[i], 3, blk_up), blk, 0, st>>>(low[i], lw[i], lh[i], low[i + 1], lw[i + 1], lh[i + 1], band[i]);
   }
 
@@ -710,30 +1061,19 @@ namespace SPLAT_NS
   // then per level from coarse to fine: in-place weights, splats, normalisation plus reconstruction; finally crop.
   // Only queues work on st (S belongs to st until it is done). -2 on a launch failure.
   // pyrP / pyrN: the pictures' pyramids made by pyramid_run (BuildScratch::pyr_ptrs layout), or null: made here.
-  static int build_run(cudaStream_t st, BuildScratch &S, const float *P, const float *N, const float *fwdP,
-    const float *bwdN, float d, float *dout, float *const *pyrP = nullptr, float *const *pyrN = nullptr)
+  // the per-level fields of both sides into lf: projection fields at ME resolution (k_splat_prep), then per level a
+  // stride into them, or own coarse fields made by repeated reduction (the first coarse level from the ME-resolution
+  // field, 1 / scale)
+  static void level_fields(cudaStream_t st, BuildScratch &S, const float *fwdP, const float *bwdN, float d,
+    LevelField (&lf)[2][MAXL + 1])
   {
     const splat::Config &cfg = S.cfg;
-    const int W = S.W, H = S.H, L = S.L, MW = S.MW, MH = S.MH;
-    const int *lw = S.lw, *lh = S.lh, sh = splat::ilog2(cfg.scale);
-    const PrepArgs pa = { cfg.pad_x / cfg.scale, cfg.pad_y / cfg.scale, cfg.splat_err_scale, cfg.splat_min_weight,
-      cfg.splat_gain };
-    const dim3 blk(32, 8), blk_up = up_cover();
-    const float *src[2] = { P, N };
+    const int L = S.L, MW = S.MW, MH = S.MH, sh = splat::ilog2(cfg.scale);
+    const PrepArgs pa = prep_args(cfg);
+    const dim3 blk(32, 8);
     const float *me[2] = { fwdP, bwdN };
-    float *const *pyr[2] = { pyrP, pyrN };
-    const float *band[2][MAXL + 1];
     for (int s = 0; s < 2; s++)
-    {
-      if (!pyr[s])
-        pyramid_run(st, S, src[s], S.low[s], S.band[s]);
-      for (int i = 0; i <= L; i++)
-        band[s][i] = pyr[s] ? pyr[s][i] : S.band[s][i];
       k_splat_prep<<<grid(MW, MH, 1, blk), blk, 0, st>>>(me[s], MW, MH, d, s, pa, S.proj[s]);
-    }
-    // per-level fields: stride into the full-resolution field, or own coarse fields made by repeated reduction (the
-    // first coarse level from the ME-resolution field, 1 / scale)
-    LevelField lf[2][MAXL + 1];
     const int log2max = sh;
     const float *cur[2] = { nullptr, nullptr };
     size_t ri = 0;
@@ -764,6 +1104,27 @@ namespace SPLAT_NS
       for (int s = 0; s < 2; s++)
         lf[s][i] = { cur[s], cw, chh, 0, sh, cfg.still_vector };
     }
+  }
+
+  static int build_run(cudaStream_t st, BuildScratch &S, const float *P, const float *N, const float *fwdP,
+    const float *bwdN, float d, float *dout, float *const *pyrP = nullptr, float *const *pyrN = nullptr)
+  {
+    const splat::Config &cfg = S.cfg;
+    const int W = S.W, H = S.H, L = S.L;
+    const int *lw = S.lw, *lh = S.lh;
+    const dim3 blk(32, 8), blk_up = up_cover();
+    const float *src[2] = { P, N };
+    float *const *pyr[2] = { pyrP, pyrN };
+    const float *band[2][MAXL + 1];
+    for (int s = 0; s < 2; s++)
+    {
+      if (!pyr[s])
+        pyramid_run(st, S, src[s], S.low[s], S.band[s]);
+      for (int i = 0; i <= L; i++)
+        band[s][i] = pyr[s] ? pyr[s][i] : S.band[s][i];
+    }
+    LevelField lf[2][MAXL + 1];
+    level_fields(st, S, fwdP, bwdN, d, lf);
     // levels from coarse to fine, each reconstructed on the way
     const float *prev = nullptr;
     int pw = 0, ph = 0;
@@ -801,12 +1162,12 @@ namespace SPLAT_NS
 #endif
       // the finest level goes straight into dout without the border (W x H at pad_x, pad_y)
       if (i == 0)
-        k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 1,
+        k_norm<<<grid(w, h, NORM_Z, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 1,
           cfg.hole_weight, dout, W, H, cfg.pad_x, cfg.pad_y);
       else
       {
         float *o = S.rec[i & 1];
-        k_norm<<<grid(w, h, 3, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 0,
+        k_norm<<<grid(w, h, NORM_Z, blk_up), blk, 0, st>>>(S.acc, band[0][i], band[1][i], w, h, d, prev, pw, ph, 0,
           cfg.hole_weight, o, w, h, 0, 0);
         prev = o;
         pw = w;
@@ -816,21 +1177,145 @@ namespace SPLAT_NS
     return cudaPeekAtLastError() == cudaSuccess ? 0 : -2;
   }
 
-  // build_run with its own scratch; waits for st before returning (the scratch goes back to the pool).
-  static int build_dev(const MvCudaSplatParams &p, cudaStream_t st, const float *P, const float *N, const float *fwdP,
-    const float *bwdN, float d, float *dout)
+  // the two-build blend after both builds: error map of the ME fields into e (MW x MH), then the mix into main
+  // (3 planes W x H, in place) with second
+  static void blend_run(cudaStream_t st, const splat::Config &cfg, const float *fwdP, const float *bwdN, int MW, int MH,
+    float *e, float *main, const float *second, int W, int H)
   {
-    BuildScratch S;
-    int rc = S.alloc(cfg_of(p), p.width, p.height, st);
-    if (!rc)
-      rc = build_run(st, S, P, N, fwdP, bwdN, d, dout);
-    if (cudaStreamSynchronize(st) != cudaSuccess || cudaGetLastError() != cudaSuccess)
-      return -2;
+    const dim3 blk(32, 8);
+    k_blend_err<<<grid(MW, MH, 1, blk), blk, 0, st>>>(fwdP, bwdN, MW, MH, e);
+    k_blend_mix<<<grid(W, H, 1, blk), blk, 0, st>>>(main, second, W, H, e, MW, MH, blend_args(cfg));
+  }
+
+#ifndef SPLAT_EXACT
+  // true when the two builds can share their fields and finest pass (build_run_blend): vector accumulation (k_splat
+  // adds the in-place parts), the same level count and sizes (the second build differs only in its pyramid filter)
+  // and at least one level above the finest
+  static bool blend_fusable(const BuildScratch &S, const BuildScratch &S2)
+  {
+    if (!splat_vec_acc() || S.L != S2.L || S.L < 1 || S.GW != S2.GW || S.GH != S2.GH || S.MW != S2.MW || S.MH != S2.MH)
+      return false;
+    return S.cfg.scale == S2.cfg.scale && S.cfg.stride_max == S2.cfg.stride_max;
+  }
+
+  // Both builds of the two-build blend and the mix (fast variant): the fields once (S's scratch), per level a splat
+  // pass per build, the coarser levels normalised per build, the finest level of both normalised and mixed straight
+  // into dout. pyr / pyr2: the pictures' pyramids of the two builds (null: made here,
+  // the second from the first one's padded picture). e: the error map (S.MW x S.MH).
+  static int build_run_blend(cudaStream_t st, BuildScratch &S, BuildScratch &S2, const float *P, const float *N,
+    const float *fwdP, const float *bwdN, float d, float *dout, float *e, float *const *pyrP, float *const *pyrN,
+    float *const *pyr2P, float *const *pyr2N)
+  {
+    const splat::Config &cfg = S.cfg;
+    const int W = S.W, H = S.H, L = S.L;
+    const int *lw = S.lw, *lh = S.lh;
+    const dim3 blk(32, 8), blk_up = up_cover();
+    const float *src[2] = { P, N };
+    float *const *pyr[2][2] = { { pyrP, pyrN }, { pyr2P, pyr2N } };
+    const float *band[2][2][MAXL + 1]; // [build][side][level]
+    for (int s = 0; s < 2; s++)
+    {
+      if (!pyr[0][s])
+        pyramid_run(st, S, src[s], S.low[s], S.band[s]);
+      if (!pyr[1][s])
+      {
+        // the second pyramid from the first one's padded picture (same border)
+        float *low[MAXL + 1];
+        for (int i = 0; i <= L; i++)
+          low[i] = S2.low[s][i];
+        low[0] = pyr[0][s] ? nullptr : S.low[s][0];
+        pyramid_run(st, S2, src[s], low[0] ? low : S2.low[s], S2.band[s], low[0] != nullptr);
+      }
+      for (int i = 0; i <= L; i++)
+      {
+        band[0][s][i] = pyr[0][s] ? pyr[0][s][i] : S.band[s][i];
+        band[1][s][i] = pyr[1][s] ? pyr[1][s][i] : S2.band[s][i];
+      }
+    }
+    LevelField lf[2][MAXL + 1];
+    level_fields(st, S, fwdP, bwdN, d, lf);
+    k_blend_err<<<grid(S.MW, S.MH, 1, blk), blk, 0, st>>>(fwdP, bwdN, S.MW, S.MH, e);
+    const BlendArgs ba = blend_args(cfg);
+    const float *prev[2] = { nullptr, nullptr };
+    int pw = 0, ph = 0;
+    for (int i = L; i >= 0; i--)
+    {
+      const int w = lw[i], h = lh[i];
+      const size_t abytes = sizeof(float) * 4 * (w + 1) * (h + 1);
+      // one splat pass per build, each right after its accumulator is cleared (the memset leaves it in L2, where the
+      // atomics then hit; clearing it in the previous normalisation instead measured 14 % slower at HD); a single
+      // pass into both accumulators measured slower too (twice the atomic working set in L2 at once)
+      cudaMemsetAsync(S.acc, 0, abytes, st);
+      k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[0][0][i], band[0][1][i], w, h, lf[0][i], lf[1][i], S.acc);
+      cudaMemsetAsync(S2.acc, 0, abytes, st);
+      k_splat<<<grid(w, h, 2, blk), blk, 0, st>>>(band[1][0][i], band[1][1][i], w, h, lf[0][i], lf[1][i], S2.acc);
+      if (i == 0)
+        k_norm_mix<<<grid(w, h, 1, blk_up), blk, 0, st>>>(S.acc, band[0][0][i], band[0][1][i], prev[0], S2.acc,
+          band[1][0][i], band[1][1][i], prev[1], w, h, d, pw, ph, cfg.hole_weight, dout, W, H, cfg.pad_x, cfg.pad_y, e,
+          S.MW, S.MH, ba);
+      else
+      {
+        float *o = S.rec[i & 1], *o2 = S2.rec[i & 1];
+        k_norm<<<grid(w, h, NORM_Z, blk_up), blk, 0, st>>>(S.acc, band[0][0][i], band[0][1][i], w, h, d, prev[0], pw, ph, 0,
+          cfg.hole_weight, o, w, h, 0, 0);
+        k_norm<<<grid(w, h, NORM_Z, blk_up), blk, 0, st>>>(S2.acc, band[1][0][i], band[1][1][i], w, h, d, prev[1], pw, ph, 0,
+          S2.cfg.hole_weight, o2, w, h, 0, 0);
+        prev[0] = o;
+        prev[1] = o2;
+        pw = w;
+        ph = h;
+      }
+    }
+    return cudaPeekAtLastError() == cudaSuccess ? 0 : -2;
+  }
+#endif
+
+  // build_run with its own scratch; waits for st before returning (the scratch goes back to the pool). part -1: the
+  // whole build (with the two-build blend when the settings have it); 0: the main build alone; 1: the second build
+  // alone (splat::blend_config).
+  static int build_dev(const MvCudaSplatParams &p, cudaStream_t st, const float *P, const float *N, const float *fwdP,
+    const float *bwdN, float d, float *dout, int part = -1)
+  {
+    const splat::Config cfg = cfg_of(p);
+    const bool blend = part < 0 && cfg.blend_sigma > 0.0;
+    int rc;
+    {
+      BuildScratch S, S2;
+      Bufs B;
+      rc = S.alloc(part == 1 ? splat::blend_config(cfg) : cfg, p.width, p.height, st);
+#ifndef SPLAT_EXACT
+      if (!rc && blend)
+      {
+        float *e = B.get((size_t)S.MW * S.MH);
+        rc = B.failed ? -2 : S2.alloc(splat::blend_config(cfg), p.width, p.height, st);
+        if (!rc && blend_fusable(S, S2))
+        {
+          rc = build_run_blend(st, S, S2, P, N, fwdP, bwdN, d, dout, e, nullptr, nullptr, nullptr, nullptr);
+          if (cudaStreamSynchronize(st) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+            return -2;
+          return rc;
+        }
+      }
+#endif
+      if (!rc)
+        rc = build_run(st, S, P, N, fwdP, bwdN, d, dout);
+      if (!rc && blend)
+      {
+        float *second = B.get((size_t)3 * p.width * p.height), *e = B.get((size_t)S.MW * S.MH);
+        rc = B.failed ? -2 : S2.alloc(splat::blend_config(cfg), p.width, p.height, st);
+        if (!rc)
+          rc = build_run(st, S2, P, N, fwdP, bwdN, d, second);
+        if (!rc)
+          blend_run(st, cfg, fwdP, bwdN, S.MW, S.MH, e, dout, second, p.width, p.height);
+      }
+      if (cudaStreamSynchronize(st) != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return -2;
+    }
     return rc;
   }
 
   int build_host(const MvCudaSplatParams &p, const float *P, const float *N, const float *fwdP, const float *bwdN, float d,
-    float *out)
+    float *out, int part)
   {
     const splat::Config cfg = cfg_of(p);
     const int W = p.width, H = p.height, MW = splat::me_width(cfg, W), MH = splat::me_height(cfg, H);
@@ -848,12 +1333,92 @@ namespace SPLAT_NS
       cudaMemcpyAsync(src[s], host_src[s], sizeof(float) * 3 * W * H, cudaMemcpyHostToDevice, st);
       cudaMemcpyAsync(me[s], host_me[s], sizeof(float) * 4 * MW * MH, cudaMemcpyHostToDevice, st);
     }
-    int rc = build_dev(p, st, src[0], src[1], me[0], me[1], d, dout);
+    int rc = build_dev(p, st, src[0], src[1], me[0], me[1], d, dout, part);
     if (rc)
       return rc;
     cudaMemcpyAsync(out, dout, sizeof(float) * 3 * W * H, cudaMemcpyDeviceToHost, st);
     if (cudaStreamSynchronize(st) != cudaSuccess || cudaGetLastError() != cudaSuccess)
       return -2;
     return 0;
+  }
+
+  // ---- host-memory entries of single build stages (tests)
+  // one data set: host -> device for every input, the kernels, device -> host for the output
+  struct HostRun
+  {
+    mvc::StreamLease lease;
+    Bufs B;
+    ~HostRun() { cudaStreamSynchronize(lease.s); } // before the buffers go back (an early return may leave copies queued)
+    float *up(const float *h, size_t n)
+    {
+      float *d = B.get(n);
+      if (d)
+        cudaMemcpyAsync(d, h, sizeof(float) * n, cudaMemcpyHostToDevice, lease.s);
+      return d;
+    }
+    int down(float *h, const float *d, size_t n)
+    {
+      cudaMemcpyAsync(h, d, sizeof(float) * n, cudaMemcpyDeviceToHost, lease.s);
+      return (cudaStreamSynchronize(lease.s) != cudaSuccess || cudaGetLastError() != cudaSuccess) ? -2 : 0;
+    }
+  };
+
+  // one pyramid reduce step of one plane (w x h) with the main taps or (second) those of the second build
+  int pyr_reduce_host(const MvCudaSplatParams &p, const float *src, int w, int h, int second, float *dst)
+  {
+    const splat::Config cfg = cfg_of(p);
+    const float *t = second ? cfg.blend_reduce : cfg.pyr_reduce;
+    const RTaps rt = { t[0], t[1], t[2], t[3] };
+    const int oh = (h + 1) / 2, ow = (w + 1) / 2;
+    HostRun R;
+    float *s = R.up(src, (size_t)w * h), *tmp = R.B.get((size_t)w * oh), *o = R.B.get((size_t)ow * oh);
+    if (R.B.failed)
+      return -2;
+    const dim3 blk(32, 8);
+    k_reduce_v<<<grid(w, oh, 1, blk), blk, 0, R.lease.s>>>(s, w, h, tmp, oh, rt);
+    k_reduce_h<<<grid(ow, oh, 1, blk), blk, 0, R.lease.s>>>(tmp, w, oh, o, ow, rt);
+    return R.down(dst, o, (size_t)ow * oh);
+  }
+
+  // the projection field of one side (k_splat_prep) on a w x h field
+  int border_weight_host(const MvCudaSplatParams &p, const float *F, int w, int h, float d, int n_side, float *G)
+  {
+    const splat::Config cfg = cfg_of(p);
+    HostRun R;
+    const size_t n = (size_t)4 * w * h;
+    float *f = R.up(F, n), *g = R.B.get(n);
+    if (R.B.failed)
+      return -2;
+    const dim3 blk(32, 8);
+    k_splat_prep<<<grid(w, h, 1, blk), blk, 0, R.lease.s>>>(f, w, h, d, n_side, prep_args(cfg), g);
+    return R.down(G, g, n);
+  }
+
+  int blend_error_map_host(const MvCudaSplatParams &p, const float *fwdP, const float *bwdN, float *e)
+  {
+    const splat::Config cfg = cfg_of(p);
+    const int MW = splat::me_width(cfg, p.width), MH = splat::me_height(cfg, p.height);
+    HostRun R;
+    const size_t n = (size_t)MW * MH;
+    float *a = R.up(fwdP, 4 * n), *b = R.up(bwdN, 4 * n), *o = R.B.get(n);
+    if (R.B.failed)
+      return -2;
+    const dim3 blk(32, 8);
+    k_blend_err<<<grid(MW, MH, 1, blk), blk, 0, R.lease.s>>>(a, b, MW, MH, o);
+    return R.down(e, o, n);
+  }
+
+  int blend_mix_host(const MvCudaSplatParams &p, const float *main, const float *second, const float *e, float *out)
+  {
+    const splat::Config cfg = cfg_of(p);
+    const int W = p.width, H = p.height, MW = splat::me_width(cfg, W), MH = splat::me_height(cfg, H);
+    HostRun R;
+    const size_t n = (size_t)3 * W * H;
+    float *m = R.up(main, n), *s = R.up(second, n), *ed = R.up(e, (size_t)MW * MH);
+    if (R.B.failed)
+      return -2;
+    const dim3 blk(32, 8);
+    k_blend_mix<<<grid(W, H, 1, blk), blk, 0, R.lease.s>>>(m, s, W, H, ed, MW, MH, blend_args(cfg));
+    return R.down(out, m, n);
   }
 }

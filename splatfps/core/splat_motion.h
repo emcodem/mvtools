@@ -31,15 +31,14 @@
 //   measured. With one side only (first picture), the lowest cost of the forward candidates.
 //   Named techniques: vector assignment by the minimum of a biased, spatially filtered displaced frame difference over
 //   a menu of candidate vectors (G. A. Thomas, BBC RD 1987/11 section 4.2,
-//   https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf, and US 4,890,160, BBC, 1986; there the bias grows with
-//   the vector length (vector_length_cost), here it is mainly a constant per candidate); a forward and a backward
-//   vector field per input picture (US 6,011,596, BBC, 1991); occlusion handling by one-sided matching: covered
-//   background is only visible in the earlier picture and uncovered background only in the later one, so where one
-//   side matches badly the side that does match supplies the motion for both (the one-sided choice of US 6,011,596,
-//   also proposed in the 1987 report).
+//   https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf; there the bias grows with the vector length
+//   (vector_length_cost), here it is mainly a constant per candidate); a forward and a backward vector field per
+//   input picture; occlusion handling by one-sided matching: covered background is only visible in the earlier
+//   picture and uncovered background only in the later one, so where one side matches badly the side that does
+//   match supplies the motion for both (also proposed in the 1987 report).
 // - Local fallback: splat_me.h, on the assigned fields.
-// - The defaults (refine_err_scale 15, refine_reg 0.001, refine_box 15, error_box 7, occlusion_error 6,
-//   occlusion_error_factor 1.5, secondary_peak_cost 3) are those of splat::Config (splat_config.h).
+// - The defaults (refine_err_scale 15, refine_reg 0.001, refine_box 15, error_box 7, occlusion_error 20,
+//   occlusion_error_factor 2, secondary_peak_cost 3) are those of splat::Config (splat_config.h).
 #pragma once
 
 #include "splat_core.h"

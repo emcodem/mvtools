@@ -6,12 +6,12 @@
 //
 // Techniques: the phase correlation is block phase correlation (Fourier-domain normalised cross-power spectrum, inverse
 // transform, search for the highest peaks; G. A. Thomas, BBC RD 1987/11,
-// https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf, and US 4,890,160, BBC, 1986) on overlapping windowed blocks
+// https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf) on overlapping windowed blocks
 // of 32, 64 and 128; the peaks form a menu of candidate vectors per pixel. The refinement is a weighted Lucas-Kanade
 // step per candidate (sub-pixel refinement). The assignment picks per pixel the forward and the backward candidate with
 // the lowest biased, filtered displaced frame difference (each side on its own, or as pairs with a speed-change penalty
 // when speed_change_cost > 0), and handles occlusions by letting the side that matches supply the vector of the side
-// that does not (forward / backward fields per input picture as in US 6,011,596, BBC, 1991).
+// that does not (a forward and a backward field per input picture).
 //
 // The phase correlation exists only in the exact variant (compiled without contraction) and both variants use it (state
 // API below): it computes the CPU's bits (float and IEEE sqrt / division, the float FFT as pocketfft's mixed-radix
@@ -37,6 +37,9 @@ namespace splat_exact
   void pcorr_pair(PcorrState *s, cudaStream_t st, int a, int b, float *cands, float *glob);
   // the prefiltered picture of a slot (device, w x h)
   const float *pcorr_hp(const PcorrState *s, int slot);
+  // the whole-picture correlation of the pair (slot a, slot b) alone (a state made with global_candidate 2 or 3):
+  // surface (T x T) and wp (gx, gy, height), device; returns T, or 0 when the picture is larger than the FFT sizes
+  int pcorr_whole(PcorrState *s, cudaStream_t st, int a, int b, const float **surface, const float **wp);
 }
 
 namespace SPLAT_NS
@@ -136,7 +139,9 @@ namespace SPLAT_NS
     }
   }
 
-  constexpr int PEAK_THREADS = 256, PEAK_CHUNK = 4096; // samples per chunk (16 per thread)
+  // samples per chunk (8 per thread): small chunks give the small block surfaces enough blocks to fill the GPU; the
+  // best-K selection (value, then index) is the same however the samples are split
+  constexpr int PEAK_THREADS = 128, PEAK_CHUNK = 1024;
   struct PeakEnt
   {
     float v;
@@ -496,20 +501,40 @@ namespace SPLAT_NS
       part[((size_t)b * nchunk + blockIdx.x) * K + threadIdx.x] = sh[0][threadIdx.x];
   }
 
-  // one thread per surface: the npk best over the chunks, then the CPU's rules (no peak: the zero vector; a further
-  // peak below ratio x the strongest: the strongest instead); vec[(p nb + b) 2 + 0/1], h0[b] = the strongest height
+  // one warp per surface (blockIdx.x): the npk best over the chunks (each lane every 32nd entry, then the lanes' lists
+  // merged in shared memory), then the CPU's rules (no peak: the zero vector; a further peak below ratio x the
+  // strongest: the strongest instead); vec[(p nb + b) 2 + 0/1], h0[b] = the strongest height
+  constexpr int MERGE_THREADS = 32;
   template <int K> __global__ void k_pc_peaks_merge(const PeakEnt *part, int nchunk, int S, int npk, int nb, float ratio,
     float *vec, float *h0)
   {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= nb)
-      return;
+    const int b = blockIdx.x, lane = threadIdx.x;
     PeakEnt l[K];
 #pragma unroll
     for (int k = 0; k < K; k++)
       l[k] = { -INFINITY, INT_MAX };
-    for (int c = 0; c < nchunk * K; c++)
+    for (int c = lane; c < nchunk * K; c += MERGE_THREADS)
       peak_insert<K>(l, part[(size_t)b * nchunk * K + c]);
+    __shared__ PeakEnt sh[MERGE_THREADS][K];
+#pragma unroll
+    for (int k = 0; k < K; k++)
+      sh[lane][k] = l[k];
+    __syncwarp();
+    for (int s = MERGE_THREADS / 2; s > 0; s >>= 1)
+    {
+      if (lane < s)
+      {
+#pragma unroll
+        for (int k = 0; k < K; k++)
+          peak_insert<K>(l, sh[lane + s][k]);
+#pragma unroll
+        for (int k = 0; k < K; k++)
+          sh[lane][k] = l[k];
+      }
+      __syncwarp();
+    }
+    if (lane != 0)
+      return;
     int n = 0;
     while (n < npk && l[n].v > 0.0f)
       n++;
@@ -539,15 +564,15 @@ namespace SPLAT_NS
     {
     case 1:
       k_pc_peaks_part<1><<<dim3(nc, nb), PEAK_THREADS, 0, st>>>(C, S, part);
-      k_pc_peaks_merge<1><<<(nb + 63) / 64, 64, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
+      k_pc_peaks_merge<1><<<nb, MERGE_THREADS, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
       break;
     case 2:
       k_pc_peaks_part<2><<<dim3(nc, nb), PEAK_THREADS, 0, st>>>(C, S, part);
-      k_pc_peaks_merge<2><<<(nb + 63) / 64, 64, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
+      k_pc_peaks_merge<2><<<nb, MERGE_THREADS, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
       break;
     default:
       k_pc_peaks_part<splat::CFG_MAX_PEAKS><<<dim3(nc, nb), PEAK_THREADS, 0, st>>>(C, S, part);
-      k_pc_peaks_merge<splat::CFG_MAX_PEAKS><<<(nb + 63) / 64, 64, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
+      k_pc_peaks_merge<splat::CFG_MAX_PEAKS><<<nb, MERGE_THREADS, 0, st>>>(part, (int)nc, S, npk, nb, ratio, vec, h0);
       break;
     }
   }
@@ -667,10 +692,11 @@ namespace SPLAT_NS
   }
 
   // block vectors -> per-pixel candidate fields (block_cover: c & 1 the far block column, c >= 2 the far row); the
-  // candidates from nbc on are the global vector (blockIdx.z = candidate)
+  // candidate nbc is the global vector (glob[3], glob[4]), a further one (global_candidate 3) the vector at glob2
   // one thread per pixel, all g.nc candidates; the covering blocks are worked out once per block grid (the groups of a
   // stage share it: they differ only in the peak, g.off)
-  __global__ void k_pc_cands(const float *bv, B2P g, int nbc, const float *glob, int w, int h, float *cands)
+  __global__ void k_pc_cands(const float *bv, B2P g, int nbc, const float *glob, const float *glob2, int w, int h,
+    float *cands)
   {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
@@ -683,8 +709,8 @@ namespace SPLAT_NS
       float vx, vy;
       if (c >= nbc)
       {
-        vx = glob[3];
-        vy = glob[4];
+        vx = c == nbc ? glob[3] : glob2[0];
+        vy = c == nbc ? glob[4] : glob2[1];
       }
       else
       {
@@ -705,6 +731,231 @@ namespace SPLAT_NS
       o[0] = vx;
       o[np] = vy;
     }
+  }
+
+  // ---- whole-picture correlation (global_candidate 2 / 3): splat::pcorr_whole_peak, the same operations in the same
+  // order. Both prefiltered pictures packed into one T x T complex tile (prev real, cur imaginary), the spectra
+  // separated (k_pc_unpack with the two pictures as the tile's two blocks), their noise floors (k_pc_median), the
+  // weighted cross power (k_pc_cross, one block), the inverse transform and the strongest peak (pc_peaks_dev).
+
+  // windowed means of both pictures (a, b) and the window sum, in the CPU's order: per row the sums along the row
+  // (k_wp_rows: one thread per row, blockIdx.y the picture; rows: [picture][row] sums, then [picture][row] weights),
+  // then the rows in order (k_wp_mean_fin: thread 0 picture a, thread 1 picture b)
+  __global__ void k_wp_rows(const float *a, const float *b, int W, int H, const float *wx, const float *wy, float *rows)
+  {
+    const int y = blockIdx.x * blockDim.x + threadIdx.x, pic = blockIdx.y;
+    if (y >= H)
+      return;
+    const float *row = (pic ? b : a) + (size_t)y * W;
+    float r = 0.0f, q = 0.0f;
+#pragma unroll 8
+    for (int x = 0; x < W; x++)
+    {
+      q = q + wy[y] * wx[x];
+      r = r + (wy[y] * wx[x]) * row[x];
+    }
+    rows[(size_t)pic * H + y] = r;
+    rows[(size_t)(2 + pic) * H + y] = q;
+  }
+  __global__ void k_wp_mean_fin(const float *rows, int H, float *mean)
+  {
+    const int pic = threadIdx.x;
+    if (pic >= 2)
+      return;
+    const float *rs = rows + (size_t)pic * H, *rw = rows + (size_t)(2 + pic) * H;
+    float s = 0.0f, sw = 0.0f;
+    for (int y = 0; y < H; y++)
+    {
+      sw = sw + rw[y];
+      s = s + rs[y];
+    }
+    mean[pic] = sw > 0.0f ? s / sw : 0.0f;
+  }
+
+  // noise floors of the two T x T spectra (the whole-picture surface): k_pc_median's radix selection with each pass
+  // spread over many blocks. k_wpm_hist: the chunk's values that match the prefix so far, counted per bucket into the
+  // surface's global histogram; k_wpm_select: k_pc_median's bucket choice (the same counts, so the same element),
+  // histogram cleared for the next pass, the root after the last pass. state: per surface prefix, rank.
+  constexpr int WPM_CHUNK = 4096;
+  __global__ void k_wpm_init(unsigned *state, unsigned *ghist, size_t SS)
+  {
+    for (int i = threadIdx.x; i < 512; i += blockDim.x)
+      ghist[i] = 0;
+    if (threadIdx.x < 2)
+    {
+      state[2 * threadIdx.x] = 0;
+      state[2 * threadIdx.x + 1] = (unsigned)((SS - 1) / 2);
+    }
+  }
+  __global__ void k_wpm_hist(const float *R, const float *I, size_t SS, int shift, unsigned mask, const unsigned *state,
+    unsigned *ghist)
+  {
+    __shared__ unsigned hist[256];
+    const int sfc = blockIdx.y;
+    const size_t off = (size_t)sfc * SS, i0 = 1 + (size_t)blockIdx.x * WPM_CHUNK, i1 = min(SS, i0 + WPM_CHUNK);
+    hist[threadIdx.x] = 0;
+    __syncthreads();
+    const unsigned pre = state[2 * sfc];
+    for (size_t i = i0 + threadIdx.x; i < i1; i += blockDim.x)
+    {
+      const float r = R[off + i], q = I[off + i];
+      const unsigned u = __float_as_uint(r * r + q * q);
+      if ((u & mask) == pre)
+        atomicAdd(&hist[(u >> shift) & 255u], 1u);
+    }
+    __syncthreads();
+    if (hist[threadIdx.x])
+      atomicAdd(&ghist[sfc * 256 + threadIdx.x], hist[threadIdx.x]);
+  }
+  __global__ void k_wpm_select(unsigned *ghist, int shift, unsigned *state, float *N)
+  {
+    __shared__ unsigned hist[256];
+    const int sfc = blockIdx.x, d = threadIdx.x;
+    unsigned v = ghist[sfc * 256 + d];
+    hist[d] = v;
+    ghist[sfc * 256 + d] = 0;
+    const unsigned k = state[2 * sfc + 1], pre = state[2 * sfc];
+    __syncthreads();
+    for (int o = 1; o < 256; o <<= 1)
+    {
+      const unsigned add = d >= o ? hist[d - o] : 0u;
+      __syncthreads();
+      v += add;
+      hist[d] = v;
+      __syncthreads();
+    }
+    const unsigned below = d ? hist[d - 1] : 0u;
+    if (below <= k && k < v)
+    {
+      const unsigned np = pre | ((unsigned)d << shift);
+      state[2 * sfc] = np;
+      state[2 * sfc + 1] = k - below;
+      if (shift == 0)
+        N[sfc] = sqrtf(__uint_as_float(np));
+    }
+  }
+
+  // the T x T tile: a windowed (mean removed) in the real part, b in the imaginary part, zero outside W x H
+  __global__ void k_wp_fill(const float *a, const float *b, int W, int H, int T, const float *wx, const float *wy,
+    const float *mean, fftp::cpx<float> *X)
+  {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= T || y >= T)
+      return;
+    float v0 = 0.0f, v1 = 0.0f;
+    if (x < W && y < H)
+    {
+      const size_t i = (size_t)y * W + x;
+      v0 = (a[i] - mean[0]) * wy[y] * wx[x];
+      v1 = (b[i] - mean[1]) * wy[y] * wx[x];
+    }
+    X[(size_t)y * T + x] = { v0, v1 };
+  }
+
+  // the peak as (gx, gy, height) into wp; replace (global_candidate 2): the global vector becomes the peak
+  __global__ void k_wp_glob(const float *vec, const float *h0, int replace, float *wp, float *glob)
+  {
+    const float gx = vec[0], gy = vec[1], gh = h0[0];
+    wp[0] = gx;
+    wp[1] = gy;
+    wp[2] = gh;
+    if (replace)
+    {
+      glob[0] = gx;
+      glob[1] = gy;
+      glob[2] = gh;
+      glob[3] = gx;
+      glob[4] = gy;
+    }
+  }
+
+  // FFT size of the whole-picture correlation of a w x h ME picture (the power of two >= both sides, from 16); 0 when
+  // larger than 1024 (the CPU's limit: global_candidate 2 then falls back to the vote)
+  static int whole_size(int w, int h)
+  {
+    int T = 16;
+    while (T < w || T < h)
+      T *= 2;
+    return T > 1024 ? 0 : T;
+  }
+
+  // constants and scratch of the whole-picture correlation (T > 0 only)
+  struct WholeTmp
+  {
+    int T = 0;
+    float *wx, *wy, *R, *I, *N, *surf, *mean, *vec, *h0, *wp, *rows;
+    unsigned *mstate, *ghist; // the noise-floor selection: per surface prefix and rank, the two histograms
+    fftp::cpx<float> *X, *tw;
+    fftp::Plan pf;
+    PeakEnt *part;
+    bool init(Bufs &B, cudaStream_t st, std::vector<std::vector<unsigned char>> &keep, const splat::Config &cfg, int w,
+      int h)
+    {
+      T = whole_size(w, h);
+      const size_t TT = (size_t)T * T;
+      std::vector<float> hx((size_t)w), hy((size_t)h);
+      splat::pcorr_window(w, cfg.block_taper, hx.data());
+      splat::pcorr_window(h, cfg.block_taper, hy.data());
+      std::vector<fftp::cpx<float>> tf;
+      pf = fftp::make_plan<float>(T, tf);
+      wx = B.get(w);
+      wy = B.get(h);
+      tw = (fftp::cpx<float> *)B.get(2 * tf.size());
+      X = (fftp::cpx<float> *)B.get(2 * TT);
+      R = B.get(2 * TT);
+      I = B.get(2 * TT);
+      N = B.get(2);
+      surf = B.get(TT);
+      mean = B.get(2);
+      vec = B.get(2);
+      h0 = B.get(1);
+      wp = B.get(4);
+      rows = B.get(4 * (size_t)h);
+      mstate = (unsigned *)B.get(4);
+      ghist = (unsigned *)B.get(512);
+      part = (PeakEnt *)B.get(2 * peak_part_size(T, 1));
+      if (B.failed)
+        return false;
+      // host copies stay alive until the stream is synchronised
+      for (auto *v : { &hx, &hy })
+        keep.emplace_back((unsigned char *)v->data(), (unsigned char *)(v->data() + v->size()));
+      keep.emplace_back((unsigned char *)tf.data(), (unsigned char *)(tf.data() + tf.size()));
+      const size_t n = keep.size();
+      cudaMemcpyAsync(wx, keep[n - 3].data(), keep[n - 3].size(), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(wy, keep[n - 2].data(), keep[n - 2].size(), cudaMemcpyHostToDevice, st);
+      cudaMemcpyAsync(tw, keep[n - 1].data(), keep[n - 1].size(), cudaMemcpyHostToDevice, st);
+      return true;
+    }
+  };
+
+  // the whole-picture peak of the pair (hp of prev, hp of cur) -> Z.vec (gx, gy), Z.h0 (height), Z.surf
+  static void whole_dev(cudaStream_t st, const splat::Config &cfg, WholeTmp &Z, const float *hpa, const float *hpb,
+    int w, int h)
+  {
+    const dim3 blk(32, 8);
+    const int T = Z.T;
+    const size_t TT = (size_t)T * T;
+    k_wp_rows<<<dim3((h + 31) / 32, 2), 32, 0, st>>>(hpa, hpb, w, h, Z.wx, Z.wy, Z.rows);
+    k_wp_mean_fin<<<1, 32, 0, st>>>(Z.rows, h, Z.mean);
+    k_wp_fill<<<grid(T, T, 1, blk), blk, 0, st>>>(hpa, hpb, w, h, T, Z.wx, Z.wy, Z.mean, Z.X);
+    fft2_dev<true, float>(st, Z.X, T, 1, Z.pf, Z.tw, 1.0f);
+    k_pc_unpack<<<nblk(TT), 256, 0, st>>>(Z.X, T, 2, TT, Z.R, Z.I);
+    {
+      const unsigned nch = (unsigned)((TT - 1 + WPM_CHUNK - 1) / WPM_CHUNK);
+      k_wpm_init<<<1, 256, 0, st>>>(Z.mstate, Z.ghist, TT);
+      unsigned mask = 0;
+      for (int shift = 24; shift >= 0; shift -= 8)
+      {
+        k_wpm_hist<<<dim3(nch, 2), 256, 0, st>>>(Z.R, Z.I, TT, shift, mask, Z.mstate, Z.ghist);
+        k_wpm_select<<<2, 256, 0, st>>>(Z.ghist, shift, Z.mstate, Z.N);
+        mask |= 255u << shift;
+      }
+    }
+    k_pc_cross<<<nblk(TT), 256, 0, st>>>(Z.R, Z.I, Z.N, Z.R + TT, Z.I + TT, Z.N + 1, T, 1, TT,
+      cfg.noise_weight * cfg.noise_weight, Z.X);
+    fft2_dev<false, float>(st, Z.X, T, 1, Z.pf, Z.tw, 1.0f / (float)T);
+    k_pc_split<<<nblk(TT), 256, 0, st>>>(Z.X, T, 1, TT, Z.surf);
+    pc_peaks_dev(st, Z.surf, T, 1, 1, cfg.peak_ratio, Z.part, Z.vec, Z.h0);
   }
 
   static void pcorr_ingest_dev(cudaStream_t st, const splat::Config &cfg, const PcorrConst &K, PcorrTmp &T, const float *B,
@@ -736,8 +987,9 @@ namespace SPLAT_NS
     }
   }
 
-  static void pcorr_pair_dev(cudaStream_t st, const splat::Config &cfg, const PcorrConst &K, PcorrTmp &T, const PcorrPic &a,
-    const PcorrPic &b, int w, int h, float *cands, float *glob)
+  // Z: the whole-picture scratch (global_candidate 2 / 3 on a picture within the FFT sizes), else null
+  static void pcorr_pair_dev(cudaStream_t st, const splat::Config &cfg, const PcorrConst &K, PcorrTmp &T, WholeTmp *Z,
+    const PcorrPic &a, const PcorrPic &b, int w, int h, float *cands, float *glob)
   {
     const dim3 blk(32, 8);
     const float k2 = cfg.noise_weight * cfg.noise_weight;
@@ -775,14 +1027,22 @@ namespace SPLAT_NS
       nv += nb;
     }
     V.v0[splat::CFG_NSTAGE] = nv;
-    if (splat::pcorr_has_global(cfg))
+    // whole-picture surface (global_candidate 2 or 3); 2 falls back to the vote on pictures above the FFT sizes
+    const bool whole = cfg.global_candidate >= 2 && Z;
+    if (whole)
+      whole_dev(st, cfg, *Z, a.hp, b.hp, w, h);
+    if (splat::pcorr_has_global(cfg) && !(cfg.global_candidate == 2 && whole))
     {
       k_pc_votes<<<nblk(nv), 256, 0, st>>>(T.bv, T.h0, V, T.vkey, T.vw);
       k_pc_vote_sums<<<nv, PC_SUM_THREADS, 0, st>>>(T.vkey, T.vw, nv, T.vsum);
       k_pc_glob<<<1, PC_GLOB_THREADS, 0, st>>>(T.vkey, T.vsum, nv, glob);
     }
+    if (whole)
+      k_wp_glob<<<1, 1, 0, st>>>(Z->vec, Z->h0, cfg.global_candidate == 2, Z->wp, glob);
     g.nc = c + splat::pcorr_has_global(cfg);
-    k_pc_cands<<<grid(w, h, 1, blk), blk, 0, st>>>(T.bv, g, c, glob, w, h, cands);
+    // the global fields: the vote (or the whole-picture vector for 2), then for 3 the whole-picture vector (the vote
+    // again when the picture is too large)
+    k_pc_cands<<<grid(w, h, 1, blk), blk, 0, st>>>(T.bv, g, c, glob, whole ? Z->wp : glob + 3, w, h, cands);
   }
 
   struct PcorrState
@@ -792,6 +1052,8 @@ namespace SPLAT_NS
     splat::Config cfg;
     PcorrConst K;
     PcorrTmp T;
+    WholeTmp Z;
+    bool whole = false;
     PcorrPic pic[3];
     int w, h;
   };
@@ -803,6 +1065,9 @@ namespace SPLAT_NS
     s->h = h;
     s->cfg = cfg;
     bool ok = s->K.init(s->B, st, s->keep, cfg) && s->T.alloc(s->B, cfg, w, h);
+    s->whole = cfg.global_candidate >= 2 && whole_size(w, h) > 0;
+    if (ok && s->whole)
+      ok = s->Z.init(s->B, st, s->keep, cfg, w, h);
     for (int i = 0; i < 3 && ok; i++)
       ok = pcorr_alloc(s->B, cfg, w, h, s->pic[i]);
     if (!ok)
@@ -822,7 +1087,18 @@ namespace SPLAT_NS
 
   void pcorr_pair(PcorrState *s, cudaStream_t st, int a, int b, float *cands, float *glob)
   {
-    pcorr_pair_dev(st, s->cfg, s->K, s->T, s->pic[a], s->pic[b], s->w, s->h, cands, glob);
+    pcorr_pair_dev(st, s->cfg, s->K, s->T, s->whole ? &s->Z : nullptr, s->pic[a], s->pic[b], s->w, s->h, cands, glob);
+  }
+
+  int pcorr_whole(PcorrState *s, cudaStream_t st, int a, int b, const float **surface, const float **wp)
+  {
+    if (!s->whole)
+      return 0;
+    whole_dev(st, s->cfg, s->Z, s->pic[a].hp, s->pic[b].hp, s->w, s->h);
+    k_wp_glob<<<1, 1, 0, st>>>(s->Z.vec, s->Z.h0, 0, s->Z.wp, nullptr);
+    *surface = s->Z.surf;
+    *wp = s->Z.wp;
+    return s->Z.T;
   }
 
   const float *pcorr_hp(const PcorrState *s, int slot) { return s->pic[slot].hp; }
@@ -1226,10 +1502,109 @@ namespace SPLAT_NS
   //   li + lp + lam (|vf_i,x + vb_p,x| + |vf_i,y + vb_p,y|) + bias[i] + bias[p]
   // (both vectors point away from the centre picture, so constant motion costs nothing); the first strict minimum
   // wins. Then splat::occlusion_switch.
+  // All pairs (lam > 0) with the backward side held in registers: NB >= n, loops unrolled to NB so the per-candidate
+  // arrays stay in registers (a run-time index would put them in local memory); every pair's cost is computed with
+  // the same operations in the same order as the scalar loop, and the backward winner is fetched once at the end.
+  template <int NB>
+  __device__ __forceinline__ void assign_pairs(const float *rf, const float *ef, const float *rb, const float *eb, int n,
+    size_t np, size_t k, const float *sb, float lam, float lenc, float &best, float &vx, float &vy, float &e, float &ovx,
+    float &ovy, float &oe)
+  {
+    float ox[NB], oy[NB], lp[NB];
+#pragma unroll
+    for (int p = 0; p < NB; p++)
+      if (p < n)
+      {
+        ox[p] = p < n - 1 ? rb[2 * p * np + k] : 0.0f;
+        oy[p] = p < n - 1 ? rb[(2 * p + 1) * np + k] : 0.0f;
+        lp[p] = eb[p * np + k] + lenc * (fabsf(ox[p]) + fabsf(oy[p]));
+      }
+    // Row bound: every pair's cost ((li + lp) + pen) + (bias_p + bias_i) with pen >= 0 (lam > 0) is >= (li + min lp) +
+    // (min bias + bias_i), since rounded addition is monotone in both operands; a row whose bound is not below the best
+    // so far cannot hold a strict new minimum and is skipped (a NaN bound means every cost of the row is NaN).
+    float lpmin = INFINITY, bmin = INFINITY;
+#pragma unroll
+    for (int p = 0; p < NB; p++)
+      if (p < n)
+      {
+        lpmin = fminf(lpmin, lp[p]);
+        bmin = fminf(bmin, sb[p]);
+      }
+    const bool prune = lam > 0.0f;
+    // Per forward candidate i, the backward candidates run as NQ independent chains over consecutive quarters of p
+    // (instruction-level parallelism instead of one compare chain through all pairs); the chains merge in p order
+    // with a strict <, then the row against the best so far with a strict <: the result is the first strict minimum
+    // in (i, p) order, as with one sequential scan. (Taking the row with the lowest bound first measured slower: the
+    // extra pass, and the lanes of a warp then skip different rows.)
+    constexpr int NQ = 4, Q = NB / NQ;
+    int pb = -1;
+    for (int i = 0; i < n; i++)
+    {
+      const float cx = i < n - 1 ? rf[2 * i * np + k] : 0.0f, cy = i < n - 1 ? rf[(2 * i + 1) * np + k] : 0.0f;
+      const float ei = ef[i * np + k];
+      const float li = ei + lenc * (fabsf(cx) + fabsf(cy));
+      const float bi = sb[i];
+      if (prune && !((li + lpmin) + (bmin + bi) < best))
+        continue;
+      float qc[NQ];
+      int qp[NQ];
+#pragma unroll
+      for (int q = 0; q < NQ; q++)
+      {
+        qc[q] = INFINITY;
+        qp[q] = -1;
+      }
+#pragma unroll
+      for (int j = 0; j < Q; j++)
+#pragma unroll
+        for (int q = 0; q < NQ; q++)
+        {
+          const int p = q * Q + j;
+          if (p < n)
+          {
+            const float t = li + lp[p];
+            const float pen = lam * (fabsf(cx + ox[p]) + fabsf(cy + oy[p]));
+            float c = t + pen;
+            c = c + (sb[p] + bi);
+            if (c < qc[q])
+            {
+              qc[q] = c;
+              qp[q] = p;
+            }
+          }
+        }
+#pragma unroll
+      for (int q = 1; q < NQ; q++)
+        if (qc[q] < qc[0])
+        {
+          qc[0] = qc[q];
+          qp[0] = qp[q];
+        }
+      if (qc[0] < best)
+      {
+        best = qc[0];
+        vx = cx; vy = cy; e = ei;
+        pb = qp[0];
+      }
+    }
+    if (pb >= 0)
+    {
+      ovx = pb < n - 1 ? rb[2 * pb * np + k] : 0.0f;
+      ovy = pb < n - 1 ? rb[(2 * pb + 1) * np + k] : 0.0f;
+      oe = eb[pb * np + k];
+    }
+  }
+
   // n = number of errors per side (candidates + zero); rb == null: forward side only (biased argmin)
   __global__ void k_assign(const float *rf, const float *ef, const float *rb, const float *eb, int n, int w, int h, Bias bias,
     float lam, float thresh, float ratio, float lenc, float *fwd, float *bwd)
   {
+    // the costs in shared memory: indexed at run time, the by-value parameter struct would be copied to local memory
+    __shared__ float sb[splat::CFG_MAX_COSTS];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if (tid < splat::CFG_MAX_COSTS)
+      sb[tid] = bias.b[tid];
+    __syncthreads();
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h)
       return;
@@ -1240,7 +1615,7 @@ namespace SPLAT_NS
       for (int i = 0; i < n; i++)
       {
         const float sx = i < n - 1 ? rf[2 * i * np + k] : 0.0f, sy = i < n - 1 ? rf[(2 * i + 1) * np + k] : 0.0f;
-        const float c = (ef[i * np + k] + lenc * (fabsf(sx) + fabsf(sy))) + bias.b[i];
+        const float c = (ef[i * np + k] + lenc * (fabsf(sx) + fabsf(sy))) + sb[i];
         if (c < best)
         {
           best = c;
@@ -1259,7 +1634,7 @@ namespace SPLAT_NS
       for (int i = 0; i < n; i++)
       {
         const float cx = i < n - 1 ? rf[2 * i * np + k] : 0.0f, cy = i < n - 1 ? rf[(2 * i + 1) * np + k] : 0.0f;
-        const float c = (ef[i * np + k] + lenc * (fabsf(cx) + fabsf(cy))) + bias.b[i];
+        const float c = (ef[i * np + k] + lenc * (fabsf(cx) + fabsf(cy))) + sb[i];
         if (c < best)
         {
           best = c;
@@ -1269,7 +1644,7 @@ namespace SPLAT_NS
       for (int p = 0; p < n; p++)
       {
         const float ox = p < n - 1 ? rb[2 * p * np + k] : 0.0f, oy = p < n - 1 ? rb[(2 * p + 1) * np + k] : 0.0f;
-        const float c = (eb[p * np + k] + lenc * (fabsf(ox) + fabsf(oy))) + bias.b[p];
+        const float c = (eb[p * np + k] + lenc * (fabsf(ox) + fabsf(oy))) + sb[p];
         if (c < bb)
         {
           bb = c;
@@ -1277,29 +1652,10 @@ namespace SPLAT_NS
         }
       }
     }
+    else if (n <= 16)
+      assign_pairs<16>(rf, ef, rb, eb, n, np, k, sb, lam, lenc, best, vx, vy, e, ovx, ovy, oe);
     else
-      for (int i = 0; i < n; i++)
-      {
-        const float cx = i < n - 1 ? rf[2 * i * np + k] : 0.0f, cy = i < n - 1 ? rf[(2 * i + 1) * np + k] : 0.0f;
-        const float ei = ef[i * np + k];
-        const float li = ei + lenc * (fabsf(cx) + fabsf(cy));
-        for (int p = 0; p < n; p++)
-        {
-          const float ox = p < n - 1 ? rb[2 * p * np + k] : 0.0f, oy = p < n - 1 ? rb[(2 * p + 1) * np + k] : 0.0f;
-          const float ep = eb[p * np + k];
-          const float lp = ep + lenc * (fabsf(ox) + fabsf(oy));
-          const float t = li + lp;
-          const float pen = lam * (fabsf(cx + ox) + fabsf(cy + oy));
-          float c = t + pen;
-          c = c + (bias.b[p] + bias.b[i]);
-          if (c < best)
-          {
-            best = c;
-            vx = cx; vy = cy; e = ei;
-            ovx = ox; ovy = oy; oe = ep;
-          }
-        }
-      }
+      assign_pairs<splat::CFG_MAX_COSTS>(rf, ef, rb, eb, n, np, k, sb, lam, lenc, best, vx, vy, e, ovx, ovy, oe);
     splat::occlusion_switch(vx, vy, e, ovx, ovy, oe, thresh, ratio);
     const float rvx = vx, rvy = vy, e2 = e, rox = ovx, roy = ovy, oe2 = oe;
     fwd[k] = rvx; fwd[np + k] = rvy; fwd[2 * np + k] = e2; fwd[3 * np + k] = 0.0f;
@@ -1425,6 +1781,46 @@ namespace SPLAT_NS
       cudaMemcpyAsync(glob, dg, sizeof(float) * 5, cudaMemcpyDeviceToHost, st);
     const int rc = finish(st);
     splat_exact::pcorr_state_free(S);
+    return rc;
+  }
+
+  // whole-picture correlation of the pair (B_prev, B_cur): out (gx, gy, height), surface (or null) T x T; *T_out = 0
+  // when the ME picture is larger than 1024
+  int whole_peak_host(const MvCudaSplatParams &p, const float *Bp, const float *Bc, float *out, float *surface, int *T_out)
+  {
+    splat::Config cfg = cfg_of(p);
+    if (cfg.global_candidate < 2)
+      cfg.global_candidate = 2;
+    int w, h;
+    me_dims(cfg, p.width, p.height, w, h);
+    *T_out = 0;
+    int TT = 16; // the FFT size (splat_exact::whole_size)
+    while (TT < w || TT < h)
+      TT *= 2;
+    if (TT > 1024)
+      return 0;
+    const size_t np = (size_t)w * h;
+    mvc::StreamLease lease;
+    cudaStream_t st = lease.s;
+    Bufs B;
+    float *dB0 = B.get(np), *dB1 = B.get(np);
+    if (B.failed)
+      return -2;
+    splat_exact::PcorrState *S = splat_exact::pcorr_state_new(st, w, h, cfg);
+    if (!S)
+      return -2;
+    cudaMemcpyAsync(dB0, Bp, sizeof(float) * np, cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(dB1, Bc, sizeof(float) * np, cudaMemcpyHostToDevice, st);
+    splat_exact::pcorr_ingest(S, st, dB0, 0);
+    splat_exact::pcorr_ingest(S, st, dB1, 1);
+    const float *surf, *wp;
+    const int T = splat_exact::pcorr_whole(S, st, 0, 1, &surf, &wp);
+    cudaMemcpyAsync(out, wp, sizeof(float) * 3, cudaMemcpyDeviceToHost, st);
+    if (surface)
+      cudaMemcpyAsync(surface, surf, sizeof(float) * T * T, cudaMemcpyDeviceToHost, st);
+    const int rc = finish(st);
+    splat_exact::pcorr_state_free(S);
+    *T_out = T;
     return rc;
   }
 

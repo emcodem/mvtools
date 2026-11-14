@@ -328,7 +328,8 @@ namespace splat
         const float ex = cfg.splat_err_scale > 0.0f ? exp32(-F.c[2].at(sx, sy) / cfg.splat_err_scale) : 1.0f;
         const float m = std::fmax(cfg.splat_min_weight, ex);
         G.c[2].at(x, y) = (cfg.splat_gain * m) * pr;
-        G.c[3].at(x, y) = F.c[3].at(sx, sy) * pr;
+        G.c[3].at(x, y) = F.c[3].at(sx, sy) * pr *
+          fallback_edge_keep(cfg, sx, sy, F.c[0].at(sx, sy), F.c[1].at(sx, sy), w, h);
       }
     return G;
   }
@@ -523,8 +524,9 @@ namespace splat
     return o;
   }
 
-  Pic3 build(const Pic3 &Pin, const Pic3 &Nin, const Field4 &MEP, const Field4 &MEN, float d, const Config &cfg,
-    BuildDebug *dbg)
+  // one build with the band split of cfg (the two-build blend is left to build())
+  static Pic3 build_one(const Pic3 &Pin, const Pic3 &Nin, const Field4 &MEP, const Field4 &MEN, float d,
+    const Config &cfg, BuildDebug *dbg)
   {
     const Geometry g(Pin.c[0].w, Pin.c[0].h, cfg);
     const int L = cfg.levels, stride_max = cfg.stride_max, PADX = cfg.pad_x, PADY = cfg.pad_y;
@@ -626,6 +628,73 @@ namespace splat
       dbg->recon = recon; dbg->projP = gP; dbg->projN = gN; dbg->fullP = fullP; dbg->fullN = fullN;
       dbg->fieldP = fP; dbg->fieldN = fN; dbg->stride = stride; dbg->levels = lv;
     }
+    return res;
+  }
+
+  Plane blend_error_map(const Field4 &MEP, const Field4 &MEN)
+  {
+    const Plane &eP = MEP.c[2], &eN = MEN.c[2];
+    const int MW = eP.w, MH = eP.h;
+    Plane e(MW, MH);
+    for (int y = 0; y < MH; y++)
+      for (int x = 0; x < MW; x++)
+      {
+        float s = 0.0f;
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+          {
+            const int xx = std::min(std::max(x + dx, 0), MW - 1), yy = std::min(std::max(y + dy, 0), MH - 1);
+            s += std::max(eP.at(xx, yy), eN.at(xx, yy));
+          }
+        e.at(x, y) = s / 9.0f;
+      }
+    return e;
+  }
+
+  void blend_mix_rows(Pic3 &main, const Pic3 &second, const Plane &e, const Config &cfg, int y0, int y1)
+  {
+    const int sc = cfg.scale, MW = e.w, MH = e.h, AW = main.c[0].w;
+    const int off_x = cfg.pad_x, off_y = cfg.pad_y;
+    const float elo = (float)cfg.blend_err_lo, einv = (float)(1.0 / (cfg.blend_err_hi - cfg.blend_err_lo));
+    for (int y = y0; y < y1; y++)
+    {
+      const float my = std::min(std::max((y + off_y + 0.5f) / sc - 0.5f, 0.0f), (float)(MH - 1));
+      const int ya = (int)my, yb = std::min(ya + 1, MH - 1);
+      const float fy = my - ya;
+      for (int x = 0; x < AW; x++)
+      {
+        const float mx = std::min(std::max((x + off_x + 0.5f) / sc - 0.5f, 0.0f), (float)(MW - 1));
+        const int xa = (int)mx, xb = std::min(xa + 1, MW - 1);
+        const float fx = mx - xa;
+        const float ev = (1 - fy) * ((1 - fx) * e.at(xa, ya) + fx * e.at(xb, ya)) +
+          fy * ((1 - fx) * e.at(xa, yb) + fx * e.at(xb, yb));
+        float t = (ev - elo) * einv;
+        t = std::min(std::max(t, 0.0f), 1.0f);
+        const float w = t * t * (3.0f - 2.0f * t);
+        for (int c = 0; c < 3; c++)
+        {
+          float &av = main.c[c].at(x, y);
+          av = w * av + (1.0f - w) * second.c[c].at(x, y);
+        }
+      }
+    }
+  }
+
+  Pic3 build(const Pic3 &Pin, const Pic3 &Nin, const Field4 &MEP, const Field4 &MEN, float d, const Config &cfg,
+    BuildDebug *dbg)
+  {
+    Pic3 res = build_one(Pin, Nin, MEP, MEN, d, cfg, dbg);
+    if (!(cfg.blend_sigma > 0.0))
+      return res;
+    const Pic3 second = build_one(Pin, Nin, MEP, MEN, d, blend_config(cfg), nullptr);
+    const Plane e = blend_error_map(MEP, MEN);
+    if (dbg)
+    {
+      dbg->blend_main = res;
+      dbg->blend_second = second;
+      dbg->blend_err = e;
+    }
+    blend_mix_rows(res, second, e, cfg, 0, res.c[0].h);
     return res;
   }
 }

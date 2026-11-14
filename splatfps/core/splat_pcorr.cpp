@@ -62,14 +62,14 @@ namespace splat
       fn(i);
   }
 
-  // float plans of the powers of two 16 .. 512 (made once)
+  // float plans of the powers of two 16 .. 1024 (made once)
   struct FloatPlans
   {
-    fftp::Plan p[6];
-    std::vector<fftp::cpx<float>> tw[6];
+    fftp::Plan p[7];
+    std::vector<fftp::cpx<float>> tw[7];
     FloatPlans()
     {
-      for (int i = 0; i < 6; i++)
+      for (int i = 0; i < 7; i++)
         p[i] = fftp::make_plan<float>(16 << i, tw[i]);
     }
     int index(int S) const
@@ -247,6 +247,99 @@ namespace splat
     return cnt;
   }
 
+  // Whole-picture phase correlation: both prefiltered pictures windowed (Tukey, block_taper, per axis over the whole
+  // width / height), their windowed means removed, zero-padded into one T x T tile (T the power of two >= both sides),
+  // the same weighted cross power as the blocks, the strongest peak of the surface -> (gx, gy), its height gh. Motions
+  // up to T / 2 are unambiguous. False when the picture is larger than the FFT sizes (1024).
+  bool pcorr_whole_peak(const Plane &prev, const Plane &cur, const Config &cfg, const PcorrOps &ops, float &gx,
+    float &gy, float &gh, std::vector<float> *surface)
+  {
+    const int W = cur.w, H = cur.h;
+    int T = 16;
+    while (T < W || T < H)
+      T *= 2;
+    if (T > 1024)
+      return false;
+    const size_t TT = (size_t)T * T;
+    std::vector<float> wx((size_t)W), wy((size_t)H);
+    pcorr_window(W, cfg.block_taper, wx.data());
+    pcorr_window(H, cfg.block_taper, wy.data());
+    float sw = 0.0f;
+    for (int y = 0; y < H; y++)
+    {
+      float r = 0.0f;
+      for (int x = 0; x < W; x++)
+        r = r + wy[(size_t)y] * wx[(size_t)x];
+      sw = sw + r;
+    }
+    std::vector<float> zr(TT, 0.0f), zi(TT, 0.0f);
+    auto tile = [&](const Plane &pic, float *dst) {
+      float s = 0.0f;
+      for (int y = 0; y < H; y++)
+      {
+        float r = 0.0f;
+        for (int x = 0; x < W; x++)
+          r = r + (wy[(size_t)y] * wx[(size_t)x]) * pic.at(x, y);
+        s = s + r;
+      }
+      const float m = sw > 0.0f ? s / sw : 0.0f;
+      for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+          dst[(size_t)y * T + x] = (pic.at(x, y) - m) * wy[(size_t)y] * wx[(size_t)x];
+    };
+    tile(prev, zr.data());
+    tile(cur, zi.data());
+    ops.prepare(T);
+    ops.fft2(zr.data(), zi.data(), T, true, 1.0f);
+    // separate the two spectra (prev in the real, cur in the imaginary input) and their noise floors
+    std::vector<float> Rp(TT), Ip(TT), Rc(TT), Ic(TT), m2(TT - 1);
+    for (int ky = 0; ky < T; ky++)
+    {
+      const int my = (T - ky) & (T - 1);
+      for (int kx = 0; kx < T; kx++)
+      {
+        const size_t i = (size_t)ky * T + kx, j = (size_t)my * T + ((T - kx) & (T - 1));
+        Rp[i] = 0.5f * (zr[i] + zr[j]);
+        Ip[i] = 0.5f * (zi[i] - zi[j]);
+        Rc[i] = 0.5f * (zi[i] + zi[j]);
+        Ic[i] = 0.5f * (zr[j] - zr[i]);
+      }
+    }
+    auto noise = [&](const std::vector<float> &R, const std::vector<float> &I) {
+      for (size_t i = 1; i < TT; i++)
+        m2[i - 1] = R[i] * R[i] + I[i] * I[i];
+      const size_t mid = m2.size() / 2;
+      std::nth_element(m2.begin(), m2.begin() + (std::ptrdiff_t)mid, m2.end());
+      return std::sqrt(m2[mid]);
+    };
+    const float Np = noise(Rp, Ip), Nc = noise(Rc, Ic);
+    const float kn = cfg.noise_weight * cfg.noise_weight * (Nc * Np);
+    for (int ky = 0; ky < T; ky++)
+      for (int kx = 0; kx < T; kx++)
+      {
+        const size_t i = (size_t)ky * T + kx;
+        const float rc = Rc[i], ic = Ic[i], rp = Rp[i], ip = Ip[i];
+        const float aa = std::sqrt((rc * rc + ic * ic) * (rp * rp + ip * ip));
+        const float gn = aa > 0.0f ? (((kx + ky) & 1) ? -1.0f : 1.0f) / (aa + kn) : 0.0f;
+        zr[i] = (rc * rp + ic * ip) * gn;
+        zi[i] = (ic * rp - rc * ip) * gn;
+      }
+    ops.fft2(zr.data(), zi.data(), T, false, 1.0f / (float)T);
+    if (surface)
+      *surface = zr;
+    int px = T / 2, py = T / 2;
+    float ph = 0.0f;
+    if (surface_peaks(zr.data(), T, 1, &px, &py, &ph) == 0)
+    {
+      px = py = T / 2;
+      ph = 0.0f;
+    }
+    gx = (float)(px - T / 2);
+    gy = (float)(py - T / 2);
+    gh = ph;
+    return true;
+  }
+
   void pcorr_candidates(const PcorrPicture &prev, const PcorrPicture &cur, const Config &cfg, const PcorrOps &ops,
     std::vector<Plane> &out, PcorrGlobal *glob)
   {
@@ -350,7 +443,10 @@ namespace splat
     out.resize(2 * (jobs.size() + nglob));
     // global: the weighted mode of the blocks' strongest vectors
     float gx = 0.0f, gy = 0.0f, gh = 0.0f;
-    if (nglob)
+    // whole-picture surface (global_candidate 2 or 3); 2 falls back to the vote on pictures above the FFT sizes
+    float wx = 0.0f, wy = 0.0f, wh = 0.0f;
+    const bool whole = cfg.global_candidate >= 2 && pcorr_whole_peak(prev.hp, cur.hp, cfg, ops, wx, wy, wh);
+    if (nglob && !(cfg.global_candidate == 2 && whole))
     {
       std::vector<std::pair<long long, long long>> votes;
       for (int s = 0; s < PCORR_NSTAGE; s++)
@@ -386,6 +482,15 @@ namespace splat
         gh = (float)((double)bw / PCORR_VOTE_ONE);
       }
     }
+    if (cfg.global_candidate == 2 && whole)
+    {
+      gx = wx;
+      gy = wy;
+      gh = wh;
+    }
+    // the global fields: the vote (or the whole-picture vector for 2), then for 3 the whole-picture vector (the vote
+    // again when the picture is too large)
+    const float gvx[2] = { gx, whole ? wx : gx }, gvy[2] = { gy, whole ? wy : gy };
     if (glob)
       *glob = PcorrGlobal{ gx, gy, gh, gx, gy };
     ops.par((int)jobs.size() + nglob, [&](int j) {
@@ -394,10 +499,11 @@ namespace splat
         ox = Plane(W, H);
       if (oy.w != W || oy.h != H)
         oy = Plane(W, H);
-      if (j == (int)jobs.size())
+      if (j >= (int)jobs.size())
       {
-        std::fill(ox.d.begin(), ox.d.end(), gx);
-        std::fill(oy.d.begin(), oy.d.end(), gy);
+        const int k = j - (int)jobs.size();
+        std::fill(ox.d.begin(), ox.d.end(), gvx[k]);
+        std::fill(oy.d.begin(), oy.d.end(), gvy[k]);
         return;
       }
       const Job &jb = jobs[(size_t)j];

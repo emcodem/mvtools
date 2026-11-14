@@ -11,8 +11,7 @@
 // Field contract between the motion stages and the pair statistic / build: per source picture c, a forward field
 // (vectors from c into c+1) and a backward field (vectors from c into c-1), each 4 float32 planes on the ME grid: vx,
 // vy (ME pixels), err (match error), local-fallback weight. Output frame (P, N, d) uses the forward field of P and the
-// backward field of N. Keeping a forward and a backward field per input picture and projecting both to the output
-// time follows the two-field method of US 6,011,596 (BBC, 1991, https://patents.google.com/patent/US6011596A/en).
+// backward field of N: a forward and a backward field per input picture, both projected to the output time.
 //
 // Exact path: the deterministic scalar path: float32 in a fixed evaluation order, no contraction, IEEE division and
 // sqrt, exp through double; the fast CPU path and CUDA (exact=true) are checked bit for bit against it. Rules for this
@@ -157,11 +156,29 @@ namespace splat
     std::vector<Field4> fieldP, fieldN; // coarse levels only (empty Field4 where the full-res field is used)
     std::vector<int> stride;            // per level: stride into the full-res field, 0 = own coarse field
     std::vector<LevelDebug> levels;
+    // two-build blend only (the fields above belong to the main build): the main build before the mix, the second
+    // build, the error map
+    Pic3 blend_main, blend_second;
+    Plane blend_err;
   };
   // The whole build: pad, pyramids of P and N, projection fields, every level built, then reconstructed from
   // coarse to fine and cropped. d is the phase after the temporal fallback.
   // P, N: source pictures W x H; MEP / MEN: ME fields (MW x MH) of P (forward) and N (backward). Returns W x H.
   // Levels, stride_max, border and scale from cfg.
+  // With cfg.blend_sigma > 0 (two-build blend): the same build again with blend_config(cfg) (the second band split),
+  // then blend_mix_rows over all rows with blend_error_map(MEP, MEN).
   Pic3 build(const Pic3 &P, const Pic3 &N, const Field4 &MEP, const Field4 &MEN, float d, const Config &cfg,
     BuildDebug *dbg = nullptr);
+
+  // ---- two-build blend
+  // Local match error on the ME grid (MW x MH): e(x, y) = the 3 x 3 sum of max(errP, errN) (the err channels of the
+  // two ME fields), positions clamped to the grid, summed in raster order (dy outer, dx inner, -1 .. 1), then / 9.
+  Plane blend_error_map(const Field4 &MEP, const Field4 &MEN);
+  // Mix of rows y0 .. y1 - 1 of the main build (W x H, in place) with the second build, all float32, no contraction:
+  // the error at pixel (x, y): ME position m = clamp((x + pad_x + 0.5) / scale - 0.5, 0, MW - 1) (likewise y, pad_y,
+  // MH), integer part i, i + 1 (clamped to the grid), fraction f = m - i; ev = (1 - fy) ((1 - fx) e00 + fx e10) +
+  // fy ((1 - fx) e01 + fx e11); t = clamp((ev - lo) * inv, 0, 1) with lo = (float)blend_err_lo and
+  // inv = (float)(1 / (blend_err_hi - blend_err_lo)) (division in double); w = t t (3 - 2 t);
+  // out = w main + (1 - w) second, the same w for the three planes. Rows are independent (any split over threads).
+  void blend_mix_rows(Pic3 &main, const Pic3 &second, const Plane &e, const Config &cfg, int y0, int y1);
 }

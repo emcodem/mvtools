@@ -475,7 +475,8 @@ namespace splat
             const float ex = cfg.splat_err_scale > 0.0f ? exp32(-F.c[2].at(sx, sy) / cfg.splat_err_scale) : 1.0f;
             const float m = std::fmax(cfg.splat_min_weight, ex);
             G.c[2].at(x, y) = (cfg.splat_gain * m) * pr;
-            G.c[3].at(x, y) = F.c[3].at(sx, sy) * pr;
+            G.c[3].at(x, y) = F.c[3].at(sx, sy) * pr *
+              fallback_edge_keep(cfg, sx, sy, F.c[0].at(sx, sy), F.c[1].at(sx, sy), w, h);
           }
       });
       return G;
@@ -501,6 +502,8 @@ namespace splat
     std::vector<Pic3> plow;
     Plane ptmp[3];
     Pyramid pyr_tmp[2];
+    // the second build of the two-build blend
+    Pic3 blend_out;
     // fields of the coarse pyramid levels (per side, ping-pong between [0] / [1], current: coarse_cur), kept between
     // frames
     Field4 coarse[2][2];
@@ -1014,7 +1017,7 @@ namespace splat
     build_pyr_into(impl_->pyr_tmp[0], impl_->pyr_tmp[1], MEP, MEN, d, cfg, res);
   }
 
-  void FastEngine::pyramid_into(const Pic3 &pic, const Config &cfg, Pyramid &out)
+  void FastEngine::pyramid_bands(const Pic3 &pic, const Config &cfg, std::vector<Pic3> &band)
   {
     Impl &m = *impl_;
     const Geometry g(pic.c[0].w, pic.c[0].h, cfg);
@@ -1022,7 +1025,7 @@ namespace splat
     if ((int)m.plow.size() < L + 1)
       m.plow.resize((size_t)L + 1);
     std::vector<Pic3> &low = m.plow;
-    out.band.resize((size_t)L + 1);
+    band.resize((size_t)L + 1);
     // pad (edge repeat) into the finest low-pass level
     for (int c = 0; c < 3; c++)
       fit(low[0].c[c], g.GW, g.GH);
@@ -1059,25 +1062,44 @@ namespace splat
       {
         l[j] = &low[i + 1].c[j];
         base[j] = &low[i].c[j];
-        o[j] = &out.band[i].c[j];
+        o[j] = &band[i].c[j];
       }
       m.maybe_serial(base[0]->d.size(), [&] { m.expand_many(3, l, base, o, mode); });
     }
     for (int c = 0; c < 3; c++)
     {
       const Plane &lo = low[L].c[c];
-      fit(out.band[L].c[c], lo.w, lo.h);
-      std::memcpy(out.band[L].c[c].d.data(), lo.d.data(), sizeof(float) * lo.d.size());
+      fit(band[L].c[c], lo.w, lo.h);
+      std::memcpy(band[L].c[c].d.data(), lo.d.data(), sizeof(float) * lo.d.size());
     }
+  }
+
+  void FastEngine::pyramid_into(const Pic3 &pic, const Config &cfg, Pyramid &out)
+  {
+    pyramid_bands(pic, cfg, out.band);
+    if (cfg.blend_sigma > 0.0)
+      pyramid_bands(pic, blend_config(cfg), out.band2);
     out.valid = true;
   }
 
   void FastEngine::build_pyr_into(const Pyramid &PP, const Pyramid &NP, const Field4 &MEP, const Field4 &MEN, float d,
     const Config &cfg, Pic3 &res)
   {
+    build_one(PP.band, NP.band, MEP, MEN, d, cfg, res);
+    if (!(cfg.blend_sigma > 0.0))
+      return;
+    Impl &m = *impl_;
+    build_one(PP.band2, NP.band2, MEP, MEN, d, blend_config(cfg), m.blend_out);
+    const Plane e = blend_error_map(MEP, MEN);
+    m.pool.rows(res.c[0].h, [&](int y0, int y1) { blend_mix_rows(res, m.blend_out, e, cfg, y0, y1); });
+  }
+
+  void FastEngine::build_one(const std::vector<Pic3> &PB, const std::vector<Pic3> &NB, const Field4 &MEP,
+    const Field4 &MEN, float d, const Config &cfg, Pic3 &res)
+  {
     Impl &m = *impl_;
     const int L = cfg.levels, stride_max = cfg.stride_max, PADX = cfg.pad_x, PADY = cfg.pad_y;
-    const int GW = PP.band[0].c[0].w, GH = PP.band[0].c[0].h;
+    const int GW = PB[0].c[0].w, GH = PB[0].c[0].h;
     const Geometry g(GW - 2 * PADX, GH - 2 * PADY, cfg);
     if ((int)m.lv.size() < L + 1)
       m.lv.resize((size_t)L + 1);
@@ -1095,7 +1117,7 @@ namespace splat
       {
         G[0] = &gP;
         G[1] = &gN;
-        m.maybe_serial(PP.band[i].c[0].d.size(), [&] { m.build_level(lv[i], PP.band[i], NP.band[i], G, true, st, d, cfg); });
+        m.maybe_serial(PB[i].c[0].d.size(), [&] { m.build_level(lv[i], PB[i], NB[i], G, true, st, d, cfg); });
         continue;
       }
       // reduced from the previous coarse fields (from gP / gN the first time, i - log2max times), ping-pong
@@ -1116,7 +1138,7 @@ namespace splat
       have_coarse = true;
       G[0] = &m.coarse[0][m.coarse_cur];
       G[1] = &m.coarse[1][m.coarse_cur];
-      m.maybe_serial(PP.band[i].c[0].d.size(), [&] { m.build_level(lv[i], PP.band[i], NP.band[i], G, false, 1, d, cfg); });
+      m.maybe_serial(PB[i].c[0].d.size(), [&] { m.build_level(lv[i], PB[i], NB[i], G, false, 1, d, cfg); });
     }
     // Laplacian reconstruction, coarse to fine: out[i] = built[i] + expand(out[i + 1]); clamp at the finest level.
     // With the AVX2 kernels the finest level is made only inside the border, straight into res

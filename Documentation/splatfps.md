@@ -27,7 +27,7 @@ the input format).
    `me_scale`) between each pair of neighbouring source pictures. The built-in source is phase correlation over
    blocks of three sizes (the classical television motion measurement: G. A. Thomas, BBC Research Department Report
    1987/11, https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf): each block offers its strongest peaks, every
-   cell gets the vectors of the blocks covering it, plus the vector most blocks agree on, giving 29 candidates per
+   cell gets the vectors of the blocks covering it, plus the vector most blocks agree on, giving 25 candidates per
    cell with the default settings. Other sources can be plugged in through a candidate clip (`vectors=`, below).
 2. **Refinement and assignment.** Each candidate is refined against the pictures (a Lucas-Kanade step), its matching
    error measured, and every cell gets one forward vector (into the next picture) and one backward vector (into the
@@ -35,11 +35,15 @@ the input format).
    set); where one side matches much worse than the other (an object covers or uncovers the background), that side
    takes the other side's vector.
 3. **Fallbacks.** Where the vector field is locally inconsistent, the cells are blended towards the plain pictures. At
-   a scene cut (the two pictures do not match at all) the output repeats the nearer source picture. An optional
-   temporal fallback (off by default) moves the output time towards the nearer picture where the vectors match badly.
+   a scene cut (the two pictures do not match at all) the output repeats the nearer source picture. Where the vectors
+   of a pair match badly over the middle of the picture (fast, detailed content: sport, crowds, water), a temporal
+   fallback moves the output time towards the nearer picture: a picture close to a real one is cleaner than a wrong
+   in-between.
 4. **Picture build.** Both source pictures are split into a Laplacian pyramid and each band is splatted (projected
-   forward) along its vectors to the output time, weighted by temporal distance, then the pyramid is
-   put back together.
+   forward) along its vectors to the output time, weighted by temporal distance and match quality, then the pyramid
+   is put back together. This runs twice with two band splits: a narrow one, which keeps thin fast objects clean, and
+   a wide one, which keeps more fine detail; the two pictures are mixed per pixel by the local match error (the wide
+   one where the motion matches well).
 
 ## Formats and limits (so far)
 
@@ -77,33 +81,34 @@ The CPU path.
   output samples. In the tests so far every frame was identical with `exact = true`.
 - `exact = true`: the exact path: the deterministic scalar path: float32 in a fixed evaluation order, no
   contraction, IEEE division and sqrt, exp through double; the fast CPU path and CUDA (exact=true) are checked bit for
-  bit against it. Scalar C++, mostly one thread, about 1.5 frames per second at 1080p. Use it for checks.
+  bit against it. Scalar C++, mostly one thread, about 1 frame per second at 1080p. Use it for checks.
 
 Speed, 1920 x 1080 4:2:2 10 bit, 50 -> 59.94 fps, built-in vectors, decoding included, 300 source pictures (360 output
-frames), Core Ultra 9 285K (24 cores, 24 threads), High priority: `exact = true` 1.5 fps, `exact = false` 20 fps.
+frames; `exact = true` over 60 source pictures), Core Ultra 9 285K (24 cores, 24 threads), High priority:
+`exact = true` 0.9 fps, `exact = false` 18 fps.
 
 ## CudaSplatFps(clip, int num, int den, bool exact = false, clip vectors, ...settings)
 
 The GPU path; same parameters as `SplatFps`, returns normal frames.
 
 - `exact = false` (default): fast arithmetic; a few output samples per frame differ from `SplatFps` by one code.
-- `exact = true`: bit-identical with `SplatFps(exact = true)` (about 30 % slower than the fast mode).
+- `exact = true`: bit-identical with `SplatFps(exact = true)` (about half the speed of the fast mode).
 - `vectors`: as for `SplatFps`; candidate frames are uploaded per source picture.
 
 Speed, 1920 x 1080 4:2:2 10 bit, 50 -> 59.94 fps, RTX 5090, fast mode, decoding included; output frames per second
-over a clip of 300 source pictures, including the start-up of about 2 s (on long clips the built-in path reaches about
-140 fps):
+over a clip of 300 source pictures, start-up included (over the whole clip of 1099 source pictures the built-in path
+reaches about 190 fps):
 
 | Vector source | fps |
 | --- | --- |
-| built-in | ~73 |
-| NVOFA (`CudaNVOFAnalyse`, see below) | ~57 |
-| `CudaMAnalyse(..., meander=false)` | ~42 |
-| `MAnalyse` (CPU) | ~20 |
+| built-in | ~146 |
+| NVOFA (`CudaNVOFAnalyse`, see below) | ~86 |
+| `CudaMAnalyse(..., meander=false)` | ~47 |
+| `MAnalyse` (CPU) | ~24 |
 
 ## SplatAnalyse(clip, ...settings)
 
-The built-in phase correlation as a candidate clip (29 candidates per cell with the 1080p defaults). With the same
+The built-in phase correlation as a candidate clip (25 candidates per cell with the 1080p defaults). With the same
 settings, `SplatFps(c, n, d, vectors=SplatAnalyse(c))` gives exactly `SplatFps(c, n, d)` (the candidate costs travel
 in the clip); the clip is for inspection and for building other sources. CPU only. Of the settings, the geometry
 (`me_scale`, `pad_x`, `pad_y`, `pyramid_levels`) must be the same as in the SplatFps call that reads the clip.
@@ -230,18 +235,18 @@ is reduced to its phase and weighted by how far each frequency stands above the 
 amplitude); the inverse FFT gives a correlation surface whose highest peaks are the block's vectors. Every cell is
 offered the vectors of the blocks that contain it (the near and the far block along each axis: four per peak), and
 the global candidate is the vector most blocks agree on. The candidate count is the sum of `block_peaks` x 4 (x 1 for
-a nearest-block stage), plus 1 for the global one (29 with the defaults); at most 31.
+a nearest-block stage), plus 1 for the global one (25 with the defaults); at most 31.
 
 | argument | type | default | range | what it does |
 | --- | --- | --- | --- | --- |
 | `block_size` | int | by size (32) | 16, 32, 64, 128 | block size of the first stage |
-| `block_peaks` | int[3] | [2, 2, 3] | 0 .. 4 each | correlation peaks taken per block in each stage (0: the stage is off) |
+| `block_peaks` | int[3] | [1, 2, 3] | 0 .. 4 each | correlation peaks taken per block in each stage (0: the stage is off) |
 | `nearest_block` | int[3] | [-1, -1, -1] | -1, 0, 1 | per stage: 1 = each peak gives one candidate, the vector of the block whose centre is nearest to the cell; 0 = four candidates, the near and the far block covering the cell along each axis; -1 = auto (1 when the stage's grid has a single block on an axis) |
 | `highpass_sigma` | float | 8 | 0 .. 16 | prefilter: picture B minus its Gaussian low-pass of this sigma (ME pixels), so slow shading does not dominate the spectra; 0 = off |
 | `block_taper` | float | 0.5 | 0 .. 1 | block window: the tapered part of a block, both edges together (1 = a Hann window); the taper keeps the block edges from correlating with themselves |
 | `noise_weight` | float | 1 | >= 0 | weighting of the spectrum: a frequency counts q / (q + noise_weight^2), q = its amplitude product over the blocks' noise floors; 0 = phase only (every frequency counts the same) |
 | `peak_ratio` | float | 0 | 0 .. 1 | a block's further peak counts when it reaches this fraction of the block's strongest; otherwise the strongest takes its place |
-| `global_candidate` | int | 1 | 0, 1 | 1 = add the vector most blocks agree on (weighted by peak height) as a candidate for every cell |
+| `global_candidate` | int | 1 | 0 .. 3 | 1 = add the vector most blocks agree on (weighted by peak height) as a candidate for every cell; 2 = instead, the strongest peak of one phase correlation over the whole picture B, which also follows a pan whose step between two pictures is too large for the blocks (an ME picture larger than 1024 in either direction falls back to 1); 3 = both (two global candidates); 0 = none. 2 and 3 cost a few per cent and are meant together with `fallback_edge` for low-rate sources with fast pans |
 | `secondary_peak_cost` | float | 3 | >= 0 | cost added to the error of a candidate from a block's further peaks (the strongest peak costs nothing): such a peak is often an alias of the strongest one (a periodic structure shows peaks one period apart), so it must match clearly better to win |
 
 ### Refinement, errors, assignment
@@ -252,13 +257,13 @@ a nearest-block stage), plus 1 for the global one (29 with the defaults); at mos
 | `refine_reg` | float | 0.001 | | added to the squared gradients of the refinement (keeps flat areas solvable, pulls them to zero) |
 | `refine_box` | int | 15 | odd, 1 .. 63 | window of the refinement sums, ME px |
 | `error_box` | int | 7 | odd, 1 .. 31 | window of the mean absolute difference that is a candidate's error, ME px |
-| `error_edge_weight` | float | 0.75 |  | weight w of the edge-aware error filter: (1 - w) e + w m, m from `error_edge_mode` |
+| `error_edge_weight` | float | 0.5 |  | weight w of the edge-aware error filter: (1 - w) e + w m, m from `error_edge_mode` |
 | `error_edge_dist` | int | 3 | 0 .. 16 | distance of the neighbours that filter looks at, ME px |
 | `error_edge_mode` | int | 1 | 0, 1 | 0: m = the mean of the smaller of the errors left / right and the smaller of those up / down; 1: shiftable windows, m = the smallest box error at the four diagonal shifts by error_edge_dist (as in area-based stereo matching) |
-| `speed_change_cost` | float | 0 |  | 0: the forward and the backward vector are chosen independently, each the lowest error plus cost of its side. Above 0: they are chosen as a pair, and the pair pays this per ME px of the difference between the forward and the (turned) backward vector, which prefers constant motion |
+| `speed_change_cost` | float | 0.5 |  | 0: the forward and the backward vector are chosen independently, each the lowest error plus cost of its side. Above 0: they are chosen as a pair, and the pair pays this per ME px of the difference between the forward and the (turned) backward vector, which prefers constant motion |
 | `vector_length_cost` | float | 0 | >= 0 | cost per ME px of the length (L1) of each chosen vector: equal matches go to the shorter vectors (the length bias of BBC RD 1987/11 section 4.2.2) |
-| `occlusion_error` | float | 6 |  | occlusion: a side whose error is above this ... |
-| `occlusion_error_factor` | float | 1.5 |  | ... and above this times the other side's error takes the other side's vector reversed (covered or uncovered background is interpolated from the side that sees it); the errors stay as measured |
+| `occlusion_error` | float | 20 |  | occlusion: a side whose error is above this ... |
+| `occlusion_error_factor` | float | 2 |  | ... and above this times the other side's error takes the other side's vector reversed (covered or uncovered background is interpolated from the side that sees it); the errors stay as measured |
 | `global_cost` | float | 0 |  | cost of the global candidate |
 | `zero_cost` | float | 0 |  | cost of the zero-vector candidate (always added after the others) |
 
@@ -277,6 +282,8 @@ are in units of one full splat.
 | `fallback_cap` | float | 1.25 | > 0 | cap of the spread weight |
 | `fallback_err_gain` | float | 0 | >= 0 | error term: the weight also grows by this x clamp((e - fallback_err_lo) / fallback_err_range, 0, 1), e the assigned match error, where even the best vectors match badly (water, leaves); 0 = off |
 | `fallback_err_lo`, `fallback_err_range` | float | 8, 16 | range > 0 | ... the error where it starts and over which it reaches the full gain |
+| `fallback_edge` | int | 0 | 0, 1 | 1 = in the build, a side's local-fallback weight is dropped where that side's own vector carries the sample out of the picture (content leaving it; for the later picture, content that has entered), so the picture is motion-compensated up to the edge instead of blended there. Meant together with `global_candidate=2` |
+| `fallback_edge_margin` | float | 0 | >= 0 | ... also where the vector ends within this many ME px inside the picture edge |
 
 ### Schedule, scene cut, temporal fallback
 
@@ -287,19 +294,22 @@ and the backward field of N), each error capped at `error_window_cap`, over the 
 | argument | type | default | range | what it does |
 | --- | --- | --- | --- | --- |
 | `copy_snap` | int | 128 | 0 or >= 2 | output phases within 1 / copy_snap of a source picture are copies of it; 0: only exact hits |
-| `error_window_div` | int | 8 | >= 3 | border of the statistic's window: 1 / this of the grid on each side |
+| `error_window_div` | int | 4 | >= 3 | border of the statistic's window: 1 / this of the grid on each side |
 | `error_window_cap` | float | 64 | > 0 | errors are capped at this in the statistic |
 | `scene_cut_error` | float | 15 | >= 0 | scene cut: when m reaches this, the two pictures are taken as unrelated and the output is a copy of the nearer source picture; 0 = off |
-| `pull_strength` | float | 0 | >= 0 | temporal fallback: the output time moves towards the nearer source picture by pull_strength x smoothstep(m, pull_error_lo, pull_error_hi) of its distance; 0 = off (the default: on the test corpus it cost more, as judder, than it saved) |
-| `pull_error_lo`, `pull_error_hi` | float | 6, 18 | hi > lo | ... the statistic where the pull starts and where it reaches its full strength |
+| `pull_strength` | float | 0.7 | >= 0 | temporal fallback: the output time moves towards the nearer source picture by pull_strength x smoothstep(m, pull_error_lo, pull_error_hi) of its distance; 0 = off |
+| `pull_error_lo`, `pull_error_hi` | float | 2, 5 | hi > lo | ... the statistic where the pull starts and where it reaches its full strength |
 
 ### Picture build
 
 | argument | type | default | range | what it does |
 | --- | --- | --- | --- | --- |
-| `splat_err_scale` | float | 0 | >= 0 | splat weight splat_gain x max(splat_min_weight, exp(-error / this)) x temporal proximity; 0: no error weighting (splat_gain x the temporal proximity alone) |
+| `splat_err_scale` | float | 15 | >= 0 | splat weight splat_gain x max(splat_min_weight, exp(-error / this)) x temporal proximity; 0: no error weighting (splat_gain x the temporal proximity alone) |
 | `splat_min_weight` | float | 0.02 | | lower limit of that error confidence |
 | `splat_gain` | float | 1 | > 0 | gain of the splat weight against the local-fallback weight (both in units of one full splat) |
 | `still_vector` | float | 1/128 (0.0078125) | | vectors up to this long (pixels of the pyramid level) are not splatted; their weight joins the in-place blend |
 | `hole_weight` | float | 1e-4 | >= 0 | output samples with less total weight are holes and get the plain cross-fade |
-| `pyramid_sigma` | float | 4 | 0.3 .. 16 | width of the pyramid's reduce filter (a 7-tap sampled Gaussian): larger keeps less detail in the coarse bands, which move with averaged vectors, and more in the fine bands, which move with the full-resolution vectors |
+| `pyramid_sigma` | float | 1 | 0.3 .. 16 | width of the pyramid's reduce filter (a 7-tap sampled Gaussian): larger keeps less detail in the coarse bands, which move with averaged vectors, and more in the fine bands, which move with the full-resolution vectors |
+| `blend_sigma` | float | 4 | 0, 0.3 .. 16 | two-build blend: the pyramid reduce sigma of a second build from the same vectors (the wide band split; `pyramid_sigma` is the main, narrow one); 0 = off (one build: the CPU path at 1080p is about 1.5 x faster without it) |
+| `blend_levels` | int | 0 | 0 .. pyramid_levels | pyramid levels of the second build; 0 = those of the main build; 2^blend_levels must be at least `field_stride_max` |
+| `blend_err_lo`, `blend_err_hi` | float | 3, 9 | hi > lo | the mix per output pixel: the main build weighs smoothstep((e - blend_err_lo) / (blend_err_hi - blend_err_lo)), the second build the rest; e = the local match error (3 x 3 mean of the larger of the two sides' errors, interpolated to the picture) |

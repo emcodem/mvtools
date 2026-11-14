@@ -64,7 +64,9 @@ namespace splat
     float noise_weight;                // spectral weighting q / (q + k^2), q = A A' / (N N'), k = noise_weight (0: phase
                                        // only)
     float peak_ratio;                  // a block's further peak counts when it reaches this fraction of its strongest
-    int global_candidate;              // 1: a global candidate (the vector most blocks agree on); 0: none
+    int global_candidate;              // 1: a global candidate (the vector most blocks agree on); 2: the strongest
+                                       // peak of the whole-picture correlation surface instead; 3: both;
+                                       // 0: none
     float secondary_peak_cost;         // candidate cost of a block's further peaks (the strongest costs nothing)
     // ---- refinement
     float refine_err_scale;            // weight exp(-err / refine_err_scale)
@@ -101,6 +103,13 @@ namespace splat
     // pull_strength * smoothstep(m, pull_error_lo, pull_error_hi); 0 = off
     double pull_strength;
     double pull_error_lo, pull_error_hi;
+    // two-build blend (blend_sigma > 0; 0 = off): a second picture build from the same fields with another band split
+    // (pyramid reduce sigma blend_sigma, blend_levels levels, 0 = the main build's count), mixed per output pixel by
+    // the local match error e: weight of the main build smoothstep((e - blend_err_lo) / (blend_err_hi - blend_err_lo)),
+    // the second build where the error is low (the mix is described at blend_mix_rows in splat_core.h)
+    double blend_sigma;
+    int blend_levels;
+    double blend_err_lo, blend_err_hi;
     // scene cut: when m reaches this, the pictures are taken as unrelated and the output is a copy of the nearer one
     // (0: off)
     float scene_cut_error;
@@ -112,7 +121,43 @@ namespace splat
     // pyramid reduce filter: a sampled Gaussian of this sigma (in samples of the finer level), 7 taps, normalised
     float pyr_sigma;
     float pyr_reduce[4];               // resolved taps: centre, distance 1, 2, 3
+    float blend_reduce[4];             // resolved taps of the second build (blend_sigma)
+    // picture build: a side's local-fallback weight is 0 where its own vector carries the sample out of the picture
+    // (content leaving, or for N having entered); fallback_edge_margin ME pixels also inside the edge (0: off)
+    int fallback_edge;
+    float fallback_edge_margin;
   };
+
+  // the settings of the second build of the two-build blend: c with the second band split, blend off
+  inline Config blend_config(const Config &c)
+  {
+    Config b = c;
+    b.pyr_sigma = (float)c.blend_sigma;
+    for (int k = 0; k < 4; k++)
+      b.pyr_reduce[k] = c.blend_reduce[k];
+    b.levels = c.blend_levels;
+    b.blend_sigma = 0.0;
+    return b;
+  }
+
+  // fallback_edge on a w x h ME grid whose border is xb x yb cells (pad / scale), margin m: 1 when the fallback weight
+  // of cell (x, y) with vector (vx, vy) is kept, 0 when the vector carries the cell out of the picture (or into the
+  // margin)
+  SPLAT_HD inline float fallback_edge_keep_at(int xb, int yb, float m, int x, int y, float vx, float vy, int w, int h)
+  {
+    const float xl = (float)xb + m, xr = (float)(w - 1 - xb) - m;
+    const float yt = (float)yb + m, yb2 = (float)(h - 1 - yb) - m;
+    const float px = (float)x + vx, py = (float)y + vy;
+    return (px < xl || px > xr || py < yt || py > yb2) ? 0.0f : 1.0f;
+  }
+
+  // fallback_edge: 1 when the fallback weight of ME cell (x, y) with vector (vx, vy) is kept, 0 when it is dropped
+  inline float fallback_edge_keep(const Config &c, int x, int y, float vx, float vy, int w, int h)
+  {
+    if (!c.fallback_edge)
+      return 1.0f;
+    return fallback_edge_keep_at(c.pad_x / c.scale, c.pad_y / c.scale, c.fallback_edge_margin, x, y, vx, vy, w, h);
+  }
 
   // ------------------------------------------------------------------------------------------------ grid helpers
   // phase-correlation block grid of a stage on an mw x mh ME picture: as many half-overlapping blocks of S as fit,
@@ -132,7 +177,7 @@ namespace splat
   SPLAT_HD inline int pcorr_fields(const PcorrGrid &g) { return g.nearest ? 1 : 4; }
 
   // the stage offers a global candidate
-  SPLAT_HD inline int pcorr_has_global(const Config &c) { return c.global_candidate ? 1 : 0; }
+  SPLAT_HD inline int pcorr_has_global(const Config &c) { return c.global_candidate == 3 ? 2 : c.global_candidate ? 1 : 0; }
 
   // Occlusion: where one side matches badly (its error above thresh and above ratio times the other side's error), the
   // area is taken as covered or uncovered on that side, and the output there is interpolated from the other side
@@ -252,7 +297,7 @@ namespace splat
         for (int f = 0; f < pcorr_fields(pg); f++)
           out[k++] = p ? c.secondary_peak_cost : 0.0f;
     }
-    if (pcorr_has_global(c))
+    for (int i = 0; i < pcorr_has_global(c); i++)
       out[k++] = c.global_cost;
     out[k++] = c.zero_cost;
     return k;
@@ -278,16 +323,29 @@ namespace splat
     c.pad_x = c.pad_y = -1;
     c.fir_generated = 1;
     c.fir_beta = kFirBeta;
-    c.peaks[0] = 2; c.peaks[1] = 2; c.peaks[2] = 3;
+    // one peak per block at the smallest blocks: their further peaks offered alias vectors that broke thin objects
+    // crossing each other (drum sticks); the second peak of the middle stage stays, it carries a graphics panel that
+    // dissolves while it moves (with one peak there the panel slides in solid). Ground-truth corpus 0.4 % worse, 4
+    // fewer candidates per cell (faster)
+    c.peaks[0] = 1; c.peaks[1] = 2; c.peaks[2] = 3;
     c.nearest[0] = c.nearest[1] = c.nearest[2] = -1;
     c.block_taper = 0.5f; c.highpass_sigma = 8.0f; c.noise_weight = 1.0f; c.peak_ratio = 0.0f;
     c.global_candidate = 1;
     // The tuned values below were fitted on a ground-truth test corpus (high-frame-rate clips of news, sports, movie,
     // nature, low-quality and problem content, frames dropped and interpolated back), judged by local block errors,
-    // artefact counts and flicker against the real frames, balanced over all content classes.
+    // artefact counts and flicker against the real frames, balanced over all content classes. Where noted, a value was
+    // then chosen on a visual acceptance set instead (single output frames of real conversions: thin fast objects such
+    // as drum sticks, dancers' limbs, sport, broadcast graphics wipes; judged on speckles, torn edges and broken
+    // outlines), with the corpus as a check that nothing else got worse.
     c.refine_err_scale = 15.0f; c.refine_reg = 0.001f; c.refine_box = 15;
-    c.error_box = 7; c.error_edge_weight = 0.75f; c.error_edge_dist = 3; c.error_edge_mode = 1;
-    c.speed_change_cost = 0.0f; c.vector_length_cost = 0.0f; c.occlusion_error = 6.0f; c.occlusion_error_factor = 1.5f;
+    // edge weight 0.5 (visual set; corpus 0.75): at 0.75 the match error near a thin object's end favoured the
+    // background vector and bent the object's tip into a hook
+    c.error_box = 7; c.error_edge_weight = 0.5f; c.error_edge_dist = 3; c.error_edge_mode = 1;
+    // speed_change_cost 0.5 (visual set): a forward / backward pair whose speeds differ pays, which removed blobs at
+    // the ends of fast thin objects. Occlusion 20 / 2 (visual set): only a clearly bad match (error above 20 and above
+    // twice the other side's) takes the area as covered; the lower 6 / 1.5 left isolated speckles along thin fast
+    // objects. Together with the edge weight: corpus about 1 % better
+    c.speed_change_cost = 0.5f; c.vector_length_cost = 0.0f; c.occlusion_error = 20.0f; c.occlusion_error_factor = 2.0f;
     // candidate costs: only a block's further peaks pay (3). A peak that is not a block's strongest is often an alias
     // of the strongest one (a periodic structure such as a row of windows shows peaks one period apart), so it must
     // match clearly better to win; every other candidate competes on its match error alone.
@@ -296,18 +354,31 @@ namespace splat
     c.fallback_cap = 1.25f;
     c.fallback_err_lo = 8.0f; c.fallback_err_range = 16.0f; c.fallback_err_gain = 0.0f;
     c.copy_snap = 128;
-    // the temporal fallback (output time pulled towards the nearer picture) is off by default: on the test corpus it
-    // cost more (judder, misplaced detail) than it saved; scene cuts are handled by scene_cut_error
-    c.error_window_div = 8; c.error_window_cap = 64.0f;
-    c.pull_strength = 0.0; c.pull_error_lo = 6.0; c.pull_error_hi = 18.0;
+    // the temporal fallback (output time pulled towards the nearer picture) acts on pairs whose mean match error over
+    // the middle half of the picture (error_window_div 4) is high: fast, detailed content (sport, crowds, water), not
+    // news, talking heads or ordinary pans. Where the motion cannot be matched, a picture close to a real one is
+    // cleaner than a wrong in-between (a graphics panel wiping over a stadium stays solid instead of letting the
+    // stadium show through). It trades ground-truth accuracy on such pairs (the corpus scores the exact in-between
+    // time) for fewer visible errors; pull_strength 0 turns it off. The middle half also sets the scene-cut statistic.
+    c.error_window_div = 4; c.error_window_cap = 64.0f;
+    c.pull_strength = 0.7; c.pull_error_lo = 2.0; c.pull_error_hi = 5.0;
+    // two-build blend: the narrow band split (pyramid_sigma 1) keeps thin fast objects clean, a wide split (sigma 4)
+    // keeps more fine detail where the motion matches well; mixed per pixel by the local match error between 3 and 9.
+    // Corpus: about 4 % better than the narrow build alone (news about 8 %), visual set as clean as the narrow build.
+    // Costs a second build (CPU fast path at 1080p about 1.5 x the time without it); blend_sigma 0 turns it off
+    c.blend_sigma = 4.0; c.blend_levels = 0; c.blend_err_lo = 3.0; c.blend_err_hi = 9.0;
     // 15: catches most cuts between similar shots (sports: grass, crowd), where the motion search still finds partial
     // matches; 10 already fires on water and splashes
     c.scene_cut_error = 15.0f;
     // weights in units of one full splat: a vector shorter than 1/128 level pixel counts as still (in-place), a total
     // weight below 1e-4 as a hole (cross-fade)
-    c.splat_err_scale = 0.0f; c.splat_min_weight = 0.02f; c.splat_gain = 1.0f;
+    // splat weight exp(-err / 15) (visual set): samples with a poor match weigh less where both sides land; kept the
+    // straight edge of a moving graphics panel; corpus about 0.5 % worse
+    c.splat_err_scale = 15.0f; c.splat_min_weight = 0.02f; c.splat_gain = 1.0f;
     c.still_vector = 1.0f / 128.0f; c.hole_weight = 1.0e-4f;
-    c.pyr_sigma = 4.0f;
+    // pyramid reduce sigma 1 (visual set): every wider band split put more speckles and torn edges on thin fast
+    // objects (the corpus alone preferred 4, which the second build of the blend restores where the match is good)
+    c.pyr_sigma = 1.0f;
     return c;
   }
 
@@ -413,16 +484,23 @@ namespace splat
       c.fir_b_n = fir_design(c.fir_b_cutoff, c.fir_b_taps, c.fir_beta, c.fir_b);
     }
     // pyramid reduce taps: g(k) = exp(-k^2 / (2 sigma^2)), k = 0 .. 3, normalised to a sum of 1 over the 7 taps
-    if (c.pyr_sigma > 0.0f)
-    {
+    auto taps = [](float sigma, float out[4]) {
       double g[4], sum = 0.0;
       for (int k = 0; k < 4; k++)
       {
-        g[k] = std::exp(-(double)(k * k) / (2.0 * (double)c.pyr_sigma * (double)c.pyr_sigma));
+        g[k] = std::exp(-(double)(k * k) / (2.0 * (double)sigma * (double)sigma));
         sum += k ? 2.0 * g[k] : g[k];
       }
       for (int k = 0; k < 4; k++)
-        c.pyr_reduce[k] = (float)(g[k] / sum);
+        out[k] = (float)(g[k] / sum);
+    };
+    if (c.pyr_sigma > 0.0f)
+      taps(c.pyr_sigma, c.pyr_reduce);
+    if (c.blend_sigma > 0.0)
+    {
+      taps((float)c.blend_sigma, c.blend_reduce);
+      if (!c.blend_levels)
+        c.blend_levels = c.levels;
     }
   }
 
@@ -470,6 +548,17 @@ namespace splat
       SPLAT_CFG_FAIL("height + 2 pad_y (%d) must be a multiple of 2^pyramid_levels (%d) and of me_scale", h + 2 * c.pad_y, m);
     if (c.stride_max < c.scale / 2 || c.stride_max > (1 << c.levels))
       SPLAT_CFG_FAIL("field_stride_max must be me_scale / 2 .. 2^pyramid_levels");
+    if (c.blend_sigma != 0.0)
+    {
+      if (!(c.blend_sigma >= 0.3 && c.blend_sigma <= 16.0))
+        SPLAT_CFG_FAIL("blend_sigma must be 0 (off) or 0.3 .. 16");
+      // the second build shares the padding and the field strides of the main build
+      if (c.blend_levels < 1 || c.blend_levels > c.levels || c.stride_max > (1 << c.blend_levels))
+        SPLAT_CFG_FAIL("blend_levels must be 0 (the main build's) or 1 .. pyramid_levels, and 2^blend_levels >= "
+          "field_stride_max");
+      if (!(c.blend_err_hi > c.blend_err_lo))
+        SPLAT_CFG_FAIL("blend_err_hi must be above blend_err_lo");
+    }
     if (c.block_size != 16 && c.block_size != 32 && c.block_size != 64 && c.block_size != 128)
       SPLAT_CFG_FAIL("block_size must be 16, 32, 64 or 128");
     const int mw = me_width(c, w), mh = me_height(c, h), smax = c.block_size << (CFG_NSTAGE - 1);
@@ -481,9 +570,9 @@ namespace splat
         SPLAT_CFG_FAIL("block_peaks must be 0 .. %d", CFG_MAX_PEAKS);
     if (!(c.block_taper >= 0.0f && c.block_taper <= 1.0f) || !(c.highpass_sigma >= 0.0f && c.highpass_sigma <= 16.0f) ||
         !(c.noise_weight >= 0.0f) || !(c.secondary_peak_cost >= 0.0f) || !(c.peak_ratio >= 0.0f && c.peak_ratio <= 1.0f) ||
-        c.global_candidate < 0 || c.global_candidate > 1)
+        c.global_candidate < 0 || c.global_candidate > 3)
       SPLAT_CFG_FAIL("block_taper and peak_ratio must be 0 .. 1, highpass_sigma 0 .. 16, noise_weight and "
-        "secondary_peak_cost >= 0, global_candidate 0 or 1");
+        "secondary_peak_cost >= 0, global_candidate 0 .. 3");
     if (pcorr_ncand(c, mw, mh) < 1)
       SPLAT_CFG_FAIL("no candidates: block_peaks all 0 and global_candidate 0");
     if (pcorr_ncand(c, mw, mh) + 1 > CFG_MAX_COSTS)

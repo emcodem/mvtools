@@ -59,23 +59,31 @@ namespace SPLAT_NS
   constexpr int S0_BW = 32, S0_TH = 8, S0_L = splat::CHROMA_HB_TAPS - 1, S0_R = splat::CHROMA_HB_TAPS;
   constexpr int S0_SPAN = S0_BW + S0_L + S0_R;
 
-  template <class T> __global__ void k_s0(const T *codes, CodeFmt f, float *out)
+  // the padded grid (GW x GH per plane, picture at px, py) that k_s0 also writes; pad null: none
+  struct PadOut { float *pad; int GW, GH, px, py; };
+
+  template <class T> __global__ void k_s0(const T *codes, CodeFmt f, float *out, PadOut po)
   {
     const int W = f.W, H = f.H;
     const int x = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y * blockDim.y + threadIdx.y, c = blockIdx.z;
     const size_t NP = (size_t)W * H;
+    // sample (xx, row) of this plane, also into the padded grid's interior
+    auto put = [&](int xx, float v) {
+      out[c * NP + (size_t)row * W + xx] = v;
+      if (po.pad)
+        po.pad[c * (size_t)po.GW * po.GH + (size_t)(row + po.py) * po.GW + xx + po.px] = v;
+    };
     if (c == 0)
     {
       if (x < W && row < H)
-        out[(size_t)row * W + x] = to_val(codes[(size_t)row * W + x], f.bits);
+        put(x, to_val(codes[(size_t)row * W + x], f.bits));
       return;
     }
     const T *s = codes + NP + (size_t)(c - 1) * f.cw * f.ch;
-    float *o = out + c * NP + (size_t)row * W;
     if (!f.sub_w)
     {
       if (x < W && row < H)
-        o[x] = chroma422(s, f, x, row);
+        put(x, chroma422(s, f, x, row));
       return;
     }
     // horizontal chroma up-sampling: thread j makes outputs 2 j and 2 j + 1
@@ -100,18 +108,18 @@ namespace SPLAT_NS
       float a = C420_0 * c0;
       a = a + C420_1 * l;
       a = a + C420_2 * rr;
-      o[2 * j] = a;
+      put(2 * j, a);
       if (odd_out)
       {
         float b = C420_0 * c0;
         b = b + C420_1 * rr;
         b = b + C420_2 * l;
-        o[2 * j + 1] = b;
+        put(2 * j + 1, b);
       }
       return;
     }
     // left siting: the even output is the input sample, the odd one the half-band taps of splat_const.h (CHROMA_HB)
-    o[2 * j] = cr[0];
+    put(2 * j, cr[0]);
     if (!odd_out)
       return;
     const float HB[splat::CHROMA_HB_TAPS] = { HB0, HB1, HB2, HB3, HB4, HB5, HB6 };
@@ -122,7 +130,35 @@ namespace SPLAT_NS
       const float sum = cr[-k] + cr[1 + k];
       acc = acc + HB[k] * sum;
     }
-    o[2 * j + 1] = acc;
+    put(2 * j + 1, acc);
+  }
+
+  // the border of a padded grid whose interior k_s0 wrote: each border sample repeats the nearest picture sample
+  // (k_pad's edge repeat); one thread per border sample (the py rows above and below, then the px columns left and
+  // right of the picture rows), 3 planes along blockIdx.y
+  static size_t pad_border_count(const PadOut &po, int H) { return 2 * (size_t)po.GW * po.py + 2 * (size_t)po.px * H; }
+  __global__ void k_pad_border(PadOut po, int W, int H)
+  {
+    const size_t q = (size_t)blockIdx.x * blockDim.x + threadIdx.x, rows = 2 * (size_t)po.GW * po.py;
+    if (q >= rows + 2 * (size_t)po.px * H)
+      return;
+    int X, Y;
+    if (q < rows)
+    {
+      const int r = (int)(q / po.GW);
+      X = (int)(q - (size_t)r * po.GW);
+      Y = r < po.py ? r : H + r; // r - py rows below the picture: H + py + (r - py)
+    }
+    else
+    {
+      const size_t s2 = q - rows;
+      const int r = (int)(s2 / (2 * po.px)), k = (int)(s2 - (size_t)r * 2 * po.px);
+      Y = po.py + r;
+      X = k < po.px ? k : W + k; // k - px columns right of the picture: W + px + (k - px)
+    }
+    const int x = X - po.px, y = Y - po.py;
+    float *p = po.pad + blockIdx.y * (size_t)po.GW * po.GH;
+    p[(size_t)Y * po.GW + X] = p[(size_t)(clampi(y, 0, H - 1) + po.py) * po.GW + clampi(x, 0, W - 1) + po.px];
   }
 
   // ---- output: 4:4:4 samples -> codes: 2^(b-1) + round(v 2^(b-8)), clamped, round half up; chroma: even samples (left
@@ -266,6 +302,7 @@ namespace SPLAT_NS
     {
       float *pic = nullptr, *A = nullptr, *B = nullptr; // 3 planes W x H; ME pictures
       float *pyr = nullptr, *band[MAXL + 1] = {};       // its pyramid (made once, used by every frame built from it)
+      float *pyr2 = nullptr, *band2[MAXL + 1] = {};     // the pyramid of the second build (two-build blend only)
     };
     struct Fld
     {
@@ -288,6 +325,10 @@ namespace SPLAT_NS
     Bufs B_; // persistent scratch
     FieldsTmp F_;
     BuildScratch BS_;
+    // two-build blend (blend_ = blend_sigma > 0): scratch of the second build, its output, the error map
+    bool blend_ = false;
+    BuildScratch BS2_;
+    float *dout2_ = nullptr, *berr_ = nullptr;
     unsigned char *codes_ = nullptr; // Y, U, V codes of one picture (in or out), packed as cf_ says
     float *tmp_ = nullptr, *vf_ = nullptr, *vb_ = nullptr, *dg_ = nullptr, *dout_ = nullptr;
     // vf_, vb_ and F_ for n candidates (waits for the stream when they exist: the old ones may be in use)
@@ -357,6 +398,8 @@ namespace SPLAT_NS
       mvc::dev_free(s.A, sizeof(float) * np);
       mvc::dev_free(s.B, sizeof(float) * np);
       mvc::dev_free(s.pyr, sizeof(float) * BS_.pyr_floats());
+      if (blend_)
+        mvc::dev_free(s.pyr2, sizeof(float) * BS2_.pyr_floats());
     }
     void free_fld(Fld &f)
     {
@@ -466,7 +509,14 @@ namespace SPLAT_NS
       dg_ = B_.get(8);
       dout_ = B_.get(3 * NP);
       tfr_ = (double *)B_.get(2 * 2 * (size_t)h);
-      if (B_.failed || !alloc_cands(nc_) || BS_.alloc(cfg_, W, H, st_))
+      blend_ = cfg_.blend_sigma > 0.0;
+      if (blend_)
+      {
+        dout2_ = B_.get(3 * NP);
+        berr_ = B_.get(np);
+      }
+      if (B_.failed || !alloc_cands(nc_) || BS_.alloc(cfg_, W, H, st_) ||
+          (blend_ && BS2_.alloc(splat::blend_config(cfg_), W, H, st_)))
         return;
       for (int i = 0; i < NSTAGE; i++)
         if (!(stage_[i] = (unsigned char *)mvc::pin_alloc(code_bytes)) ||
@@ -561,7 +611,9 @@ namespace SPLAT_NS
         s.A = (float *)mvc::dev_alloc(sizeof(float) * np);
         s.B = (float *)mvc::dev_alloc(sizeof(float) * np);
         s.pyr = (float *)mvc::dev_alloc(sizeof(float) * BS_.pyr_floats());
-        if (!s.pic || !s.A || !s.B || !s.pyr)
+        if (blend_)
+          s.pyr2 = (float *)mvc::dev_alloc(sizeof(float) * BS2_.pyr_floats());
+        if (!s.pic || !s.A || !s.B || !s.pyr || (blend_ && !s.pyr2))
         {
           free_src(s);
           return -2;
@@ -582,18 +634,63 @@ namespace SPLAT_NS
       cudaMemcpyAsync(codes_, stage_[k], code_bytes, cudaMemcpyHostToDevice, st_);
       cudaEventRecord(stage_ev_[k], st_);
       const dim3 blk(32, 8);
+      // the picture, and the same samples straight into the main pyramid's padded grid (no separate pad pass)
+      const PadOut po = { BS_.low[0][0], BS_.GW, BS_.GH, cfg_.pad_x, cfg_.pad_y };
       if (cf_.bits == 8)
-        k_s0<<<grid(W, H, 3, blk), blk, 0, st_>>>(codes_, cf_, s.pic);
+        k_s0<<<grid(W, H, 3, blk), blk, 0, st_>>>(codes_, cf_, s.pic, po);
       else
-        k_s0<<<grid(W, H, 3, blk), blk, 0, st_>>>((const uint16_t *)codes_, cf_, s.pic);
+        k_s0<<<grid(W, H, 3, blk), blk, 0, st_>>>((const uint16_t *)codes_, cf_, s.pic, po);
+      if (pad_border_count(po, H))
+        k_pad_border<<<dim3(nblk(pad_border_count(po, H)), 3), 256, 0, st_>>>(po, W, H);
       me_pics_dev(st_, cfg_, s.pic, W, H, w, h, tmp_, s.A, s.B);
+      bool v2_done = false;        // the second pyramid's level-0 vertical pass is in BS2_.tmp (level-0 bands: k_band2)
+      const float *low1_main = nullptr; // level 1 of the main pyramid
+      bool band2 = false;               // both level-0 bands by k_band2
       {
         BS_.pyr_ptrs(s.pyr, s.band);
         float *low[MAXL + 1];
         for (int i = 0; i < BS_.L; i++)
           low[i] = BS_.low[0][i];
         low[BS_.L] = s.band[BS_.L];
-        pyramid_run(st_, BS_, s.pic, low, s.band);
+        // two-build blend: the level-0 vertical pass of both pyramids from one read of the padded picture (doing both
+        // horizontal passes right after it measured slower at UHD: the two intermediates do not fit in L2 together)
+        const bool v2 = blend_ && BS_.L >= 1 && BS2_.L >= 1 && BS_.GW == BS2_.GW && BS_.GH == BS2_.GH;
+        if (v2)
+        {
+          const splat::Config &c1 = BS_.cfg, &c2 = BS2_.cfg;
+          const RTaps r1 = { c1.pyr_reduce[0], c1.pyr_reduce[1], c1.pyr_reduce[2], c1.pyr_reduce[3] };
+          const RTaps r2 = { c2.pyr_reduce[0], c2.pyr_reduce[1], c2.pyr_reduce[2], c2.pyr_reduce[3] };
+          const int *lw = BS_.lw, *lh = BS_.lh;
+          k_reduce_v2<<<grid(lw[0], lh[1], 3, blk), blk, 0, st_>>>(BS_.low[0][0], lw[0], lh[0], BS_.tmp, BS2_.tmp, lh[1],
+            r1, r2);
+        }
+        // the level-0 bands together (k_band2) only where the padded picture does not stay in L2 between the two
+        // pyramids (UHD); smaller pictures measured faster with two k_band passes
+        band2 = v2 && (size_t)3 * BS_.GW * BS_.GH * sizeof(float) > l2_bytes();
+        pyramid_run(st_, BS_, s.pic, low, s.band, BS_.L >= 1, v2 ? BS_.tmp : nullptr, !band2);
+        v2_done = v2;
+        low1_main = low[1];
+      }
+      if (blend_)
+      {
+        // made with the picture, so a reused source buffer never keeps another picture's second pyramid
+        // from the main pyramid's padded picture (BS_.low[0][0], the same border), so the picture is not padded twice
+        BS2_.pyr_ptrs(s.pyr2, s.band2);
+        float *low[MAXL + 1];
+        for (int i = 0; i < BS2_.L; i++)
+          low[i] = BS2_.low[0][i];
+        low[BS2_.L] = s.band2[BS2_.L];
+        const bool share = BS_.L >= 1 && BS2_.L >= 1 && BS_.GW == BS2_.GW && BS_.GH == BS2_.GH;
+        if (share)
+          low[0] = BS_.low[0][0];
+        pyramid_run(st_, BS2_, s.pic, low, s.band2, share, v2_done ? BS2_.tmp : nullptr, !band2);
+        if (band2)
+        {
+          // both level-0 bands from one read of the padded picture
+          const dim3 blk_up = up_cover();
+          k_band2<<<grid(BS_.lw[0], BS_.lh[0], 3, blk_up), blk, 0, st_>>>(BS_.low[0][0], BS_.lw[0], BS_.lh[0], low1_main,
+            low[1], BS_.lw[1], BS_.lh[1], s.band[0], s.band2[0]);
+        }
       }
       trim(src_, q, spare_src_);
       src_[q] = s;
@@ -634,8 +731,24 @@ namespace SPLAT_NS
       const double dd = splat::phase_pull_from_rows(pull_sums(cfg_, w, h, hr), d, strength, cfg_, nullptr);
       if (d_adj)
         *d_adj = dd;
-      rc = build_run(st_, BS_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout_, src_[p].band,
-        src_[p + 1].band);
+      // fast variant: both builds and the mix in one pass where the settings allow it
+      bool fused = false;
+#ifndef SPLAT_EXACT
+      fused = blend_ && blend_fusable(BS_, BS2_);
+      if (fused)
+        rc = build_run_blend(st_, BS_, BS2_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout_, berr_,
+          src_[p].band, src_[p + 1].band, src_[p].band2, src_[p + 1].band2);
+#endif
+      if (!fused)
+        rc = build_run(st_, BS_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout_, src_[p].band,
+          src_[p + 1].band);
+      if (!rc && blend_ && !fused)
+      {
+        rc = build_run(st_, BS2_, src_[p].pic, src_[p + 1].pic, fp.fwd, fn.bwd, (float)dd, dout2_, src_[p].band2,
+          src_[p + 1].band2);
+        if (!rc)
+          blend_run(st_, cfg_, fp.fwd, fn.bwd, w, h, berr_, dout_, dout2_, W, H);
+      }
       if (rc)
         return rc;
       const dim3 blk(32, 8);

@@ -39,6 +39,7 @@ namespace splat
   struct Pyramid
   {
     std::vector<Pic3> band;
+    std::vector<Pic3> band2; // the second band split of the two-build blend (Config::blend_sigma > 0), else empty
     bool valid = false;
   };
 
@@ -76,7 +77,8 @@ namespace splat
       const float *bias, bool local_fb, const Config &cfg, Field4 &fwd, Field4 &bwd);           // refinement to local fallback
     Pic3 build(const Pic3 &P, const Pic3 &N, const Field4 &MEP, const Field4 &MEN, float d, const Config &cfg); // build
     // build into out, reusing its memory when it already has the size
-    // the same in two steps: the pyramid of a picture, then the build from the pyramids of P and N
+    // the same in two steps: the pyramid of a picture, then the build from the pyramids of P and N (both include the
+    // two-build blend when cfg.blend_sigma > 0, as build() of splat_core)
     void pyramid_into(const Pic3 &pic, const Config &cfg, Pyramid &out);
     void build_pyr_into(const Pyramid &P, const Pyramid &N, const Field4 &MEP, const Field4 &MEN, float d,
       const Config &cfg, Pic3 &out);
@@ -84,6 +86,10 @@ namespace splat
       Pic3 &out);
 
   private:
+    // the bands of one pyramid of pic with the band split of cfg; one build from such bands (no blend)
+    void pyramid_bands(const Pic3 &pic, const Config &cfg, std::vector<Pic3> &band);
+    void build_one(const std::vector<Pic3> &PB, const std::vector<Pic3> &NB, const Field4 &MEP, const Field4 &MEN,
+      float d, const Config &cfg, Pic3 &res);
     struct Impl;
     std::unique_ptr<Impl> impl_;
   };

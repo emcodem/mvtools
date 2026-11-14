@@ -8,7 +8,13 @@
 // the host-memory entries of one variant (both namespaces declare the same set)
 #define SPLAT_VARIANT_DECLS                                                                                                \
   int build_host(const MvCudaSplatParams &p, const float *P, const float *N, const float *fwdP, const float *bwdN, float d, \
-    float *out);                                                                                                           \
+    float *out, int part);                                                                                                 \
+  int pyr_reduce_host(const MvCudaSplatParams &p, const float *src, int w, int h, int second, float *dst);               \
+  int border_weight_host(const MvCudaSplatParams &p, const float *F, int w, int h, float d, int n_side, float *G);       \
+  int blend_error_map_host(const MvCudaSplatParams &p, const float *fwdP, const float *bwdN, float *e);                  \
+  int blend_mix_host(const MvCudaSplatParams &p, const float *main, const float *second, const float *e, float *out);    \
+  int whole_peak_host(const MvCudaSplatParams &p, const float *Bp, const float *Bc, float *out, float *surface,          \
+    int *T_out);                                                                                                           \
   int me_picture_host(const MvCudaSplatParams &p, const float *y, int fir, float *out);                                    \
   int errors_host(const MvCudaSplatParams &p, const float *cur, const float *other, const float *vecs, int n, float *errs); \
   int disorder_weight_host(const MvCudaSplatParams &p, const float *fv, int count, float *ch3);    \
@@ -40,8 +46,19 @@ extern "C" int mvcuda_splat_build_host(const MvCudaSplatParams *p, const float *
     return -4;
   if (!mvc::use_device())
     return -1;
-  return p->exact ? splat_exact::build_host(*p, P, N, fwd_P, bwd_N, d, out)
-                  : splat_fast::build_host(*p, P, N, fwd_P, bwd_N, d, out);
+  return p->exact ? splat_exact::build_host(*p, P, N, fwd_P, bwd_N, d, out, -1)
+                  : splat_fast::build_host(*p, P, N, fwd_P, bwd_N, d, out, -1);
+}
+
+extern "C" int mvcuda_splat_build_part_host(const MvCudaSplatParams *p, const float *P, const float *N,
+  const float *fwd_P, const float *bwd_N, float d, int part, float *out)
+{
+  if (!p || !P || !N || !fwd_P || !bwd_N || !out || part < 0 || part > 1)
+    return -4;
+  if (!mvc::use_device())
+    return -1;
+  return p->exact ? splat_exact::build_host(*p, P, N, fwd_P, bwd_N, d, out, part)
+                  : splat_fast::build_host(*p, P, N, fwd_P, bwd_N, d, out, part);
 }
 
 #define SPLAT_DISPATCH(fn, ...)                                                                                        \
@@ -50,6 +67,38 @@ extern "C" int mvcuda_splat_build_host(const MvCudaSplatParams *p, const float *
   if (!mvc::use_device())                                                                                              \
     return -1;                                                                                                         \
   return p->exact ? splat_exact::fn(*p, __VA_ARGS__) : splat_fast::fn(*p, __VA_ARGS__);
+
+extern "C" int mvcuda_splat_pyr_reduce_host(const MvCudaSplatParams *p, const float *src, int w, int h, int second,
+  float *dst)
+{
+  if (!src || !dst || w < 1 || h < 1)
+    return -4;
+  SPLAT_DISPATCH(pyr_reduce_host, src, w, h, second, dst)
+}
+
+extern "C" int mvcuda_splat_border_weight_host(const MvCudaSplatParams *p, const float *F, int w, int h, float d,
+  int n_side, float *G)
+{
+  if (!F || !G || w < 1 || h < 1)
+    return -4;
+  SPLAT_DISPATCH(border_weight_host, F, w, h, d, n_side, G)
+}
+
+extern "C" int mvcuda_splat_blend_error_map_host(const MvCudaSplatParams *p, const float *fwd_P, const float *bwd_N,
+  float *e)
+{
+  if (!fwd_P || !bwd_N || !e)
+    return -4;
+  SPLAT_DISPATCH(blend_error_map_host, fwd_P, bwd_N, e)
+}
+
+extern "C" int mvcuda_splat_blend_mix_host(const MvCudaSplatParams *p, const float *main, const float *second,
+  const float *e, float *out)
+{
+  if (!main || !second || !e || !out)
+    return -4;
+  SPLAT_DISPATCH(blend_mix_host, main, second, e, out)
+}
 
 extern "C" int mvcuda_splat_me_picture_host(const MvCudaSplatParams *p, const float *y, int fir, float *out)
 {
@@ -79,6 +128,14 @@ extern "C" int mvcuda_splat_pcorr_host(const MvCudaSplatParams *p, const float *
   if (!B_prev || !B_cur || !cands)
     return -4;
   SPLAT_DISPATCH(pcorr_host, B_prev, B_cur, cands, hp, glob)
+}
+
+extern "C" int mvcuda_splat_whole_peak_host(const MvCudaSplatParams *p, const float *B_prev, const float *B_cur,
+  float *out, float *surface, int *T)
+{
+  if (!B_prev || !B_cur || !out || !T)
+    return -4;
+  SPLAT_DISPATCH(whole_peak_host, B_prev, B_cur, out, surface, T)
 }
 
 extern "C" int mvcuda_splat_refine_host(const MvCudaSplatParams *p, const float *cur, const float *other, const float *cands,

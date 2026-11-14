@@ -1,13 +1,13 @@
 // splat_pcorr: the exact CPU path of SplatFps' phase-correlation vector source.
 //
 // Technique: phase correlation motion measurement (G. A. Thomas, "Television motion measurement for DATV and other
-// applications", BBC RD 1987/11, https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf; US 4,890,160, BBC, 1986,
-// https://patents.google.com/patent/US4890160). Two pictures are Fourier-transformed block by block; the cross-power
+// applications", BBC RD 1987/11, https://downloads.bbc.co.uk/rd/pubs/reports/1987-11.pdf).
+// Two pictures are Fourier-transformed block by block; the cross-power
 // spectrum G1 G2* is normalised to (roughly) unit amplitude so only the phase difference remains, and its inverse
 // transform is a correlation surface with a sharp peak at each displacement present in the block, almost
 // independent of brightness and contrast. The several highest peaks of a block are not the answer for any pixel yet;
 // they form a menu of candidate vectors from which the assignment picks per pixel (the two-stage measurement /
-// assignment scheme of the report and the patent). A block measures motions up to half its size, hence several block
+// assignment scheme of the report). A block measures motions up to half its size, hence several block
 // sizes. Peaks are taken at integer positions (no sub-pixel peak interpolation); the refinement adds the
 // fractions.
 //
@@ -99,4 +99,9 @@ namespace splat
     std::vector<Plane> &out, PcorrGlobal *glob = nullptr);
   std::vector<Plane> pcorr_candidates(const PcorrPicture &prev, const PcorrPicture &cur, const Config &cfg,
     PcorrGlobal *glob = nullptr);
+  // Whole-picture phase correlation of two prefiltered pictures (the hp planes; global_candidate 2 / 3): the strongest
+  // peak of the surface -> (gx, gy) and its height gh; surface (or null): the T x T surface (T the power of two >= both
+  // sides, row-major, zero motion at (T / 2, T / 2)). False (nothing written) when the picture is larger than 1024.
+  bool pcorr_whole_peak(const Plane &prev, const Plane &cur, const Config &cfg, const PcorrOps &ops, float &gx,
+    float &gy, float &gh, std::vector<float> *surface = nullptr);
 }

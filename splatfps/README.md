@@ -8,9 +8,9 @@ correlation, or any candidate clip (`vectors=`, layout in `cand_clip.h`): `Splat
 
 Each output picture is built from its two source neighbours: both are splatted along their motion vectors with
 per-pixel weights into a Laplacian pyramid (5 bands at 1080p), normalised, with an in-place blend where the vectors
-are inconsistent and a cross-fade where nothing lands. A scene cut repeats the nearer source picture; an optional
-temporal fallback (off by default) pulls the output time towards the nearer source picture when the vectors match
-badly.
+are inconsistent and a cross-fade where nothing lands. The build runs twice, with a narrow and a wide band split,
+mixed per pixel by the local match error. A scene cut repeats the nearer source picture; a temporal fallback pulls
+the output time towards the nearer source picture when the vectors of a pair match badly.
 
 ## Stages
 
@@ -41,15 +41,14 @@ planar YUV 4:2:0 / 4:2:2 / 4:4:4 at 8-16 bit, output = input format, copy frames
 
 ## Phase correlation
 
-Built from the published technique (G. A. Thomas, BBC RD 1987/11; US 4,890,160) and measurements on a ground-truth
+Built from the published technique (G. A. Thomas, BBC RD 1987/11) and measurements on a ground-truth
 test corpus (local errors, artefacts and flicker against the real frames): Tukey-windowed blocks of 32 / 64 / 128 with
 the windowed mean removed, an optional Gaussian high-pass prefilter, the cross-power spectrum weighted by q / (q + k^2)
 against the blocks' median amplitude, the highest positive peaks per block, the near and far covering blocks per
 pixel, a global candidate by weighted vote. Design and arithmetic in `core/splat_pcorr.h`; settings `block_peaks`,
 `nearest_block`, `highpass_sigma`, `block_taper`, `noise_weight`, `peak_ratio`, `global_candidate`,
 `secondary_peak_cost`.
-- Defaults `block_peaks=[2, 2, 3]` (29 candidates at 1080p), `highpass_sigma=8`. Cheaper layouts measured equal
-  within noise: `nearest_block=[0, 0, 1]` (20 candidates), `block_peaks=[1, 2, 3], nearest_block=[0, 0, 1]` (16).
+- Defaults `block_peaks=[1, 2, 3]` (25 candidates at 1080p), `highpass_sigma=8`.
 - Arithmetic: float only, two real blocks per complex FFT both ways, no trigonometric functions, fixed-point vote
   sums; exact CPU path == fast CPU path (AVX2 FFT lines) == CUDA, bit for bit.
 - Speed (Core Ultra 9 285K 24 threads / RTX 5090, 1080p 50 -> 59.94): ingest 3.7 ms, pair 4 ms per picture on the
@@ -117,7 +116,3 @@ the clip by the exact CPU path (`test/stage_inputs.py`), so no stored data is ne
   CudaSplatFps with `vectors=`).
 - In run_suite itself: sequential runs, other frame sizes, non-default named arguments and every pixel format, each
   `SplatFps` (fast) == `CudaSplatFps(exact=true)`.
-
-## Quality
-
-Results on the ground-truth test corpus: to be filled in.

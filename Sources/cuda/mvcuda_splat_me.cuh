@@ -154,7 +154,9 @@ namespace SPLAT_NS
   // then slides it over a short segment (add the entering sample, drop the leaving one), so the cost per sample no
   // longer grows with the box size. Short segments keep the rounding of the running sum local (only samples of the
   // segment's own neighbourhood ever enter it); the result differs from the in-order sums in the last bits only.
-  constexpr int BOX_SEG_V = 16, BOX_SEG_H = 8, BOX_H_THREADS = 64;
+  // BOX_SEG_H odd: the lanes of a warp start their segments BOX_SEG_H floats apart in shared memory, an odd stride
+  // touches 32 different banks (8 gave 8-way conflicts)
+  constexpr int BOX_SEG_V = 4, BOX_SEG_H = 7, BOX_H_THREADS = 64;
 
   // vertical: thread = (column x, segment of BOX_SEG_V rows); planes along blockIdx.z
   __global__ void k_boxs_v(const float *in, int w, int h, int size, float *out)

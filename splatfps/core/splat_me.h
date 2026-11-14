@@ -22,8 +22,8 @@
 //   picture build uses this weight to blend the two pictures in place (no motion compensation) where the field is
 //   too irregular to trust.
 // - Pair statistic (splat_phase_pull.h): the mean capped match error m of the two fields that meet at an output
-//   frame. A scene cut (m >= scene_cut_error) repeats the nearer picture; the temporal fallback (pull_strength > 0,
-//   off by default) moves the output phase d towards the nearer source picture when m is high. At the limit the
+//   frame. A scene cut (m >= scene_cut_error) repeats the nearer picture; the temporal fallback (pull_strength > 0)
+//   moves the output phase d towards the nearer source picture when m is high. At the limit the
 //   output is a repeat of the nearer picture, which judders but shows no interpolation artefacts.
 // - Schedule: output frame k sits at source time k * rate_in / rate_out (exact fractions); phases within
 //   1 / copy_snap of a source picture are copies.
