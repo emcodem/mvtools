@@ -77,8 +77,13 @@ How a frame is made:
 | `session` | `"reset"` | the encoder keeps the previous field as predictors. `"reset"`: one run on a flat picture before each real run (same output as `"fresh"`, about 4x faster); `"fresh"`: a new encoder per run; `"kept"`: neither (fastest, but the output depends on the thread order) |
 | `half` | false | ME on the picture downscaled 2x2: twice the search range, cells of 16 pixels |
 
-Sessions: at most 4 open at once by default (`MVTOOLS_NVENC_SESSIONS`); GeForce drivers limit concurrent NVENC
-sessions, and other programs (ffmpeg, OBS) count too.
+Sessions: at most 4 encoder sessions per process (all CudaNVENCAnalyse instances together); a call waits for a free
+one. `MVTOOLS_NVENC_SESSIONS=<n>` changes the limit. The NVIDIA driver also limits open NVENC sessions (GeForce: a few to
+about a dozen, depending on the driver), counted over all programs (ffmpeg, OBS ...), and the API cannot tell how many
+are left. Too high a value does not make it faster: more sessions only open when that many calls run at once (about
+the number of Prefetch threads), idle ones stay open until the process ends (picture buffers on the GPU: about 37 MB
+per UHD session with luma, 87 MB with `channels="yuv"`), and once the driver refuses a session the frame falls back
+to MAnalyse (see Logging) and another program's NVENC encode may fail to start. Up to the Prefetch thread count is safe.
 
 ### Candidates
 
@@ -109,6 +114,19 @@ True when NVENC ME-only can be used for that codec (`"h264"` default). Without i
 reason, unless `global cuda_cpu_fallback = true` (or the environment variable `CUDA_CPU_FALLBACK`): then it returns
 `MAnalyse(MSuper(c, pel, hpad, vpad, chroma), isb, delta, blksize, blksizeV, overlap, overlapV, truemotion=true, chroma)`
 (mvtools2 must be loaded). A single frame NVENC fails on gets that MAnalyse's level-0 vectors.
+
+### Logging (stderr)
+
+- Replaced as a whole at load time (`cuda_cpu_fallback`): one line with the reason.
+- Every frame that falls back to MAnalyse: one line with the frame number and the reason (no session could be opened,
+  NVENC failed, CUDA error, input evicted); the library adds the driver's message.
+- When the filter closes, if any frame fell back: `N of M frames used MAnalyse instead of NVENC` with the reasons. With
+  `stats`, the file line ends with `frames=M manalyse_frames=N`.
+
+stderr is shown by ffmpeg and avs2pipemod; some hosts drop it.
+
+`MVTOOLS_GPU_FORCE_FALLBACK` (environment, as for mvtools2) sends every frame through the per-frame fallback: a
+test of that path.
 
 ## Examples
 

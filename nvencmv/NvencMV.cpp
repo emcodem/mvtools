@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -197,6 +198,20 @@ namespace
     std::mutex _m;
     std::string _stats_path;
     long long _stats[64] = {};
+    // frames made, frames that fell back to MAnalyse, by reason (see reason_of)
+    static const int REASONS = 5;
+    std::atomic<long long> _frames{ 0 }, _fallbacks{ 0 }, _reason_count[REASONS] = {};
+
+    static int reason_of(int rc)
+    {
+      return rc == MVCUDA_NEEDS_CPU ? 0 : rc == MVCUDA_TOKEN_GONE ? 1 : rc == -2 ? 2 : rc == -4 ? 3 : 4;
+    }
+    static const char *reason_text(int r)
+    {
+      static const char *t[REASONS] = { "NVENC failed or no session could be opened (see the mvcuda nvenc line)",
+        "an input frame was evicted and could not be made again", "CUDA error", "bad arguments", "other error" };
+      return t[r];
+    }
     static const int HEADER = 256;
 
     PClip fallback(IScriptEnvironment *env)
@@ -492,6 +507,16 @@ namespace
 
     ~CudaNVENCAnalyse() override
     {
+      const long long done = _frames.load(), fb = _fallbacks.load();
+      if (fb > 0)
+      {
+        std::fprintf(stderr, "CudaNVENCAnalyse (isb=%s, delta=%d): %lld of %lld frames used MAnalyse instead of NVENC:", _isb ? "true" : "false",
+          _delta, fb, done);
+        for (int i = 0; i < REASONS; i++)
+          if (_reason_count[i].load())
+            std::fprintf(stderr, " %s %lld;", reason_text(i), _reason_count[i].load());
+        std::fprintf(stderr, "\n");
+      }
       if (_stats_path.empty())
         return;
       if (FILE *o = std::fopen(_stats_path.c_str(), "a"))
@@ -499,7 +524,7 @@ namespace
         std::fprintf(o, "isb=%d delta=%d channels=%d swap=%d neighbours=%d", (int)_isb, _delta, _ep.channels, _ep.swap, _ep.neighbours);
         for (long long v : _stats)
           std::fprintf(o, " %lld", v);
-        std::fprintf(o, "\n");
+        std::fprintf(o, " frames=%lld manalyse_frames=%lld\n", done, fb);
         std::fclose(o);
       }
     }
@@ -559,14 +584,22 @@ namespace
           hints_from_clip(n, hints.data(), _ep.hints, first, env);
       }
       long long st[64] = {};
+      // MVTOOLS_GPU_FORCE_FALLBACK (as mvtools2's): every frame takes the per-frame fallback (test of that path)
+      static const bool force = std::getenv("MVTOOLS_GPU_FORCE_FALLBACK") != nullptr;
+      if (rc == 0 && force)
+        rc = MVCUDA_NEEDS_CPU;
       if (rc == 0)
         rc = call(_ep, n, nref, hints.empty() ? nullptr : hints.data(), payload, nullptr, _stats_path.empty() ? nullptr : st, env);
+      _frames++;
       if (rc != 0)
       {
-        static bool told = false;
-        if (!told)
-          std::fprintf(stderr, "CudaNVENCAnalyse: frame %d: NVENC failed (%d), MAnalyse's level 0 instead\n", n, rc);
-        told = true;
+        // every fallback frame is reported (the vectors of that frame are MAnalyse's, not NVENC's), and counted for the
+        // summary when the filter closes
+        const int r = reason_of(rc);
+        _fallbacks++;
+        _reason_count[r]++;
+        std::fprintf(stderr, "CudaNVENCAnalyse (isb=%s, delta=%d): frame %d: %s (code %d), MAnalyse's vectors for this frame\n",
+          _isb ? "true" : "false", _delta, n, reason_text(r), rc);
         from_fallback(n, payload, env);
       }
       else if (!_stats_path.empty())
@@ -683,6 +716,8 @@ namespace
       if (!fallback_allowed(env))
         env->ThrowError("CudaNVENCAnalyse: NVENC cannot be used: %s. Set global cuda_cpu_fallback = true to run MAnalyse instead",
           why.c_str());
+      std::fprintf(stderr, "CudaNVENCAnalyse: NVENC cannot be used (%s); cuda_cpu_fallback: MAnalyse on the CPU for the whole clip\n",
+        why.c_str());
       return make_manalyse(c, isb, delta, bx, by, ox, oy, pel, hpad, vpad, chroma, env);
     }
     return new CudaNVENCAnalyse(c, isb, delta, bx, by, ox, oy, pel, hpad, vpad, chroma, ep, temporal, hintclip, stats, env);

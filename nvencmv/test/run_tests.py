@@ -176,8 +176,9 @@ if want('stats'):
     sp = os.path.join(WORK, 'stats.txt').replace('\\', '/')
     rc, out, err = run('c = m.Trim(0, 5)\nreturn CudaNVENCAnalyse(c, channels="yuv", neighbours=true, stats="%s")' % sp)
     line = open(sp).read().split() if os.path.exists(sp) else []
-    cnt = sum(int(x) for x in line[5:]) if len(line) > 5 else 0
-    case('stats file', rc == 0 and cnt > 0, '%d cells counted' % cnt)
+    cnt = sum(int(x) for x in line[5:] if '=' not in x) if len(line) > 5 else 0
+    tail = [x for x in line if x.startswith('frames=') or x.startswith('manalyse_frames=')]
+    case('stats file', rc == 0 and cnt > 0 and tail == ['frames=5', 'manalyse_frames=0'], '%d cells counted, %s' % (cnt, ' '.join(tail)))
 
 # ---- into MVTools: MRecalculate, MFlowFps, MDegrain2, MCompensate accept the clip
 if want('chain'):
@@ -200,6 +201,15 @@ if want('fallback'):
     ma, e2 = md5('c = m.Trim(0, 5)\nreturn MAnalyse(MSuper(c, pel=2, hpad=8, vpad=8, chroma=true), isb=true, delta=1, blksize=16, '
                  'blksizeV=16, overlap=8, overlapV=8, truemotion=true, chroma=true, scaleCSAD=0)', {'MVTOOLS_GPU_DISABLE': '1'})
     case('no GPU, cuda_cpu_fallback: = MAnalyse', fb is not None and fb == ma, '%s %s %s' % (fb, ma, e1 or e2))
+    rc, out, err = run('global cuda_cpu_fallback = true\n' + body, {'MVTOOLS_GPU_DISABLE': '1'})
+    case('no GPU, cuda_cpu_fallback: logged', 'MAnalyse on the CPU for the whole clip' in err, err.strip()[-160:])
+    # per-frame fallback: every frame (5 with a reference) reported, summary at the end
+    rc, out, err = run(body, {'MVTOOLS_GPU_FORCE_FALLBACK': '1'})
+    LAST_ERR[0] = ''
+    lines = err.count("MAnalyse's vectors for this frame")
+    # every request counts (the host may ask for a frame twice): at least the 5 frames, and the summary agrees
+    case('no GPU per frame: every frame logged + summary', rc == 0 and lines >= 5 and '%d of %d frames used MAnalyse' % (lines, lines) in err,
+         '%d lines; %s' % (lines, err.strip().splitlines()[-1][:150] if err.strip() else ''))
 
 bad = [r for r in results if not r[1]]
 print('\n%d/%d passed' % (len(results) - len(bad), len(results)))

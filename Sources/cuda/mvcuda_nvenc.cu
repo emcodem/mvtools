@@ -547,8 +547,20 @@ namespace mvc_nvenc
     c.hevc = hevc;
     std::string e;
     Session *s = acquire(c, e);
-    release(s);
     std::lock_guard<std::mutex> lk(g_mutex);
+    if (s)
+    {
+      // the test session is closed at once: it would hold one of the pool's places (and a driver session) for nothing
+      for (size_t i = 0; i < g_pool.size(); i++)
+        if (g_pool[i] == s)
+        {
+          g_pool.erase(g_pool.begin() + (std::ptrdiff_t)i);
+          break;
+        }
+      g_open--;
+      destroy(s);
+      g_cv.notify_all();
+    }
     result[hevc] = s ? 1 : 0;
     why[hevc] = e;
     err = e;
