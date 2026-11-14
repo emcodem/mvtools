@@ -123,8 +123,8 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
 
 | stage | GPU chain (`gpu=true`, default) | CPU chain (`gpu=false`) |
 |---|---|---|
-| deinterlace | QTGMC (`QTGMC_gpu.avsi`) with its GPU switches; motion vectors optionally from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) | QTGMC; preset `uc_qtgmc_preset` (default "Fast") in both chains |
-| frame-rate conversion (MC) | `CudaSplatFps`; candidates optionally from the NVIDIA optical flow accelerator (`uc_frc_nvof`: `CudaNVOFAnalyse` via `MSplatVectors`) | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
+| deinterlace | QTGMC (`QTGMC_gpu.avsi`) with its GPU switches; motion vectors optionally from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) or NVENC's motion estimation (`uc_qtgmc_nvenc`, nvencmv) | QTGMC; preset `uc_qtgmc_preset` (default "Fast") in both chains |
+| frame-rate conversion (MC) | `CudaSplatFps`; candidates optionally from the NVIDIA optical flow accelerator (`uc_frc_nvof`: `CudaNVOFAnalyse` via `MSplatVectors`) or NVENC's motion estimation (`uc_frc_nvenc`: `CudaNVENCAnalyse`) | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
 | scale | `z_ConvertFormat` (avsresize), Spline36 | same |
 | interlace | `CudaConvolution` with `uc_interlace.json` | `mt_convolution` |
 
@@ -159,8 +159,12 @@ All verified bit-exact as round trips (`tests/run_tests.py exact_`):
 
 ## Threading
 
-`UConvert` puts the source in `Prefetch(3)` and passes `threads` (default 3) to `UConvertClip`, which places the
-thread pool itself:
+`UConvert` puts the source in `Prefetch(3)` and passes `threads` (default -1: automatic) to `UConvertClip`, which
+places the thread pool itself. Automatic means `uc_gpu_threads` (10) on the GPU chain and 3 on the CPU chain. The GPU
+needs many frames in flight: one picture's QTGMC motion search (`CudaMAnalyse`, 95 % of the GPU time of deinterlacing)
+occupies only about 24 of an RTX 5090's 170 SMs at 1080p, so with 3 threads most of the chip idles although
+`nvidia-smi` shows it 99 % busy. Measured on the RTX 5090: deinterlacing 1080i25 -> 1080p50 147 -> 353 fps (3 -> 10
+threads), whole GPU chain 75 -> 131 fps; the deinterlaced output is identical for any thread count.
 
 - CPU chain: `Prefetch(threads)` on the progressive chain before the interlace step, `Prefetch(3)` at the end. Each
   interlaced frame needs two adjacent progressive frames; with the pool after the interlace step, threads compute

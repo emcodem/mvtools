@@ -29,6 +29,7 @@ REPO_DOCS = {
     "splatfps": MVTOOLS_DOCS + ["Documentation/splatfps.md"],
     "CudaConvolution": MVTOOLS_DOCS + ["cudaconvolution/THIRD_PARTY.md", "cudaconvolution/docs/usage.md"],
     "MovingPattern": MVTOOLS_DOCS + ["movingpattern/README.md"],
+    "nvencmv": MVTOOLS_DOCS + ["Documentation/nvencmv.md"],
 }
 # where each component comes from (written to licences/<name>/SOURCE.txt): public download locations only
 MVTOOLS_URL = "https://github.com/emcodem/mvtools (branch gpu_work)"
@@ -39,6 +40,7 @@ SOURCES = {
     "splatfps": MVTOOLS_URL,
     "CudaConvolution": MVTOOLS_URL + ", folder cudaconvolution",
     "MovingPattern": MVTOOLS_URL + ", folder movingpattern",
+    "nvencmv": MVTOOLS_URL + ", folder nvencmv",
     "QTGMC_gpu": AVS_STUFF + "QTGMC.avsi (QTGMC 3.393s), patched by qtgmc/make_qtgmc_gpu.py of " + MVTOOLS_URL,
     "Zs_RF_Shared": AVS_STUFF + "Zs_RF_Shared.avsi",
     "mxfsource": "https://github.com/emcodem/avisynth_mxfsource",
@@ -46,6 +48,7 @@ SOURCES = {
 # DLLs a plugin loads at run time from its own folder (not in its import table): copied next to it
 RUNTIME_DLLS = {
     "mvtools2": ["mvtools_cuda.dll", "avstp.dll"],
+    "nvencmv": ["mvtools_cuda.dll"],
 }
 # files uconvert.avsi reads from its own folder
 SIDE_FILES = ["uc_interlace.json"]

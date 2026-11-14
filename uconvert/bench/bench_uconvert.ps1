@@ -6,20 +6,22 @@ nothing and the whole benchmark takes about a minute on any machine. The speed o
 frames per second over 1 s windows, after its start-up. Results: results\uconvert_bench_<date>.json (to post) and
 .txt (to read), next to this script. They contain no paths and no user or computer names.
 
-  bench_uconvert.cmd [-FFmpeg <ffmpeg.exe>] [-Seconds 5] [-NoCpu] [-Stages deint,frc,...]
+  bench_uconvert.cmd [-FFmpeg <ffmpeg.exe>] [-Seconds 5] [-NoCpu] [-Stages deint,frc,...] [-Threads n]
 
-Needs: AviSynth+ 3.7 or newer (x64; installed, or the x64 AviSynth.dll next to ffmpeg.exe), ffmpeg with AviSynth input (-FFmpeg, ffmpeg.exe next to this script or in the
-UConvert folder above it, or on the PATH), for the GPU stages an NVIDIA GPU with a current driver.
+Needs: ffmpeg with AviSynth input (ffmpeg.exe next to this script, in the UConvert folder above it or on the PATH,
+else -FFmpeg <path>); AviSynth+ 3.7 or newer, x64, with AviSynth.dll in System32 or next to ffmpeg.exe; for the GPU
+stages an NVIDIA GPU with a current driver. Both ffmpeg checks run first, before anything else.
 #>
 param(
   [string]$FFmpeg = "",
   [double]$Seconds = 5,
   [switch]$NoCpu,
   [string]$Stages = "",
+  [int]$Threads = -1,
   [switch]$KeepScripts
 )
 $ErrorActionPreference = "Stop"
-$BenchVersion = 1
+$BenchVersion = 3
 $here = $PSScriptRoot
 $ucDir = Split-Path $here -Parent
 $ucAvsi = Join-Path $ucDir "uconvert.avsi"
@@ -37,7 +39,16 @@ if (-not $FFmpeg) {
   $cmd = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
   if ($cmd) { $FFmpeg = $cmd.Source }
 }
-if (-not $FFmpeg -or -not (Test-Path $FFmpeg)) { Fail "ffmpeg.exe not found: pass -FFmpeg <path>, or put it next to this script or on the PATH" }
+if (-not $FFmpeg) {
+  Fail ("ffmpeg.exe not found (looked next to this script, in the UConvert folder and on the PATH).`n" +
+        "       Tell the benchmark where it is with the -FFmpeg switch, e.g.:`n" +
+        "       bench_uconvert.cmd -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe")
+}
+if (-not (Test-Path $FFmpeg -PathType Leaf)) {
+  Fail ("ffmpeg not found at the -FFmpeg path: $FFmpeg`n" +
+        "       Give the full path of ffmpeg.exe, e.g.: bench_uconvert.cmd -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe")
+}
+$FFmpeg = (Resolve-Path $FFmpeg).Path
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("uconvert_bench_" + $PID)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -82,6 +93,41 @@ function Run-FFmpeg([string[]]$a, [int]$timeoutSec = 120) {
   $p.WaitForExit()
   return @{ code = $p.ExitCode; out = $out.Result; err = $err.Result }
 }
+
+# ---- checks before anything else: 1. ffmpeg runs, 2. ffmpeg can read AviSynth scripts
+try { $ffv = Run-FFmpeg @('-hide_banner', '-version') 30 } catch { $ffv = @{ code = -1; out = ""; err = $_.Exception.Message } }
+if ($ffv.code -ne 0 -or $ffv.out -notmatch '^ffmpeg version') {
+  Fail ("$FFmpeg does not run as ffmpeg (ffmpeg -version failed).`n" +
+        "       Give the path of a working ffmpeg.exe with the -FFmpeg switch, e.g.: bench_uconvert.cmd -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe")
+}
+$ffVersion = (($ffv.out -split "`n")[0] -replace '\s*Copyright.*$', '').Trim()
+Write-Host "ffmpeg:    $FFmpeg"
+
+$verAvs = Join-Path $work "version.avs"
+Set-Content -Path $verAvs -Encoding ASCII -Value 'Assert(false, "AVSVERSION " + VersionString())'
+$r = Run-FFmpeg @('-hide_banner', '-nostdin', '-i', $verAvs) 60
+if ($r.err -match 'AVSVERSION ([^\r\n(]+)') { $avsVersion = $Matches[1].Trim() }
+else {
+  $ffDir = Split-Path $FFmpeg -Parent
+  $sys32 = Join-Path $env:WINDIR "System32"
+  $dmx = Run-FFmpeg @('-hide_banner', '-demuxers') 30
+  if ($dmx.out -notmatch '(?m)^\s*D\S*\s+avisynth\b') {
+    Fail ("this ffmpeg cannot read AviSynth scripts at all: it is built without AviSynth input.`n" +
+          "       Use an ffmpeg build with AviSynth support (e.g. the gyan.dev or BtbN full builds) and pass it with -FFmpeg <path>.")
+  }
+  # ffmpeg loads AviSynth.dll from its own folder or System32 (or the PATH); when that fails it only says "Unknown error"
+  $nextTo = Join-Path $ffDir "AviSynth.dll"
+  $inSys = Join-Path $sys32 "AviSynth.dll"
+  $why = if (Test-Path $nextTo) { "The AviSynth.dll next to ffmpeg.exe ($nextTo, used before the one in System32) could not be loaded: 32-bit, too old or broken? Replace or remove it." }
+         elseif (Test-Path $inSys) { "The AviSynth.dll in System32 ($inSys) could not be loaded: 32-bit, too old or broken?" }
+         else { "AviSynth.dll was found neither in $sys32 nor next to ffmpeg.exe." }
+  Fail ("ffmpeg cannot read AviSynth scripts. $why`n" +
+        "       AviSynth.dll (AviSynth+ 3.7 or newer, x64) must be either in $sys32 (installed by the AviSynth+ installer)`n" +
+        "       or next to ffmpeg.exe in $ffDir (the x64 AviSynth.dll from the AviSynth+ release archive,`n" +
+        "       https://github.com/AviSynth/AviSynthPlus/releases). Then run the benchmark again.`n" +
+        "       ffmpeg said: " + (($r.err.Trim() -split "`n")[-1]).Trim())
+}
+Write-Host "AviSynth:  $avsVersion"
 
 # ---- host
 Write-Host "UConvert benchmark v${BenchVersion}: collecting host information ..."
@@ -163,27 +209,13 @@ try {
 } catch { $host_.on_battery = $null }
 try { $host_.power_plan = ((powercfg /getactivescheme) -replace '^.*\((.*)\).*$', '$1').Trim() } catch {}
 
-$ffv = Run-FFmpeg @('-hide_banner', '-version') 30
-$host_.ffmpeg = (($ffv.out -split "`n")[0] -replace '\s*Copyright.*$', '').Trim()
-
-$verAvs = Join-Path $work "version.avs"
-Set-Content -Path $verAvs -Encoding ASCII -Value 'Assert(false, "AVSVERSION " + VersionString())'
-$r = Run-FFmpeg @('-hide_banner', '-nostdin', '-i', $verAvs) 60
-if ($r.err -match 'AVSVERSION ([^\r\n(]+)') { $host_.avisynth = $Matches[1].Trim() }
-else {
-  $dmx = Run-FFmpeg @('-hide_banner', '-demuxers') 30
-  if ($dmx.out -notmatch '(?m)^\s*D\S*\s+avisynth\b') {
-    Fail "this ffmpeg is built without AviSynth input (no avisynth demuxer in 'ffmpeg -demuxers'): use an ffmpeg build with AviSynth support (e.g. the gyan.dev or BtbN full builds), with -FFmpeg <path>"
-  }
-  # ffmpeg loads AviSynth.dll (from its own folder, System32 or the PATH); when that fails it only says "Unknown error"
-  $dllHere = @((Join-Path (Split-Path $FFmpeg) "AviSynth.dll"), (Join-Path $env:WINDIR "System32\AviSynth.dll")) | Where-Object { Test-Path $_ }
-  $why = if ($dllHere) { "AviSynth.dll is there but could not be loaded (a 32-bit or broken installation?)" } else { "AviSynth.dll not found" }
-  Fail ("ffmpeg cannot open AviSynth scripts: $why.`n       Install AviSynth+ 3.7 or newer, x64 (https://github.com/AviSynth/AviSynthPlus/releases), or put the x64 AviSynth.dll next to ffmpeg.exe, then run the benchmark again.`n       ffmpeg said: " + (Scrub ($r.err.Trim() -split "`n")[-1]))
-}
+$host_.ffmpeg = $ffVersion
+$host_.avisynth = $avsVersion
 
 # ---- stages: generated source -> UConvertClip with targets that leave one stage (or the whole chain) to run
 # src: MovingPattern arguments; target: UConvertClip arguments after the clip; pre: UConvert settings for the run;
-# nvof: a comparison stage with motion vectors from the NVIDIA optical flow accelerator, skipped on GPUs without it
+# nvof / nvenc: a comparison stage with motion vectors from the NVIDIA optical flow accelerator / the NVENC encoder's
+# motion estimation, skipped where UConvert's plan shows it is not used (GPU without it, nvencmv.dll missing)
 $src_i25 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=25, fps_den=1, scan="tff"'
 $src_p50 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=50, fps_den=1, scan="p"'
 $src_p5994 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=60000, fps_den=1001, scan="p"'
@@ -191,8 +223,11 @@ $src_uhd50 = 'width=3840, height=2160, pixel_type="YUV422P10", fps_num=50, fps_d
 $all = @(
   [ordered]@{ name = "deint";       desc = "deinterlace 1080i25 -> 1080p50";                src = $src_i25;   target = '1080, 1920, out_rate_nom=50, out_rate_den=1' },
   [ordered]@{ name = "deint_nvof";  desc = "deinterlace 1080i25 -> 1080p50, NVOFA vectors"; src = $src_i25;   target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_nvof = true'; nvof = $true },
+  [ordered]@{ name = "deint_wave";  desc = "deinterlace 1080i25 -> 1080p50, wavefront search"; src = $src_i25; target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_wavefront = true' },
+  [ordered]@{ name = "deint_nvenc"; desc = "deinterlace 1080i25 -> 1080p50, NVENC vectors"; src = $src_i25;  target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_nvenc = true'; nvenc = $true },
   [ordered]@{ name = "frc";         desc = "frame-rate conversion 1080p50 -> 1080p59.94";   src = $src_p50;   target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001' },
   [ordered]@{ name = "frc_nvof";    desc = "frame-rate conversion 1080p50 -> 1080p59.94, NVOFA vectors"; src = $src_p50; target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001'; pre = 'global uc_frc_nvof = true'; nvof = $true },
+  [ordered]@{ name = "frc_nvenc";   desc = "frame-rate conversion 1080p50 -> 1080p59.94, NVENC vectors"; src = $src_p50; target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001'; pre = 'global uc_frc_nvenc = true'; nvenc = $true },
   [ordered]@{ name = "interlace";   desc = "interlace 1080p59.94 -> 1080i29.97";            src = $src_p5994; target = '1080, 1920, out_interlace="tff", out_rate_nom=30000, out_rate_den=1001' },
   [ordered]@{ name = "scale";       desc = "scale 2160p50 -> 1080p50";                      src = $src_uhd50; target = '1080, 1920, out_rate_nom=50, out_rate_den=1' },
   [ordered]@{ name = "chain_gpu";   desc = "whole chain 1080i25 -> 1080i29.97 (GPU)";       src = $src_i25;   target = '1080, 1920, out_interlace="tff", out_rate_nom=30000, out_rate_den=1001' },
@@ -208,7 +243,7 @@ function Stage-Script($s, [bool]$info) {
     $(if ($s.pre) { $s.pre } else { "" }),
     "LoadPlugin(""$mpDll"")",
     "src = MovingPattern($($s.src), frames=1000000, storage=""memory"")",
-    "c = src.UConvertClip($($s.target), threads=3)"
+    "c = src.UConvertClip($($s.target), threads=$Threads)"
   )
   if ($info) {
     $t += 'Assert(false, "UCPLAN " + (propGetType(c, "_uc_plan") == 3 ? propGetString(c, "_uc_plan") : "-"))'
@@ -288,17 +323,18 @@ foreach ($s in $run) {
   if (-not $plan) {
     $res.ok = $false
     $res.error = Error-Text $r.err
-    Write-Host ("  {0,-10} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red
-  } elseif ($s.nvof -and $plan -notmatch 'nvof') {
+    Write-Host ("  {0,-11} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red
+  } elseif (($s.nvof -and $plan -notmatch 'nvof') -or ($s.nvenc -and $plan -notmatch 'nvenc')) {
     $res.ok = $false
-    $res.skipped = "no NVIDIA optical flow accelerator on this GPU (Turing or newer)"
-    Write-Host ("  {0,-10} skipped: {1}" -f $s.name, $res.skipped) -ForegroundColor Yellow
+    $res.skipped = if ($s.nvof) { "no NVIDIA optical flow accelerator on this GPU (Turing or newer)" }
+                   else { "no NVENC motion estimation (nvencmv.dll missing, or a GPU older than Pascal)" }
+    Write-Host ("  {0,-11} skipped: {1}" -f $s.name, $res.skipped) -ForegroundColor Yellow
   } else {
-    Write-Host ("  {0,-10} {1} ..." -f $s.name, $s.desc)
+    Write-Host ("  {0,-11} {1} ..." -f $s.name, $s.desc)
     $m = Time-Stage (Stage-Script $s $false)
     foreach ($k in $m.Keys) { $res[$k] = $m[$k] }
-    if ($res.ok) { Write-Host ("  {0,-10} {1,7:N1} fps   (start-up {2} s)" -f $s.name, $res.fps, $res.startup_s) -ForegroundColor Green }
-    else { Write-Host ("  {0,-10} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red }
+    if ($res.ok) { Write-Host ("  {0,-11} {1,7:N1} fps   (start-up {2} s)" -f $s.name, $res.fps, $res.startup_s) -ForegroundColor Green }
+    else { Write-Host ("  {0,-11} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red }
   }
   $results += $res
 }
@@ -307,7 +343,7 @@ foreach ($s in $run) {
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $doc = [ordered]@{
   benchmark = "uconvert"; version = $BenchVersion; date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-  seconds_per_stage = $Seconds; duration_s = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+  seconds_per_stage = $Seconds; threads = $Threads; duration_s = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
   host = $host_; stages = $results
 }
 $resDir = Join-Path $here "results"
@@ -325,9 +361,9 @@ $txt = @("UConvert benchmark v$BenchVersion  $($doc.date)",
   "CPU features: $($host_.cpu_features)",
   $gpuLine, "OS: $($host_.os); $($host_.avisynth); $($host_.ffmpeg)", "")
 foreach ($r in $results) {
-  if ($r.ok) { $txt += ("{0,-10} {1,8:N1} fps   {2}" -f $r.stage, $r.fps, $r.what) }
-  elseif ($r.skipped) { $txt += ("{0,-10}  skipped   {1}: {2}" -f $r.stage, $r.what, $r.skipped) }
-  else { $txt += ("{0,-10}   FAILED   {1}: {2}" -f $r.stage, $r.what, $r.error) }
+  if ($r.ok) { $txt += ("{0,-11} {1,8:N1} fps   {2}" -f $r.stage, $r.fps, $r.what) }
+  elseif ($r.skipped) { $txt += ("{0,-11}  skipped   {1}: {2}" -f $r.stage, $r.what, $r.skipped) }
+  else { $txt += ("{0,-11}   FAILED   {1}: {2}" -f $r.stage, $r.what, $r.error) }
 }
 [System.IO.File]::WriteAllLines([System.IO.Path]::ChangeExtension($json, ".txt"), [string[]]$txt, $utf8)
 Write-Host ""

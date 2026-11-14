@@ -7,12 +7,17 @@ Measures how fast UConvert's stages run on this machine, in about a minute, and 
 Double-click `bench_uconvert.cmd` (in `UConvert\bench\`), or from a command prompt:
 
 ```
-bench_uconvert.cmd [-FFmpeg C:\path\ffmpeg.exe] [-Seconds 5] [-NoCpu] [-Stages deint,frc]
+bench_uconvert.cmd [-FFmpeg C:\path\ffmpeg.exe] [-Seconds 5] [-NoCpu] [-Stages deint,frc] [-Threads n]
 ```
 
-Needs AviSynth+ 3.7 or newer (x64): installed, or the x64 `AviSynth.dll` from the AviSynth+ release archive placed
-next to `ffmpeg.exe`. Further: ffmpeg with AviSynth input (`-FFmpeg`, or `ffmpeg.exe` next to the script, in
-the UConvert folder, or on the PATH), and for the GPU stages an NVIDIA GPU with a current driver. Nothing is
+Needs:
+- **ffmpeg** with AviSynth input: `ffmpeg.exe` next to the script, in the UConvert folder or on the PATH, otherwise
+  give its path with `-FFmpeg C:\path\ffmpeg.exe`.
+- **AviSynth+ 3.7 or newer, x64**: `AviSynth.dll` either in `C:\Windows\System32` (the AviSynth+ installer puts it
+  there) or next to `ffmpeg.exe` (the x64 `AviSynth.dll` from the AviSynth+ release archive).
+- for the GPU stages an NVIDIA GPU with a current driver.
+
+The benchmark checks the first two before anything else and says what is missing. Nothing is
 installed or changed. Close other heavy programs (games, renders) while it runs: they change the numbers.
 
 ## What it measures
@@ -25,16 +30,24 @@ leaves only that stage to do:
 | stage | what |
 | --- | --- |
 | `deint` | deinterlacing (QTGMC on the GPU) 1080i25 -> 1080p50 |
+| `deint_wave` | the same with the wavefront motion search (`uc_qtgmc_wavefront`; slightly different vectors than the CPU QTGMC) |
 | `deint_nvof` | the same with QTGMC's motion vectors from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) |
+| `deint_nvenc` | the same with QTGMC's motion vectors from NVENC's motion estimation (`uc_qtgmc_nvenc`, `nvencmv.dll`) |
 | `frc` | motion-compensated frame-rate conversion (CudaSplatFps) 1080p50 -> 1080p59.94 |
 | `frc_nvof` | the same with SplatFps' candidates from the NVIDIA optical flow accelerator (`uc_frc_nvof`) |
+| `frc_nvenc` | the same with SplatFps' candidates from NVENC's motion estimation (`uc_frc_nvenc`, `nvencmv.dll`) |
 | `interlace` | interlacing (CudaConvolution) 1080p59.94 -> 1080i29.97 |
 | `scale` | scaling 2160p50 -> 1080p50 |
 | `chain_gpu` | the whole chain 1080i25 -> 1080i29.97 on the GPU |
 | `chain_cpu` | the whole chain on the CPU only (`gpu=false`; `-NoCpu` skips it) |
 
-The `_nvof` stages compare the optical flow accelerator (Turing or newer) with the built-in motion searches; on GPUs
-without it they are listed as skipped.
+The `_nvof` and `_nvenc` stages compare the optical flow accelerator (Turing or newer) and the video encoder's motion
+estimation (Pascal or newer) with the built-in motion searches. Both run on their own chips next to the CUDA cores,
+so the whole stage is timed, not the search alone. Where the hardware (or `nvencmv.dll`) is missing they are listed
+as skipped.
+
+Every stage runs with UConvert's default number of frames in flight (GPU chain: `uc_gpu_threads`, 10; CPU chain: 3);
+`-Threads n` sets another one for all stages, to find the best value for a GPU.
 
 Every stage runs for `-Seconds` (5) after its start-up. Its speed is the median of the frames per second over 1 s
 windows (the first second is skipped); the result also lists the slowest and fastest window and the start-up time.

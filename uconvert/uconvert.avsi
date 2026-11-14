@@ -35,9 +35,19 @@ global uc_interlace_preset_kernel = "31 -66 -235 1075 2486 1075 -235 -66 31"   #
 # false: the GPU search gives the same vectors as the CPU QTGMC.
 global uc_qtgmc_nvof = false
 
+# GPU QTGMC: wavefront motion search instead of the slice search (faster where few frames run at once, slightly
+# different vectors than the CPU QTGMC; with uc_gpu_threads 10 on an RTX 5090 the gain is small).
+global uc_qtgmc_wavefront = false
+
 # GPU frame-rate conversion: CudaSplatFps candidates from the NVIDIA optical flow accelerator (CudaNVOFAnalyse via
 # MSplatVectors) instead of its built-in phase correlation. Without NVOFA (older than Turing) the built-in one is used.
 global uc_frc_nvof = false
+
+# The same two with motion vectors from NVIDIA's video encoder (CudaNVENCAnalyse of nvencmv.dll, NVENC motion
+# estimation, Pascal or newer). Research option. Where both are set, the optical flow accelerator wins; without
+# nvencmv.dll or NVENC the built-in search is used.
+global uc_qtgmc_nvenc = false
+global uc_frc_nvenc = false
 
 # QTGMC preset of the deinterlacer (both chains). "Super Fast" is about 1.5x faster on the GPU chain, at lower quality.
 global uc_qtgmc_preset = "Fast"
@@ -45,21 +55,27 @@ global uc_qtgmc_preset = "Fast"
 # default of the gpu parameter (set to false after the Import to run every UConvert call on the CPU chain)
 global uc_gpu_default = true
 
+# frames in flight on the GPU chain when threads is not given. One picture's motion search fills only a small part of
+# a large GPU, so several pictures must run at once (RTX 5090, 1080i25 -> 1080p50: 3 -> 147 fps, 6 -> 270, 10 -> 353;
+# whole chain 75 -> 131 fps). The deinterlaced output does not depend on it. Costs about 60 MB RAM per thread.
+global uc_gpu_threads = 10
+
 
 function UConvert(string file, int out_h, int out_w, string "out_interlace", int "out_rate_nom", int "out_rate_den",
 \                 string "source", string "cachedir", string "scan_in", int "sar_num", int "sar_den",
 \                 int "out_sar_num", int "out_sar_den", string "aspect_mode", bool "frc_8bit", int "threads",
 \                 bool "gpu")
 {
-    threads = Default(threads, 3)
+    threads = Default(threads, -1)
     c = uc_Source(file, source, cachedir)
-    c = threads > 0 ? c.Prefetch(3) : c
+    c = threads != 0 ? c.Prefetch(3) : c
     return UConvertClip(c, out_h, out_w, out_interlace, out_rate_nom, out_rate_den, scan_in=scan_in,
     \                   sar_num=sar_num, sar_den=sar_den, out_sar_num=out_sar_num, out_sar_den=out_sar_den,
     \                   aspect_mode=aspect_mode, frc_8bit=frc_8bit, threads=threads, gpu=gpu)
 }
 
 
+# threads < 0: automatic (GPU chain uc_gpu_threads, CPU chain 3; UConvert's default). threads = 0: no thread pool.
 # threads > 0: UConvertClip places the thread pool itself - Prefetch(threads) on the progressive chain before the
 # interlace step and Prefetch(3) at the end. Do not add a large Prefetch after it: with the pool behind the
 # interlace step, threads compute the same deint/FRC frames twice (measured: 25i output at half speed).
@@ -71,6 +87,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
 {
     threads = Default(threads, 0)
     gpu = Default(gpu, uc_gpu_default)
+    threads = threads < 0 ? (gpu ? uc_gpu_threads : 3) : threads
     Assert(Defined(out_rate_nom) && Defined(out_rate_den) && out_rate_nom > 0 && out_rate_den > 0,
     \      "UConvert: out_rate_nom and out_rate_den are required")
     oi = LCase(Default(out_interlace, ""))
@@ -158,7 +175,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
         c = (i_in || frc == "mc") && wbits != bits ? c.ConvertBits(wbits, dither=-1, fulls=full, fulld=full) : c
         if (i_in) {
             c = uc_Deint(c, scan == "tff", gpu)
-            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : "") : "") + " " + scan
+            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : uc_qtgmc_nvenc && uc_NvencOk() ? "-nvenc" : uc_qtgmc_wavefront ? "-wave" : "") : "") + " " + scan
         }
         if (spatial && pre_scale) {
             c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb)
@@ -168,7 +185,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
             c = mc_gpu && threads > 0 ? c.Prefetch(threads) : c
             c = uc_FRC(c, p_n, p_d, gpu)
             c = mc_gpu && threads > 0 ? c.Prefetch(1) : c
-            plan = plan + " | frc=" + (gpu ? "splat" + (uc_frc_nvof && uc_NvofOk() ? "-nvof " : " ") : "mc ") + string(p_n) + "/" + string(p_d)
+            plan = plan + " | frc=" + (gpu ? "splat" + (uc_frc_nvof && uc_NvofOk() ? "-nvof " : uc_frc_nvenc && uc_NvencOk() ? "-nvenc " : " ") : "mc ") + string(p_n) + "/" + string(p_d)
         }
         if (frc == "drop") {
             c = c.SelectEvery(round(r / p), 0).AssumeFPS(p_n, p_d)
@@ -404,6 +421,8 @@ function uc_Deint(clip c, bool tff, bool "gpu")
     global QTGMC_gpu_out = gpu
     global QTGMC_gpu_edi = false
     global QTGMC_gpu_nvof = gpu && uc_qtgmc_nvof
+    global QTGMC_gpu_nvenc = gpu && uc_qtgmc_nvenc
+    global QTGMC_gpu_meander = !uc_qtgmc_wavefront
     m = c.HasAlpha ? c.RemoveAlphaPlane() : c
     d = uc_Order(m, tff).QTGMC(Preset=uc_qtgmc_preset)
     d = c.HasAlpha ? d.AddAlphaPlane(uc_Order(c.ExtractA(), tff).QTGMC(Preset=uc_qtgmc_preset)) : d
@@ -428,13 +447,17 @@ function uc_FRCGpu(clip c, int num, int den)
     m = grey ? m.ConvertToYUV444() : m
     m = m.Is420 && uc_PropInt(m, "_ChromaLocation", 0) >= 2 ? m.propSet("_ChromaLocation", 0) : m
     nvof = uc_frc_nvof && uc_NvofOk()
-    # NVOFA: 4x4 blocks match SplatFps' grid; hpad / vpad 64 limit the vectors to 64 pixels per frame
+    nvenc = !nvof && uc_frc_nvenc && uc_NvencOk()
+    # NVOFA / NVENC: 4x4 blocks match SplatFps' grid; hpad / vpad 64 limit the vectors to 64 pixels per frame
     vec = nvof ? MSplatVectors(m.CudaNVOFAnalyse(isb=true, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64),
-    \                          m.CudaNVOFAnalyse(isb=false, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64)) : Undefined()
-    out = nvof ? m.CudaSplatFps(num, den, vectors=vec) : m.CudaSplatFps(num, den)
+    \                          m.CudaNVOFAnalyse(isb=false, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64))
+    \   : nvenc ? MSplatVectors(m.CudaNVENCAnalyse(isb=true, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64),
+    \                           m.CudaNVENCAnalyse(isb=false, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64))
+    \   : Undefined()
+    out = nvof || nvenc ? m.CudaSplatFps(num, den, vectors=vec) : m.CudaSplatFps(num, den)
     if (c.HasAlpha) {
         ac = c.ExtractA().ConvertToYUV444()
-        vec = nvof ? vec : m.SplatAnalyse()
+        vec = nvof || nvenc ? vec : m.SplatAnalyse()
         av = ac.CudaSplatFps(num, den, vectors=vec).ExtractY()
     }
     out = grey ? out.ExtractY() : out
@@ -445,6 +468,12 @@ function uc_FRCGpu(clip c, int num, int den)
 function uc_NvofOk()
 {
     return FunctionExists("CudaNVOFAvailable") ? CudaNVOFAvailable() : false
+}
+
+# true when NVENC motion estimation can be used (nvencmv loaded, a GPU with NVENC ME-only mode, Pascal or newer)
+function uc_NvencOk()
+{
+    return FunctionExists("CudaNVENCAvailable") ? CudaNVENCAvailable() : false
 }
 
 function uc_FRCCpu(clip c, int num, int den)

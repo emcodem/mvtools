@@ -14,6 +14,8 @@ LoadPlugin(T + "/lsmash/x64/LSMASHSource.dll")
 LoadPlugin(G + "/plugins/mvtools2.dll")
 LoadPlugin(G + "/plugins/cudafilters.dll")
 LoadPlugin(G + "/plugins/splatfps.dll")
+# optional: NVENC motion vectors (uc_qtgmc_nvenc / uc_frc_nvenc); needs mvtools_cuda.dll in the same folder
+LoadPlugin(G + "/plugins/nvencmv.dll")
 LoadPlugin(CC + "/CudaConvolution.dll")
 LoadPlugin(FF + "/MaskTools/x64/masktools2.dll")
 LoadPlugin(FF + "/RgTools/x64/RgTools.dll")
