@@ -1,6 +1,7 @@
 // splatcore_test: a C ABI over splat_core for the stage parity tests (Python ctypes: the exact CPU path, the fast CPU
 // path and the CUDA stages are compared on inputs this library derives itself). Not shipped.
 // Arrays are float32, planar, rows contiguous: a picture is 3 planes, a field 4 planes.
+#include "../core/splat_args.h"
 #include "../core/splat_const.h"
 #include "../core/splat_core.h"
 #include "../core/splat_me.h"
@@ -10,9 +11,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 
 #if defined(_WIN32)
 #define SC_API extern "C" __declspec(dllexport)
@@ -61,7 +65,7 @@ static void field_out(const Field4 &s, float *p)
     plane_out(s.c[c], p + c * n);
 }
 
-SC_API int sc_version() { return 8; }
+SC_API int sc_version() { return 10; }
 
 // The configuration every entry uses: the defaults of a picture size (sc_set_size; 1920 x 1080 until called).
 static Config g_cfg = config_for_size(1920, 1080);
@@ -92,6 +96,69 @@ SC_API int sc_set_peaks(int p0, int p1, int p2, int w, int h)
   char why[256];
   return config_check(g_cfg, w, h, why, sizeof(why)) ? 0 : -1;
 }
+
+// two-build blend settings (blend_sigma 0 = off; levels 0 = the main build's), resolved for a w x h picture; returns
+// 0, or -1 when the configuration does not pass the checks (g_cfg is set anyway)
+SC_API int sc_set_blend(double sigma, int levels, double err_lo, double err_hi, int w, int h)
+{
+  g_cfg.blend_sigma = sigma;
+  g_cfg.blend_levels = levels;
+  g_cfg.blend_err_lo = err_lo;
+  g_cfg.blend_err_hi = err_hi;
+  config_resolve(g_cfg, w, h);
+  char why[256];
+  return config_check(g_cfg, w, h, why, sizeof(why)) ? 0 : -1;
+}
+
+// Settings by name, as the filters take them: the defaults, then spec ("name=value name=v1,v2,v3 ...", names of
+// core/splat_args.h, separated by spaces), then the per-size rules of a w x h picture and the checks. Returns 0; -1 for
+// an unknown name or a wrong number of values, -2 when the result does not pass the checks (g_cfg is set anyway); why
+// (or null) gets the reason.
+SC_API int sc_set_args(const char *spec, int w, int h, char *why, int why_size)
+{
+  Config c = config_defaults();
+  char msg[512] = "";
+  int rc = 0;
+  std::string all(spec ? spec : "");
+  size_t i = 0;
+  while (rc == 0 && i < all.size())
+  {
+    const size_t e = std::min(all.find(' ', i), all.size());
+    const std::string tok = all.substr(i, e - i);
+    i = e + 1;
+    if (tok.empty())
+      continue;
+    const size_t eq = tok.find('=');
+    double vals[CFG_NSTAGE + 1];
+    int n = 0;
+    for (size_t v = eq == std::string::npos ? tok.size() : eq + 1; v < tok.size() && n <= CFG_NSTAGE;)
+    {
+      const size_t comma = std::min(tok.find(',', v), tok.size());
+      vals[n++] = std::atof(tok.substr(v, comma - v).c_str());
+      v = comma + 1;
+    }
+    const std::string name = tok.substr(0, eq);
+    if (eq == std::string::npos || config_set_arg(c, name.c_str(), vals, n) != 0)
+    {
+      std::snprintf(msg, sizeof(msg), "%s: unknown setting or wrong number of values", tok.c_str());
+      rc = -1;
+    }
+  }
+  if (rc == 0)
+  {
+    config_resolve(c, w, h);
+    if (!config_check(c, w, h, msg, sizeof(msg)))
+      rc = -2;
+    g_cfg = c;
+  }
+  if (why && why_size > 0)
+    std::snprintf(why, (size_t)why_size, "%s", msg);
+  return rc;
+}
+
+// the current value(s) of a named setting (resolved, e.g. pad_x after the per-size rules) into vals (room for 3);
+// returns the count, -1 for an unknown name
+SC_API int sc_get_arg(const char *name, double *vals) { return config_get_arg(g_cfg, name, vals); }
 
 // number of phase-correlation candidates (without the zero vector) on the ME grid of the current configuration
 SC_API int sc_ncand(int mw, int mh) { return pcorr_ncand(g_cfg, mw, mh); }
@@ -126,6 +193,9 @@ SC_API void sc_pad(const float *src, int w, int h, float *dst, int gw, int gh, i
 }
 
 SC_API void sc_pyr_reduce(const float *src, int w, int h, float *dst) { plane_out(pyr_reduce(plane_in(src, w, h), g_cfg.pyr_reduce), dst); }
+
+// the same with the taps of the second build (two-build blend)
+SC_API void sc_pyr_reduce2(const float *src, int w, int h, float *dst) { plane_out(pyr_reduce(plane_in(src, w, h), g_cfg.blend_reduce), dst); }
 
 SC_API void sc_pyr_expand(const float *low, int lw, int lh, float *dst, int ow, int oh)
 {
@@ -169,6 +239,33 @@ SC_API void sc_build(const float *P, const float *N, int W, int H, const float *
     pic_out(g_fast->build(pic_in(P, W, H), pic_in(N, W, H), field_in(MEP, mw, mh), field_in(MEN, mw, mh), d, g_cfg), out);
   else
     pic_out(build(pic_in(P, W, H), pic_in(N, W, H), field_in(MEP, mw, mh), field_in(MEN, mw, mh), d, g_cfg), out);
+}
+
+// one build of the two-build blend without the mix: part 0 = the main build, 1 = the second build (blend_config)
+SC_API void sc_build_part(const float *P, const float *N, int W, int H, const float *MEP, const float *MEN, int mw,
+  int mh, float d, int part, float *out)
+{
+  Config c = part ? blend_config(g_cfg) : g_cfg;
+  c.blend_sigma = 0.0;
+  if (g_fast)
+    pic_out(g_fast->build(pic_in(P, W, H), pic_in(N, W, H), field_in(MEP, mw, mh), field_in(MEN, mw, mh), d, c), out);
+  else
+    pic_out(build(pic_in(P, W, H), pic_in(N, W, H), field_in(MEP, mw, mh), field_in(MEN, mw, mh), d, c), out);
+}
+
+// error map of the two-build blend: MEP, MEN 4 planes mw x mh -> out mw x mh
+SC_API void sc_blend_error_map(const float *MEP, const float *MEN, int mw, int mh, float *out)
+{
+  plane_out(blend_error_map(field_in(MEP, mw, mh), field_in(MEN, mw, mh)), out);
+}
+
+// mix of the two-build blend: main, second 3 planes W x H, e mw x mh -> out 3 planes W x H
+SC_API void sc_blend_mix(const float *main, const float *second, int W, int H, const float *e, int mw, int mh,
+  float *out)
+{
+  Pic3 m = pic_in(main, W, H);
+  blend_mix_rows(m, pic_in(second, W, H), plane_in(e, mw, mh), g_cfg, 0, H);
+  pic_out(m, out);
 }
 
 // ---- stages around the motion vectors (splat_me.h)
@@ -262,6 +359,26 @@ SC_API void sc_pcorr(const float *Bprev, const float *Bcur, int w, int h, float 
   }
 }
 
+
+// whole-picture phase correlation of the pair (B_prev, B_cur), exact path: out (gx, gy, height); surface (or null):
+// T x T floats. Returns T, or 0 when the ME picture is larger than 1024 (nothing written).
+SC_API int sc_whole_peak(const float *Bprev, const float *Bcur, int w, int h, float *out, float *surface)
+{
+  const PcorrPicture a = pcorr_ingest(plane_in(Bprev, w, h), g_cfg), b = pcorr_ingest(plane_in(Bcur, w, h), g_cfg);
+  std::vector<float> surf;
+  float gx, gy, gh;
+  if (!pcorr_whole_peak(a.hp, b.hp, g_cfg, pcorr_ops_exact(), gx, gy, gh, surface ? &surf : nullptr))
+    return 0;
+  out[0] = gx;
+  out[1] = gy;
+  out[2] = gh;
+  if (surface)
+    std::memcpy(surface, surf.data(), surf.size() * sizeof(float));
+  int T = 16;
+  while (T < w || T < h)
+    T *= 2;
+  return T;
+}
 
 // refinement: n candidates (2 planes each) -> n refined
 SC_API void sc_refine(const float *cur, const float *other, int w, int h, const float *cands, int n, int neg, float *out)

@@ -11,7 +11,8 @@ The other paths (the fast CPU path, CUDA exact and fast) run the same stages on 
 exact CPU results. Grid sizes and candidate counts come from the library's configuration.
 
 Also here: ctypes wrappers of splatcore_test.dll (CpuLib) and of the CUDA host test entries of mvtools_cuda.dll
-(CudaLib), shared by check_fast, check_motion, check_cuda and check_avs.
+(CudaLib), shared by check_fast, check_motion, check_cuda and check_avs. A CUDA entry the loaded mvtools_cuda.dll does
+not export raises Missing (the checks report it as a failure with the entry's name).
 """
 import ctypes as C
 import os
@@ -26,6 +27,10 @@ import avs_util as AU  # noqa: E402
 f32 = np.float32
 FP = C.POINTER(C.c_float)
 KINDS = ('copyP', 'copyN', 'built', 'eos')
+
+
+class Missing(Exception):
+    """a test entry the loaded library does not export"""
 
 
 def fp(a):
@@ -46,6 +51,38 @@ def out_codes(o):
     return codes10(o[0]), np.stack([codes10(o[1][:, 0::2]), codes10(o[2][:, 0::2])])
 
 
+# bounds of a built picture that may differ from the exact one (fast variants): per plane group (luma; both chroma
+# planes together) at most MAX_CODES_HD codes differing at 1920 x 1080, scaled with the pixel count (about 2000 at
+# 3840 x 2160), none by more than MAX_DIFF. Not counted: codes whose exact value lies within TIE_EPS codes of a
+# rounding boundary - there any last-bit difference of the arithmetic flips the code (averages of integer codes at
+# phase 0.5 land exactly on a tie), which says nothing about the build.
+MAX_CODES_HD, MAX_DIFF, TIE_EPS = 500, 2, 1e-3
+
+
+def max_codes(w, h):
+    """the number of differing codes a built w x h picture may have per plane group"""
+    return int(round(MAX_CODES_HD * w * h / (1920 * 1080)))
+
+
+def near_tie(v):
+    """float samples whose code (codes10) sits within TIE_EPS codes of a rounding boundary"""
+    t = np.asarray(v, np.float64) * 4 + 0.5
+    return np.abs(t - np.round(t)) < TIE_EPS
+
+
+def picture_diff(got, ref):
+    """built 4:4:4 float pictures as output codes (Y, 4:2:2 C): (luma differing, chroma differing, max difference,
+    luma / chroma differing apart from rounding ties, within the bounds)"""
+    (gY, gC), (rY, rC) = out_codes(got), out_codes(ref)
+    dY, dC = gY != rY, gC != rC
+    tY, tC = near_tie(ref[0]), np.stack([near_tie(ref[1][:, 0::2]), near_tie(ref[2][:, 0::2])])
+    nY, nC = int(dY.sum()), int(dC.sum())
+    cY, cC = int((dY & ~tY).sum()), int((dC & ~tC).sum())
+    mx = int(max(np.abs(gY - rY).max(initial=0), np.abs(gC - rC).max(initial=0)))
+    lim = max_codes(rY.shape[1], rY.shape[0])
+    return nY, nC, mx, cY, cC, cY <= lim and cC <= lim and mx <= MAX_DIFF
+
+
 def nbits(a, b):
     """number of values that differ bit for bit (floats compared as bits)"""
     a, b = np.asarray(a), np.asarray(b)
@@ -61,8 +98,8 @@ class CpuLib:
 
     def __init__(self, path, w=1920, h=1080):
         self.d = C.CDLL(os.path.abspath(path))
-        if self.d.sc_version() < 8:
-            sys.exit('splatcore_test.dll too old (sc_version < 8)')
+        if self.d.sc_version() < 10:
+            sys.exit('splatcore_test.dll too old (sc_version < 10)')
         d = self.d
         d.sc_disorder_weight.argtypes = [FP, FP, C.c_int, C.c_int, FP]
         d.sc_phase_pull.restype = C.c_double
@@ -71,17 +108,45 @@ class CpuLib:
         d.sc_phase_pull_strength.argtypes = [C.c_longlong] * 4
         d.sc_plan.argtypes = [C.c_int] + [C.c_longlong] * 4 + [C.c_int, C.POINTER(C.c_longlong)]
         d.sc_build.argtypes = [FP, FP, C.c_int, C.c_int, FP, FP, C.c_int, C.c_int, C.c_float, FP]
+        d.sc_build_part.argtypes = [FP, FP, C.c_int, C.c_int, FP, FP, C.c_int, C.c_int, C.c_float, C.c_int, FP]
+        d.sc_border_weight.argtypes = [FP, C.c_int, C.c_int, C.c_float, C.c_int, FP]
+        d.sc_set_args.argtypes = [C.c_char_p, C.c_int, C.c_int, C.c_char_p, C.c_int]
+        d.sc_get_arg.argtypes = [C.c_char_p, C.POINTER(C.c_double)]
+        self.args = ''
         self.set_size(w, h)
 
     def set_size(self, w, h):
         """the defaults of picture size w x h; sets the ME grid (mw, mh) from the configuration"""
         if self.d.sc_set_size(w, h) != 0:
             sys.exit(f'the defaults of {w} x {h} do not pass the configuration checks')
-        self.W, self.H = w, h
+        self.W, self.H, self.args = w, h, ''
+        self._refresh()
+
+    def set_args(self, spec, w=None, h=None):
+        """the defaults with named settings ("name=value name=v1,v2,v3", the filters' argument names) for w x h
+        (default: the current size); ValueError when a name is unknown or the result fails the checks"""
+        w, h = w or self.W, h or self.H
+        why = C.create_string_buffer(512)
+        rc = self.d.sc_set_args(spec.encode(), w, h, why, len(why))
+        if rc:
+            self.set_size(self.W, self.H)
+            raise ValueError(f'settings "{spec}" at {w} x {h}: {why.value.decode()}')
+        self.W, self.H, self.args = w, h, spec
+        self._refresh()
+
+    def get(self, name):
+        """the current value of a named setting (a list for the arrays)"""
+        v = (C.c_double * 4)()
+        n = self.d.sc_get_arg(name.encode(), v)
+        if n < 0:
+            raise ValueError(f'unknown setting {name}')
+        return v[0] if n == 1 else list(v[:n])
+
+    def _refresh(self):
         self.cfg = C.create_string_buffer(self.d.sc_config(None))
         self.d.sc_config(self.cfg)
         scale, pad_x, pad_y = struct.unpack_from('3i', self.cfg.raw)  # splat::Config begins with scale, pad_x, pad_y
-        self.mw, self.mh = (w + 2 * pad_x) // scale, (h + 2 * pad_y) // scale
+        self.mw, self.mh = (self.W + 2 * pad_x) // scale, (self.H + 2 * pad_y) // scale
         self.n = self.d.sc_ncand(self.mw, self.mh)
         self.costs = np.empty(self.n + 1, f32)
         assert self.d.sc_costs(self.mw, self.mh, fp(self.costs)) == self.n + 1
@@ -177,6 +242,51 @@ class CpuLib:
         self.d.sc_build(fp(P), fp(N), w, h, fp(cf(MEP)), fp(cf(MEN)), MEP.shape[2], MEP.shape[1], d, fp(o))
         return o
 
+    def build_part(self, P, N, MEP, MEN, d, part):
+        """one build of the two-build blend without the mix: part 0 the main build, 1 the second build"""
+        P, N = cf(P), cf(N)
+        h, w = P.shape[1:]
+        o = np.empty((3, h, w), f32)
+        self.d.sc_build_part(fp(P), fp(N), w, h, fp(cf(MEP)), fp(cf(MEN)), MEP.shape[2], MEP.shape[1], d, part, fp(o))
+        return o
+
+    def blend_error_map(self, MEP, MEN):
+        o = np.empty(MEP.shape[1:], f32)
+        self.d.sc_blend_error_map(fp(cf(MEP)), fp(cf(MEN)), MEP.shape[2], MEP.shape[1], fp(o))
+        return o
+
+    def blend_mix(self, main, second, e):
+        o = np.empty_like(cf(main))
+        h, w = main.shape[1:]
+        self.d.sc_blend_mix(fp(cf(main)), fp(cf(second)), w, h, fp(cf(e)), e.shape[1], e.shape[0], fp(o))
+        return o
+
+    def pyr_reduce(self, src, second=False):
+        """one pyramid reduce step of a plane, with the main taps or the second build's (two-build blend)"""
+        src = cf(src)
+        h, w = src.shape
+        o = np.empty(((h + 1) // 2, (w + 1) // 2), f32)
+        (self.d.sc_pyr_reduce2 if second else self.d.sc_pyr_reduce)(fp(src), w, h, fp(o))
+        return o
+
+    def border_weight(self, F, d, n_side):
+        """the projection field of one side (splat prep: border, splat weight, fallback weight incl. fallback_edge)"""
+        F = cf(F)
+        o = np.empty_like(F)
+        self.d.sc_border_weight(fp(F), F.shape[2], F.shape[1], d, int(n_side), fp(o))
+        return o
+
+    def whole_peak(self, Bp, Bc):
+        """whole-picture phase correlation (exact path): (gx, gy, height), the T x T surface; None when too large"""
+        Bp, Bc = cf(Bp), cf(Bc)
+        h, w = Bc.shape
+        T = whole_size(w, h)
+        if T > 1024:
+            return None
+        out, surf = np.empty(3, f32), np.empty((T, T), f32)
+        assert self.d.sc_whole_peak(fp(Bp), fp(Bc), w, h, fp(out), fp(surf)) == T
+        return out, surf
+
     def plan(self, n, rin, rout):
         """the filter's frame plan (default copy threshold): list of (k, p, d as Fraction, kind name)"""
         from fractions import Fraction
@@ -186,6 +296,14 @@ class CpuLib:
         assert cnt <= cap
         return [(buf[5 * i], buf[5 * i + 1], Fraction(buf[5 * i + 2], buf[5 * i + 3]), KINDS[buf[5 * i + 4]])
                 for i in range(cnt)]
+
+
+def whole_size(w, h):
+    """FFT size of the whole-picture correlation of a w x h ME picture"""
+    T = 16
+    while T < w or T < h:
+        T *= 2
+    return T
 
 
 class Params(C.Structure):
@@ -205,11 +323,94 @@ class CudaLib:
         self.cpu = cpu
         self.exact = exact
         self.name = 'cuda ' + ('exact' if exact else 'fast')
-        self.prm = Params(cpu.W, cpu.H, int(exact), C.cast(cpu.cfg, C.c_void_p), 10, 1, 0, 0)
+        self._prm = Params(cpu.W, cpu.H, int(exact), None, 10, 1, 0, 0)
+
+    @property
+    def prm(self):
+        """the parameters with the CPU library's current size and configuration (set_args may change them)"""
+        p = self._prm
+        p.width, p.height, p.config = self.cpu.W, self.cpu.H, C.cast(self.cpu.cfg, C.c_void_p)
+        return p
+
+    def has(self, fn):
+        return hasattr(self.d, f'mvcuda_splat_{fn}_host')
+
+    def _fn(self, fn):
+        try:
+            return getattr(self.d, f'mvcuda_splat_{fn}_host')
+        except AttributeError:
+            raise Missing(f'mvcuda_splat_{fn}_host') from None
 
     def _ok(self, rc, fn):
         if rc:
             raise RuntimeError(f'mvcuda_splat_{fn}_host returned {rc}')
+
+    # ---- entries of the two-build blend, the fallback_edge prep and the whole-picture correlation. Signatures (all
+    # return 0 or an error code as mvcuda_splat_build_host; sizes from the parameters' width / height and config):
+    #   pyr_reduce_host(p, const float *src, int w, int h, int second, float *dst)  one reduce step of a plane with the
+    #     main taps or (second) the second build's; dst (w + 1) / 2 x (h + 1) / 2
+    #   border_weight_host(p, const float *F, int w, int h, float d, int n_side, float *G)  the projection field of one
+    #     side (splat prep), 4 planes w x h each
+    #   build_part_host(p, P, N, fwd_P, bwd_N, float d, int part, float *out)  as build_host, without the mix: part 0
+    #     the main build, 1 the second build
+    #   blend_error_map_host(p, const float *fwd_P, const float *bwd_N, float *e)  e on the ME grid
+    #   blend_mix_host(p, const float *main, const float *second, const float *e, float *out)  3 planes each
+    #   whole_peak_host(p, const float *B_prev, const float *B_cur, float *out3, float *surface, int *T)  ME-grid
+    #     inputs; out3 (gx, gy, height), surface (or null) T x T; T = 0 (nothing else written) when the ME picture is
+    #     larger than 1024
+    def pyr_reduce(self, src, second=False):
+        src = cf(src)
+        h, w = src.shape
+        o = np.empty(((h + 1) // 2, (w + 1) // 2), f32)
+        f = self._fn('pyr_reduce')
+        f.argtypes = [C.POINTER(Params), FP, C.c_int, C.c_int, C.c_int, FP]
+        self._ok(f(C.byref(self.prm), fp(src), w, h, int(second), fp(o)), 'pyr_reduce')
+        return o
+
+    def border_weight(self, F, d, n_side):
+        F = cf(F)
+        o = np.empty_like(F)
+        f = self._fn('border_weight')
+        f.argtypes = [C.POINTER(Params), FP, C.c_int, C.c_int, C.c_float, C.c_int, FP]
+        self._ok(f(C.byref(self.prm), fp(F), F.shape[2], F.shape[1], d, int(n_side), fp(o)), 'border_weight')
+        return o
+
+    def build_part(self, P, N, MEP, MEN, d, part):
+        P = cf(P)
+        o = np.empty_like(P)
+        f = self._fn('build_part')
+        f.argtypes = [C.POINTER(Params), FP, FP, FP, FP, C.c_float, C.c_int, FP]
+        self._ok(f(C.byref(self.prm), fp(P), fp(cf(N)), fp(cf(MEP)), fp(cf(MEN)), d, part, fp(o)), 'build_part')
+        return o
+
+    def blend_error_map(self, MEP, MEN):
+        o = np.empty(MEP.shape[1:], f32)
+        f = self._fn('blend_error_map')
+        f.argtypes = [C.POINTER(Params), FP, FP, FP]
+        self._ok(f(C.byref(self.prm), fp(cf(MEP)), fp(cf(MEN)), fp(o)), 'blend_error_map')
+        return o
+
+    def blend_mix(self, main, second, e):
+        o = np.empty_like(cf(main))
+        f = self._fn('blend_mix')
+        f.argtypes = [C.POINTER(Params), FP, FP, FP, FP]
+        self._ok(f(C.byref(self.prm), fp(cf(main)), fp(cf(second)), fp(cf(e)), fp(o)), 'blend_mix')
+        return o
+
+    def whole_peak(self, Bp, Bc):
+        Bp, Bc = cf(Bp), cf(Bc)
+        h, w = Bc.shape
+        T = whole_size(w, h)
+        out, t = np.empty(3, f32), C.c_int(-1)
+        surf = np.empty((T, T), f32) if T <= 1024 else None
+        f = self._fn('whole_peak')
+        f.argtypes = [C.POINTER(Params), FP, FP, FP, FP, C.POINTER(C.c_int)]
+        self._ok(f(C.byref(self.prm), fp(Bp), fp(Bc), fp(out), fp(surf), C.byref(t)), 'whole_peak')
+        if t.value == 0:
+            return None
+        if t.value != T:
+            raise RuntimeError(f'mvcuda_splat_whole_peak_host: T {t.value}, expected {T}')
+        return out, surf
 
     def me(self, y, fir):
         o = np.empty((self.cpu.mh, self.cpu.mw), f32)
@@ -313,7 +514,10 @@ def make_inputs(lib, src, start=0, count=5, phases=(0.5, 0.3), log=print):
     import time
     t0 = time.perf_counter()
     raw, (w, h) = read_pictures(src, start, count)
-    lib.set_size(w, h)
+    if lib.args:
+        lib.set_args(lib.args, w, h)  # named settings stay, at the size of the clip
+    else:
+        lib.set_size(w, h)
     lib.mode(0)  # the exact path
     I = dict(w=w, h=h, start=start, pics=raw, y={}, P={}, A={}, B={}, pair={}, ctr={}, build={})
     for c, r in enumerate(raw):
@@ -343,7 +547,7 @@ def make_inputs(lib, src, start=0, count=5, phases=(0.5, 0.3), log=print):
             I['build'][(p, d)] = lib.build(I['P'][p], I['P'][p + 1], I['ctr'][p]['fields'][0],
                                            I['ctr'][p + 1]['fields'][1], d)
     if log:
-        log(f'stage inputs: pictures {start} .. {start + count - 1} of {os.path.basename(src)} ({w} x {h}), ME grid '
+        log(f'stage inputs{" (" + lib.args + ")" if lib.args else ""}: pictures {start} .. {start + count - 1} of {os.path.basename(src)} ({w} x {h}), ME grid '
             f'{lib.mw} x {lib.mh}, {lib.n} candidates + zero; centres {sorted(I["ctr"])} (0: forward side only), '
             f'builds {sorted(I["build"])}; exact CPU path {time.perf_counter() - t0:.0f} s', flush=True)
     return I

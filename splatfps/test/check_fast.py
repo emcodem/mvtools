@@ -13,8 +13,9 @@ Whole filter (AviSynth+ through ffmpeg, hidden): the first F source pictures of 
 SplatFps(exact=false) against SplatFps(exact=true), every output code.
 
 Bounds (exit code 1 when exceeded): final vectors of the chain from luma equal (bit for bit) on at least 99.9 % of the
-ME pixels; per built frame (stage build and whole filter) at most 500 luma and 500 chroma codes differing, none by more
-than 2. The fast path is designed to give the exact bits (see splat_fast.h): the expected result is 0 differences.
+ME pixels; per built frame (stage build and whole filter) at most 500 luma and 500 chroma codes differing at
+1920 x 1080 (scaled with the pixel count: about 2000 at 3840 x 2160), none by more than 2; in the stage builds codes on
+a rounding tie of the exact value are not counted (stage_inputs.picture_diff). The fast path is designed to give the exact bits (see splat_fast.h): the expected result is 0 differences.
 """
 import argparse
 import os
@@ -27,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import avs_util as AU  # noqa: E402
 import stage_inputs as SI  # noqa: E402
 
-MAX_CODES, MAX_DIFF, MIN_VEC = 500, 2, 0.999
+MIN_VEC = 0.999
 
 
 def stage_results(lib, I):
@@ -67,7 +68,8 @@ def compare_frame(Ya, Ca, Yb, Cb):
     dY, dC = np.abs(Ya.astype(np.int64) - Yb), np.abs(Ca.astype(np.int64) - Cb)
     nY, nC = int(np.count_nonzero(dY)), int(np.count_nonzero(dC))
     mx = int(max(dY.max(initial=0), dC.max(initial=0)))
-    return nY, nC, mx, nY <= MAX_CODES and nC <= MAX_CODES and mx <= MAX_DIFF
+    lim = SI.max_codes(Yb.shape[-1], Yb.shape[-2])
+    return nY, nC, mx, nY <= lim and nC <= lim and mx <= SI.MAX_DIFF
 
 
 def check_stages(lib, I, modes):
@@ -96,8 +98,8 @@ def check_stages(lib, I, modes):
                 if eq < MIN_VEC:
                     bad.append(f'mode {m} {k}')
             elif k.startswith('build'):
-                nY, nC, mx, ok = compare_frame(*SI.out_codes(ref[k]), *SI.out_codes(got[k]))
-                notes[-1] += f' (codes: luma {nY}, chroma {nC}, max {mx})'
+                nY, nC, mx, cY, cC, ok = SI.picture_diff(got[k], ref[k])
+                notes[-1] += f' (codes: luma {nY}, chroma {nC}, without rounding ties {cY}, {cC}; max {mx})'
                 if not ok:
                     bad.append(f'mode {m} {k}')
         label = 'fast, AVX2' if simd else 'fast, portable'

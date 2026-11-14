@@ -1,6 +1,6 @@
 """The whole filter through AviSynth+ (ffmpeg's avs input, hidden), random access: copy frames and built frames.
 
-  python -I check_avs.py <dll dir> <splatcore_test.dll> <src clip> <rate num/den> <frames> <cpu | cuda>
+  python -I check_avs.py <dll dir> <splatcore_test.dll> <src clip> <rate num/den> <frames> <cpu | cuda> [settings]
 
 <frames>: comma-separated tokens: "copies" (every copy frame of the clip: P side, N side and end-of-clip
 placeholders), "builtK" (K built frames spread over the clip), or frame numbers. The frames are selected inside the
@@ -10,7 +10,8 @@ copy threshold).
   CudaSplatFps(exact=true).
 - cuda: CudaSplatFps(exact=true). Copy frames must be the source picture; built frames must equal
   SplatFps(exact=true) (the exact CPU path as a whole filter).
-10-bit 4:2:2 sources; the default settings of the filters.
+10-bit 4:2:2 sources; the default settings of the filters, or [settings]: named arguments given to both filters as
+written ("global_candidate=2, fallback_edge=1").
 """
 import os
 import random
@@ -25,6 +26,7 @@ import stage_inputs as SI  # noqa: E402
 
 def main():
     ddir, capi, src, rate, which, variant = sys.argv[1:7]
+    extra = (', ' + sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7].strip() else ''
     from fractions import Fraction
     rout = Fraction(rate)
     n, rin, w, h, pix = AU.probe(src)
@@ -46,9 +48,9 @@ def main():
     random.Random(1).shuffle(frames)
     r = f'{rout.numerator}, {rout.denominator}'
     if variant == 'cpu':
-        test, other = f'SplatFps({r}, exact=false)', f'CudaSplatFps({r}, exact=true)'
+        test, other = f'SplatFps({r}, exact=false{extra})', f'CudaSplatFps({r}, exact=true{extra})'
     else:
-        test, other = f'CudaSplatFps({r}, exact=true)', f'SplatFps({r}, exact=true)'
+        test, other = f'CudaSplatFps({r}, exact=true{extra})', f'SplatFps({r}, exact=true{extra})'
     head = AU.source_script(src, [os.path.join(ddir, 'splatfps.dll')])
     src_script = AU.source_script(src, var='s')
 
