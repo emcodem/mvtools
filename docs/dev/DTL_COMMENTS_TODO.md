@@ -174,10 +174,20 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
 13. NVOFA chroma: run `CudaNVOFAnalyse` with NV12 / ABGR8 input on the flat-luma synthetic clip. If NVOFA ignores
     colour: 3 runs + per-block colour-SAD selection in `k_of_blocks` (SAD kernel exists), opt-in, judged on real
     material. Cost 3 OFA runs (~2.6 ms each UHD medium, 1 OFA engine on the 5090).
-14. NVENC revisited along DTL's lines, target Pascal-Turing cards without OFA, in this order:
-    (a) Y/U/V (or R/G/B) runs on separate NVENC engines (3 on the 5090: about one run's wall time), selection by
-        colour SAD + median of engine cells per block; score with `compare/nvencme_frc/scripts/prescreen.py`
-        against the old prototype.
+14. NVENC revisited along DTL's lines, target Pascal-Turing cards without OFA, in this order. Engine: the NVENC SDK
+    (it also runs on Linux); D3D12 only as a Windows comparison.
+    (a) DONE 2026-11-14 as a prototype (`compare/nvencme_colour`, `NVME_COLOUR` in NVENCMEProto): Y/U/V or R/G/B grey
+        runs + per-cell colour-SAD selection. Chroma-only motion is found (88-93 % vs 0 %). seg1_wires_pole: +0.2..0.7
+        dB in the skip-frame test, about the same as a luma run choosing among its 8 neighbours (`ynb`); fields less
+        coherent; all variants far behind NVOFA (blocks > 24: 13-18 k vs 2.2 k). Open: a clip with colour-only
+        detail (DTL's case), speed with 3 NVENC engines in parallel (the prototype runs the 3 calls one after another),
+        judging by eye. Own levers on top (same folder): encoder QP, smoothness term, swapped run with
+        forward-backward check, temporal hints. Best accuracy: luma + swapped run, QP 10 (beats the exact search in
+        the skip-frame test); every coherence gain costs accuracy. Next: speed on a Pascal / Turing card.
+        Research plugin for DTL: nvencmv.dll / CudaNVENCAnalyse (Documentation/nvencmv.md), all of the above as
+        parameters plus hintclip (any vector clip as NVENC hints, his additional-predictor idea from the other side).
+        DTL's GTX 1060 MShow/Subtract test does not show chroma use (MShow draws on the colour picture, showsad
+        includes chroma SAD): ask him for a raw vector comparison or the flat-luma probe on Pascal.
     (b) the same vectors fed to MAnalyse through item 12 (software search supplies the coherence NVENC lacks);
         compare with the exact search and NVOFA, user judges by eye.
     (c) DTL's interleaving ideas only if (a) / (b) fall short. Sceptical: the engine's sub-pel interpolation mixes

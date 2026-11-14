@@ -10,11 +10,11 @@
 
 set(MVCUDA_SOURCES
   mvcuda.cu mvcuda_core.cu mvcuda_frames.cu mvcuda_resample.cu mvcuda_temporal.cu mvcuda_merge.cu mvcuda_kobs.cu
-  mvcuda_nnedi3.cu mvcuda_comp.cu mvcuda_nvofa.cu
+  mvcuda_nnedi3.cu mvcuda_comp.cu mvcuda_nvofa.cu mvcuda_nvenc.cu
   mvcuda_analyse_16.cu mvcuda_analyse_8.cu mvcuda_analyse_16_p1.cu mvcuda_analyse_8_p1.cu mvcuda_analyse_16_p2.cu
   mvcuda_analyse_8_p2.cu mvcuda_analyse_16_p3.cu mvcuda_analyse_8_p3.cu
   mvcuda_super_8.cu mvcuda_super_16.cu mvcuda_recalc_8.cu mvcuda_recalc_16.cu
-  mvcuda_flow_8.cu mvcuda_flow_16.cu mvcuda_nvof_vec_8.cu mvcuda_nvof_vec_16.cu
+  mvcuda_flow_8.cu mvcuda_flow_16.cu mvcuda_nvof_vec_8.cu mvcuda_nvof_vec_16.cu mvcuda_nvenc_vec_8.cu mvcuda_nvenc_vec_16.cu
   mvcuda_splat.cu mvcuda_splat_exact.cu mvcuda_splat_fast.cu)
 
 add_library(mvtools_cuda SHARED ${MVCUDA_SOURCES})

@@ -139,7 +139,25 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
 - X1 fully parallel block search (predictors only from the coarser level and the previous frame): expected 10-50x for the
   search; vector fields less coherent, needs visual judgement (e.g. `exact=false`).
 - X2 approximate SADs for pruning, exact SAD for the best few (2-4x at large radii).
-- X3 NVENC ME-only (see NVENCMEAnalyse.md, DTL list item 14).
+- X3 NVENC ME-only (see NVENCMEAnalyse.md, DTL list item 14). 2026-11-14: DTL's colour proposal (3 grey runs Y/U/V
+  or R/G/B, per-cell colour-SAD selection) prototyped in compare/nvencme_colour: works for chroma-only motion, small
+  gain on real footage, still far behind NVOFA. NVENC SDK is the engine to build on (Linux); D3D12 for comparison only.
+  Further levers tested the same day (QP, smoothness term, swapped run + forward-backward check, temporal hints): QP and
+  smoothing trade accuracy for coherence; best = luma + swapped run at QP 10 (skip-frame test better than the exact
+  search, fields less coherent). NVENC lands in the exact search's class, so for old cards it is a speed question:
+  measure NVENC vs CudaMAnalyse on a Pascal / Turing card (DTL's GTX 1060?) before building anything.
+  2026-11-14 night: built anyway as a research plugin for DTL and us: nvencmv.dll, CudaNVENCAnalyse
+  (Documentation/nvencmv.md; device code mvcuda_nvenc*.cu, API 33). Every option of the prototype, deterministic
+  session="reset" (= fresh encoders, 4x faster). Open: QTGMC test and QTGMC-tuned defaults (user: defaults for what QTGMC
+  needs), whole-chain overlap test (NVENC next to busy CUDA), Pascal / Turing run, VapourSynth via the bridge, Linux build,
+  HEVC ME-only output (zero vectors), lambda pulls to the luma field (works against channels=yuv).
+  2026-11-15: QTGMC test done (compare/nvencme_colour, QTGMC_gpu_nvenc in make_qtgmc_gpu.py): NVENC vectors slightly
+  worse than the exact search (-0.1..-0.5 dB vs ground truth), NVOFA between; on the 5090 slower than the exact GPU
+  search in the whole chain (XDCAM Fast 3.31 vs 2.54 s, NVOFA 1.67). Open: crops not judged, QTGMC default args
+  (plain is fastest, variants within 0.15 dB), Pascal / Turing timing, ground truth with clean source + added grain.
+- CudaNVOFAnalyse defaults to hpad / vpad 16, MSuper to 8: with the defaults on both sides, CPU MCompensate / MDegrain1
+  crash (exit 139, also in release 2026-11-13; found by the nvencmv suite). Decide: NVOFA default 8, and/or a padding
+  check in the MVTools consumers (MVClip vs super). CudaNVENCAnalyse uses 8.
 - X4 tolerance-based instead of exact CPU fallback (fewer forced CPU frames, possible flicker).
 - meander=false for uc_FRC (vectors differ from stock; FRC 8.71 -> 5.51 s at the time).
 - Milestone F: FFT3DFilter (and dfttest, only if used anywhere) on the GPU with cuFFT; cannot be bit-exact.

@@ -17,6 +17,8 @@ LoadPlugin(QTGMC_gpu_plugins + "LoadDLL.dll")
 LoadDLL(QTGMC_gpu_plugins + "libfftw3f-3.dll")
 LoadPlugin(QTGMC_gpu_plugins + "mvtools2.dll")
 LoadPlugin(QTGMC_gpu_plugins + "cudafilters.dll")
+# nvencmv.dll (CudaNVENCAnalyse, QTGMC_gpu_nvenc) is optional
+Exist(QTGMC_gpu_plugins + "nvencmv.dll") ? LoadPlugin(QTGMC_gpu_plugins + "nvencmv.dll") : NOP()
 LoadPlugin(QTGMC_gpu_plugins + "ffms2.dll")
 LoadPlugin(QTGMC_gpu_plugins + "masktools2.dll")
 LoadPlugin(QTGMC_gpu_plugins + "RgTools.dll")
@@ -33,6 +35,9 @@ Import(QTGMC_gpu_bundle + "scripts\QTGMC_gpu.avsi")
 # global QTGMC_gpu_meander = false after QTGMC_gpu_on() for the faster wavefront search with slightly different vectors)
 # QTGMC_gpu_nvof (global QTGMC_gpu_nvof = true after QTGMC_gpu_on()): the vectors come from the NVIDIA optical flow
 # accelerator instead of a search; not exact, about as fast as the wavefront search
+# QTGMC_gpu_nvenc (global QTGMC_gpu_nvenc = true after QTGMC_gpu_on()): the vectors come from the video encoder's motion
+# estimation (CudaNVENCAnalyse of nvencmv.dll, also on cards without NVOFA); not exact; further arguments in
+# QTGMC_gpu_nvenc_args, e.g. global QTGMC_gpu_nvenc_args = """, channels="yuv" """
 function QTGMC_gpu_on()
 {
 	global QTGMC_gpu = true

@@ -19,7 +19,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 32
+#define MVCUDA_API_VERSION 33
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -165,6 +165,52 @@ MVCUDA_API int mvcuda_nvof_token(const MvCudaSuperParams *sp, const MvCudaNvofPa
 
 // 1 when NVOFA can be used (device present, nvofapi64.dll of the driver loaded, a session can be made), else 0.
 MVCUDA_API int mvcuda_nvof_available(void);
+
+// ---- vectors from the video encoder's motion estimation (nvencmv's CudaNVENCAnalyse, API 33), see mvcuda_nvenc_vec.cu --
+// NOT MAnalyse's search and not bit-exact with any CPU code. Per call: one or more grey pictures per frame (luma, or
+// three colour channels), NVENC ME-only runs on them (8x8 grid, quarter pel), per grid cell the candidate with the lowest
+// cost (SAD + optional smoothness / consistency terms), then per block the median of the cells under it at 1/pel pixel,
+// clamped to MAnalyse's search area, with its SAD.
+
+typedef struct
+{
+  int blk_x, blk_y, overlap_x, overlap_y; // block geometry
+  int n_blk_x, n_blk_y;                   // number of blocks (MAnalyse's formula)
+  int chroma_sad_scale;                   // effective chroma SAD scale (>0 shift right, <0 shift left), as MAnalyse's
+  int codec;      // 0 H.264, 1 HEVC
+  int preset;     // NVENC P1..P7
+  int qp;         // -1: the preset's rate control; 0..51: constant QP (higher: vectors cost more, smoother fields)
+  int no_intra;   // H.264: no intra search
+  int p16;        // H.264: 16x16 partitions only
+  int fresh;      // encoder state: 1 a new encoder per run; 2 kept, reset by a run on a flat picture; 0 kept (the previous
+                  // field serves as predictors: the result depends on the call order)
+  int half;       // 1: ME on the picture downscaled 2x2 (twice the range, cells of 16 pixels)
+  int channels;   // 0: luma; 1: Y, U, V (chroma at luma size) as three grey runs; 2: R, G, B (BT.709) as three runs
+  int swap;       // 1: one more run of the first channel with the pictures swapped: its negated field adds candidates
+  int neighbours; // 1: every run's 8 neighbouring cells are candidates too
+  int lambda;     // smoothness: cost += lambda * d^2 / 256, d in half pel to the 3x3 median of the first run's field
+  int fb_penalty; // with swap: cost += fb_penalty when the vector fails the forward-backward check (more than 1 pixel)
+  int hints;      // external hint candidates per 16x16 macroblock in `hints` (H.264, 0..4; 0: none)
+  int sad_chroma; // 1: chroma in the SADs (output, and selection; with channels > 0 the selection always uses chroma);
+                  // sp->chroma only says the chroma planes are there
+} MvCudaNvencParams;
+
+// The grid of the ME picture for a source of width x height: cells of 8 (half: 16) source pixels.
+MVCUDA_API int mvcuda_nvenc_grid(int width, int height, int codec, int half, int *grid_w, int *grid_h);
+
+// One vector field from src_token to ref_token (device frames of the format sp describes; sp: levels 1, pel 1 or 2,
+// padding of the MSuper used downstream). hints: ep->hints (x, y) integer-pel pairs of the ME picture per 16x16
+// macroblock in raster order, applied to the forward runs, or null. payload: one-level MAnalyse payload, as
+// mvcuda_nvof_token. grid_out (optional, grid_w * grid_h (x, y) pairs): the chosen cell vectors, quarter pel of the ME
+// picture. stats (optional, 64 counters, added to): how often each candidate won (index: run * (neighbours ? 9 : 1) +
+// cell, runs = channel runs then the swapped run). Call from an ordinary worker thread (NVENC calls block).
+// MVCUDA_TOKEN_GONE when a token was evicted, MVCUDA_NEEDS_CPU when NVENC is not available or fails, -4 bad arguments.
+MVCUDA_API int mvcuda_nvenc_token(const MvCudaSuperParams *sp, const MvCudaNvencParams *ep, unsigned long long src_token,
+  unsigned long long ref_token, const short *hints, int *payload, int payload_words, short *grid_out, int grid_words,
+  long long *stats);
+
+// 1 when NVENC ME-only can be used for that codec (0 H.264, 1 HEVC), else 0; why (optional) gets the reason.
+MVCUDA_API int mvcuda_nvenc_available(int codec, char *why, int why_len);
 
 // ---- GPU MFlowFps (M7), see mvcuda_flow.cu -----------------------------------------------------------------------
 

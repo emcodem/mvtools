@@ -483,6 +483,10 @@ CPU QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (
 plain search clip, `QTGMC_gpu_nvof_preset` 1 fast / 2 medium / 3 slow; MRecalculate refines them as usual): not bit-exact. The search
 itself costs about as much as the `meander=false` wavefront search (about 0.2 ms per 1080p frame, against 1.3 ms for
 the exact search); the rest of QTGMC is unchanged. SubPel 4 and GPUs without NVOFA use the exact search.
+`global QTGMC_gpu_nvenc = true` takes them from the video encoder's motion estimation (CudaNVENCAnalyse of nvencmv.dll,
+[nvencmv.md](nvencmv.md); for GPUs without NVOFA, Pascal and newer); `QTGMC_gpu_nvenc_args` passes further arguments, e.g.
+`global QTGMC_gpu_nvenc_args = """, channels="yuv", qp=20"""`. Not bit-exact; `QTGMC_gpu_nvof` wins when both are set;
+SubPel 4, GPUs without NVENC ME and a missing nvencmv.dll use the exact search.
 A stage without a GPU path (above 10 bit: lookup tables and NNEDI3; NNEDI3 also on CPUs without its AVX2 + FMA path)
 stops the script at creation; set `global cuda_cpu_fallback = true` before QTGMC to run such stages on the CPU.
 

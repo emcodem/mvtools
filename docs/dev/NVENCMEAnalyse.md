@@ -1,5 +1,11 @@
 # NVENCMEAnalyse: motion vectors from the NVENC motion estimator (plan)
 
+> **Status 2026-11-14: built as `nvencmv.dll` / `CudaNVENCAnalyse`** ([Documentation/nvencmv.md](../../Documentation/nvencmv.md)),
+> a research plugin with every engine option, after the colour and selection tests in
+> [compare/nvencme_colour](../../compare/nvencme_colour/README.md). Decisions (user): own DLL, requires mvtools_cuda (no
+> driver-only mode), name CudaNVENCAnalyse, defaults to be tuned for QTGMC. This plan below is older: the "two modes",
+> NVENCMEAnalyse name and the standalone mode were dropped.
+
 > **Status 2026-11-02:** on hold. DTL's own DX12_ME build was tried (compare/dtl_dx12_frc): same vectors as our D3D12
 > prototype, far behind NVOFA. Phase 0 (CMake as the only build, Linux, Windows) is done. Open idea: TODO.md / DTL list
 > item 14 (NVENC for cards without NVOFA).

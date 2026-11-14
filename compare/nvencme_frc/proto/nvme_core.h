@@ -162,6 +162,14 @@ namespace nvme
         return fail("nvEncGetEncodePresetConfigEx", s);
       pc.presetCfg.frameIntervalP = 1; // no B frames in ME-only mode
       pc.presetCfg.gopLength = NVENC_INFINITE_GOPLENGTH;
+      // NVME_QP=<0..51>: constant QP; the encoder's ME cost is SAD + lambda(QP) * vector bits, so a high QP should
+      // favour cheap (predictor-like, smoother) vectors
+      if (const char *q = std::getenv("NVME_QP"))
+      {
+        const int qp = std::atoi(q);
+        pc.presetCfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
+        pc.presetCfg.rcParams.constQP.qpInterP = pc.presetCfg.rcParams.constQP.qpInterB = pc.presetCfg.rcParams.constQP.qpIntra = qp;
+      }
       // ME-only mode reads the codec union as NV_ENC_CONFIG_H264_MEONLY / _HEVC_MEONLY: clear what the encoder preset
       // put there (it would be read as "disable partition" / "disable intra" bits) and set the ME-only fields
       std::memset(&pc.presetCfg.encodeCodecConfig, 0, sizeof(pc.presetCfg.encodeCodecConfig));
@@ -524,20 +532,23 @@ namespace nvme
       }
   }
 
-  // Hints for the macroblocks of a picture twice the size of the coarse one: per MB the coarse vector under its centre
-  // and the median of the 3x3 coarse cells around it, in integer pixels of the fine picture (2 candidates).
-  inline void hints_from(const std::vector<Mv> &cg, int cgw, int cgh, int fw, int fh, std::vector<NVENC_EXTERNAL_ME_HINT> &out)
+  // Hints for the macroblocks of a picture `scale` (2: twice, 1: the same) times the size of the coarse one: per MB the
+  // coarse vector under its centre and the median of the 3x3 coarse cells around it, in integer pixels of the fine
+  // picture (2 candidates).
+  inline void hints_from(const std::vector<Mv> &cg, int cgw, int cgh, int fw, int fh, std::vector<NVENC_EXTERNAL_ME_HINT> &out,
+    int scale = 2)
   {
     const int mbw = (fw + 15) / 16, mbh = (fh + 15) / 16;
     out.assign((size_t)mbw * mbh * 2, NVENC_EXTERNAL_ME_HINT{});
-    auto conv = [](int q) { // coarse quarter pel -> fine integer pel: q * 2 / 4, rounded half away from zero
-      return q >= 0 ? (q + 1) / 2 : -((-q + 1) / 2);
+    auto conv = [scale](int q) { // coarse quarter pel -> fine integer pel: q * scale / 4, rounded half away from zero
+      const int d = 4 / scale;
+      return q >= 0 ? (q + d / 2) / d : -((-q + d / 2) / d);
     };
     int vx[9], vy[9];
     for (int my = 0; my < mbh; my++)
       for (int mx = 0; mx < mbw; mx++)
       {
-        const int gx = std::min((mx * 16 + 8) / 2 / 8, cgw - 1), gy = std::min((my * 16 + 8) / 2 / 8, cgh - 1);
+        const int gx = std::min((mx * 16 + 8) / scale / 8, cgw - 1), gy = std::min((my * 16 + 8) / scale / 8, cgh - 1);
         int n = 0;
         for (int dy = -1; dy <= 1; dy++)
           for (int dx = -1; dx <= 1; dx++)

@@ -87,6 +87,8 @@ def main():
             'global QTGMC_gpu_meander = true # with QTGMC_gpu: true = as stock QTGMC (slice search, byte-identical to the CPU-mt result), false = wavefront search (meander=false, single slice: faster on the GPU, slightly different vectors)\n'
             'global QTGMC_gpu_nvof = false # with QTGMC_gpu: MAnalyse vectors from the optical flow accelerator (CudaNVOFAnalyse, not bit-exact; MRecalculate refines them); pel 4 and GPUs without NVOFA use the exact search\n'
             'global QTGMC_gpu_nvof_preset = 2 # with QTGMC_gpu_nvof: 1 fast, 2 medium, 3 slow\n'
+            'global QTGMC_gpu_nvenc = false # with QTGMC_gpu: MAnalyse vectors from the video encoder (CudaNVENCAnalyse of nvencmv.dll, not bit-exact); pel 4 and GPUs without NVENC ME use the exact search; QTGMC_gpu_nvof wins when both are set\n'
+            'global QTGMC_gpu_nvenc_args = "" # with QTGMC_gpu_nvenc: further CudaNVENCAnalyse arguments, e.g. """, channels="yuv", qp=20"""\n'
             'global QTGMC_gpu_search = false # with QTGMC_gpu: true = the search clip is made by cudafilters.dll (needs LoadPlugin of it)\n'
             'global QTGMC_gpu_tokens = true # with QTGMC_gpu_search: the search clip stays on the device, MSuper / MAnalyse read it there\n'
             'global QTGMC_gpu_edi = false # with QTGMC_gpu: NNEDI3 by cudafilters.dll CudaNNEDI3 (needs LoadPlugin of it)\n'
@@ -113,11 +115,15 @@ def main():
             return 'c.%s( %s )' % (fn, ', '.join('%s=%s' % (p.split()[0], extra.get(p.split()[0], p.split()[0])) for p in params))
         nv = ('nv_clip.CudaNVOFAnalyse( isb=isb, delta=delta, blksize=blksize, blksizeV=blksizeV, overlap=overlap, overlapV=overlapV, '
               'pel=nv_pel, hpad=nv_hpad, vpad=nv_vpad, chroma=chroma, preset=QTGMC_gpu_nvof_preset )')
+        ne = ('Eval("nv_clip.CudaNVENCAnalyse( isb=isb, delta=delta, blksize=blksize, blksizeV=blksizeV, overlap=overlap, '
+              'overlapV=overlapV, pel=nv_pel, hpad=nv_hpad, vpad=nv_vpad, chroma=chroma" + QTGMC_gpu_nvenc_args + " )")')
         return ('function QTGMC_MAnalyse( clip c, clip "nv_clip", int "nv_pel", int "nv_hpad", int "nv_vpad", %s )\n{\n'
                 '\tnvof = QTGMC_gpu && QTGMC_gpu_nvof && IsClip(nv_clip) && nv_pel <= 2 \\\n'
                 '\t       && FunctionExists("CudaNVOFAvailable") && CudaNVOFAvailable()\n'
-                '\treturn nvof ? %s \\\n\t             : QTGMC_gpu ? %s \\\n\t                       : %s\n}\n'
-                % (decl, nv, call('CudaMAnalyse', {'meander': 'Default(meander, QTGMC_gpu_meander)'}), call('MAnalyse', {})))
+                '\tnvenc = !nvof && QTGMC_gpu && QTGMC_gpu_nvenc && IsClip(nv_clip) && nv_pel <= 2 \\\n'
+                '\t       && FunctionExists("CudaNVENCAvailable") && CudaNVENCAvailable()\n'
+                '\treturn nvof ? %s \\\n\t     : nvenc ? %s \\\n\t             : QTGMC_gpu ? %s \\\n\t                       : %s\n}\n'
+                % (decl, nv, ne, call('CudaMAnalyse', {'meander': 'Default(meander, QTGMC_gpu_meander)'}), call('MAnalyse', {})))
 
     def wrapper(name, clips, params, gpu_extra=None):
         decl = ', '.join('%s "%s"' % (types[p.split()[1]], p.split()[0]) for p in params)

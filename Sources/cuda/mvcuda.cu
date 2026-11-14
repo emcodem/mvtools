@@ -3,6 +3,7 @@
 #include "mvcuda.h"
 #include "mvcuda_internal.h"
 #include "mvcuda_nvofa.h"
+#include "mvcuda_nvenc.h"
 
 #include <cuda_runtime.h>
 
@@ -214,6 +215,49 @@ extern "C" int mvcuda_nvof_token(const MvCudaSuperParams *sp, const MvCudaNvofPa
 extern "C" int mvcuda_nvof_available(void)
 {
   return mvc::use_device() && mvc_nvofa::available() ? 1 : 0;
+}
+
+extern "C" int mvcuda_nvenc_token_8(const MvCudaSuperParams *, const MvCudaNvencParams *, unsigned long long, unsigned long long,
+  const short *, int *, int, short *, int, long long *);
+extern "C" int mvcuda_nvenc_token_16(const MvCudaSuperParams *, const MvCudaNvencParams *, unsigned long long, unsigned long long,
+  const short *, int *, int, short *, int, long long *);
+
+extern "C" int mvcuda_nvenc_token(const MvCudaSuperParams *sp, const MvCudaNvencParams *ep, unsigned long long src_token,
+  unsigned long long ref_token, const short *hints, int *payload, int payload_words, short *grid_out, int grid_words,
+  long long *stats)
+{
+  if (!sp)
+    return -4;
+  return sp->bits_per_pixel <= 8
+    ? mvcuda_nvenc_token_8(sp, ep, src_token, ref_token, hints, payload, payload_words, grid_out, grid_words, stats)
+    : mvcuda_nvenc_token_16(sp, ep, src_token, ref_token, hints, payload, payload_words, grid_out, grid_words, stats);
+}
+
+extern "C" int mvcuda_nvenc_grid(int width, int height, int codec, int half, int *grid_w, int *grid_h)
+{
+  if (width < 1 || height < 1 || !grid_w || !grid_h)
+    return -4;
+  const int s = half ? 2 : 1;
+  const int w = (((width + s - 1) / s) + 1) & ~1, h = (((height + s - 1) / s) + 1) & ~1;
+  *grid_w = codec ? (w + 7) / 8 : (w + 15) / 16 * 2;
+  *grid_h = codec ? (h + 7) / 8 : (h + 15) / 16 * 2;
+  return 0;
+}
+
+extern "C" int mvcuda_nvenc_available(int codec, char *why, int why_len)
+{
+  std::string err;
+  int r = 0;
+  if (!mvc::use_device())
+    err = "no usable CUDA device";
+  else
+    r = mvc_nvenc::available(codec, err);
+  if (why && why_len > 0)
+  {
+    std::strncpy(why, err.c_str(), (size_t)why_len - 1);
+    why[why_len - 1] = 0;
+  }
+  return r;
 }
 
 extern "C" int mvcuda_flow_host_8(const MvCudaSuperParams *, const MvCudaFlowParams *, const void *const[3], const int[3],
