@@ -43,7 +43,7 @@ and `_uc_plan` (the chosen chain), e.g.
 | input | video | audio | fallback |
 |---|---|---|---|
 | `.mxf` | `MxfSource` | `MxfSource(use_audio="always")`: all tracks merged in track order | audio fails: video from MxfSource, audio from LWLibav; open fails: LWLibav for both |
-| `.mov`, `.mp4`, `.m4v` | `LSMASHVideoSource` (container sample tables, no index) | `LSMASHAudioSource`, one call per track, merged | open fails: LWLibav |
+| `.mov`, `.mp4`, `.m4v` | `LSMASHVideoSource` (container sample tables, no index) | `LSMASHAudioSource`, one call per track, merged | open fails: LWLibav for both; no audio track L-SMASH can open: audio from LWLibav |
 | everything else | `LWLibavVideoSource` (index file in `cachedir`, never next to the source; no `cachedir`: not written) | `LWLibavAudioSource`, one call per stream, merged in stream order | - |
 
 - `source=` forces one of `"mxf"`, `"lsmash"`, `"lwlibav"`.
@@ -124,7 +124,7 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
 | stage | GPU chain (`gpu=true`, default) | CPU chain (`gpu=false`) |
 |---|---|---|
 | deinterlace | QTGMC (`QTGMC_gpu.avsi`) with its GPU switches; motion vectors optionally from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) | QTGMC; preset `uc_qtgmc_preset` (default "Fast") in both chains |
-| frame-rate conversion (MC) | `CudaSplatFps` | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
+| frame-rate conversion (MC) | `CudaSplatFps`; candidates optionally from the NVIDIA optical flow accelerator (`uc_frc_nvof`: `CudaNVOFAnalyse` via `MSplatVectors`) | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
 | scale | `z_ConvertFormat` (avsresize), Spline36 | same |
 | interlace | `CudaConvolution` with `uc_interlace.json` | `mt_convolution` |
 

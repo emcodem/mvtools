@@ -35,6 +35,10 @@ global uc_interlace_preset_kernel = "31 -66 -235 1075 2486 1075 -235 -66 31"   #
 # false: the GPU search gives the same vectors as the CPU QTGMC.
 global uc_qtgmc_nvof = false
 
+# GPU frame-rate conversion: CudaSplatFps candidates from the NVIDIA optical flow accelerator (CudaNVOFAnalyse via
+# MSplatVectors) instead of its built-in phase correlation. Without NVOFA (older than Turing) the built-in one is used.
+global uc_frc_nvof = false
+
 # QTGMC preset of the deinterlacer (both chains). "Super Fast" is about 1.5x faster on the GPU chain, at lower quality.
 global uc_qtgmc_preset = "Fast"
 
@@ -154,7 +158,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
         c = (i_in || frc == "mc") && wbits != bits ? c.ConvertBits(wbits, dither=-1, fulls=full, fulld=full) : c
         if (i_in) {
             c = uc_Deint(c, scan == "tff", gpu)
-            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof ? "-nvof" : "") : "") + " " + scan
+            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : "") : "") + " " + scan
         }
         if (spatial && pre_scale) {
             c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb)
@@ -164,7 +168,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
             c = mc_gpu && threads > 0 ? c.Prefetch(threads) : c
             c = uc_FRC(c, p_n, p_d, gpu)
             c = mc_gpu && threads > 0 ? c.Prefetch(1) : c
-            plan = plan + " | frc=" + (gpu ? "splat " : "mc ") + string(p_n) + "/" + string(p_d)
+            plan = plan + " | frc=" + (gpu ? "splat" + (uc_frc_nvof && uc_NvofOk() ? "-nvof " : " ") : "mc ") + string(p_n) + "/" + string(p_d)
         }
         if (frc == "drop") {
             c = c.SelectEvery(round(r / p), 0).AssumeFPS(p_n, p_d)
@@ -259,9 +263,12 @@ function uc_Source(string file, string "source", string "cachedir")
             ok = false
         }
         if (ok) {
+            # no audio track L-SMASH can open (e.g. big-endian PCM of some cameras): the audio from LWLibav
             a = uc_LSAudio(file)
+            la = IsClip(a)
+            a = la ? a : uc_LWAudio(file, cf)
             c = IsClip(a) ? AudioDub(c, a) : c
-            info = "video=lsmash audio=" + (IsClip(a) ? "lsmash" : "none")
+            info = "video=lsmash audio=" + (la ? "lsmash" : IsClip(a) ? "lwlibav (none from L-SMASH)" : "none")
         } else {
             kind = "lwlibav"
             info = " (L-SMASH: " + e3 + ")"
@@ -410,26 +417,34 @@ function uc_FRC(clip c, int num, int den, bool "gpu")
     return Default(gpu, false) ? uc_FRCGpu(c, num, den) : uc_FRCCpu(c, num, den)
 }
 
-# GPU: CudaSplatFps with the benchmarked light settings (16 candidates). Greyscale runs as 4:4:4 with neutral chroma;
+# GPU: CudaSplatFps with its default settings. Greyscale runs as 4:4:4 with neutral chroma;
 # alpha is converted with the picture's motion candidates (SplatAnalyse of the picture). SplatFps refuses 4:2:0 sited
 # on the luma rows (_ChromaLocation 2..5): such clips are treated as left-sited here (the output gets the source's
 # property back at the end).
 function uc_FRCGpu(clip c, int num, int den)
 {
-    bp = [1, 2, 3]
-    nb = [0, 0, 1]
     m = c.HasAlpha ? c.RemoveAlphaPlane() : c
     grey = m.IsY
     m = grey ? m.ConvertToYUV444() : m
     m = m.Is420 && uc_PropInt(m, "_ChromaLocation", 0) >= 2 ? m.propSet("_ChromaLocation", 0) : m
-    out = m.CudaSplatFps(num, den, block_peaks=bp, nearest_block=nb)
+    nvof = uc_frc_nvof && uc_NvofOk()
+    # NVOFA: 4x4 blocks match SplatFps' grid; hpad / vpad 64 limit the vectors to 64 pixels per frame
+    vec = nvof ? MSplatVectors(m.CudaNVOFAnalyse(isb=true, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64),
+    \                          m.CudaNVOFAnalyse(isb=false, delta=1, blksize=4, overlap=0, pel=2, hpad=64, vpad=64)) : Undefined()
+    out = nvof ? m.CudaSplatFps(num, den, vectors=vec) : m.CudaSplatFps(num, den)
     if (c.HasAlpha) {
         ac = c.ExtractA().ConvertToYUV444()
-        vec = m.SplatAnalyse(block_peaks=bp, nearest_block=nb)
-        av = ac.CudaSplatFps(num, den, vectors=vec, block_peaks=bp, nearest_block=nb).ExtractY()
+        vec = nvof ? vec : m.SplatAnalyse()
+        av = ac.CudaSplatFps(num, den, vectors=vec).ExtractY()
     }
     out = grey ? out.ExtractY() : out
     return c.HasAlpha ? out.AddAlphaPlane(av) : out
+}
+
+# true when the NVIDIA optical flow accelerator can be used (cudafilters loaded, a GPU with NVOFA)
+function uc_NvofOk()
+{
+    return FunctionExists("CudaNVOFAvailable") ? CudaNVOFAvailable() : false
 }
 
 function uc_FRCCpu(clip c, int num, int den)
