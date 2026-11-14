@@ -50,6 +50,7 @@ This is the only build this branch maintains and tests.
 | `DePan.dll`, `DePanEstimate.dll` / `libdepan.so`, `libdepanestimate.so` | DePan plugins | |
 | `mvtools_vsbridge.dll` / `libmvtools_vsbridge.so` | VapourSynth host for the plugins (`-DMVTOOLS_VAPOURSYNTH=OFF` skips it) | nothing extra (headers vendored) |
 | `cudafilters.dll` / `libcudafilters.so` | GPU filters (AviSynth+; VapourSynth `cuda`) | nothing extra (`-DMVTOOLS_GPU=OFF` skips it) |
+| `MovingPattern.dll` / `libmovingpattern.so` | synthetic moving test clips (AviSynth+ source filter; `-DMVTOOLS_MOVINGPATTERN=OFF` skips it) | C++17 compiler |
 | `mvtools_cuda.dll` / `libmvtools_cuda.so` | CUDA backend, loaded at run time | CUDA 12.8 .. 12.x, 12.9 recommended (`CMAKE_CUDA_COMPILER`); Windows: MSVC 14.4x (v143) as host compiler; `-DMVTOOLS_CUDA=OFF` skips it |
 
 The CUDA part is built with CUDA 12 only: CUDA 13 has no Pascal (GTX 10xx) or Volta targets any more. CMake checks the
@@ -261,6 +262,18 @@ compute capability 6.0); reads and writes the GPU token frames of `mvtools_cuda.
     CudaConvolution(width=1920, height=1080)
 
 * Reference: `cudaconvolution/docs/usage.md`. Sources and its own build / tests: `cudaconvolution/` (README.md).
+
+## MovingPattern (this branch)
+
+`MovingPattern.dll`: an AviSynth+ source of synthetic moving test clips, any size, frame rate, scan (each field of
+an interlaced clip at its own instant) and planar YUV / Y format, with all colour and scan frame properties as
+arguments. The default pattern stresses deinterlacing and frame-rate conversion (textured sub-pixel pan, zoom,
+moving objects with occlusion, fine stripes, grain, a scene cut). The clip is generated once and kept in memory
+(or in a temp file, or rendered per frame). UConvert's benchmark (`uconvert/bench/`) uses it.
+
+    MovingPattern(1920, 1080, "YUV422P10", 25, 1, "tff")
+
+* Reference and sources: `movingpattern/` (README.md).
 
 ## VapourSynth (this branch; Linux and Windows)
 

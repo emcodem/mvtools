@@ -17,6 +17,7 @@
 #   splatfps        splatfps.dll (MVTOOLS_SPLATFPS)
 #   nvencmv         nvencmv.dll (MVTOOLS_NVENCMV; needs mvtools_cuda at run time)
 #   CudaConvolution CudaConvolution.dll (MVTOOLS_CUDACONVOLUTION, MSVC only; cudaconvolution/README.md)
+#   movingpattern   MovingPattern.dll / libmovingpattern.so (MVTOOLS_MOVINGPATTERN; synthetic test clips)
 # This CMake build is the one we maintain and test. The Visual Studio solution (mvtools.sln / .slnx) is upstream's,
 # unchanged: it builds upstream's CPU plugins only (without the GPU and VapourSynth parts).
 cmake_minimum_required(VERSION 3.18...3.31)
@@ -230,6 +231,13 @@ if(MVTOOLS_NVENCMV)
   mv_plugin_exports(nvencmv)
 endif()
 
+# MovingPattern (synthetic moving test clips: benchmarks, tests), its own plugin; plain C++
+option(MVTOOLS_MOVINGPATTERN "Build MovingPattern (synthetic moving test clips)" ON)
+if(MVTOOLS_MOVINGPATTERN)
+  add_subdirectory("movingpattern")
+  mv_plugin_exports(movingpattern)
+endif()
+
 # CudaConvolution (progressive -> interlaced with integer downscale), its own plugin with its own CUDA engine
 # (cudart_static); built with the CUDA engine when mvtools_cuda is built, else CPU-only. Windows x64 + MSVC only.
 option(MVTOOLS_CUDACONVOLUTION "Build CudaConvolution (MSVC only)" ON)
@@ -243,7 +251,8 @@ endif()
 
 # Everything the plugins load from their own folder, in one place: <build>/bin (copied after each build).
 set(MVTOOLS_DIST_DIR "${CMAKE_BINARY_DIR}/bin" CACHE PATH "Folder that receives all plugin libraries after the build")
-set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda splatfps nvencmv CudaConvolution)
+set(_mv_dist_targets mvtools2 depan depanestimate mvtools_vsbridge cudafilters mvtools_cuda splatfps nvencmv CudaConvolution
+  movingpattern)
 set(_mv_dist_cmds "")
 set(_mv_dist_deps "")
 foreach(t ${_mv_dist_targets})

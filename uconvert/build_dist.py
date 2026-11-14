@@ -3,7 +3,8 @@
 The plugin set is read from load_plugins.avs (LoadPlugin / Import lines, variables FF and T resolved). Each plugin
 DLL is copied to <out>/dlls/ together with the non-system DLLs it links to (PE import table, followed
 recursively, looked up next to the plugin) and licence/readme files found next to it. uconvert.avsi loads
-everything from its own folder (ScriptDir() + "dlls\\") when that folder exists.
+everything from its own folder (ScriptDir() + "dlls\\") when that folder exists. The benchmark (bench/) goes to
+<out>/bench/ with MovingPattern.dll, taken from the folder of splatfps.dll (one build).
 
 usage: python -I build_dist.py [--out dist/UConvert]
 """
@@ -27,6 +28,7 @@ REPO_DOCS = {
     "cudafilters": MVTOOLS_DOCS + ["cudafilters/README.md"],
     "splatfps": MVTOOLS_DOCS + ["Documentation/splatfps.md"],
     "CudaConvolution": MVTOOLS_DOCS + ["cudaconvolution/THIRD_PARTY.md", "cudaconvolution/docs/usage.md"],
+    "MovingPattern": MVTOOLS_DOCS + ["movingpattern/README.md"],
 }
 # where each component comes from (written to licences/<name>/SOURCE.txt): public download locations only
 MVTOOLS_URL = "https://github.com/emcodem/mvtools (branch gpu_work)"
@@ -36,6 +38,7 @@ SOURCES = {
     "cudafilters": MVTOOLS_URL,
     "splatfps": MVTOOLS_URL,
     "CudaConvolution": MVTOOLS_URL + ", folder cudaconvolution",
+    "MovingPattern": MVTOOLS_URL + ", folder movingpattern",
     "QTGMC_gpu": AVS_STUFF + "QTGMC.avsi (QTGMC 3.393s), patched by qtgmc/make_qtgmc_gpu.py of " + MVTOOLS_URL,
     "Zs_RF_Shared": AVS_STUFF + "Zs_RF_Shared.avsi",
     "mxfsource": "https://github.com/emcodem/avisynth_mxfsource",
@@ -46,6 +49,8 @@ RUNTIME_DLLS = {
 }
 # files uconvert.avsi reads from its own folder
 SIDE_FILES = ["uc_interlace.json"]
+# the benchmark: these files of bench/ plus MovingPattern.dll go to <out>/bench/
+BENCH_FILES = ["bench_uconvert.cmd", "bench_uconvert.ps1", "README.md"]
 # readme-like files next to a plugin that are not licences (the GPU bench package's own instructions)
 NOT_LICENCE = {"readme.txt", "readme_bench.txt"}
 
@@ -128,7 +133,8 @@ def main():
                 elif not os.path.isfile(os.path.join(SYS32, imp)):
                     missing.add(f"{imp} (needed by {os.path.basename(p)})")
 
-    for kind, path in plugin_list(os.path.join(HERE, "load_plugins.avs")):
+    plist = plugin_list(os.path.join(HERE, "load_plugins.avs"))
+    for kind, path in plist:
         if not os.path.isfile(path):
             sys.exit(f"not found: {path}")
         if kind == "LoadPlugin":
@@ -162,6 +168,21 @@ def main():
             nolic.append(stem)
 
     shutil.copy2(os.path.join(HERE, "uconvert.avsi"), a.out)
+    bench = os.path.join(a.out, "bench")
+    os.makedirs(bench)
+    for f in BENCH_FILES:
+        shutil.copy2(os.path.join(HERE, "bench", f), bench)
+    sf = [p for k, p in plist if os.path.basename(p).lower() == "splatfps.dll"]
+    mp = os.path.join(os.path.dirname(sf[0]), "MovingPattern.dll") if sf else ""
+    if not os.path.isfile(mp):
+        sys.exit("MovingPattern.dll not found next to splatfps.dll (the benchmark needs it)")
+    shutil.copy2(mp, bench)
+    lic_dir = os.path.join(a.out, "licences", "MovingPattern")
+    os.makedirs(lic_dir, exist_ok=True)
+    for f in REPO_DOCS["MovingPattern"]:
+        shutil.copy2(os.path.join(REPO, f), lic_dir)
+    with open(os.path.join(lic_dir, "SOURCE.txt"), "w", encoding="utf-8") as fh:
+        fh.write(f"MovingPattern: {SOURCES['MovingPattern']}\n")
     for f in SIDE_FILES:
         shutil.copy2(os.path.join(HERE, f), a.out)
     open(os.path.join(dlls, "uc_load.avs"), "w").write(
@@ -169,6 +190,7 @@ def main():
         "uc_dlls = ScriptDir()\n" + "".join(f'LoadPlugin(uc_dlls + "{p}")\n' for p in plugins) +
         "".join(f'Import(uc_dlls + "{s}")\n' for s in scripts))
     print(f"{a.out}\n  plugins: {', '.join(plugins)}\n  scripts: {', '.join(scripts)}")
+    print(f"  bench: {', '.join(BENCH_FILES)}, MovingPattern.dll")
     print(f"  dependencies copied: {', '.join(sorted(set(copied) - {p.lower() for p in plugins} - {s.lower() for s in scripts}))}")
     print(f"  system runtime needed (not copied): {', '.join(sorted(runtime))}")
     if nolic:
