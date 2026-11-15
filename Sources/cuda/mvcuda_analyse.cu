@@ -2663,6 +2663,560 @@ namespace
     }
   }
 
+#if MVC_ANALYSE_PART == 0
+  // k_search for the fixed-batch plans only (wave_plan != WP_GEN or an exhaustive radius <= 3, no trymany): the same
+  // candidates, order and comparisons as k_search (bit-identical vectors), with a shorter serial chain per block:
+  // - every batch has its own SAD table, so a fold never has to be finished by all warps before the next batch;
+  // - every warp folds the ring itself (identical values), so the left predictor of the next block stays in registers;
+  // - the folds compute the candidate costs independently and take the first smallest (instead of a compare chain);
+  // - the next block's source block is loaded at the start of a block and stored before the ring barrier, which
+  //   publishes it; its predictor vectors are loaded two blocks ahead by warp 7, which has no phase A candidate;
+  // - the global vector of the level is read once.
+  // Two barriers per block remain (after the phase A SADs and after the ring SADs), plus one per hexagon / UMH batch.
+  // Instances per SAD routine (eval_fix): without the mvc_refine and trymany code, and with one inlined SAD routine,
+  // the kernel needs far fewer registers than k_search and fits the instruction cache.
+  // The SAD routine of k_search_fix, fixed per kernel instance (one inlined routine keeps the kernel small enough for
+  // the instruction cache): EV = fix_eval_id() of the level, 0 = eval_dispatch (any geometry)
+  template <int EV>
+  __device__ __forceinline__ void eval_fix(const LevelArgs &a, const pix *s_y, const pix *s_u, const pix *s_v,
+    int x0, int y0, int x1, int y1, int cx, int cy, int lane, bool pair, int &sl, int &sc)
+  {
+    if constexpr (EV == 1)
+      eval_candidate_pk<16, 16, 0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+    else if constexpr (EV == 2)
+      eval_candidate_pk<16, 16, 8, 8>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+    else if constexpr (EV == 3)
+      eval_candidate_pk<16, 16, 8, 16>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+    else if constexpr (EV == 4)
+      eval_candidate<8, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+    else if constexpr (EV == 5)
+      eval_candidate_pk<32, 32, 0, 0>(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, sl, sc);
+    else
+      eval_dispatch(a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+  }
+  // the routine eval_dispatch picks for these arguments, if eval_fix has it as an instance of its own, else 0
+  inline int fix_eval_id(const LevelArgs &a)
+  {
+    if (a.packed_s) // the order of eval_dispatch
+    {
+      if (a.bs_x == 32 && a.bs_y == 32 && a.cw == 16 && (a.ch == 32 || a.ch == 16))
+        return 0;
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 16)
+        return 3;
+      if (a.bs_x == 16 && a.bs_y == 16 && a.cw == 8 && a.ch == 8)
+        return 2;
+      if (a.bs_x == 32 && a.bs_y == 32 && a.ch == 0)
+        return 5;
+      if (a.bs_x == 16 && a.bs_y == 16 && a.ch == 0)
+        return 1;
+    }
+    if (a.ch == 0 && a.bs_y == 8)
+      return 4;
+    return 0;
+  }
+
+  // The first lane index of the smallest cost of a warp (every lane gets it; cost INT_MAX = no candidate): -1 if
+  // there is none, else the index, and m = its cost. Ties go to the smallest index, as the CPU's sequential "accept
+  // if cost < minimum" over candidates in index order.
+  __device__ __forceinline__ int warp_first_min(int cost, int idx, int &m)
+  {
+#if MVC_ARCH_BELOW(800)
+    long long key = cost == INT_MAX ? 0x7fffffffffffffffLL : (long long)cost * 256 + idx;
+    for (int o = 16; o > 0; o >>= 1)
+    {
+      const long long other = __shfl_xor_sync(0xffffffffu, key, o);
+      key = other < key ? other : key;
+    }
+    if (key == 0x7fffffffffffffffLL)
+      return -1;
+    m = (int)(key >> 8);
+    return (int)(key & 255);
+#else
+    const int mc = __reduce_min_sync(0xffffffffu, cost);
+    if (mc == INT_MAX)
+      return -1;
+    m = mc;
+    return (int)__reduce_min_sync(0xffffffffu, (unsigned)(cost == mc ? idx : 0x7fffffff));
+#endif
+  }
+
+  struct FixShared
+  {
+    int slA[8], scA[8];       // phase A
+    int slU[20], scU[20];     // UMH cross + hex grid ring (WP_UMH)
+    int slH[8], scH[8];       // radius-2 hexagon (WP_HEX, WP_UMH)
+    int slR[48], scR[48];     // ring (radius <= 3: at most 48 candidates)
+    int ring_dx[48], ring_dy[48];
+    int nlambda;              // smallest level: nLambda of the current block (thread 0)
+    int nxt[2][9];            // own, up and bottom-right / up-right vector of a block, by block parity (warp 7)
+  };
+
+  template <int EV>
+  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search_fix(LevelArgs a)
+  {
+    static_assert(SEARCH_THREADS >= 256, "warp 7 prepares the next block during phase A (7 candidates)");
+    extern __shared__ __align__(16) pix s_dyn[];
+    __shared__ FixShared b;
+    __shared__ int s_nl[SEARCH_NL_MAX];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
+    const int plan = wave_plan(a.search_type, a.radius);
+    const int slice = blockIdx.x;
+    const bool row_nl = !a.smallest && a.n_blk_x <= SEARCH_NL_MAX;
+#ifdef MVC_PHASE_PROF
+    const int bk = 31 - __clz(a.n_blk_x);
+    long long ph_t = 0;
+#endif
+    const int beg = slice * a.n_blk_y / a.n_slices, end = (slice + 1) * a.n_blk_y / a.n_slices;
+    const int step_x = a.bs_x - a.ov_x, step_y = a.bs_y - a.ov_y;
+    const int h_scaled = a.hpad[0] >> a.log_scale, v_scaled = a.vpad[0] >> a.log_scale;
+    const int ring_radius = a.search_type == mvc_refine::S_EXHAUSTIVE ? a.radius : 1;
+    const int ring_n = 4 * ring_radius * (ring_radius + 1);
+    const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
+    const int glob_x = a.glob[0] * a.pel, glob_y = a.glob[1] * a.pel; // written by k_global before this kernel
+    pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
+    auto issue_src = [&](pix *dst, int bx, int by, int t0, int ts) {
+      const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
+      const int xc = a.hpad[1] + bx * (step_x >> a.log_x_uv), yc = a.vpad[1] + by * (step_y >> a.log_y_uv);
+      if (!a.async_src)
+      {
+        for (int i = t0; i < a.bs_x * a.bs_y; i += ts)
+        {
+          const int row = i / a.bs_x, col = i - row * a.bs_x;
+          dst[i] = a.src[0][(size_t)(ys + row) * a.ew[0] + xs + col];
+        }
+        for (int i = t0; i < a.cw * a.ch; i += ts)
+        {
+          const int row = i / a.cw, col = i - row * a.cw;
+          dst[a.bs_x * a.bs_y + i] = a.src[1][(size_t)(yc + row) * a.ew[1] + xc + col];
+          dst[a.bs_x * a.bs_y + a.cw * a.ch + i] = a.src[2][(size_t)(yc + row) * a.ew[2] + xc + col];
+        }
+        return;
+      }
+      const int wl = (a.bs_x * a.bs_y) / SPW, wc = (a.cw * a.ch) / SPW;
+      const int rl = a.bs_x / SPW, rc = a.cw / SPW;
+      for (int i = t0; i < wl + 2 * wc; i += ts)
+      {
+        if (i < wl)
+        {
+          const int row = i / rl, col = SPW * (i - row * rl);
+          cp_async4(dst + row * a.bs_x + col, a.src[0] + (size_t)(ys + row) * a.ew[0] + xs + col);
+        }
+        else
+        {
+          int j = i - wl;
+          const int pl = j >= wc ? 2 : 1;
+          if (j >= wc)
+            j -= wc;
+          const int row = j / rc, col = SPW * (j - row * rc);
+          pix *d = dst + a.bs_x * a.bs_y + (pl - 1) * a.cw * a.ch;
+          cp_async4(d + row * a.cw + col, a.src[pl] + (size_t)(yc + row) * a.ew[pl] + xc + col);
+        }
+      }
+      cp_async_commit();
+    };
+    const bool pair_chroma = (2 * a.cw <= 32);
+    // the block geometry of the instances with a fixed SAD routine (fix_eval_id): their source copy goes through
+    // registers (staged), the others use issue_src (cp.async)
+    constexpr int GBX = EV == 5 ? 32 : (EV >= 1 && EV <= 3) ? 16 : 0;
+    constexpr int GCW = (EV == 2 || EV == 3) ? 8 : 0, GCH = EV == 2 ? 8 : EV == 3 ? 16 : 0;
+    constexpr int GWL = GBX * GBX / SPW, GWC = GCW * GCH / SPW, GW = GWL + 2 * GWC;
+    constexpr int GN = GBX ? (GW + SEARCH_THREADS - 1) / SEARCH_THREADS : 1;
+    const bool staged = GBX && a.async_src; // async_src: all plane rows 4-byte aligned (word loads)
+    unsigned stage[GN];
+    // word i of the source block of block (bx, by): its global address, and its place in the shared block buffer
+    auto src_word = [&](int i, int bx, int by, int &dofs) -> const unsigned * {
+      const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
+      if (i < GWL)
+      {
+        constexpr int RL = GBX ? GBX / SPW : 1;
+        const int row = i / RL, col = SPW * (i - row * RL);
+        dofs = row * GBX + col;
+        return (const unsigned *)(a.src[0] + (size_t)(ys + row) * a.ew[0] + xs + col);
+      }
+      const int xc = a.hpad[1] + bx * (step_x >> a.log_x_uv), yc = a.vpad[1] + by * (step_y >> a.log_y_uv);
+      int j = i - GWL;
+      const int pl = j >= GWC ? 2 : 1;
+      if (j >= GWC)
+        j -= GWC;
+      constexpr int RC = GCW ? GCW / SPW : 1;
+      const int row = j / RC, col = SPW * (j - row * RC);
+      dofs = GBX * GBX + (pl - 1) * GCW * GCH + row * GCW + col;
+      return (const unsigned *)(a.src[pl] + (size_t)(yc + row) * a.ew[pl] + xc + col);
+    };
+
+    if (tid == 0)
+    {
+      int n = 0;
+      for (int r = 1; r <= ring_radius; r++)
+      {
+        for (int i = -r + 1; i < r; i++)
+        {
+          b.ring_dx[n] = i; b.ring_dy[n++] = -r;
+          b.ring_dx[n] = i; b.ring_dy[n++] = r;
+        }
+        for (int j = -r + 1; j < r; j++)
+        {
+          b.ring_dx[n] = -r; b.ring_dy[n++] = j;
+          b.ring_dx[n] = r; b.ring_dy[n++] = j;
+        }
+        b.ring_dx[n] = -r; b.ring_dy[n++] = -r;
+        b.ring_dx[n] = -r; b.ring_dy[n++] = r;
+        b.ring_dx[n] = r; b.ring_dy[n++] = -r;
+        b.ring_dx[n] = r; b.ring_dy[n++] = r;
+      }
+    }
+
+    for (int blky = beg; blky < end; blky++)
+    {
+      const int dir = (blky % 2 == 0 || !a.meander) ? 1 : -1;
+      const int start = (dir == 1) ? 0 : a.n_blk_x - 1;
+      const bool is_top = (blky == beg), is_bottom = (blky == end - 1);
+      // the previous row's last vector (thread 0's store) is read by fetch_pred below as the up predictor, and the
+      // previous row's last reads of s_nl and of both source buffers are done
+      __syncthreads();
+
+      // the bottom-right predictor (not yet searched, the interpolated vector) or else the up-right one, if any
+      auto p3_index = [&](int bx) {
+        const int id = blky * a.n_blk_x + bx;
+        const bool side = (dir == 1 && bx < a.n_blk_x - 1) || (dir == -1 && bx > 0);
+        if (!is_bottom && !a.smallest && side)
+          return id + a.n_blk_x + dir;
+        if (!is_top && side)
+          return id - a.n_blk_x + dir;
+        return -1;
+      };
+      // one of the three vectors of block bx (lanes 0..8: own, up, bottom-right / up-right; x, y, sad)
+      auto fetch_pred = [&](int bx, int ln) {
+        int v = 0;
+        if (ln < 9)
+        {
+          const int id = blky * a.n_blk_x + bx, k = ln / 3, e = ln - 3 * k;
+          int src = -1;
+          if (k == 0)
+            src = id;
+          else if (k == 1)
+            src = is_top ? -1 : id - a.n_blk_x;
+          else
+            src = p3_index(bx);
+          if (src >= 0)
+            v = a.vec[3 * src + e];
+        }
+        return v;
+      };
+      // warp 7 loads the predictors of block it + 2 into nxt_reg during the phase A of block it and stores them into
+      // b.nxt during the phase A of block it + 1, so it never waits for the loads
+      int nxt_reg = 0;
+      if (warp == 0 && lane < 9)
+        b.nxt[0][lane] = fetch_pred(start, lane);
+      if (warp == 7 && a.n_blk_x > 1)
+        nxt_reg = fetch_pred(start + dir, lane);
+      issue_src(s_dyn, start, blky, tid, blockDim.x);
+      if (row_nl)
+        for (int bx = tid; bx < a.n_blk_x; bx += blockDim.x)
+          s_nl[bx] = calc_nlambda(a.lambda_level, a.lsad, a.vec[3 * (blky * a.n_blk_x + bx) + 2], is_top);
+      cp_async_wait_all();
+      __syncthreads(); // the first source block, its predictors and s_nl
+      int prev_x = 0, prev_y = 0, prev_sad = 0; // left predictor (the previous block's result, in every thread)
+
+      for (int it = 0; it < a.n_blk_x; it++)
+      {
+        PH_START();
+        const int blkx = start + it * dir;
+        const int idx = blky * a.n_blk_x + blkx;
+        // this block's predictor vectors (loaded by warp 7 during the previous block's phase A, or at the row start)
+        const int *nv = b.nxt[it & 1];
+        const int own_v[3] = { nv[0], nv[1], nv[2] };
+        const int up_v[3] = { nv[3], nv[4], nv[5] };
+        const int p3_v[3] = { nv[6], nv[7], nv[8] };
+        const bool use_up = !is_top, use_p3 = p3_index(blkx) >= 0;
+
+        int x0[3], y0[3];
+        x0[0] = a.hpad[0] + blkx * step_x;
+        y0[0] = a.vpad[0] + blky * step_y;
+        for (int p = 1; p < 3; p++)
+        {
+          x0[p] = a.hpad[p] + blkx * (step_x >> a.log_x_uv);
+          y0[p] = a.vpad[p] + blky * (step_y >> a.log_y_uv);
+        }
+        // this block's source is in buffer (it & 1), published by the previous block's ring barrier (or the row start);
+        // buffer ((it + 1) & 1) was last read by the previous block, before that barrier
+        s_y = s_dyn + (it & 1) * blk_el;
+        s_u = s_y + a.bs_x * a.bs_y;
+        s_v = s_u + a.cw * a.ch;
+        // the next block's source: staged = word loads into registers now, stored into the other buffer (last read
+        // by the previous block) before the ring barrier; else cp.async, waited for before that barrier
+        if (it + 1 < a.n_blk_x)
+        {
+          if constexpr (GBX > 0)
+          {
+            if (staged)
+            {
+              #pragma unroll
+              for (int n = 0; n < GN; n++)
+              {
+                const int i = tid + n * SEARCH_THREADS;
+                int dofs;
+                if (i < GW)
+                  stage[n] = __ldg(src_word(i, start + (it + 1) * dir, blky, dofs));
+              }
+            }
+            else
+              issue_src(s_dyn + ((it + 1) & 1) * blk_el, start + (it + 1) * dir, blky, tid, blockDim.x);
+          }
+          else
+            issue_src(s_dyn + ((it + 1) & 1) * blk_el, start + (it + 1) * dir, blky, tid, blockDim.x);
+        }
+        PH(6);
+
+        const int dx_max = a.pel * (a.ext_w - x0[0] - a.bs_x - a.hpad[0] + h_scaled);
+        const int dy_max = a.pel * (a.ext_h - y0[0] - a.bs_y - a.vpad[0] + v_scaled);
+        const int dx_min = -a.pel * (x0[0] - a.hpad[0] + h_scaled);
+        const int dy_min = -a.pel * (y0[0] - a.vpad[0] + v_scaled);
+
+        const Vec own_c = clip_mv(dx_min, dx_max, dy_min, dy_max, own_v[0], own_v[1], own_v[2]);
+        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0);
+        Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
+        if (it > 0)
+          p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, prev_x, prev_y, prev_sad);
+        if (use_up)
+          p2 = clip_mv(dx_min, dx_max, dy_min, dy_max, up_v[0], up_v[1], up_v[2]);
+        if (use_p3)
+          p3 = clip_mv(dx_min, dx_max, dy_min, dy_max, p3_v[0], p3_v[1], p3_v[2]);
+        if (!is_top)
+        {
+          p0.x = median3(p1.x, p2.x, p3.x);
+          p0.y = median3(p1.y, p2.y, p3.y);
+          p0.sad = max(p1.sad, max(p2.sad, p3.sad));
+        }
+        else
+          p0 = p1;
+        const Vec pred = a.smallest ? p0 : own_c;
+        PH(7);
+        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, glob_x, glob_y, 0);
+        int nlambda;
+        if (row_nl)
+          nlambda = s_nl[blkx];
+        else
+        {
+          // smallest level (or very long rows): thread 0 computes it in FP64, published by the phase A barrier
+          if (tid == 0)
+            b.nlambda = calc_nlambda(a.lambda_level, a.lsad, pred.sad, is_top);
+          nlambda = 0; // read after the barrier below
+        }
+        PH(0);
+
+        // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
+        // warp 7 (no candidate here) stores the next block's predictor vectors (loaded during the previous block)
+        // into b.nxt and starts loading those of the block after it
+        if (warp == 7 && it + 1 < a.n_blk_x)
+        {
+          if (lane < 9)
+            b.nxt[(it + 1) & 1][lane] = nxt_reg;
+          if (it + 2 < a.n_blk_x)
+            nxt_reg = fetch_pred(start + (it + 2) * dir, lane);
+        }
+        for (int c = warp; c < 7; c += nwarps)
+        {
+          int cx, cy;
+          switch (c)
+          {
+          case 0: cx = 0; cy = 0; break;
+          case 1: cx = glob.x; cy = glob.y; break;
+          case 2: cx = pred.x; cy = pred.y; break;
+          case 3: cx = p0.x; cy = p0.y; break;
+          case 4: cx = p1.x; cy = p1.y; break;
+          case 5: cx = p2.x; cy = p2.y; break;
+          default: cx = p3.x; cy = p3.y; break;
+          }
+          int sl, sc;
+          eval_fix<EV>(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+          if (lane == 0)
+          {
+            b.slA[c] = sl;
+            b.scA[c] = sc;
+          }
+        }
+        __syncthreads();
+        if (!row_nl)
+          nlambda = b.nlambda;
+        PH(1);
+
+        // ---- fold phase A (every thread, identical): PseudoEPZSearch's sequence of "accept if cost < minimum"
+        // (zero with pzero, global with pglobal, the predictor, then CheckMV0 of predictors[0..3]) is the first
+        // smallest of the 7 costs: computed independently, then one pass of compares (the cost parts are >= 0, so
+        // CheckMV0's early exits accept exactly when the full cost is below the minimum)
+        int best_x, best_y, best_sad, min_cost;
+        {
+          const Vec pv[4] = { p0, p1, p2, p3 };
+          int cst[7], sads[7];
+          #pragma unroll
+          for (int c = 0; c < 7; c++)
+            sads[c] = b.slA[c] + b.scA[c];
+          cst[0] = sads[0] + (int)(((long long)a.pzero * sads[0]) >> 8);
+          cst[1] = sads[1] + (int)(((long long)a.pglobal * sads[1]) >> 8);
+          cst[2] = sads[2];
+          #pragma unroll
+          for (int i = 0; i < 4; i++)
+          {
+            const int cx = pv[i].x, cy = pv[i].y;
+            const int dxp = pred.x - cx, dyp = pred.y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            const int cost = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits)) + b.slA[3 + i] + b.scA[3 + i];
+            cst[3 + i] = (cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max) ? cost : INT_MAX;
+          }
+          // (unrolled with constant indices: a dynamic index would put the arrays into local memory)
+          const int vx[7] = { 0, glob.x, pred.x, p0.x, p1.x, p2.x, p3.x }, vy[7] = { 0, glob.y, pred.y, p0.y, p1.y, p2.y, p3.y };
+          min_cost = cst[0];
+          best_sad = sads[0];
+          best_x = 0;
+          best_y = 0;
+          #pragma unroll
+          for (int c = 1; c < 7; c++)
+            if (cst[c] < min_cost)
+            {
+              min_cost = cst[c];
+              best_sad = sads[c];
+              best_x = vx[c];
+              best_y = vy[c];
+            }
+        }
+        PH(2);
+
+        // ---- fixed batches before the ring (see k_search): UMH = CrossSearch +-1 and one hex grid ring (20 CheckMV),
+        // Hex2 = the radius-2 hexagon (CheckMVdir), then the centre moves to the winning direction
+        if (plan == WP_HEX || plan == WP_UMH)
+        {
+          for (int stage = plan == WP_UMH ? 0 : 1; stage < 2; stage++)
+          {
+            const int n = stage == 0 ? 20 : 6, off = stage == 0 ? 0 : 20;
+            int *tl = stage == 0 ? b.slU : b.slH, *tc = stage == 0 ? b.scU : b.scH;
+            for (int c = warp; c < n; c += nwarps)
+            {
+              const int cx = best_x + g_fix_dx[off + c], cy = best_y + g_fix_dy[off + c];
+              if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+                continue;
+              int sl, sc;
+              eval_fix<EV>(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+              if (lane == 0)
+              {
+                tl[c] = sl;
+                tc[c] = sc;
+              }
+            }
+            __syncthreads();
+            // the batch's sequential CheckMV / CheckMVdir (penaltyNew) = the first smallest cost below the minimum
+            {
+              int cost = INT_MAX;
+              const int c = lane;
+              if (c < n)
+              {
+                const int cx = best_x + g_fix_dx[off + c], cy = best_y + g_fix_dy[off + c];
+                if (cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max)
+                {
+                  const int dxp = pred.x - cx, dyp = pred.y - cy;
+                  const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+                  const int sl = tl[c], sc = tc[c];
+                  const int t = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits))
+                    + sl + (int)(((long long)a.pnew * sl) >> 8) + sc + (int)(((long long)a.pnew * sc) >> 8);
+                  if (t < min_cost)
+                    cost = t;
+                }
+              }
+              int m = 0;
+              const int w = warp_first_min(cost, c, m);
+              if (w >= 0)
+              {
+                min_cost = m;
+                best_sad = tl[w] + tc[w];
+                best_x += g_fix_dx[off + w];
+                best_y += g_fix_dy[off + w];
+              }
+            }
+          }
+        }
+
+        // ---- phase B: SADs of the ring candidates around the best vector so far
+        for (int c = warp; c < ring_n; c += nwarps)
+        {
+          const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
+          if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+            continue;
+          int sl, sc;
+          eval_fix<EV>(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
+          if (lane == 0)
+          {
+            b.slR[c] = sl;
+            b.scR[c] = sc;
+          }
+        }
+        if constexpr (GBX > 0)
+          if (staged && it + 1 < a.n_blk_x)
+          {
+            #pragma unroll
+            for (int n = 0; n < GN; n++)
+            {
+              const int i = tid + n * SEARCH_THREADS;
+              int dofs;
+              if (i < GW)
+              {
+                (void)src_word(i, start + (it + 1) * dir, blky, dofs);
+                *(unsigned *)(s_dyn + ((it + 1) & 1) * blk_el + dofs) = stage[n];
+              }
+            }
+          }
+        cp_async_wait_all(); // the next block's source (cp.async), published by this barrier
+        __syncthreads();
+        PH(3);
+
+        // ---- fold the ring in every warp (one lane per candidate, first smallest cost below the minimum, see k_search)
+        {
+          int lc = INT_MAX, li = 0;
+          for (int c = lane; c < ring_n; c += 32)
+          {
+            const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
+            if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
+              continue;
+            const int dxp = pred.x - cx, dyp = pred.y - cy;
+            const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+            const int sl = b.slR[c], sc = b.scR[c];
+            const int t = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits))
+              + sl + (int)(((long long)a.pnew * sl) >> 8) + sc + (int)(((long long)a.pnew * sc) >> 8);
+            if (t < min_cost && t < lc)
+            {
+              lc = t;
+              li = c;
+            }
+          }
+          int m = 0;
+          const int w = warp_first_min(lc, li, m);
+          if (w >= 0)
+          {
+            best_x += b.ring_dx[w];
+            best_y += b.ring_dy[w];
+            best_sad = b.slR[w] + b.scR[w];
+          }
+        }
+        if (tid == 0)
+        {
+          if (idx > 1 + beg * a.n_blk_x && best_sad > a.bad_sad)
+            atomicExch(a.bad_flag, 1);
+          a.vec[3 * idx + 0] = best_x;
+          a.vec[3 * idx + 1] = best_y;
+          a.vec[3 * idx + 2] = best_sad;
+        }
+        prev_x = best_x;
+        prev_y = best_y;
+        prev_sad = best_sad;
+        PH(4);
+#ifdef MVC_PHASE_PROF
+        if (tid == 0)
+          atomicAdd(&g_prof[bk][5], 1ull);
+#endif
+      }
+    }
+  }
+#endif // MVC_ANALYSE_PART == 0
+
   // ================================================================================================================
   // Wavefront search: meander=false and one slice, i.e. the CPU result of
   // MAnalyse(meander=false, mt=false). Without meander a block depends on its left neighbour, on the block above and,
@@ -4494,7 +5048,25 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
           k_search<true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
 #endif
         else
-          k_search<false><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
+        {
+          // the fixed-batch plans without trymany: the leaner kernel (same result); MVCUDA_SEARCH_FIX=0: k_search
+          static const bool fix_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
+          const bool fixed = !a.exh_fast && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || wave_plan(a.search_type, a.radius) != WP_GEN);
+          if (fix_allowed && fixed)
+          {
+            switch (fix_eval_id(a))
+            {
+            case 1: k_search_fix<1><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 2: k_search_fix<2><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 3: k_search_fix<3><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 4: k_search_fix<4><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 5: k_search_fix<5><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            default: k_search_fix<0><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            }
+          }
+          else
+            k_search<false><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a);
+        }
       }
       AN_CHECK(cudaGetLastError());
     }
