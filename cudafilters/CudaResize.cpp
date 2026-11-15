@@ -1,16 +1,20 @@
-// CudaGaussResize(clip, width, height, src_left, src_top, src_width, src_height, p, b, s, force, keep_center, placement) and
-// CudaBilinearResize(clip, width, height, src_left, src_top, src_width, src_height, force, keep_center, placement):
-// AviSynth+ GaussResize / BilinearResize on the GPU (QTGMC blurs the search clip with
-// GaussResize(w, h, 0, 0, w + eps, h + eps, p=2); SrchClipPP 1 uses BilinearResize to half size and back), bit for bit. The passes, their order and the programs follow
-// FilteredResize::CreateResize / CreateResizeH / CreateResizeV and the FilteredResizeH / V constructors of AviSynth+ 3.7.5
-// (resample.cpp, GPL v2 or later); the arithmetic is in mvcuda_resample.cu. The CPU filter with the same arguments is
-// built too (VideoInfo, exact fallback).
+// The AviSynth+ 3.7.5 core resizers on the GPU, bit for bit, with the same arguments as the CPU filter plus the Cuda
+// prefix: CudaPointResize, CudaBilinearResize, CudaBicubicResize, CudaLanczosResize, CudaLanczos4Resize,
+// CudaBlackmanResize, CudaSpline16Resize, CudaSpline36Resize, CudaSpline64Resize, CudaGaussResize, CudaSincResize,
+// CudaSinPowerResize, CudaSincLin2Resize, CudaUserDefined2Resize (QTGMC blurs the search clip with
+// GaussResize(w, h, 0, 0, w + eps, h + eps, p=2); SrchClipPP 1 uses BilinearResize to half size and back). The passes,
+// their order and the programs follow FilteredResize::CreateResize / CreateResizeH / CreateResizeV and the
+// FilteredResizeH / V constructors of AviSynth+ 3.7.5 (resample.cpp, GPL v2 or later); the kernels are in Resample.cpp,
+// the arithmetic in mvcuda_resample.cu. The CPU filter with the same arguments is built too (VideoInfo, exact fallback).
 
 #include "CudaCommon.h"
 #include "Resample.h"
 
 #include <cctype>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
 
 using namespace cf;
 
@@ -52,9 +56,79 @@ namespace
     }
   }
 
-  // kind 0: GaussResize, 1: BilinearResize (no p / b / s arguments)
-  // kind 0: GaussResize, 1: BilinearResize (no p / b / s arguments)
-  class CudaGaussResize : public GenericVideoFilter
+  // One resizer as AviSynth+ 3.7.5 registers it (resample.cpp: the function table and FilteredResize::Create_*):
+  // the argument signature, the index of src_left (the source window follows it), of force, keep_center and placement,
+  // and the kernel made from the arguments with the same defaults and the same AsFloat / AsDblDef / AsInt reads.
+  // BlackmanResize reads keep_center from the force index and placement from the keep_center index (a value of another
+  // type reads as the default, so it always works as keep_center=true, placement "auto"); kept as it is, because the
+  // result is compared with that filter.
+  struct ResizeKind
+  {
+    const char *cpu_name, *gpu_name, *params;
+    int window, force, keep_center, placement;
+    std::unique_ptr<ResampleKernel> (*kernel)(const AVSValue &args);
+  };
+
+#define CF_WINDOW "[src_left]f[src_top]f[src_width]f[src_height]f"
+#define CF_TAIL "[force]i[keep_center]b[placement]s"
+  const ResizeKind kResizeKinds[] = {
+    { "PointResize", "CudaPointResize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<PointKernel>(); } },
+    { "BilinearResize", "CudaBilinearResize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<TriangleKernel>(); } },
+    { "BicubicResize", "CudaBicubicResize", "cii[b]f[c]f" CF_WINDOW CF_TAIL, 5, 9, 10, 11,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> {
+        return std::make_unique<MitchellNetravaliKernel>(a[3].AsDblDef(1. / 3.), a[4].AsDblDef(1. / 3.)); } },
+    { "LanczosResize", "CudaLanczosResize", "cii" CF_WINDOW "[taps]i" CF_TAIL, 3, 8, 9, 10,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> { return std::make_unique<LanczosKernel>(a[7].AsInt(3)); } },
+    { "Lanczos4Resize", "CudaLanczos4Resize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<LanczosKernel>(4); } },
+    { "BlackmanResize", "CudaBlackmanResize", "cii" CF_WINDOW "[taps]i" CF_TAIL, 3, 8, 8, 9,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> { return std::make_unique<BlackmanKernel>(a[7].AsInt(4)); } },
+    { "Spline16Resize", "CudaSpline16Resize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<Spline16Kernel>(); } },
+    { "Spline36Resize", "CudaSpline36Resize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<Spline36Kernel>(); } },
+    { "Spline64Resize", "CudaSpline64Resize", "cii" CF_WINDOW CF_TAIL, 3, 7, 8, 9,
+      [](const AVSValue &) -> std::unique_ptr<ResampleKernel> { return std::make_unique<Spline64Kernel>(); } },
+    { "GaussResize", "CudaGaussResize", "cii" CF_WINDOW "[p]f[b]f[s]f" CF_TAIL, 3, 10, 11, 12,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> {
+        return std::make_unique<GaussianKernel>(a[7].AsFloat(30.0f), a[8].AsFloat(2.0f), a[9].AsFloat(4.0f)); } },
+    { "SincResize", "CudaSincResize", "cii" CF_WINDOW "[taps]i" CF_TAIL, 3, 8, 9, 10,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> { return std::make_unique<SincKernel>(a[7].AsInt(4)); } },
+    { "SinPowerResize", "CudaSinPowerResize", "cii" CF_WINDOW "[p]f" CF_TAIL, 3, 8, 9, 10,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> { return std::make_unique<SinPowerKernel>(a[7].AsFloat(2.5f)); } },
+    { "SincLin2Resize", "CudaSincLin2Resize", "cii" CF_WINDOW "[taps]i" CF_TAIL, 3, 8, 9, 10,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> { return std::make_unique<SincLin2Kernel>(a[7].AsInt(15)); } },
+    { "UserDefined2Resize", "CudaUserDefined2Resize", "cii[b]f[c]f[s]f" CF_WINDOW CF_TAIL, 6, 10, 11, 12,
+      [](const AVSValue &a) -> std::unique_ptr<ResampleKernel> {
+        return std::make_unique<UserDefined2Kernel>(a[3].AsFloat(121.0f), a[4].AsFloat(19.0f), a[5].AsFloat(2.3f)); } },
+  };
+#undef CF_WINDOW
+#undef CF_TAIL
+
+  // the argument names of a signature ("cii[src_left]f..."): null for the unnamed ones
+  std::vector<std::string> param_names(const char *params)
+  {
+    std::vector<std::string> names;
+    for (const char *s = params; *s;)
+    {
+      if (*s == '[')
+      {
+        const char *e = std::strchr(s, ']');
+        names.emplace_back(s + 1, e);
+        s = e + 2; // the type letter after the name
+      }
+      else
+      {
+        names.emplace_back();
+        s++;
+      }
+    }
+    return names;
+  }
+
+  class CudaResize : public GenericVideoFilter
   {
     PClip _cpu;
     VideoInfo _src_vi;
@@ -72,57 +146,53 @@ namespace
 
     static int regen(void *user, int frame, void *env, MvCudaTokenHeader *out)
     {
-      CudaGaussResize *self = static_cast<CudaGaussResize *>(user);
+      CudaResize *self = static_cast<CudaResize *>(user);
       if (self->make(frame, static_cast<IScriptEnvironment *>(env), *out) == 0)
         return 0;
       return cpu_regen(self->_cpu, frame, self->vi, self->_out_fmt, self->_producer, env, out); // as GetFrame
     }
 
   public:
-    CudaGaussResize(const AVSValue &args, int kind, IScriptEnvironment *env)
+    CudaResize(const AVSValue &args, const ResizeKind &kind, IScriptEnvironment *env)
       : GenericVideoFilter(args[0].AsClip()), _src_vi(args[0].AsClip()->GetVideoInfo())
     {
-      const char *gnames[13] = { nullptr, nullptr, nullptr, "src_left", "src_top", "src_width", "src_height", "p", "b", "s", "force",
-        "keep_center", "placement" };
-      const char *bnames[10] = { nullptr, nullptr, nullptr, "src_left", "src_top", "src_width", "src_height", "force", "keep_center", "placement" };
-      const int nmax = kind ? 10 : 13, ex = kind ? 7 : 10; // ex: index of force (then keep_center, placement)
       // the CPU filter reads pixels: token inputs go through CudaDownload (cpu_input); undefined optional arguments left out
-      AVSValue cargs[13];
-      const char *cnames[13];
+      const std::vector<std::string> names = param_names(kind.params);
+      const int nmax = (int)names.size();
+      std::vector<AVSValue> cargs(nmax);
+      std::vector<const char *> cnames(nmax);
       int na = 0;
       for (int i = 0; i < nmax && i < args.ArraySize(); i++)
         if (i < 3 || args[i].Defined())
         {
           cargs[na] = i == 0 ? AVSValue(cpu_input(args[0].AsClip(), env)) : args[i];
-          cnames[na++] = kind ? bnames[i] : gnames[i];
+          cnames[na++] = names[i].empty() ? nullptr : names[i].c_str();
         }
-      _cpu = env->Invoke(kind ? "BilinearResize" : "GaussResize", AVSValue(cargs, na), cnames).AsClip();
+      _cpu = env->Invoke(kind.cpu_name, AVSValue(cargs.data(), na), cnames.data()).AsClip();
       vi = _cpu->GetVideoInfo();
 
       CudaLib &lib = CudaLib::get();
-      const char *const gpu_name = kind ? "CudaBilinearResize" : "CudaGaussResize";
-      const char *const cpu_name = kind ? "BilinearResize" : "GaussResize";
       const char *const fmt_why = "only planar Y / YUV 8 to 16 bit, 4:2:0 / 4:2:2 / 4:4:0 / 4:4:4, at least 68 bytes wide";
       _ok = lib.ok && make_format(_src_vi, _src_fmt) && make_format(vi, _out_fmt);
       if (!_ok)
       {
-        gpu_decide(gpu_name, cpu_name, false, fmt_why, env);
+        gpu_decide(kind.gpu_name, kind.cpu_name, false, fmt_why, env);
         return;
       }
       // ---- FilteredResize::CreateResize
+      const int w0 = kind.window;
       const int target_w = args[1].AsInt(), target_h = args[2].AsInt();
-      const double sub_left = args[3].AsFloat(0), sub_top = args[4].AsFloat(0);
-      double sub_w = args[5].AsDblDef(_src_vi.width), sub_h = args[6].AsDblDef(_src_vi.height);
+      const double sub_left = args[w0].AsFloat(0), sub_top = args[w0 + 1].AsFloat(0);
+      double sub_w = args[w0 + 2].AsDblDef(_src_vi.width), sub_h = args[w0 + 3].AsDblDef(_src_vi.height);
       if (sub_w <= 0.0)
         sub_w = _src_vi.width - sub_left + sub_w;
       if (sub_h <= 0.0)
         sub_h = _src_vi.height - sub_top + sub_h;
-      const GaussianKernel gauss(kind ? 30.0 : args[7].AsFloat(30.0f), kind ? 2.0 : args[8].AsFloat(2.0f), kind ? 4.0 : args[9].AsFloat(4.0f));
-      const TriangleKernel triangle;
-      const ResampleKernel &kernel = kind ? (const ResampleKernel &)triangle : (const ResampleKernel &)gauss;
-      const int force = args[ex].AsInt(0);
-      const bool keep_center = args[ex + 1].AsBool(true);
-      const char *placement = args[ex + 2].AsString("auto");
+      const std::unique_ptr<ResampleKernel> kernel = kind.kernel(args);
+      const int force = args[kind.force].AsInt(0);
+      const bool keep_center = args[kind.keep_center].AsBool(true);
+      // a placement index that holds another type (BlackmanResize) counts as not given
+      const char *placement = args[kind.placement].IsString() ? args[kind.placement].AsString() : "auto";
       int cplace = CL_UNUSED;
       if (_src_vi.Is420() || _src_vi.Is422() || _src_vi.IsYV411())
       {
@@ -153,25 +223,25 @@ namespace
         const int hx = p ? sx : 0, hy = p ? sy : 0, divx = 1 << hx, divy = 1 << hy;
         if (do_h)
         {
-          const ResampleProgram prog = make_program(kernel, h_src_w >> hx, sub_left / divx, sub_w / divx, target_w >> hx, bits,
+          const ResampleProgram prog = make_program(*kernel, h_src_w >> hx, sub_left / divx, sub_w / divx, target_w >> hx, bits,
             p ? cp_h_chroma : cp_luma, p ? cp_h_chroma : cp_luma);
           _ph[p] = lib.resample_program_create(prog.target_size, prog.taps, prog.offset.data(), prog.coeff.data());
           _ok = _ph[p] != 0;
         }
         if (do_v && _ok)
         {
-          const ResampleProgram prog = make_program(kernel, v_src_h >> hy, sub_top / divy, sub_h / divy, target_h >> hy, bits,
+          const ResampleProgram prog = make_program(*kernel, v_src_h >> hy, sub_top / divy, sub_h / divy, target_h >> hy, bits,
             p ? cp_v_chroma : cp_luma, p ? cp_v_chroma : cp_luma);
           _pv[p] = lib.resample_program_create(prog.target_size, prog.taps, prog.offset.data(), prog.coeff.data());
           _ok = _pv[p] != 0;
         }
       }
-      _ok = gpu_decide(gpu_name, cpu_name, _ok, "a resampling program could not be made on the GPU", env);
+      _ok = gpu_decide(kind.gpu_name, kind.cpu_name, _ok, "a resampling program could not be made on the GPU", env);
       if (_ok)
-        _producer = lib.producer_register(&CudaGaussResize::regen, this);
+        _producer = lib.producer_register(&CudaResize::regen, this);
     }
 
-    ~CudaGaussResize()
+    ~CudaResize()
     {
       CudaLib &lib = CudaLib::get();
       if (_producer)
@@ -203,14 +273,16 @@ namespace
       return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
     }
   };
+
+  AVSValue __cdecl Create_CudaResize(AVSValue args, void *user_data, IScriptEnvironment *env)
+  {
+    return new CudaResize(args, *static_cast<const ResizeKind *>(user_data), env);
+  }
 }
 
-AVSValue __cdecl Create_CudaGaussResize(AVSValue args, void *, IScriptEnvironment *env)
+// registers every Cuda*Resize (called from AvisynthPluginInit3)
+void register_cuda_resizers(IScriptEnvironment *env)
 {
-  return new CudaGaussResize(args, 0, env);
-}
-
-AVSValue __cdecl Create_CudaBilinearResize(AVSValue args, void *, IScriptEnvironment *env)
-{
-  return new CudaGaussResize(args, 1, env);
+  for (const ResizeKind &k : kResizeKinds)
+    env->AddFunction(k.gpu_name, k.params, Create_CudaResize, const_cast<ResizeKind *>(&k));
 }

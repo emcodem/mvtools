@@ -50,6 +50,85 @@ namespace cf
     double param, b, s;
   };
 
+  // PointResize (support 0: GetResamplingProgram takes the nearest sample)
+  struct PointKernel : ResampleKernel
+  {
+    double f(double x) const override;
+    double support() const override { return 0.0; }
+  };
+
+  // LanczosResize (taps, AviSynth default 3) / Lanczos4Resize
+  struct LanczosKernel : ResampleKernel
+  {
+    explicit LanczosKernel(int taps);
+    double f(double x) const override;
+    double support() const override { return taps; }
+    double taps;
+  };
+
+  // BlackmanResize (taps, default 4)
+  struct BlackmanKernel : ResampleKernel
+  {
+    explicit BlackmanKernel(int taps);
+    double f(double x) const override;
+    double support() const override { return taps; }
+    double taps, rtaps;
+  };
+
+  struct Spline16Kernel : ResampleKernel
+  {
+    double f(double x) const override;
+    double support() const override { return 2.0; }
+  };
+
+  struct Spline36Kernel : ResampleKernel
+  {
+    double f(double x) const override;
+    double support() const override { return 3.0; }
+  };
+
+  struct Spline64Kernel : ResampleKernel
+  {
+    double f(double x) const override;
+    double support() const override { return 4.0; }
+  };
+
+  // SincResize (taps, default 4)
+  struct SincKernel : ResampleKernel
+  {
+    explicit SincKernel(int taps);
+    double f(double x) const override;
+    double support() const override { return taps; }
+    double taps;
+  };
+
+  // SinPowerResize (p, default 2.5); the support stays 2 whatever p is
+  struct SinPowerKernel : ResampleKernel
+  {
+    explicit SinPowerKernel(double p);
+    double f(double x) const override;
+    double support() const override { return 2.0; }
+    double param;
+  };
+
+  // SincLin2Resize (taps, default 15)
+  struct SincLin2Kernel : ResampleKernel
+  {
+    explicit SincLin2Kernel(int taps);
+    double f(double x) const override;
+    double support() const override { return taps; }
+    double taps;
+  };
+
+  // UserDefined2Resize (b, c, s; defaults 121, 19, 2.3)
+  struct UserDefined2Kernel : ResampleKernel
+  {
+    UserDefined2Kernel(double b, double c, double s);
+    double f(double x) const override;
+    double support() const override { return s; }
+    double a, b, c, s;
+  };
+
   // GetResamplingProgram followed by resize_prepare_coeffs; center_src / center_dst as AviSynth passes them (0.5 for
   // luma and for chroma with the default chroma placement)
   ResampleProgram make_program(const ResampleKernel &k, int source_size, double crop_start, double crop_size, int target_size,

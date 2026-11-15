@@ -444,8 +444,7 @@ AVSValue __cdecl Create_CudaMergeLuma(AVSValue args, void *, IScriptEnvironment 
 AVSValue __cdecl Create_CudaMergeChroma(AVSValue args, void *, IScriptEnvironment *env);
 AVSValue __cdecl Create_CudaKobs(AVSValue args, void *, IScriptEnvironment *env); // CudaKobs.cpp
 AVSValue __cdecl Create_CudaRemoveGrain(AVSValue args, void *, IScriptEnvironment *env);
-AVSValue __cdecl Create_CudaGaussResize(AVSValue args, void *, IScriptEnvironment *env); // CudaResize.cpp
-AVSValue __cdecl Create_CudaBilinearResize(AVSValue args, void *, IScriptEnvironment *env);
+void register_cuda_resizers(IScriptEnvironment *env); // CudaResize.cpp: every Cuda*Resize
 AVSValue __cdecl Create_CudaNnedi3(AVSValue args, void *, IScriptEnvironment *env); // CudaNnedi3.cpp
 AVSValue __cdecl Create_CudaLogic(AVSValue args, void *, IScriptEnvironment *env); // CudaMt.cpp
 AVSValue __cdecl Create_CudaClamp(AVSValue args, void *, IScriptEnvironment *env);
@@ -477,8 +476,7 @@ extern "C" __declspec(dllexport) const char *__stdcall AvisynthPluginInit3(IScri
   env->AddFunction("CudaMergeChroma", "cc[weight]f", Create_CudaMergeChroma, 0);
   env->AddFunction("CudaKeepOnlyBobShimmerFixes", "cc[rep]i[chroma]b", Create_CudaKobs, 0);
   env->AddFunction("CudaRemoveGrain", "c[mode]i[modeU]i[modeV]i", Create_CudaRemoveGrain, 0);
-  env->AddFunction("CudaGaussResize", "cii[src_left]f[src_top]f[src_width]f[src_height]f[p]f[b]f[s]f[force]i[keep_center]b[placement]s", Create_CudaGaussResize, 0);
-  env->AddFunction("CudaBilinearResize", "cii[src_left]f[src_top]f[src_width]f[src_height]f[force]i[keep_center]b[placement]s", Create_CudaBilinearResize, 0);
+  register_cuda_resizers(env);
   env->AddFunction("CudaNNEDI3", "c[field]i[dh]b[Y]b[U]b[V]b[nsize]i[nns]i[qual]i[etype]i[pscrn]i[threads]i[opt]i[fapprox]i", Create_CudaNnedi3, 0);
   env->AddFunction("CudaLogic", "cc[mode]s[Y]i[U]i[V]i", Create_CudaLogic, 0);
   env->AddFunction("CudaClamp", "ccc[overshoot]i[undershoot]i[Y]i[U]i[V]i", Create_CudaClamp, 0);

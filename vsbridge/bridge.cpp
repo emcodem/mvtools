@@ -1691,20 +1691,32 @@ VSNode *nearest_bob(const std::string &, const std::vector<AVSValue> &a, std::st
   return vs_call("com.vapoursynth.std", "Interleave", il, err);
 }
 
-// nearest for BilinearResize: resize.Bilinear with the same source window (AviSynth's src_width / src_height <= 0 count
-// from the right / bottom edge)
-VSNode *nearest_bilinear(const std::string &, const std::vector<AVSValue> &a, std::string &err)
+// nearest for the AviSynth core resizers that have a VapourSynth resize.* counterpart: the same kernel (BicubicResize
+// b / c, LanczosResize taps) and the same source window (AviSynth's src_width / src_height <= 0 count from the right /
+// bottom edge). The argument lists are the stand-in specs' below.
+VSNode *nearest_resize(const std::string &l, const std::vector<AVSValue> &a, std::string &err)
 {
+  struct Map { const char *avs, *vs; size_t window; };
+  static const Map maps[] = { { "pointresize", "Point", 3 }, { "bilinearresize", "Bilinear", 3 }, { "bicubicresize", "Bicubic", 5 },
+    { "lanczosresize", "Lanczos", 3 }, { "lanczos4resize", "Lanczos", 3 }, { "spline16resize", "Spline16", 3 },
+    { "spline36resize", "Spline36", 3 }, { "spline64resize", "Spline64", 3 } };
+  const Map *m = nullptr;
+  for (const Map &e : maps)
+    if (l == e.avs)
+      m = &e;
+  if (!m)
+    return err = "no VapourSynth resizer for " + l, nullptr;
   const PClip c = a[0].AsClip();
   const VideoInfo &vi = c->GetVideoInfo();
-  const double left = a[3].AsDblDef(0), top = a[4].AsDblDef(0);
-  double sw = a[5].AsDblDef(vi.width), sh = a[6].AsDblDef(vi.height);
+  const size_t w0 = m->window;
+  const double left = a[w0].AsDblDef(0), top = a[w0 + 1].AsDblDef(0);
+  double sw = a[w0 + 2].AsDblDef(vi.width), sh = a[w0 + 3].AsDblDef(vi.height);
   if (sw <= 0)
     sw = vi.width - left + sw;
   if (sh <= 0)
     sh = vi.height - top + sh;
   VSMap *in = g_vsapi->createMap();
-  if (!append_clips(in, "clip", {c}, "BilinearResize", err))
+  if (!append_clips(in, "clip", {c}, l.c_str(), err))
   {
     g_vsapi->freeMap(in);
     return nullptr;
@@ -1715,7 +1727,14 @@ VSNode *nearest_bilinear(const std::string &, const std::vector<AVSValue> &a, st
   g_vsapi->mapSetFloat(in, "src_top", top, maAppend);
   g_vsapi->mapSetFloat(in, "src_width", sw, maAppend);
   g_vsapi->mapSetFloat(in, "src_height", sh, maAppend);
-  return vs_call("com.vapoursynth.resize", "Bilinear", in, err);
+  if (l == "bicubicresize")
+  {
+    g_vsapi->mapSetFloat(in, "filter_param_a", a[3].AsDblDef(1. / 3.), maAppend);
+    g_vsapi->mapSetFloat(in, "filter_param_b", a[4].AsDblDef(1. / 3.), maAppend);
+  }
+  else if (l == "lanczosresize" || l == "lanczos4resize")
+    g_vsapi->mapSetFloat(in, "filter_param_a", l == "lanczos4resize" ? 4.0 : (double)a[7].AsInt(3), maAppend);
+  return vs_call("com.vapoursynth.resize", m->vs, in, err);
 }
 
 // nearest for mt_logic "min" / "max" (others have none): std.Expr
@@ -1804,7 +1823,55 @@ const std::vector<StandInSpec> &stand_in_specs()
       {"bilinearresize",
        {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
         "placement"},
-       vi_resize, nearest_bilinear, "resize.Bilinear"},
+       vi_resize, nearest_resize, "resize.Bilinear"},
+      {"pointresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_resize, "resize.Point"},
+      {"bicubicresize",
+       {"clip", "target_width", "target_height", "b", "c", "src_left", "src_top", "src_width", "src_height", "force",
+        "keep_center", "placement"},
+       vi_resize, nearest_resize, "resize.Bicubic"},
+      {"lanczosresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "taps", "force",
+        "keep_center", "placement"},
+       vi_resize, nearest_resize, "resize.Lanczos"},
+      {"lanczos4resize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_resize, "resize.Lanczos"},
+      {"blackmanresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "taps", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
+      {"spline16resize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_resize, "resize.Spline16"},
+      {"spline36resize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_resize, "resize.Spline36"},
+      {"spline64resize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "force", "keep_center",
+        "placement"},
+       vi_resize, nearest_resize, "resize.Spline64"},
+      {"sincresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "taps", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
+      {"sinpowerresize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "p", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
+      {"sinclin2resize",
+       {"clip", "target_width", "target_height", "src_left", "src_top", "src_width", "src_height", "taps", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
+      {"userdefined2resize",
+       {"clip", "target_width", "target_height", "b", "c", "s", "src_left", "src_top", "src_width", "src_height", "force",
+        "keep_center", "placement"},
+       vi_resize, nullptr, ""},
       {"removegrain", {"clip", "mode", "modeu", "modev", "planar"}, vi_first, nullptr, ""},
       {"nnedi3",
        {"clip", "field", "dh", "y", "u", "v", "nsize", "nns", "qual", "etype", "pscrn", "threads", "opt", "fapprox"},

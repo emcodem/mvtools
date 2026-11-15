@@ -55,6 +55,158 @@ namespace cf
     return pow(b, -p * value * value);
   }
 
+  namespace
+  {
+    const double PI = 3.14159265358979323846; // M_PI as resample_functions.h defines it
+
+    double sinc(double value) // the sinc of LanczosFilter / SincFilter / SincLin2Filter (value >= 0)
+    {
+      if (value > 0.000001)
+      {
+        value *= PI;
+        return sin(value) / value;
+      }
+      return 1.0;
+    }
+  }
+
+  double PointKernel::f(double) const
+  {
+    return 1.0;
+  }
+
+  LanczosKernel::LanczosKernel(int _taps)
+  {
+    taps = (double)clamp(_taps, 1, 100);
+  }
+
+  double LanczosKernel::f(double value) const
+  {
+    value = fabs(value);
+    return value < taps ? sinc(value) * sinc(value / taps) : 0.0;
+  }
+
+  BlackmanKernel::BlackmanKernel(int _taps)
+  {
+    taps = (double)clamp(_taps, 1, 100);
+    rtaps = 1.0 / taps;
+  }
+
+  double BlackmanKernel::f(double value) const
+  {
+    value = fabs(value);
+    if (value < taps)
+    {
+      if (value > 0.000001)
+      {
+        value *= PI;
+        return (sin(value) / value) * (0.42 + 0.5 * cos(value * rtaps) + 0.08 * cos(2 * value * rtaps));
+      }
+      return 1.0;
+    }
+    return 0.0;
+  }
+
+  double Spline16Kernel::f(double value) const
+  {
+    value = fabs(value);
+    if (value < 1.0)
+      return ((value - 9.0 / 5.0) * value - 1.0 / 5.0) * value + 1.0;
+    else if (value < 2.0)
+      return ((-1.0 / 3.0 * (value - 1.0) + 4.0 / 5.0) * (value - 1.0) - 7.0 / 15.0) * (value - 1.0);
+    return 0.0;
+  }
+
+  double Spline36Kernel::f(double value) const
+  {
+    value = fabs(value);
+    if (value < 1.0)
+      return ((13.0 / 11.0 * (value) - 453.0 / 209.0) * (value) - 3.0 / 209.0) * (value) + 1.0;
+    else if (value < 2.0)
+      return ((-6.0 / 11.0 * (value - 1.0) + 270.0 / 209.0) * (value - 1.0) - 156.0 / 209.0) * (value - 1.0);
+    else if (value < 3.0)
+      return ((1.0 / 11.0 * (value - 2.0) - 45.0 / 209.0) * (value - 2.0) + 26.0 / 209.0) * (value - 2.0);
+    return 0.0;
+  }
+
+  double Spline64Kernel::f(double value) const
+  {
+    value = fabs(value);
+    if (value < 1.0)
+      return ((49.0 / 41.0 * (value) - 6387.0 / 2911.0) * (value) - 3.0 / 2911.0) * (value) + 1.0;
+    else if (value < 2.0)
+      return ((-24.0 / 41.0 * (value - 1.0) + 4032.0 / 2911.0) * (value - 1.0) - 2328.0 / 2911.0) * (value - 1.0);
+    else if (value < 3.0)
+      return ((6.0 / 41.0 * (value - 2.0) - 1008.0 / 2911.0) * (value - 2.0) + 582.0 / 2911.0) * (value - 2.0);
+    else if (value < 4.0)
+      return ((-1.0 / 41.0 * (value - 3.0) + 168.0 / 2911.0) * (value - 3.0) - 97.0 / 2911.0) * (value - 3.0);
+    return 0.0;
+  }
+
+  SincKernel::SincKernel(int _taps)
+  {
+    taps = (double)clamp(_taps, 1, 150);
+  }
+
+  double SincKernel::f(double value) const
+  {
+    return sinc(fabs(value));
+  }
+
+  SinPowerKernel::SinPowerKernel(double p)
+  {
+    param = clamp(p, 1.0, 10.0);
+  }
+
+  double SinPowerKernel::f(double value) const
+  {
+    value = fabs(value);
+    value *= PI / param;
+    if (value < (PI / 2))
+      return pow(cos(value), 1.8);
+    if (value < PI)
+      return -(cos(value) * cos(value)) / (0.9 * value);
+    return 0;
+  }
+
+  SincLin2Kernel::SincLin2Kernel(int _taps)
+  {
+    taps = (double)clamp(_taps, 1, 30);
+  }
+
+  double SincLin2Kernel::f(double value) const
+  {
+    value = fabs(value);
+    if (value < (taps / 2.0))
+      return sinc(value);
+    return sinc(value) * ((2.0 - (2.0 * value / taps)));
+  }
+
+  UserDefined2Kernel::UserDefined2Kernel(double _b, double _c, double _s)
+  {
+    a = 1.0;
+    b = clamp(_b, -50.0, 250.0);
+    c = clamp(_c, -50.0, 250.0);
+    b = (b - 16.0) / 219.0;
+    c = (c - 16.0) / 219.0;
+    s = clamp(_s, 1.5, 15.0);
+  }
+
+  double UserDefined2Kernel::f(double x) const
+  {
+    // UserDefined2Filter::sinc takes fabs itself: its arguments x - 1 / x - 2 can be negative
+    auto sincs = [](double v) {
+      if (fabs(v) > 0.000001)
+      {
+        v *= PI;
+        return sin(v) / v;
+      }
+      return 1.0;
+    };
+    x = fabs(x);
+    return c * sincs(x + 2) + b * sincs(x + 1) + a * sincs(x) + b * sincs(x - 1) + c * sincs(x - 2);
+  }
+
   ResampleProgram make_program(const ResampleKernel &k, int source_size, double crop_start, double crop_size, int target_size,
     int bits_per_pixel, double center_pos_src, double center_pos_dst)
   {

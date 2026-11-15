@@ -333,6 +333,17 @@ An evicted frame is made again by its producer. It stops with an error when a to
 | `CudaMergeChroma(clip, clip2, float weight)` | `MergeChroma` | `weight` 1.0 | same format, YUV |
 | `CudaGaussResize(clip, int width, int height, float src_left, float src_top, float src_width, float src_height, float p, float b, float s, int force, bool keep_center, string placement)` | `GaussResize` | `src_left`/`src_top` 0, `src_width`/`src_height` = source size, `p` 30, `b` 2, `s` 4, `force` 0, `keep_center` true, `placement` "auto" | any device frame format |
 | `CudaBilinearResize(clip, int width, int height, float src_left, float src_top, float src_width, float src_height, int force, bool keep_center, string placement)` | `BilinearResize` | as CudaGaussResize, without `p` / `b` / `s` | any device frame format |
+| `CudaPointResize`, `CudaSpline16Resize`, `CudaSpline36Resize`, `CudaSpline64Resize`, `CudaLanczos4Resize` (arguments as CudaBilinearResize) | `PointResize`, `Spline16Resize`, `Spline36Resize`, `Spline64Resize`, `Lanczos4Resize` | as CudaBilinearResize | any device frame format |
+| `CudaBicubicResize(clip, int width, int height, float b, float c, float src_left, ...)` | `BicubicResize` | `b` 1/3, `c` 1/3, the rest as CudaBilinearResize | any device frame format |
+| `CudaLanczosResize`, `CudaBlackmanResize`, `CudaSincResize`, `CudaSincLin2Resize` (`clip, int width, int height, float src_left, float src_top, float src_width, float src_height, int taps, int force, bool keep_center, string placement`) | `LanczosResize`, `BlackmanResize`, `SincResize`, `SincLin2Resize` | `taps` 3 / 4 / 4 / 15, the rest as CudaBilinearResize | any device frame format |
+| `CudaSinPowerResize(clip, int width, int height, float src_left, float src_top, float src_width, float src_height, float p, int force, bool keep_center, string placement)` | `SinPowerResize` | `p` 2.5, the rest as CudaBilinearResize | any device frame format |
+| `CudaUserDefined2Resize(clip, int width, int height, float b, float c, float s, float src_left, ...)` | `UserDefined2Resize` | `b` 121, `c` 19, `s` 2.3, the rest as CudaBilinearResize | any device frame format |
+
+All `Cuda*Resize` filters take the arguments of the AviSynth+ 3.7.5 filter of the same name (same defaults, same
+clamping, same chroma placement from `_ChromaLocation` or `placement`) and give its result bit for bit, upscaling and
+downscaling, 8 to 16 bit. Planar RGB and 32-bit float have no GPU path (creation error, or the CPU filter with
+`cuda_cpu_fallback`). CudaBlackmanResize keeps a quirk of BlackmanResize 3.7.5, which reads `keep_center` and
+`placement` from the wrong argument slots: it always works as `keep_center=true, placement="auto"`.
 
 `radius`, `luma_threshold` and `chroma_threshold` of CudaTemporalSoften are required, as in TemporalSoften. With
 `radius` 0 or both thresholds 0 TemporalSoften returns the clip unchanged; CudaTemporalSoften stops with an error

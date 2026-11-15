@@ -275,6 +275,10 @@ CF_CHAINS = {
     'cf_tsoften': ('hd444p10', 'out = CudaDownload(CudaTemporalSoften(CudaUpload(c), 2, 4, 8, scenechange=15, mode=2))\n'),
     'cf_gauss': ('hd420p8', 'out = CudaDownload(CudaGaussResize(CudaUpload(c), 1280, 720, p=5.0))\n'),
     'cf_bilinear': ('hd444p10', 'out = CudaDownload(CudaBilinearResize(CudaUpload(c), 960, 540, src_left=2.5))\n'),
+    'cf_spline36': ('hd420p8', 'out = CudaDownload(CudaSpline36Resize(CudaUpload(c), 1280, 720, src_top=0.5))\n'),
+    'cf_sinpower': ('uhd422p10', 'out = CudaDownload(CudaSinPowerResize(CudaUpload(c), 1920, 1080, p=3.0))\n'),
+    'cf_lanczos_up': ('hd444p10', 'out = CudaDownload(CudaLanczosResize(c, 2560, 1440, taps=4))\n'),
+    'cf_userdefined2': ('hd420p8', 'out = CudaDownload(CudaUserDefined2Resize(CudaUpload(c), 960, 540))\n'),
     'cf_binomial0': ('hd420p8', 'out = CudaDownload(CudaQtgmcBinomial0(CudaUpload(c)))\n'),
     # NVOFA vectors (deterministic run to run); without libmvtools_cuda.so CudaNVOFAnalyse Invokes MSuper / MAnalyse
     'cf_nvof': ('uhd422p10', 'sup = MSuper(c, pel=2, hpad=16, vpad=16, levels=1)\n'

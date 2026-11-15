@@ -16,7 +16,10 @@ pixels (normal frames pass through); the `Cuda*` functions of mvtools2 (`CudaMSu
 return token frames too, apart from the vector clips (see `..\Documentation\gpu.md`). Design: `..\docs\dev\ARCHITECTURE.md`.
 
 Filters: `CudaUpload`, `CudaDownload`, `CudaBob`, `CudaTemporalSoften`, `CudaMerge`, `CudaMergeLuma`, `CudaMergeChroma`,
-`CudaKeepOnlyBobShimmerFixes`, `CudaRemoveGrain`, `CudaGaussResize`, `CudaBilinearResize`, `CudaNNEDI3`, `CudaLogic`,
+`CudaKeepOnlyBobShimmerFixes`, `CudaRemoveGrain`, the AviSynth+ core resizers (`CudaGaussResize`, `CudaBilinearResize`,
+`CudaPointResize`, `CudaBicubicResize`, `CudaLanczosResize`, `CudaLanczos4Resize`, `CudaBlackmanResize`,
+`CudaSpline16Resize`, `CudaSpline36Resize`, `CudaSpline64Resize`, `CudaSincResize`, `CudaSinPowerResize`,
+`CudaSincLin2Resize`, `CudaUserDefined2Resize`), `CudaNNEDI3`, `CudaLogic`,
 `CudaClamp`, `CudaExpand`, `CudaInpand`, `CudaLutxy`, `CudaQtgmcSharpLimit`, `CudaQtgmcBinomial0`, `CudaQtgmcBackBlend`,
 `CudaQtgmcAddNoise`, and `CudaNVOFAnalyse` / `CudaNVOFAvailable` (motion vectors from NVIDIA's optical flow
 accelerator, not bit-exact with anything). QTGMC uses them through the patched script made by `..\qtgmc\make_qtgmc_gpu.py`. Parameters, defaults
