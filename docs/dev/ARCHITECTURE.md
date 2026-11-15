@@ -87,6 +87,11 @@ reference .md files (links to online resources are fine).
   range 2..3 (`wave_plan`) run as inline batches + the ring fold; other refines through mvc_refine (AnaChecker), whose
   out-of-line run_batch with local-memory candidate lists cost ~19k cycles per block for the default hex search vs ~6k
   inline. nLambda is computed per row in parallel above the smallest level (`s_nl`).
+- **k_search_fix** (meander=true, ring / Hex2 / UMH fixed plans, no trymany: the QTGMC presets): k_search's candidates
+  and comparisons with a shorter serial chain per block: SAD tables per batch, the ring folded in every warp (left
+  predictor in registers), parallel cost folds (first smallest), next source block staged through registers, predictor
+  vectors two blocks ahead by warp 7 (idle in phase A), one instance per SAD routine (`eval_fix`, ~100-120 registers,
+  small enough for the instruction cache). Two barriers per block. `MVCUDA_SEARCH_FIX=0` forces k_search.
 - **k_wave** (meander=false): one CTA of 4 warps per block row, rows by atomic ticket, per-row progress counters
   (release / acquire), all levels in one launch. Fixed plans for small Hex2 / UMH in the fast kernel, GEN kernel
   (mvc_refine) otherwise; register cap 96. Runs the bad-vector wide search itself (k_search sends such frames to the

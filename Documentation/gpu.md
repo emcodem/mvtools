@@ -548,4 +548,5 @@ Read once per process.
 
 For comparisons only (same output, older or slower code forms): `MVCUDA_TM_PAR=0` (trymany refines one after the
 other), `MVCUDA_EXH_FAST=0` (no parallel exhaustive pass), `MVCUDA_SEARCH_PACK=0` / `MVCUDA_WAVE_PACK=0` (no packed
-SADs), `MVCUDA_NOPIN` (no pinned host staging).
+SADs), `MVCUDA_SEARCH_FIX=0` (the general slice kernel also for the ring / hexagon / UMH searches of the QTGMC presets),
+`MVCUDA_NOPIN` (no pinned host staging).

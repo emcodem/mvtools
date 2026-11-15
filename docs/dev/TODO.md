@@ -121,6 +121,21 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
 
 ## Exact speed work
 
+- **k_search_fix (2026-11-15, branch ksearch-speed)**: QTGMC Fast / Slow slice search 1080p, 5090: finest level 5770 ->
+  3540 cycles per block; search -34 % (1 thread) / -24 % (10 threads), Slow search -38 % / -30 %; UConvert deint t=3
+  Fast -19 %, Slow -22 %, t=10 Fast ~0 %, Slow -8 %. Remaining per finest block: setup ~820, phase A SADs ~870 (one
+  warp's first SAD ~770, of which ~500 is the first read of new reference rows; a repeated SAD costs ~260), fold A ~270,
+  ring SADs ~920 (same: a one-sample shift reads a new row), ring fold ~650. Tried without gain (all exact): 64 / 128
+  thread CTAs (slower), L1 prefetch of the next block's or of all candidate windows (no effect / slower: issue cost),
+  out-of-line SAD routine (slower SADs), speculative ring / hexagon around the left predictor (hit 65 % finest, 77-91 %
+  coarser, real footage) with 512 threads (every other phase slower) or two candidates per warp (phase A +540 cycles,
+  ring -690): net zero. Ideas left: ncu (needs admin) to see where the first-touch latency goes; a smaller SAD routine.
+- **QTGMC deint at t >= 10 is not search-bound any more**: ~2.5 analyses in flight (k_search_fix ~90 % of GPU time, GPU
+  ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
+  the run is CPU-bound (25 CPU-s for 600 frames, NNEDI3 on the CPU); QTGMC_gpu_edi = true gives identical output, half
+  the CPU time, t=3 Fast -8 % / Slow -12 %, t=10 unchanged. Next: why only ~2.5 analyses are in flight with 10 threads
+  (per-frame host syncs, cudaEventSynchronize 1828 x 2.9 ms; MT modes of the chain; submitter).
+
 - **meander=true slice kernel critical path** (largest remaining exact gap): compute the predictor-independent candidates
   of the next block while the serial chain runs. PAL QTGMC Fast meander=true 3.88 s vs meander=false 1.85 s (before E1),
   HD 1.9 vs 0.9 s. Also the reason the GPU MAnalyse default is slower than the CPU on SD (500 frames 0.71 vs 0.49 s;
