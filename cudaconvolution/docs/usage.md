@@ -78,9 +78,9 @@ Without it nothing changes, except that a token frame CudaConvolution cannot rea
   `CudaDownload()` chain. Every frame is checked (clips may mix token and ordinary frames), also before the automatic
   format conversion.
 - **Output:** `token_out=true` returns token frames; put `CudaDownload()` after the last GPU stage that follows it.
-- **Zero-copy:** with a library that offers it (token interface 1, `mvcuda_frame_run`), token input frames of 10, 12
-  or 16 bit on CudaConvolution's GPU are read in place, and with `token_out=true` the result stays on the GPU: no copies
-  between GPU and CPU for CudaConvolution at all. Otherwise (older library, 8 bit, another GPU, an input evicted meanwhile)
+- **Zero-copy:** with a library that offers it (token interface 1, `mvcuda_frame_run`), token input frames of 8, 10,
+  12 or 16 bit on CudaConvolution's GPU are read in place, and with `token_out=true` the result stays on the GPU: no copies
+  between GPU and CPU for CudaConvolution at all. Otherwise (older library, RGB, another GPU, an input evicted meanwhile)
   the frames are copied as above; the output is identical either way.
 - **One library per process:** two different copies of `mvtools_cuda.dll` loaded at the same time are two separate
   registries; CudaConvolution stops with an error then. Load CudaConvolution.dll and all GPU plugins from one folder.
@@ -121,7 +121,8 @@ CudaConvolution(width=1920, height=1080, clip_min=1, clip_max=1020)
   RGB stays RGB and YUV stays YUV: no colour matrix is guessed. For other targets (e.g. 4:2:0 -> 4:4:4, or a
   specific chroma resampler) convert explicitly before CudaConvolution.
 - 8-bit input gives 8-bit output computed with the 10-bit arithmetic: identical to
-  `ConvertBits(10).CudaConvolution(...).ConvertBits(8)` (rounded, no dither), same speed. `clip_min` / `clip_max` are then
+  `ConvertBits(10).CudaConvolution(...).ConvertBits(8)` (rounded, no dither). The GPU engine reads and writes the 8-bit frames as they are
+  (half the transfer of 10 bit; no conversion on the CPU). `clip_min` / `clip_max` are then
   8-bit codes. If the source is 10-bit, feed it to CudaConvolution before any reduction to 8 bit (e.g. a `ConvertBits(8)`
   added by a workflow tool): reducing UHD with error-diffusion dither is slow, and the dither noise then goes
   through the filter.

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- 8-bit input on the GPU: the GPU engine reads and writes the 8-bit frames itself (samples x 4 into the 10-bit
+  arithmetic and the rounding to 8 bit, `clip_min` / `clip_max` included, now happen in the kernels) instead of
+  widening them to 10-bit buffers on the CPU and narrowing the result there. Half the PCIe transfer, no CPU passes;
+  8-bit token frames are now read in place (zero-copy) and returned with `token_out=true` without copies. Output
+  unchanged (bit-identical; the self-test checks the 8-bit vectors through the 8-bit GPU path as well). RTX 5090,
+  synthetic source: UHD 4:2:2 8 bit -> 1080i 67 -> 254 fps, with Prefetch(4) 153 -> 589 fps; token in/out 46 -> 231
+  fps; HD 1080p 8 bit 153 -> 546 fps. 10 to 16 bit unchanged. The CPU engine keeps the 10-bit buffers.
 - Moved into the mvtools repository (`cudaconvolution/`): built with the other plugins by the root CMake build
   (`MVTOOLS_CUDACONVOLUTION`, MSVC only; CUDA engine when the root builds `mvtools_cuda`); the standalone build from
   this folder (`tools/build.ps1`, `tools/package.ps1`) works as before.

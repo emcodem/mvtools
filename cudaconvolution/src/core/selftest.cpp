@@ -58,7 +58,7 @@ std::vector<SelftestCase> selftest_cases() {
   return cases;
 }
 
-std::string selftest_md5(const SelftestCase& c, const EngineFn& run) {
+std::string selftest_md5(const SelftestCase& c, const EngineFn& run, const EngineFn8& run8) {
   const bool eight = c.format.bits == 8;  // as the plugin: 10-bit arithmetic, from_8bit in, to_8bit out
   const Preset p = adapt_preset(parse_preset(load_preset(c.preset), c.factor_h, c.factor_v),
                                 {c.format.layout, eight ? 10 : c.format.bits});
@@ -66,12 +66,19 @@ std::string selftest_md5(const SelftestCase& c, const EngineFn& run) {
   std::vector<uint16_t> src[2][3], dst[3];
   ConstFrame in[2];
   Frame out;
+  const bool native8 = eight && run8;
+  std::vector<uint8_t> src8[2][3], dst8[3];
+  ConstFrame8 in8[2];
+  Frame8 out8;
   for (int f = 0; f < 2; ++f)
     for (int i = 0; i < 3; ++i) {
       const int w = i ? cw : c.width;
       src[f][i].resize(static_cast<std::size_t>(w) * c.height);
       selftest_fill(src[f][i].data(), w, c.height, f, i, c.format.bits);
-      if (eight)
+      if (native8) {
+        for (uint16_t v : src[f][i]) src8[f][i].push_back(static_cast<uint8_t>(v));  // values < 256
+        in8[f].plane[i] = {src8[f][i].data(), w, w, c.height};
+      } else if (eight)
         for (uint16_t& v : src[f][i]) v = from_8bit(static_cast<uint8_t>(v));
       in[f].plane[i] = {src[f][i].data(), w, w, c.height};
     }
@@ -79,11 +86,18 @@ std::string selftest_md5(const SelftestCase& c, const EngineFn& run) {
     const int w = (i ? cw : c.width) / p.factor_h, h = c.height / p.factor_v;
     dst[i].assign(static_cast<std::size_t>(w) * h, 0);
     out.plane[i] = {dst[i].data(), w, w, h};
+    dst8[i].assign(dst[i].size(), 0);
+    out8.plane[i] = {dst8[i].data(), w, w, h};
   }
-  run(in[0], in[1], out, p);
-  if (eight)
-    for (auto& d : dst)
-      for (uint16_t& v : d) v = to_8bit(v);
+  if (native8) {
+    run8(in8[0], in8[1], out8, p);
+    for (int i = 0; i < 3; ++i) dst[i].assign(dst8[i].begin(), dst8[i].end());  // MD5 over uint16 as below
+  } else {
+    run(in[0], in[1], out, p);
+    if (eight)
+      for (auto& d : dst)
+        for (uint16_t& v : d) v = to_8bit(v);
+  }
   Md5 m;
   for (const auto& d : dst) m.update(d.data(), d.size() * sizeof(uint16_t));
   return m.hex();

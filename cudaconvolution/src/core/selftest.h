@@ -24,9 +24,13 @@ struct SelftestCase {
 // 3x2 in YUV422P10. Expected MD5 from the embedded vectors file.
 std::vector<SelftestCase> selftest_cases();
 
-// Runs one case through `run` (an engine) and returns the MD5 of its output.
+// Runs one case through `run` (an engine) and returns the MD5 of its output. 8-bit cases: with `run8` the engine gets
+// the 8-bit frames as they are (and must do the 8-bit rounding itself); without it they go through `run` as
+// from_8bit -> 10-bit engine -> to_8bit. Both must give the same MD5.
 using EngineFn = std::function<void(const ConstFrame& first, const ConstFrame& second, const Frame& out, const Preset& p)>;
-std::string selftest_md5(const SelftestCase& c, const EngineFn& run);
+using EngineFn8 =
+    std::function<void(const ConstFrame8& first, const ConstFrame8& second, const Frame8& out, const Preset& p)>;
+std::string selftest_md5(const SelftestCase& c, const EngineFn& run, const EngineFn8& run8 = {});
 
 // Deterministic input sample: xorshift32 stream per (frame, plane) in raster order, value = (state >> 8) mod 2^bits.
 // tools/selftest_check.py reproduces it.

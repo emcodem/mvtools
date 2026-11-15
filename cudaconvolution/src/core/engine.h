@@ -7,17 +7,17 @@
 
 namespace cudaconvolution {
 
-struct ConstPlane {
-  const uint16_t* data;
+// One plane of samples of type T (uint16_t: 10..16 bit and the 8-bit route of the CPU engine; uint8_t: 8-bit frames
+// read and written by the GPU engine as they are).
+template <class T> struct BasicPlane {
+  T* data;
   std::ptrdiff_t stride;  // in samples
   int width, height;
 };
-
-struct Plane {
-  uint16_t* data;
-  std::ptrdiff_t stride;  // in samples
-  int width, height;
-};
+using ConstPlane = BasicPlane<const uint16_t>;
+using Plane = BasicPlane<uint16_t>;
+using ConstPlane8 = BasicPlane<const uint8_t>;
+using Plane8 = BasicPlane<uint8_t>;
 
 enum class CpuPath {
   Auto,    // AVX2/FMA3 if the CPU has it, else scalar
@@ -39,12 +39,13 @@ void resample_plane(const ConstPlane& src, const Plane& dst, int row_first, int 
 
 
 // Planar YUV frame (plane 0 luma, 1/2 chroma).
-struct ConstFrame {
-  ConstPlane plane[3];
+template <class T> struct BasicFrame {
+  BasicPlane<T> plane[3];
 };
-struct Frame {
-  Plane plane[3];
-};
+using ConstFrame = BasicFrame<const uint16_t>;
+using Frame = BasicFrame<uint16_t>;
+using ConstFrame8 = BasicFrame<const uint8_t>;
+using Frame8 = BasicFrame<uint8_t>;
 
 // One output frame. Interlaced: the temporally first field (top for TFF, bottom for BFF) is computed from `first`,
 // the other one from `second`. Progressive: all rows from `first` (`second` unused).

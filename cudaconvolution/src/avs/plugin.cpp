@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -188,7 +189,10 @@ class CudaConvolution : public GenericVideoFilter {
 #ifdef CUDACONVOLUTION_HAVE_CUDA
     if (device >= 0) {
       try {
-        gpu_ = std::make_unique<cudaconvolution::CudaEngine>(device, p_);
+        // 8 bit: the GPU reads and writes the 8-bit planes itself (same result as the CPU route in compute())
+        std::optional<cudaconvolution::EightBit> eight;
+        if (eight_bit()) eight = cudaconvolution::EightBit{lo8_, hi8_};
+        gpu_ = std::make_unique<cudaconvolution::CudaEngine>(device, p_, eight);
       } catch (const std::exception& e) {
         env->ThrowError("CudaConvolution: %s", e.what());
       }
@@ -295,20 +299,20 @@ class CudaConvolution : public GenericVideoFilter {
     cudaconvolution::CudaEngine::DevicePlanes first{}, second{};
     const int s = n_in > 1 ? 3 : 0;
     for (int p = 0; p < 3; ++p) {
-      first.plane[p] = static_cast<const uint16_t*>(in_planes[p]);
-      second.plane[p] = static_cast<const uint16_t*>(in_planes[s + p]);
+      first.plane[p] = in_planes[p];
+      second.plane[p] = in_planes[s + p];
     }
-    uint16_t* out[3] = {};
+    void* out[3] = {};
     if (c.token_out)
       for (int p = 0; p < 3; ++p) {
         if (!out_planes[p] || out_pitch[p] != plane_bytes(c.out_fmt, p)) return -4;
-        out[p] = static_cast<uint16_t*>(out_planes[p]);
+        out[p] = out_planes[p];
       }
     return c.engine->launch_device(*c.job, first, second, c.token_out ? out : nullptr, stream);
   }
 #endif
 
-  // Zero-copy: when every input frame is a device frame on the engine's GPU (10..16 bit), the engine reads it in place
+  // Zero-copy: when every input frame is a device frame on the engine's GPU (8..16 bit), the engine reads it in place
   // through the registry (mvcuda_frame_run). token: nullptr = output as pixels in dst; else the output stays a device
   // frame of this producer and *token receives its header. false: not possible here (the caller takes the copy path,
   // which also makes evicted inputs again and reports unreadable ones).
@@ -316,7 +320,7 @@ class CudaConvolution : public GenericVideoFilter {
                  PVideoFrame& dst) {
 #ifdef CUDACONVOLUTION_HAVE_CUDA
     namespace tk = cudaconvolution::token;
-    if (!gpu_ || eight_bit() || format_.layout == cudaconvolution::Layout::RGB) return false;
+    if (!gpu_ || format_.layout == cudaconvolution::Layout::RGB) return false;
     const VideoInfo& cvi = child->GetVideoInfo();
     tk::Header ha, hb;
     if (tk::classify(a, cvi, ha) != tk::Kind::Token) return false;
@@ -330,16 +334,12 @@ class CudaConvolution : public GenericVideoFilter {
     reg.require_single_instance(env);
 
     dst = env->NewVideoFrameP(vi, const_cast<PVideoFrame*>(&a));
-    static constexpr int kYuv[3] = {PLANAR_Y, PLANAR_U, PLANAR_V};
     cudaconvolution::Frame shape;
-    for (int i = 0; i < 3; ++i) {
-      const int pl = kYuv[i];
-      shape.plane[i] = {token ? nullptr : reinterpret_cast<uint16_t*>(dst->GetWritePtr(pl)), dst->GetPitch(pl) / 2,
-                        dst->GetRowSize(pl) / 2, dst->GetHeight(pl)};
-    }
+    cudaconvolution::Frame8 shape8;
+    planes_of(dst, token == nullptr, shape, shape8);
     cudaconvolution::CudaEngine::DeviceJobPtr job;
     try {
-      job = gpu_->prepare_device(shape, token == nullptr);
+      job = eight_bit() ? gpu_->prepare_device(shape8, token == nullptr) : gpu_->prepare_device(shape, token == nullptr);
     } catch (const std::exception& e) {
       env->ThrowError("CudaConvolution: frame %d: %s", n, e.what());
     }
@@ -349,7 +349,7 @@ class CudaConvolution : public GenericVideoFilter {
                            &CudaConvolution::run_on_device, &ctx, token);
     if (rc == tk::kTokenGone) return false;  // an input was evicted: the copy path has it made again
     if (rc != 0) env->ThrowError("CudaConvolution: frame %d: the zero-copy GPU call failed (code %d).", n, rc);
-    if (!token) gpu_->finish_device(*job, shape);
+    if (!token) eight_bit() ? gpu_->finish_device(*job, shape8) : gpu_->finish_device(*job, shape);
     set_props(dst, env);
     return true;
 #else
@@ -379,9 +379,28 @@ class CudaConvolution : public GenericVideoFilter {
     if (p_.interlaced) b = cudaconvolution::token::materialize(b_in, cvi, na + 1, env);
     PVideoFrame dst = env->NewVideoFrameP(vi, &a);
 
-    static constexpr int kYuv[3] = {PLANAR_Y, PLANAR_U, PLANAR_V}, kRgb[3] = {PLANAR_G, PLANAR_B, PLANAR_R};
-    const int* kPlanes = format_.layout == cudaconvolution::Layout::RGB ? kRgb : kYuv;
-    const bool narrow = eight_bit();  // the engines work on uint16_t samples: 8 bit goes through packed 10-bit buffers
+#ifdef CUDACONVOLUTION_HAVE_CUDA
+    if (gpu_ && eight_bit()) {  // the GPU engine reads and writes the 8-bit planes as they are
+      cudaconvolution::ConstFrame8 fa8, fb8;
+      cudaconvolution::Frame8 fd8;
+      for (int i = 0; i < 3; ++i) {
+        const int pl = plane_id(i);
+        fa8.plane[i] = {a->GetReadPtr(pl), a->GetPitch(pl), a->GetRowSize(pl), a->GetHeight(pl)};
+        fb8.plane[i] = {b->GetReadPtr(pl), b->GetPitch(pl), b->GetRowSize(pl), b->GetHeight(pl)};
+        fd8.plane[i] = {dst->GetWritePtr(pl), dst->GetPitch(pl), dst->GetRowSize(pl), dst->GetHeight(pl)};
+      }
+      try {
+        gpu_->process_frame(fa8, fb8, fd8);
+      } catch (const std::exception& e) {
+        env->ThrowError("CudaConvolution: frame %d: %s", n, e.what());
+      }
+      set_props(dst, env);
+      return dst;
+    }
+#endif
+    // the CPU engine works on uint16_t samples: 8 bit goes through packed 10-bit buffers
+    const bool narrow = eight_bit();
+    const int kPlanes[3] = {plane_id(0), plane_id(1), plane_id(2)};
     thread_local std::vector<uint16_t> wide[3][3];  // [a, b, dst][plane]
     cudaconvolution::ConstFrame fa, fb;
     cudaconvolution::Frame fd;
@@ -431,6 +450,23 @@ class CudaConvolution : public GenericVideoFilter {
   }
 
   bool eight_bit() const { return format_.bits == 8; }
+
+  // AviSynth plane of engine plane i (0 luma / G, 1-2 chroma / B, R)
+  int plane_id(int i) const {
+    static constexpr int kYuv[3] = {PLANAR_Y, PLANAR_U, PLANAR_V}, kRgb[3] = {PLANAR_G, PLANAR_B, PLANAR_R};
+    return (format_.layout == cudaconvolution::Layout::RGB ? kRgb : kYuv)[i];
+  }
+
+  // planes of a new output frame in the engine's sample type (frame for 10..16 bit, frame8 for 8 bit); data only
+  // when writable (else just the shape)
+  void planes_of(PVideoFrame& f, bool writable, cudaconvolution::Frame& frame, cudaconvolution::Frame8& frame8) const {
+    for (int i = 0; i < 3; ++i) {
+      const int pl = plane_id(i);
+      BYTE* p = writable ? f->GetWritePtr(pl) : nullptr;
+      if (eight_bit()) frame8.plane[i] = {p, f->GetPitch(pl), f->GetRowSize(pl), f->GetHeight(pl)};
+      else frame.plane[i] = {reinterpret_cast<uint16_t*>(p), f->GetPitch(pl) / 2, f->GetRowSize(pl) / 2, f->GetHeight(pl)};
+    }
+  }
 
   bool token_out_;                          // result frames are GPU token frames (needs mvtools_cuda.dll)
   cudaconvolution::token::FrameFormat out_format_{};
@@ -545,14 +581,14 @@ AVSValue __cdecl cudaconvolution_selftest(AVSValue args, void*, IScriptEnvironme
   const int device = args[0].AsInt(0);
   std::string report = "CudaConvolution " CUDACONVOLUTION_VERSION " self-test";
   bool all_ok = true;
-  auto run = [&](const char* label, const cudaconvolution::EngineFn& fn) {
+  auto run = [&](const char* label, const cudaconvolution::EngineFn& fn, const cudaconvolution::EngineFn8& fn8 = {}) {
     int ok = 0, total = 0;
     std::string failed;
     for (const cudaconvolution::SelftestCase& c : cudaconvolution::selftest_cases()) {
       ++total;
       std::string md5;
       try {
-        md5 = cudaconvolution::selftest_md5(c, fn);
+        md5 = cudaconvolution::selftest_md5(c, fn, fn8);
       } catch (const std::exception& e) {
         md5 = std::string("error: ") + e.what();
       }
@@ -576,10 +612,13 @@ AVSValue __cdecl cudaconvolution_selftest(AVSValue args, void*, IScriptEnvironme
 #ifdef CUDACONVOLUTION_HAVE_CUDA
   const cudaconvolution::CudaStatus& st = cudaconvolution::cuda_status(device);
   if (st.ok) {
-    run(("GPU " + st.info).c_str(), [device](const cudaconvolution::ConstFrame& a, const cudaconvolution::ConstFrame& b,
-                                             const cudaconvolution::Frame& o, const Preset& p) {
-      cudaconvolution::CudaEngine(device, p).process_frame(a, b, o);
-    });
+    run(("GPU " + st.info).c_str(),
+        [device](const cudaconvolution::ConstFrame& a, const cudaconvolution::ConstFrame& b, const cudaconvolution::Frame& o,
+                 const Preset& p) { cudaconvolution::CudaEngine(device, p).process_frame(a, b, o); },
+        [device](const cudaconvolution::ConstFrame8& a, const cudaconvolution::ConstFrame8& b,
+                 const cudaconvolution::Frame8& o, const Preset& p) {
+          cudaconvolution::CudaEngine(device, p, cudaconvolution::EightBit{}).process_frame(a, b, o);
+        });
   } else {
     all_ok = false;
     report += "\nGPU: not available: " + st.error;

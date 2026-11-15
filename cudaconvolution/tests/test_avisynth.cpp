@@ -197,6 +197,18 @@ TEST_CASE("8-bit input = 10-bit route (x 4 in, rounded / 4 out), on every engine
   }
 }
 
+TEST_CASE("8-bit input: GPU (8-bit frames on the device) == CPU engine, with limits, factors 1 / 2, TFF / BFF", "[avs]") {
+  Avs& avs = Avs::get();
+  if (!avs.gpu()) SKIP("no usable GPU");
+  for (const char* layout : {"ConvertToYUV422()", "ConvertToYUV444()", "ConvertToPlanarRGB()"})
+    for (const char* opt : {"width=256, height=144", "width=256, height=144, clip_min=17, clip_max=234",
+                            "field_order=\"bff\"", "width=128, height=72, preset=\"balanced\""}) {
+      INFO(layout << " " << opt);
+      const std::string in = std::string("src8.") + layout;
+      CHECK(compare(avs.clip(in + ".CudaConvolution(" + opt + ")"), avs.clip(in + ".CudaConvolution(" + opt + ", cpu=true)")) == "");
+    }
+}
+
 TEST_CASE("clip_min / clip_max: limits in the input bit depth, same as clamping afterwards", "[avs]") {
   Avs& avs = Avs::get();
   const std::string args = std::string("width=256, height=144") + avs.engine();
@@ -276,6 +288,16 @@ TEST_CASE("GPU token frames: identical to ordinary frames, every frame checked",
   }
   CHECK(compare(avs.clip("src8.ConvertToYUV422().ConvertBits(10).CudaUpload().CudaConvolution(token_out=true).CudaDownload()"),
                 avs.clip("src8.ConvertToYUV422().ConvertBits(10).CudaConvolution()")) == "");
+  // 8 bit: token in (zero-copy) and token out, against the CPU engine; limits applied on the device as well
+  for (const char* in : {"src8.ConvertToYUV422()", "src8.ConvertToYUV444()"})
+    for (const char* opt : {"", ", clip_min=17, clip_max=234", ", width=128, height=72, field_order=\"bff\""}) {
+      INFO(in << opt);
+      const std::string s = in, o = opt;
+      const PClip cpu = avs.clip(s + ".CudaConvolution(cpu=true" + o + ")");
+      CHECK(compare(avs.clip(s + ".CudaUpload().CudaConvolution(token_out=false" + o + ")"), cpu) == "");
+      CHECK(compare(avs.clip(s + ".CudaUpload().CudaConvolution(token_out=true" + o + ").CudaDownload()"), cpu) == "");
+      CHECK(compare(avs.clip(s + ".CudaConvolution(token_out=true" + o + ").CudaDownload()"), cpu) == "");
+    }
   CHECK(std::string(avs.eval("CudaConvolution_Version()").AsString()).find("GPU token frames: available") != std::string::npos);
 
   // A second, different copy of the library in the process is a second registry: CudaConvolution must refuse to read tokens
