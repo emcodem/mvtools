@@ -10,6 +10,12 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Next
 
+- Race in the GPU QTGMC chain, exact path: XDCAM HD Fast, `gpu all` (QTGMC_gpu_out = true), 120 frames, Prefetch 12,
+  HAGS on: about 1 of 6 runs started after the GPU was idle (20 s pause) gives a different frame 43 (186 luma samples
+  in rows 1001..1029, columns 1187..1220, |diff| mostly 1-2, max 14; chroma identical); back-to-back runs (8 of 8)
+  always give the CPU result. Not seen with HAGS off (frames one after another) and not yet with `gpu tokens+edi`.
+  Repro: run it repeatedly with an idle pause before each run and compare framemd5. Next: bisect the output stages (QTGMC_gpu_out parts), then
+  compute-sanitizer racecheck / synccheck on the culprit kernel.
 - Hardware-accelerated GPU scheduling off (Windows 10 default, PR #1's RTX 3090 Ti) runs the GPU work of the Prefetch
   frames one after another: RTX 5090 QTGMC Fast 576i 1125 -> 210 frames/s, 1080i 375 -> 74, UConvert GPU chain
   105 -> 26 (identical to `CUDA_DEVICE_MAX_CONNECTIONS=1`; bench v5 measures it, results 2026-11-15). Documented in
