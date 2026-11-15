@@ -16,6 +16,15 @@ Mark an item done by deleting it here (the commit message says what was done). *
   always give the CPU result. Not seen with HAGS off (frames one after another) and not yet with `gpu tokens+edi`.
   Repro: run it repeatedly with an idle pause before each run and compare framemd5. Next: bisect the output stages (QTGMC_gpu_out parts), then
   compute-sanitizer racecheck / synccheck on the culprit kernel.
+  2026-11-15 evening, much more often (QTGMC_gpu_on(), same XDCAM file, 100 frames, Prefetch 12, back-to-back runs):
+  Slow 3 runs -> 3 different md5 (one = CPU), Slower 3 runs -> 3 different md5. Our CPU path (QTGMC_gpu_off()) also
+  gave two different md5 in two HD Slower runs. HD Fast and PAL Fast / Slow / Slower stable. So not only the GPU chain
+  and not only after an idle pause; check the CPU Slower case first (stock + avstp too?).
+- **User:** avstp in the bundle. Its internal threads (mvtools' slices) cost our CPU path 8-10 % speed and 35-50 % CPU
+  time under Prefetch 12 (QTGMC Fast PAL 463 vs 513 fps, HD 72.8 vs 77.6; stock + avstp the same); with
+  `avstp_set_threads(0, 1)` ours = stock exactly (speed and md5). The slice count also decides the vectors: the bundle's
+  output equals stock mvtools WITH avstp, plain stock without it (e.g. FFAStrans' set) gives another md5. Option: avstp
+  threading off in `QTGMC_gpu_off()`; the GPU path keeps its slices (its search parallelism).
 - Hardware-accelerated GPU scheduling off (Windows 10 default, PR #1's RTX 3090 Ti) runs the GPU work of the Prefetch
   frames one after another: RTX 5090 QTGMC Fast 576i 1125 -> 210 frames/s, 1080i 375 -> 74, UConvert GPU chain
   105 -> 26 (identical to `CUDA_DEVICE_MAX_CONNECTIONS=1`; bench v5 measures it, results 2026-11-15). Documented in
@@ -140,8 +149,21 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   t=10 1.83 -> 1.64 s; UConvert deint crop Fast t=3 3.42 -> 3.05 s, t=10 2.06 -> 1.96 s, Slow t=3 5.65 -> 5.1 s.
   Skipping cudaSetDevice when the thread's context is current (CPU profile: 0.17 s of lock waits) measured no gain.
   Left: phase A barrier (~5-7 %: warps wait for the slowest candidate), the reference L1 misses (~6 %).
-- **QTGMC deint at t >= 10 is not search-bound any more**: ~2.5 analyses in flight (k_search_fix ~90 % of GPU time, GPU
-  ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
+- **Measure steady state, not short runs (2026-11-15 evening)**: the 300-frame `*_crop.avs` runs are about half start-up
+  (~0.9 s Fast, ~1.1 s Slow at t=10, more with more threads). Throughput = (T 1500 frames - T 300 frames) on
+  `*_long.avs` (MovingPattern keeps only its 100-frame period in memory). Steady state, UConvert deint t=10: the search
+  is 22 % (Fast) / 22-29 % (Slow) of the time (skip-search ceiling: Fast ~585 -> 757 fps, Slow 437 -> 564); t=16 is
+  +11-12 % (t=24: Fast +16 %, Slow worse) - "more threads are slower" below was start-up. Removing half the analysis
+  launches (k_global / k_interp) gains nothing.
+- **Real HD QTGMC on the GPU (XDCAM, QTGMC_gpu_on(), nsys GPU metrics, 2026-11-15)**: some kernel runs 97-98 % of the
+  time, k_search_fix 86-88 % of kernel time, SMs active 59 % (Fast) / 70 % (Slow), SM issue 32-36 %, warps in flight
+  30-34 %, DRAM / PCIe / copy < 8 %. So the GPU is never idle: vector tokens (no host round trip between MAnalyse and
+  MDegrain) would gain little; the lever is the slice search's SM efficiency (sm_120 102-166 registers x 256 threads =
+  1-2 CTAs per SM; sm_61 113-210): one warp per slice instead of one CTA, fewer registers, the next block's reference
+  window fetched ahead. QTGMC vs stock on this machine (steady state, Prefetch 12): PAL Fast / Slow / Slower 3.2x /
+  3.7x / 3.0x, HD 2.8x / 6.0x / 4.6x; CPU time per frame 1/10.
+- **QTGMC deint at t >= 10 is not search-bound any more** (older note, see the two above): ~2.5 analyses in flight
+  (k_search_fix ~90 % of GPU time, GPU ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
   the run is CPU-bound (25 CPU-s for 600 frames, NNEDI3 on the CPU); QTGMC_gpu_edi = true gives identical output, half
   the CPU time, t=3 Fast -8 % / Slow -12 %, t=10 unchanged (UConvert uses it since 2026-11-15; CudaNNEDI3 runs the
   plugin itself where it cannot be exact, e.g. 16-bit: same md5 checked).
@@ -165,6 +187,9 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
 - Thread block clusters (sm_90+): k_wave row hand-over through distributed shared memory (today 2.5-5 us per wavefront
   step), or one meander slice spread over several SMs. Large refactor, gain unknown.
 - CUDA Graphs for fixed per-frame launch sequences (super build, QTGMC output side): about 9 us per WDDM launch.
+  Measured 2026-11-15 for analyse_dev (prototype `MVCUDA_GRAPH=1`, local branch x1-parallel 34d9c2b): exact, +3-5 %
+  steady state at t=10; stream capture still costs ~6.4 us per captured launch + ~60 us graph launch + ~21 us update,
+  so a graph pays only with kernel-node parameter updates instead of re-capture.
 - Fewer launches: super build in one launch (5 fewer per frame), MCompensate / MDegrain tables without separate upload
   waits, fuse RemoveGrain + GaussResize + MergeLuma in the search clip (submitter about 70% busy, ~30 driver calls / frame).
 - trymany: share the first (start-vector-only) batch of hex / UMH Refines like the exhaustive table (trymanyall level 0
@@ -182,8 +207,15 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
 
 ## Non-exact options (each behind its own switch, default off) - User
 
-- X1 fully parallel block search (predictors only from the coarser level and the previous frame): expected 10-50x for the
-  search; vector fields less coherent, needs visual judgement (e.g. `exact=false`).
+- X1 fully parallel block search: prototyped and measured 2026-11-15 (`MVCUDA_PARALLEL=1`, local branch x1-parallel
+  34d9c2b; results profile\x1_parallel): k_search_fix with one CTA per block, all blocks of a level at once,
+  predictors from the interpolated coarse vectors only, same candidates and costs. Vectors (9 clips, finest level):
+  49-98 % identical, > 4 px off 0.03-10 %, total SAD +0..2 %. Speed: search alone t=1 2.8x faster, but no gain at
+  t=10 / UConvert (it removes latency, not work; the same SADs per block); a second pass (X1b) is slower. Not pursued.
+- QTGMC with `QTGMC_gpu_meander = false` as the default (**User**): DTL's GTX 1060 (PAL DVCAM, Slow, doom9 #16): meander
+  19 fps vs meander=false 78 / 92 fps, about half the output blocks change, "no clear quality winner". RTX 5090:
+  -18..-33 % (rel25), SD PAL default preset whole clip only -8 % (2026-11-15, scaling_test_SD_PAL 576i -> 1080p50:
+  median Y PSNR between the two 55 dB, worst 47 dB; differences at moving edges). User to judge the two encodes.
 - X2 approximate SADs for pruning, exact SAD for the best few (2-4x at large radii).
 - X3 NVENC ME-only (see NVENCMEAnalyse.md, DTL list item 14). 2026-11-14: DTL's colour proposal (3 grey runs Y/U/V
   or R/G/B, per-cell colour-SAD selection) prototyped in compare/nvencme_colour: works for chroma-only motion, small
