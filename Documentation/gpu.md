@@ -11,7 +11,7 @@ This page covers the CUDA part of this mvtools build:
 Until 2026-11-02 the mvtools2 GPU paths were switched on with a `gpu=true` parameter on MSuper, MAnalyse, ...; that
 parameter is gone. MSuper, MAnalyse and the other M* functions are the CPU filters, as upstream.
 
-This page describes what the functions do now (library API version 19). Design notes for developers:
+This page describes what the functions do now (library API version 33). Design notes for developers:
 `docs/dev/ARCHITECTURE.md`.
 
 ## Principles
@@ -79,6 +79,10 @@ does not understand tokens shows obvious stripes, not a plausible picture.
 - **Readers.** Every `Cuda*` function reads token frames and uses the device frame directly. Of the CPU filters, `MSuper`,
   `MCompensate`, `MDegrain1..6`, `MAnalyse`, `MRecalculate` and `MFlowFps` accept token frames too and download the
   picture. Any other filter needs `CudaDownload` in front of it.
+- **Other plugins.** Plugins built against `mvtools_cuda.dll` (library API 31 or newer) can read and write token
+  frames through it (device frame lookup, checked download, registering their own results): `CudaConvolution.dll`
+  and `nvencmv.dll` do, so `Cuda*` filters followed by `CudaConvolution` stay on the GPU without a download in
+  between.
 - **Usage rule.** One rule for mvtools2 and cudafilters: a `Cuda*` function accepts normal or token frames and always
   returns token frames; given normal frames, it uploads them itself (`CudaUpload` is not needed). End the GPU part with
   `CudaDownload` (it passes normal frames of any format through unchanged), and put it in front of every filter that
@@ -366,12 +370,13 @@ Replaces `nnedi3` of plugins_JPSDR 4.1.0, which must be loaded (the network weig
 nnedi3's: `field` -1, `dh` false, `Y`/`U`/`V` true, `nsize` 6, `nns` 1, `qual` 1, `etype` 0, `pscrn` 2, `opt` 0,
 `fapprox` 15. `threads` is passed to the CPU fallback only.
 
-The GPU reproduces the plugin's AVX2 + FMA code path (its `opt` 6 / 7). It runs on the GPU when all of these hold:
+The GPU reproduces the plugin's AVX2 + FMA code path (its `opt` 6 / 7; its AVX-512 path `opt` 8 gives the same
+result). It runs on the GPU when all of these hold:
 
 - 8 or 10-bit planar YUV or Y (above 10 bit the plugin takes a different code path; 9 bit is not tested)
 - `dh=false`, `field` -2..3
-- the plugin would take its AVX2 + FMA path on this CPU: `opt=0` on a CPU with AVX2 + FMA3 (or FMA4) and without
-  AVX-512, or `opt` 6 / 7 set explicitly
+- the plugin would take its AVX2 + FMA or AVX-512 path on this CPU: `opt=0` on a CPU with AVX2 + FMA3 (or FMA4) or
+  AVX-512, or `opt` 6 / 7 / 8 set explicitly
 - `pscrn` 2..4 (the new prescreener)
 - `fapprox` with the int16 predictor and the fastest exp (bits 2 and 8 set; the default 15 has them)
 - `qual` 1 or 2; any `nsize`, `nns`, `etype`

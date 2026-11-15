@@ -66,6 +66,9 @@ the input format).
 - The last one to five output frames of a clip are copies of the nearest source picture (the last source pair is not
   interpolated yet).
 - `MT_SERIALIZED` (one frame at a time per instance).
+- Source access: the filter reads a few source pictures ahead and keeps the ones within 4 of the last request itself,
+  so it never asks the source for an earlier frame again, also when AviSynth's frame cache is too small (big frames,
+  `SetMemoryMax`). Sources that decode from the start of the file on a backward read (ffms2 `seekmode=0`) stay fast.
 
 ## SplatFps(clip, int num, int den, clip vectors, bool exact = false, ...settings)
 
