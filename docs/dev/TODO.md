@@ -129,7 +129,17 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   thread CTAs (slower), L1 prefetch of the next block's or of all candidate windows (no effect / slower: issue cost),
   out-of-line SAD routine (slower SADs), speculative ring / hexagon around the left predictor (hit 65 % finest, 77-91 %
   coarser, real footage) with 512 threads (every other phase slower) or two candidates per warp (phase A +540 cycles,
-  ring -690): net zero. Ideas left: ncu (needs admin) to see where the first-touch latency goes; a smaller SAD routine.
+  ring -690): net zero.
+- **ncu round (2026-11-15, elevated; ncu works as admin without any driver setting)**: finest level k_search_fix<1>
+  (search_t1, 24 x 256, 2 warps per SMSP) was latency-bound: stall wait 28 %, short scoreboard 20 %, barrier 9 %, long
+  scoreboard 8 % (the reference first touch; with warm caches `--cache-control none` L2 hit 99.95 %, the wait is the L1
+  miss -> L2 latency). Per source line (`-DMVTOOLS_CUDA_FLAGS=-lineinfo`, `--print-source cuda,sass`) the largest item
+  was warp_sum's 5 dependent shuffles. Exact changes: warp_sum = `__reduce_add_sync` on sm_80+ (finest kernel 2.17 ->
+  1.86 ms); luma-only SAD routines skip the chroma reduction; ring fold with the ring offsets in registers and the winner
+  by shuffle (-> 1.74 ms); luma-only instances do not read the chroma SAD tables. Search t=1 9.11 -> 7.3 s (-20 %),
+  t=10 1.83 -> 1.64 s; UConvert deint crop Fast t=3 3.42 -> 3.05 s, t=10 2.06 -> 1.96 s, Slow t=3 5.65 -> 5.1 s.
+  Skipping cudaSetDevice when the thread's context is current (CPU profile: 0.17 s of lock waits) measured no gain.
+  Left: phase A barrier (~5-7 %: warps wait for the slowest candidate), the reference L1 misses (~6 %).
 - **QTGMC deint at t >= 10 is not search-bound any more**: ~2.5 analyses in flight (k_search_fix ~90 % of GPU time, GPU
   ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
   the run is CPU-bound (25 CPU-s for 600 frames, NNEDI3 on the CPU); QTGMC_gpu_edi = true gives identical output, half
@@ -140,8 +150,10 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   source floor 0.43 s): Fast t=3 3.45 -> 1.90 s, Slow t=3 5.76 -> 2.51 s; t=10 unchanged (Fast 2.04, Slow 2.6 s). So the
   lookahead equals more threads; at t >= 10 neither helps. Remaining ceiling at t=10: ~2.5 analyses in flight, every
   search stream 35-50 % busy, pipeline stream 26 %, submitter thread 23 % in CUDA calls (39k launches), workers 35 % in
-  cudaEventSynchronize: no single saturated resource found without a CPU profiler (needs admin). Next: why only ~2.5 analyses are in flight with 10 threads
-  (per-frame host syncs, cudaEventSynchronize 1828 x 2.9 ms; MT modes of the chain; submitter).
+  cudaEventSynchronize. CPU profile (nsys CPU sampling + context switches, elevated, PDB build): steady state, 10
+  workers = 12 thread-s: on-CPU 4.2 s, waiting for the analyses' GPU completion 5.9 s (cudaEventSynchronize in
+  leased_call, 4.8 ms per call), pipe_call queue 0.6 s (0.5 ms per call), AviSynth MT cache 0.6 s, downloads 0.3 s;
+  the submitter thread is busy 50 %. So the CPU side is not the limit; the analyses' GPU latency is.
 
 - **meander=true slice kernel critical path** (largest remaining exact gap): compute the predictor-independent candidates
   of the next block while the serial chain runs. PAL QTGMC Fast meander=true 3.88 s vs meander=false 1.85 s (before E1),

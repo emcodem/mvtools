@@ -144,9 +144,14 @@ namespace
 
   __device__ __forceinline__ int warp_sum(int v)
   {
+#if MVC_ARCH_BELOW(800)
     for (int o = 16; o > 0; o >>= 1)
       v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#else
+    // one warp-wide integer add (REDUX) instead of five dependent shuffles; the same integer sum
+    return __reduce_add_sync(0xffffffffu, v);
+#endif
   }
 
   __device__ __forceinline__ int scale_chroma(int sad, int scale)
@@ -726,7 +731,11 @@ namespace
         sum_c = pk_row<PK_WPR>(wc + PK_WPR * i, shc, q + i * CRP * CW * sizeof(pix) / 4, sum_c);
     }
     sl = warp_sum((int)sum_l);
-    sc = scale_chroma(warp_sum((int)sum_c), a.chroma_scale);
+    // luma only: the chroma sum is 0 (the warp reduction of a constant is not folded by the compiler)
+    if constexpr (CHH > 0)
+      sc = scale_chroma(warp_sum((int)sum_c), a.chroma_scale);
+    else
+      sc = 0;
   }
 
   // picks the compile-time row counts for the common block sizes
@@ -2817,6 +2826,8 @@ namespace
     const bool pair_chroma = (2 * a.cw <= 32);
     // the block geometry of the instances with a fixed SAD routine (fix_eval_id): their source copy goes through
     // registers (staged), the others use issue_src (cp.async)
+    // the instances whose SAD routine has no chroma (fix_eval_id: ch == 0): their chroma SADs are 0, not read back
+    constexpr bool LUMA = EV == 1 || EV == 4 || EV == 5;
     constexpr int GBX = EV == 5 ? 32 : (EV >= 1 && EV <= 3) ? 16 : 0;
     constexpr int GCW = (EV == 2 || EV == 3) ? 8 : 0, GCH = EV == 2 ? 8 : EV == 3 ? 16 : 0;
     constexpr int GWL = GBX * GBX / SPW, GWC = GCW * GCH / SPW, GW = GWL + 2 * GWC;
@@ -2874,6 +2885,15 @@ namespace
       // the previous row's last vector (thread 0's store) is read by fetch_pred below as the up predictor, and the
       // previous row's last reads of s_nl and of both source buffers are done
       __syncthreads();
+      // the ring offsets of the candidates lane and lane + 32 (the ring fold's; ring_n <= 48), for the whole row
+      int rdx[2] = { 0, 0 }, rdy[2] = { 0, 0 };
+      #pragma unroll
+      for (int k = 0; k < 2; k++)
+        if (lane + 32 * k < ring_n)
+        {
+          rdx[k] = b.ring_dx[lane + 32 * k];
+          rdy[k] = b.ring_dy[lane + 32 * k];
+        }
 
       // the bottom-right predictor (not yet searched, the interpolated vector) or else the up-right one, if any
       auto p3_index = [&](int bx) {
@@ -3051,7 +3071,7 @@ namespace
           int cst[7], sads[7];
           #pragma unroll
           for (int c = 0; c < 7; c++)
-            sads[c] = b.slA[c] + b.scA[c];
+            sads[c] = b.slA[c] + (LUMA ? 0 : b.scA[c]);
           cst[0] = sads[0] + (int)(((long long)a.pzero * sads[0]) >> 8);
           cst[1] = sads[1] + (int)(((long long)a.pglobal * sads[1]) >> 8);
           cst[2] = sads[2];
@@ -3061,7 +3081,7 @@ namespace
             const int cx = pv[i].x, cy = pv[i].y;
             const int dxp = pred.x - cx, dyp = pred.y - cy;
             const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
-            const int cost = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits)) + b.slA[3 + i] + b.scA[3 + i];
+            const int cost = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits)) + b.slA[3 + i] + (LUMA ? 0 : b.scA[3 + i]);
             cst[3 + i] = (cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max) ? cost : INT_MAX;
           }
           // (unrolled with constant indices: a dynamic index would put the arrays into local memory)
@@ -3115,7 +3135,7 @@ namespace
                 {
                   const int dxp = pred.x - cx, dyp = pred.y - cy;
                   const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
-                  const int sl = tl[c], sc = tc[c];
+                  const int sl = tl[c], sc = LUMA ? 0 : tc[c];
                   const int t = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits))
                     + sl + (int)(((long long)a.pnew * sl) >> 8) + sc + (int)(((long long)a.pnew * sc) >> 8);
                   if (t < min_cost)
@@ -3127,7 +3147,7 @@ namespace
               if (w >= 0)
               {
                 min_cost = m;
-                best_sad = tl[w] + tc[w];
+                best_sad = tl[w] + (LUMA ? 0 : tc[w]);
                 best_x += g_fix_dx[off + w];
                 best_y += g_fix_dy[off + w];
               }
@@ -3170,30 +3190,43 @@ namespace
 
         // ---- fold the ring in every warp (one lane per candidate, first smallest cost below the minimum, see k_search)
         {
-          int lc = INT_MAX, li = 0;
-          for (int c = lane; c < ring_n; c += 32)
+          // the ring offsets of this lane's candidates are in registers (rdx / rdy, loaded at the row start); the
+          // winner's offset and SAD come from the lane that holds it (shuffles instead of shared loads after the fold)
+          int lc = INT_MAX, li = 0, ldx = 0, ldy = 0, lsad = 0;
+          #pragma unroll
+          for (int k = 0; k < 2; k++)
           {
-            const int cx = best_x + b.ring_dx[c], cy = best_y + b.ring_dy[c];
+            const int c = lane + 32 * k;
+            if (c >= ring_n)
+              break;
+            const int cx = best_x + rdx[k], cy = best_y + rdy[k];
             if (!(cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max))
               continue;
             const int dxp = pred.x - cx, dyp = pred.y - cy;
             const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
-            const int sl = b.slR[c], sc = b.scR[c];
+            const int sl = b.slR[c], sc = LUMA ? 0 : b.scR[c];
             const int t = ((int)((unsigned)nlambda * (unsigned)dist) >> (16 - a.bits))
               + sl + (int)(((long long)a.pnew * sl) >> 8) + sc + (int)(((long long)a.pnew * sc) >> 8);
             if (t < min_cost && t < lc)
             {
               lc = t;
               li = c;
+              ldx = rdx[k];
+              ldy = rdy[k];
+              lsad = sl + sc;
             }
           }
           int m = 0;
           const int w = warp_first_min(lc, li, m);
+          // (the lane of candidate w chose w itself: w is the first smallest cost of the warp)
+          const int wdx = __shfl_sync(0xffffffffu, ldx, w & 31);
+          const int wdy = __shfl_sync(0xffffffffu, ldy, w & 31);
+          const int wsad = __shfl_sync(0xffffffffu, lsad, w & 31);
           if (w >= 0)
           {
-            best_x += b.ring_dx[w];
-            best_y += b.ring_dy[w];
-            best_sad = b.slR[w] + b.scR[w];
+            best_x += wdx;
+            best_y += wdy;
+            best_sad = wsad;
           }
         }
         if (tid == 0)

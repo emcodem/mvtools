@@ -91,7 +91,9 @@ reference .md files (links to online resources are fine).
   and comparisons with a shorter serial chain per block: SAD tables per batch, the ring folded in every warp (left
   predictor in registers), parallel cost folds (first smallest), next source block staged through registers, predictor
   vectors two blocks ahead by warp 7 (idle in phase A), one instance per SAD routine (`eval_fix`, ~100-120 registers,
-  small enough for the instruction cache). Two barriers per block. `MVCUDA_SEARCH_FIX=0` forces k_search.
+  small enough for the instruction cache). Two barriers per block. `MVCUDA_SEARCH_FIX=0` forces k_search. The ring
+  fold keeps each lane's ring offsets in registers and takes the winner by shuffle; luma-only instances neither reduce
+  nor read chroma SADs. warp_sum (all SAD routines) is one `__reduce_add_sync` on sm_80+, shuffles below.
 - **k_wave** (meander=false): one CTA of 4 warps per block row, rows by atomic ticket, per-row progress counters
   (release / acquire), all levels in one launch. Fixed plans for small Hex2 / UMH in the fast kernel, GEN kernel
   (mvc_refine) otherwise; register cap 96. Runs the bad-vector wide search itself (k_search sends such frames to the
