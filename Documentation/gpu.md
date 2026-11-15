@@ -60,6 +60,11 @@ Requirements:
 - An NVIDIA GPU with compute capability 6.0 or newer (GTX 10xx / Pascal, Volta, RTX 20xx .. 50xx); older cards count as
   "no usable device". The first usable device is used; `MVCUDA_DEVICE=n` picks another. Pascal / Volta are verified
   only as PTX 6.1 on an RTX 50xx, not yet on real 6.x / 7.0 hardware.
+- Windows: hardware-accelerated GPU scheduling on (Settings > System > Display > Graphics > Change default graphics
+  settings; a restart is needed after changing it). The GPU work of the frames in flight (`Prefetch`) only runs at the
+  same time with it on; with it off Windows runs it one after another, and the speed drops several times, most at SD
+  (RTX 5090, QTGMC Fast: 576i 1125 -> 210 frames/s, 1080i 375 -> 74 frames/s). The environment variable
+  `CUDA_DEVICE_MAX_CONNECTIONS=1` has the same effect. Windows 10 and older drivers often have it off.
 - `CudaNNEDI3` needs the nnedi3 weights: from a loaded `plugins_JPSDR.dll` (nnedi3), else `nnedi3_weights.bin` next to
   cudafilters (under AviSynth+ its CPU fallback still needs nnedi3 itself). `CudaKeepOnlyBobShimmerFixes` needs
   `QTGMC.avsi` (`QTGMC_KeepOnlyBobShimmerFixes`) with masktools2 and RgTools loaded.

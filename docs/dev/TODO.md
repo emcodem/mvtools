@@ -10,6 +10,12 @@ Mark an item done by deleting it here (the commit message says what was done). *
 
 ## Next
 
+- Hardware-accelerated GPU scheduling off (Windows 10 default, PR #1's RTX 3090 Ti) runs the GPU work of the Prefetch
+  frames one after another: RTX 5090 QTGMC Fast 576i 1125 -> 210 frames/s, 1080i 375 -> 74, UConvert GPU chain
+  105 -> 26 (identical to `CUDA_DEVICE_MAX_CONNECTIONS=1`; bench v5 measures it, results 2026-11-15). Documented in
+  gpu.md / README / bundle READMEs. Open: make the GPU part less dependent on it (fewer, larger launches: the searches
+  of several frames in one launch, CUDA graphs per frame in CudaSplatFps), and a log line or warning when it is off
+  (D3DKMT `WDDM_2_7_CAPS.HwSchEnabled`, as the bench reads it). **User:** which of these.
 - uconvert.avsi (`uconvert/`, D8 done): switch `uc_frc_gpu` to the Cuda* names (+ CudaDownload at the end of the
   FRC chain, cudafilters.dll loaded), deploy a new all-arch DLL set (replaces its mvtools2.dll too: 2.7.48 CPU result),
   uc_FRC HD branch with the whole pel-4 chain on the GPU (CudaMSuper is lite at pel 4 since D8; `run_frc_pel4.ps1`

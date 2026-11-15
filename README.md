@@ -228,7 +228,8 @@ A `Cuda*` function that cannot run on the GPU (no device or library, settings or
 that names the reason; with `global cuda_cpu_fallback = true` (or the environment variable `CUDA_CPU_FALLBACK=1`) it runs
 the CPU filter instead, with the same output. Needs an NVIDIA GPU with compute capability 6.0+ (GTX 10xx and newer) and `mvtools_cuda.dll` next to
 `mvtools2.dll` (built with CUDA 12.9, "Build Instructions"). Pascal / Volta are verified only as PTX 6.1 on an RTX 50xx,
-not yet on real 6.x / 7.0 hardware.
+not yet on real 6.x / 7.0 hardware. On Windows, turn on hardware-accelerated GPU scheduling (Settings > System >
+Display > Graphics): with it off, the GPU work of parallel frames runs one after another and is several times slower.
 
 * Reference of every `Cuda*` function, the `cudafilters` plugin, the CPU fallback and the environment variables:
   `Documentation/gpu.md`.
@@ -236,8 +237,8 @@ not yet on real 6.x / 7.0 hardware.
   `CudaNVOFAnalyse` (vectors from NVIDIA's optical flow accelerator).
 * `qtgmc/`: `make_qtgmc_gpu.py` makes `QTGMC_gpu.avsi` from an unmodified QTGMC.avsi; `qtgmc/bundle/` holds the loader
   and the example scripts of the Windows release bundle.
-* Windows release bundles (AviSynth+ x64, DLLs, patched QTGMC, examples, docs): GitHub releases `gpu-qtgmc-*` of
-  github.com/emcodem/mvtools.
+* Windows release bundles (AviSynth+ x64, DLLs, patched QTGMC, examples, docs): GitHub releases `gpu-<date>` of
+  github.com/emcodem/mvtools (also VapourSynth Windows and Linux bundles, and UConvert with its benchmark).
 * Developer notes: `docs/dev/` (`ARCHITECTURE.md` design and lessons, `DECISIONS.md`, `TODO.md` open work).
 
 ## SplatFps (this branch, in development)
@@ -274,6 +275,25 @@ moving objects with occlusion, fine stripes, grain, a scene cut). The clip is ge
     MovingPattern(1920, 1080, "YUV422P10", 25, 1, "tff")
 
 * Reference and sources: `movingpattern/` (README.md).
+
+## nvencmv (this branch, research)
+
+`nvencmv.dll`: `CudaNVENCAnalyse` makes MVTools vector clips (MAnalyse format, one level) with the motion estimation of
+NVIDIA's video encoder (NVENC ME-only mode, Pascal or newer), which runs beside the CUDA cores. Not bit-exact with
+any search; every engine option is a parameter. QTGMC_gpu uses it with `global QTGMC_gpu_nvenc = true`.
+
+* Reference: `Documentation/nvencmv.md`. Sources and tests: `nvencmv/`.
+
+## UConvert (this branch)
+
+`uconvert/uconvert.avsi`: one AviSynth+ entry point for broadcast conversions (`UConvert(file, out_h, out_w,
+out_interlace, out_rate_nom, out_rate_den, ...)`): source, deinterlacing (QTGMC), frame-rate conversion (SplatFps),
+interlacing (CudaConvolution) and scaling, on the GPU or the CPU (`gpu=false`). `uconvert/build_dist.py` makes the
+redistributable folder (every plugin in `dlls\`), which the GitHub releases ship with the benchmark.
+
+* Benchmark: `uconvert/bench/` (`bench_uconvert.cmd`, README.md): speed of each stage and of the whole chain on
+  generated clips, the GPU's state under load and the GPU scheduling setting, one JSON file to post.
+* Design and decision tables: `uconvert/DESIGN.md`.
 
 ## VapourSynth (this branch; Linux and Windows)
 

@@ -15,7 +15,9 @@ Needs:
   give its path with `-FFmpeg C:\path\ffmpeg.exe`.
 - **AviSynth+ 3.7 or newer, x64**: `AviSynth.dll` either in `C:\Windows\System32` (the AviSynth+ installer puts it
   there) or next to `ffmpeg.exe` (the x64 `AviSynth.dll` from the AviSynth+ release archive).
-- for the GPU stages an NVIDIA GPU with a current driver.
+- for the GPU stages an NVIDIA GPU with a current driver. On Windows, hardware-accelerated GPU scheduling should be on
+  (Settings > System > Display > Graphics > Change default graphics settings; restart after changing it): with it
+  off the GPU stages run several times slower. The result file records the setting.
 
 The benchmark checks the first two before anything else and says what is missing. Nothing is
 installed or changed. Close other heavy programs (games, renders) while it runs: they change the numbers.
