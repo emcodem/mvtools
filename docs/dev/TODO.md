@@ -134,7 +134,13 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
   the run is CPU-bound (25 CPU-s for 600 frames, NNEDI3 on the CPU); QTGMC_gpu_edi = true gives identical output, half
   the CPU time, t=3 Fast -8 % / Slow -12 %, t=10 unchanged (UConvert uses it since 2026-11-15; CudaNNEDI3 runs the
-  plugin itself where it cannot be exact, e.g. 16-bit: same md5 checked). Next: why only ~2.5 analyses are in flight with 10 threads
+  plugin itself where it cannot be exact, e.g. 16-bit: same md5 checked).
+- **Analysis lookahead, measured 2026-11-15 (prototype, not committed)**: Prefetch(4, 8) on QTGMC's vector clips (script
+  only, identical md5). UConvert deint 600 frames, output cropped to 64x64 (the full-frame ffmpeg read alone costs 1.7 s;
+  source floor 0.43 s): Fast t=3 3.45 -> 1.90 s, Slow t=3 5.76 -> 2.51 s; t=10 unchanged (Fast 2.04, Slow 2.6 s). So the
+  lookahead equals more threads; at t >= 10 neither helps. Remaining ceiling at t=10: ~2.5 analyses in flight, every
+  search stream 35-50 % busy, pipeline stream 26 %, submitter thread 23 % in CUDA calls (39k launches), workers 35 % in
+  cudaEventSynchronize: no single saturated resource found without a CPU profiler (needs admin). Next: why only ~2.5 analyses are in flight with 10 threads
   (per-frame host syncs, cudaEventSynchronize 1828 x 2.9 ms; MT modes of the chain; submitter).
 
 - **meander=true slice kernel critical path** (largest remaining exact gap): compute the predictor-independent candidates
