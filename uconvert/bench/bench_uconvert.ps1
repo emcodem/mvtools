@@ -48,7 +48,8 @@ if (-not (Test-Path $FFmpeg -PathType Leaf)) {
   Fail ("ffmpeg not found at the -FFmpeg path: $FFmpeg`n" +
         "       Give the full path of ffmpeg.exe, e.g.: bench_uconvert.cmd -FFmpeg C:\tools\ffmpeg\bin\ffmpeg.exe")
 }
-$FFmpeg = (Resolve-Path $FFmpeg).Path
+# ProviderPath: a network path (\\server\share\...) as Windows writes it; .Path would carry PowerShell's provider prefix
+$FFmpeg = (Resolve-Path $FFmpeg).ProviderPath
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("uconvert_bench_" + $PID)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
