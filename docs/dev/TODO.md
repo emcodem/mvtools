@@ -133,7 +133,8 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
 - **QTGMC deint at t >= 10 is not search-bound any more**: ~2.5 analyses in flight (k_search_fix ~90 % of GPU time, GPU
   ~83 % busy, 170 SMs mostly idle), more threads are slower (t=16 / 24). With QTGMC_gpu_edi = false (UConvert default)
   the run is CPU-bound (25 CPU-s for 600 frames, NNEDI3 on the CPU); QTGMC_gpu_edi = true gives identical output, half
-  the CPU time, t=3 Fast -8 % / Slow -12 %, t=10 unchanged. Next: why only ~2.5 analyses are in flight with 10 threads
+  the CPU time, t=3 Fast -8 % / Slow -12 %, t=10 unchanged (UConvert uses it since 2026-11-15; CudaNNEDI3 runs the
+  plugin itself where it cannot be exact, e.g. 16-bit: same md5 checked). Next: why only ~2.5 analyses are in flight with 10 threads
   (per-frame host syncs, cudaEventSynchronize 1828 x 2.9 ms; MT modes of the chain; submitter).
 
 - **meander=true slice kernel critical path** (largest remaining exact gap): compute the predictor-independent candidates

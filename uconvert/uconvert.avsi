@@ -410,8 +410,9 @@ function uc_GpuCheck()
 }
 
 # Bob deinterlace to field rate. Alpha (unsupported by QTGMC) is deinterlaced as a separate luma clip.
-# gpu: QTGMC_gpu.avsi's switches (motion search, search clip and output side on the GPU; NNEDI3 stays on the CPU,
-# CudaNNEDI3 refuses CPUs without its AVX2 + FMA path).
+# gpu: QTGMC_gpu.avsi's switches (motion search, search clip, NNEDI3 and output side on the GPU). CudaNNEDI3 is exact
+# against plugins_JPSDR nnedi3's AVX2 + FMA path; where it cannot be (older CPU, above 10 bit, other settings) it runs
+# the plugin itself (cuda_cpu_fallback, set by UConvertClip), same result.
 function uc_Deint(clip c, bool tff, bool "gpu")
 {
     gpu = Default(gpu, false)
@@ -419,7 +420,7 @@ function uc_Deint(clip c, bool tff, bool "gpu")
     global QTGMC_gpu_search = gpu
     global QTGMC_gpu_tokens = gpu
     global QTGMC_gpu_out = gpu
-    global QTGMC_gpu_edi = false
+    global QTGMC_gpu_edi = gpu
     global QTGMC_gpu_nvof = gpu && uc_qtgmc_nvof
     global QTGMC_gpu_nvenc = gpu && uc_qtgmc_nvenc
     global QTGMC_gpu_meander = !uc_qtgmc_wavefront
