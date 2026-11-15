@@ -4,6 +4,10 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
 
 ## State today (gpu_work, checked 2026-11-01 from code gates + Documentation\gpu.md, not run)
 
+Rechecked 2026-11-16 (gpu_work 6586527, code only): unchanged. `max_param()` still 64 / 24, MVRecalculate.cpp has
+no `trymany`, and no QTGMC script in the repository (`qtgmc/make_qtgmc_gpu.py`, the bundle) has `RefineMotionSearch`
+/ `RefineMotionRadius` / `TryMany` arguments. TODO 1-3 below are open.
+
 - `profile\qtgmc\QTGMC_gpu.avsi` has no `RefineMotionSearch`, `RefineMotionRadius` or `TryMany` arguments (only
   `RefineMotion` bool; MRecalculate reuses `Search` / `SearchParam` / `PNew`; MAnalyse never gets `trymany`). No QTGMC
   .avsi on this machine has them. Passing them now = script error "does not have a named argument".
@@ -161,6 +165,10 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
 - NVOFA input is luma only today (`NV_OF_BUFFER_FORMAT_GRAYSCALE8`, `Sources\cuda\mvcuda_nvofa.cu:118`); the SDK
   also takes NV12 and ABGR8 (`nvOpticalFlowCommon.h:259-260`) - whether it then uses colour is untested.
 - Why NVENC still matters: D11 supports compute capability 6.0+; Pascal has NVENC but no OFA engine.
+- NVOFA vectors in QTGMC exist since 2026-11-11 (5b506b4): global `QTGMC_gpu_nvof = true` (preset
+  `QTGMC_gpu_nvof_preset` 1..3) makes the 12 MAnalyse calls use `CudaNVOFAnalyse`; MRecalculate refines them as
+  before; CudaMAnalyse for SubPel 4 and without NVOFA. Not bit-exact. A first form of hardware vectors in QTGMC,
+  replacing the search rather than adding a predictor (item 12).
 - DTL's chroma ideas: 3 single-channel runs (Y/U/V or R/G/B) + per-block selection by full-colour SAD
   (`MAverage mode=8` in his fork) or 3 extra predictors; interleaving Y/U/V (or nibble-split U/V) into one wide
   8-bit luma frame; his bit-count argument (4:2:0 = 12 bits per sample position, 8-bit input loses 4).
@@ -174,7 +182,9 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
 13. NVOFA chroma: run `CudaNVOFAnalyse` with NV12 / ABGR8 input on the flat-luma synthetic clip. If NVOFA ignores
     colour: 3 runs + per-block colour-SAD selection in `k_of_blocks` (SAD kernel exists), opt-in, judged on real
     material. Cost 3 OFA runs (~2.6 ms each UHD medium, 1 OFA engine on the 5090).
-14. NVENC revisited along DTL's lines, target Pascal-Turing cards without OFA, in this order. Engine: the NVENC SDK
+14. **DONE / checked 2026-11-15:** research plugin nvencmv.dll / `CudaNVENCAnalyse` (gpu_work cf1cf6a,
+    Documentation/nvencmv.md) covers the proposal; (b) and (c) below stay ideas, not planned work.
+    NVENC revisited along DTL's lines, target Pascal-Turing cards without OFA, in this order. Engine: the NVENC SDK
     (it also runs on Linux); D3D12 only as a Windows comparison.
     (a) DONE 2026-11-14 as a prototype (`compare/nvencme_colour`, `NVME_COLOUR` in NVENCMEProto): Y/U/V or R/G/B grey
         runs + per-cell colour-SAD selection. Chroma-only motion is found (88-93 % vs 0 %). seg1_wires_pole: +0.2..0.7
@@ -188,6 +198,11 @@ Recalculate needs both trymany and a very large radius to recover from poor pred
         parameters plus hintclip (any vector clip as NVENC hints, his additional-predictor idea from the other side).
         DTL's GTX 1060 MShow/Subtract test does not show chroma use (MShow draws on the colour picture, showsad
         includes chroma SAD): ask him for a raw vector comparison or the flat-luma probe on Pascal.
+        QTGMC test 2026-11-15 (compare/nvencme_colour, `QTGMC_gpu_nvenc` in make_qtgmc_gpu.py): NVENC vectors
+        -0.1..-0.5 dB vs ground truth against the exact search, NVOFA in between; on the 5090 NVENC is slower than
+        the exact GPU search in the whole chain (XDCAM Fast 3.31 vs 2.54 s, NVOFA 1.67 s). So NVENC only matters for
+        cards without OFA; open: Pascal / Turing timing (ask DTL: GTX 1060, CudaNVENCAnalyse vs CudaMAnalyse
+        meander=false), crops not judged.
     (b) the same vectors fed to MAnalyse through item 12 (software search supplies the coherence NVENC lacks);
         compare with the exact search and NVOFA, user judges by eye.
     (c) DTL's interleaving ideas only if (a) / (b) fall short. Sceptical: the engine's sub-pel interpolation mixes
@@ -224,3 +239,66 @@ default presets and each new feature on / off. Publish results per footage type 
 15. Build the test: interlace the four 50p clips (vertical lowpass as the CrowdRun 1080i25 file), grain variants,
     QTGMC presets (default, then each opt-in feature on / off), scoring script with global + per-block metrics,
     worst-frame crops for the user. Then the same for SMDegrain.
+    Add DTL's two synthetic scripts (doom9 t=187172 #17 and 9 Nov) as cases: (a) static colour-noise texture + dynamic
+    grain, MAnalyse with and without `SuperCurrent` (noisy / clean / temporally smoothed src), MShow showSAD;
+    (b) multi-generation refining (MDegrainN -> MSuper -> MAnalyse with `SuperCurrent` = the noisy super, 4
+    generations) scored with Compare / SSIM against the clean texture. Both need item 16 first.
+
+## DTL posts #16-#18 (doom9 t=187172, 3-13 Nov 2026)
+
+Read 2026-11-15 from the single-post pages (showpost.php p=2051850, 2051951, 2052164). Not run, not checked
+against his code yet.
+
+### Already covered / done
+
+- #16 MRecalculate has no `trymany` (quoting this file): item 2 above.
+- #16 QTGMC 3.393 instead of 3.385 (`trymany` came in 3.389): done, the QTGMC_gpu.avsi base is 3.393 since the
+  2026-11-10 release.
+- #16 R/G/B as three grey MAnalyse runs + `MAverage(mode=8)` ("a bit better quality"): same idea as item 14 (a).
+- #16 GTX 1060 timings, PAL DVCAM, i5-9600K, preset "slow": GPU meander on 19 fps; GPU with meander off 78 / 92 fps
+  (no Prefetch / Prefetch(6)); `meander=false` about 3x faster, changes about 50 % of the output blocks, no clear
+  quality winner. Fits our own numbers (meander=false = existing non-exact faster order, rel25 QTGMC -18..-33 %).
+  SD PAL default preset, whole clip (2026-11-15): only -8 %; median Y PSNR between the two outputs 55 dB, worst
+  frame 47 dB, differences at moving edges. Whether meander=false becomes the QTGMC GPU default is a User decision
+  (TODO.md, non-exact options). His 19 fps for meander=true predate two exact speed-ups: f250b9a (hex / UMH refines
+  inline in the slice kernel, release 2026-11-12+: PAL QTGMC Slow 5.49 -> 3.35 s, Slower 10.48 -> 5.88 s) and
+  k_search_fix (9c0eb63 / 782086e, gpu_work, not in a release yet: search Fast / Slow -24..-38 %).
+- #18 ends by quoting our non-exact list in TODO.md ("X1 fully parallel block search ... expected 10-50x"); his
+  comment on it is cut off in the page text. X1 was prototyped and measured 2026-11-15 (TODO.md, 96bb00f): vectors
+  49-98 % identical to the exact search, SAD +0..2 %; search alone 2.8x at t=1, no gain at t=10 / whole UConvert
+  chain (it removes latency, not work). Not pursued; the 10-50x was an estimate for the search kernel alone. Still
+  ask him what he meant (X1 as a switch, or only discussion).
+
+### TODO
+
+16. Second super input for MAnalyse (#16, #17): DTL's `SuperCurrent` (he suggests the name `super2`). Source blocks
+    come from the second super clip (pre-processed / denoised), reference from the first (or the other way round);
+    checked to match the first clip's geometry. Reference code: DTL2020/mvtools 9eedb9d `Sources/MVAnalyse.cpp`
+    line 820. His theory: noise on both src and ref causes search errors, one clean side is enough. His test (#17,
+    synthetic texture + AddGrain var 50, chained MDegrainN -> MAnalyse generations, frame 10): dual input gen4
+    37.57 dB / SSIM 0.974 vs single-input gen2 35.87 / 0.967 (trymany, tr=6); about +1 dB at medium noise, about 0
+    or negative at very low / very high noise. trymany=false, tr=3: gen1 35.85 -> gen4 36.49 dB (SSIM 0.941 ->
+    0.959), single-input gen2 35.33. Opt-in, CPU first, then GPU (the SAD reads src from a second plane
+    set; small change in k_search / k_wave). Check his numbers on real footage with the quality test (item 15).
+    His open question (9 Nov, static texture 640x480, AddGrain var 150 on a var 50 texture, pel 4, trymany):
+    `SuperCurrent` = vsTTempSmooth(maxr=7) clip gives a lower average SAD and steadier vectors than the perfectly
+    clean reference clip; strongest with maxr=1, which favours zero vectors. He suspects MSuper. Our hypothesis (not
+    tested): the temporal average also contains the frame the ref block comes from (delta 1), so its noise is
+    correlated with the ref block and the SAD at zero motion drops; the clean clip shares no noise with the ref frame.
+    Test: same script with the ref frame excluded from the average (and with the clean clip), compare zero-vector SADs.
+17. Zero-predictor verification clip (#18, DTL r.2.7.46-a.30 / a.31, commits b721031, f26399c): third super input
+    `super_przero` (a temporally averaged clip) checked as an extra zero-vector candidate; whichever clip's src block
+    gives the lower metric is kept and used in the refine (per predictor with trymany). `Nframes_przero` = frames in
+    the average, `SADadj_przero` = manual metric correction for the lower variance of the averaged clip (automatic
+    from the previous level's median variance planned; x2 per level suggested, only on the levels at 1x size and
+    coarser, not on the sub-pel levels). With `ALIGN_SOURCE_BLOCK=1` the chosen src block has to be copied to the
+    aligned buffer again before the refine. His rule: the averaged clip must not contain the current frame, else the
+    metric drops falsely and worse vectors win; most temporal averagers (incl. stock MDegrainN) include it. His helper
+    `SurroundFramesAverage_TS` averages the neighbours without the current frame - but it still contains the
+    neighbours that serve as ref frames (delta 1..tr), so the correlation in item 16's open question may remain:
+    check before building. Result: very stable vectors on
+    static texture below the noise level, extra distortion on moving objects; a.31 (13 Nov) changed the algorithm.
+    Generalised plan ("multi-hypothesis MC temporal denoising for predictor verification"): MC-denoised alternative
+    src blocks per expected vector from a coarse-level field. Wait until it settles in his fork; builds on item 16.
+18. Global-motion predictor clip (#18, planned in his fork, not built): a predictor that follows camera pans. Same
+    mechanism as item 12 (extra predictor clip); do them together.
