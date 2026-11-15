@@ -100,7 +100,11 @@ deinterlace / re-interlace), only the output properties are set.
 
 #### Spatial
 
-One resize (`z_ConvertFormat`, Spline36) in the work pixel format; no matrix, range or subsampling change. The
+One resize in the work pixel format with an AviSynth+ core resizer (default Spline36Resize); no matrix, range or
+subsampling change. The kernel is chosen per axis: `uc_scale_down_h` / `uc_scale_down_v` where the source window is
+larger than the scaled picture (`uc_scale_down_v_interlaced` for interlaced output, where the interlace step's
+vertical low-pass follows), `uc_scale_up` otherwise; each is a resizer name with optional arguments
+(`"SinPowerResize, p=3.0"`). Two different kernels run one after the other (horizontal first). The
 display aspect comes from input SAR and output SAR; `aspect_mode`:
 
 - `pillar` (default): fit the whole picture, pad with black (pillar- or letterbox);
@@ -125,9 +129,12 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
 |---|---|---|
 | deinterlace | QTGMC (`QTGMC_gpu.avsi`) with its GPU switches; motion vectors optionally from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) or NVENC's motion estimation (`uc_qtgmc_nvenc`, nvencmv) | QTGMC; preset `uc_qtgmc_preset` (default "Fast") in both chains |
 | frame-rate conversion (MC) | `CudaSplatFps`; candidates optionally from the NVIDIA optical flow accelerator (`uc_frc_nvof`: `CudaNVOFAnalyse` via `MSplatVectors`) or NVENC's motion estimation (`uc_frc_nvenc`: `CudaNVENCAnalyse`) | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
-| scale | `z_ConvertFormat` (avsresize), Spline36 | same |
+| scale | `Cuda*Resize` (cudafilters, bit-identical with the CPU resizer); borders on the CPU | the AviSynth+ core resizer (`uc_scale_*`) |
 | interlace | `CudaConvolution` with `uc_interlace.json` | `mt_convolution` |
 
+- GPU chain frames: QTGMC (`QTGMC_gpu_out_tokens`, not with alpha) and the Cuda resizers keep the pictures on the GPU
+  as token frames up to the next stage that reads normal frames (borders, bit-depth change, CudaSplatFps, 4:2:0 /
+  greyscale interlacing, the output); there a `CudaDownload()` is inserted. CudaConvolution reads token frames itself.
 - The GPU chain stops with an error when no usable NVIDIA GPU is found. Single stages without a GPU path for a format
   (e.g. greyscale or alpha in QTGMC) run on the CPU with the same result (`cuda_cpu_fallback`).
 - Deinterlacing and MC frame-rate conversion run in 8 bit by default (`frc_8bit=true`) and are converted back to the

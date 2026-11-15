@@ -52,6 +52,16 @@ global uc_frc_nvenc = false
 # QTGMC preset of the deinterlacer (both chains). "Super Fast" is about 1.5x faster on the GPU chain, at lower quality.
 global uc_qtgmc_preset = "Fast"
 
+# Kernels of the scale step: an AviSynth+ core resizer, optionally followed by its own arguments after a comma
+# (e.g. "SinPowerResize, p=3.0"). "down" applies to an axis whose source window is larger than the scaled picture,
+# "up" to every other axis; when the two axes need different kernels they are resized one after the other. The GPU
+# chain runs the Cuda version of the same resizer (cudafilters.dll, bit-identical with the CPU filter).
+global uc_scale_up = "Spline36Resize"
+global uc_scale_down_h = "Spline36Resize"
+global uc_scale_down_v = "Spline36Resize"
+# vertical downscaling for interlaced output (the interlace step's vertical low-pass filter follows it)
+global uc_scale_down_v_interlaced = "Spline36Resize"
+
 # default of the gpu parameter (set to false after the Import to run every UConvert call on the CPU chain)
 global uc_gpu_default = true
 
@@ -171,17 +181,25 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
         global cuda_cpu_fallback = true   # GPU present: only stages without a GPU path for the format use the CPU
     }
     mc_gpu = gpu && frc == "mc"
+    # tok: c may hold GPU token frames (GPU chain: QTGMC's output, the Cuda resizers). Only Cuda* filters,
+    # CudaConvolution and CudaDownload read them; CudaDownload goes in front of every CPU step (it passes normal
+    # frames through, so a stage that returned normal frames after all is fine too)
+    tok = false
     if (!passthrough) {
         c = (i_in || frc == "mc") && wbits != bits ? c.ConvertBits(wbits, dither=-1, fulls=full, fulld=full) : c
         if (i_in) {
             c = uc_Deint(c, scan == "tff", gpu)
+            tok = gpu && !c.HasAlpha
             plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : uc_qtgmc_nvenc && uc_NvencOk() ? "-nvenc" : uc_qtgmc_wavefront ? "-wave" : "") : "") + " " + scan
         }
         if (spatial && pre_scale) {
-            c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb)
+            c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb, gpu, i_out)
+            tok = gpu && sc_w == out_w && sc_h == out_h   # the borders are added on the CPU
             plan = plan + scale_plan
         }
         if (frc == "mc") {
+            c = tok ? c.CudaDownload() : c   # CudaSplatFps and the CPU chain read normal frames
+            tok = false
             c = mc_gpu && threads > 0 ? c.Prefetch(threads) : c
             c = uc_FRC(c, p_n, p_d, gpu)
             c = mc_gpu && threads > 0 ? c.Prefetch(1) : c
@@ -191,9 +209,13 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
             c = c.SelectEvery(round(r / p), 0).AssumeFPS(p_n, p_d)
             plan = plan + " | frc=drop 1/" + string(round(r / p))
         }
-        c = c.BitsPerComponent != bits ? c.ConvertBits(bits, dither=-1, fulls=full, fulld=full) : c
+        back = c.BitsPerComponent != bits
+        c = back && tok ? c.CudaDownload() : c
+        tok = tok && !back
+        c = back ? c.ConvertBits(bits, dither=-1, fulls=full, fulld=full) : c
         if (spatial && !pre_scale) {
-            c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb)
+            c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb, gpu, i_out)
+            tok = gpu && sc_w == out_w && sc_h == out_h
             plan = plan + scale_plan
         }
         # repeating after scaling: identical frames are scaled once
@@ -208,8 +230,10 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
         c = threads > 0 && !mc_gpu ? c.Prefetch(threads) : c
         if (i_out) {
             c = uc_Interlace(c, oi == "tff", gpu)
+            tok = false
             plan = plan + " | interlace=" + oi + (gpu && uc_interlace_kernel != "" ? " gpu" : "")
         }
+        c = tok ? c.CudaDownload() : c
     } else {
         plan = plan + " | passthrough"
     }
@@ -424,6 +448,9 @@ function uc_Deint(clip c, bool tff, bool "gpu")
     global QTGMC_gpu_nvof = gpu && uc_qtgmc_nvof
     global QTGMC_gpu_nvenc = gpu && uc_qtgmc_nvenc
     global QTGMC_gpu_meander = !uc_qtgmc_wavefront
+    # without alpha the GPU result stays on the GPU as token frames (the caller downloads before CPU steps); with
+    # alpha the planes are joined on the CPU
+    global QTGMC_gpu_out_tokens = gpu && !c.HasAlpha
     m = c.HasAlpha ? c.RemoveAlphaPlane() : c
     d = uc_Order(m, tff).QTGMC(Preset=uc_qtgmc_preset)
     d = c.HasAlpha ? d.AddAlphaPlane(uc_Order(c.ExtractA(), tff).QTGMC(Preset=uc_qtgmc_preset)) : d
@@ -495,16 +522,30 @@ function uc_FRCCpu(clip c, int num, int den)
     return out
 }
 
-# Resize (Spline36) the source window to w x h, then pad to out_w x out_h with black. Resize only: no matrix,
-# range or subsampling change.
+# Resize the source window to w x h (kernels uc_scale_*), then pad to out_w x out_h with black. Resize only: no
+# matrix, range or subsampling change. gpu: the Cuda resizers (they take normal and token frames and return token
+# frames; formats without a GPU path run the CPU resizer, cuda_cpu_fallback); the borders are added on the CPU.
 function uc_Scale(clip c, int w, int h, float s_left, float s_top, float s_w, float s_h, int pad_l, int pad_t,
-\                 int out_w, int out_h, bool full, bool rgb)
+\                 int out_w, int out_h, bool full, bool rgb, bool "gpu", bool "i_out")
 {
-    c = c.z_ConvertFormat(width=w, height=h, resample_filter="spline36",
-    \                     src_left=s_left, src_top=s_top, src_width=s_w, src_height=s_h)
+    gpu = Default(gpu, false)
+    kh = w < s_w ? uc_scale_down_h : uc_scale_up
+    kv = h < s_h ? (Default(i_out, false) ? uc_scale_down_v_interlaced : uc_scale_down_v) : uc_scale_up
+    pre = gpu ? "Cuda" : ""
+    c = kh == kv ? uc_Resize(c, pre, kh, w, h, s_left, s_top, s_w, s_h)
+    \   : uc_Resize(uc_Resize(c, pre, kh, w, c.Height, s_left, 0.0, s_w, float(c.Height)), pre, kv, w, h, 0.0, s_top, float(w), s_h)
     black = rgb ? (full ? $000000 : $101010) : full ? $008080 : $108080
     return w == out_w && h == out_h ? c
-    \      : c.AddBorders(pad_l, pad_t, out_w - w - pad_l, out_h - h - pad_t, color_yuv=black)
+    \      : (gpu ? c.CudaDownload() : c).AddBorders(pad_l, pad_t, out_w - w - pad_l, out_h - h - pad_t, color_yuv=black)
+}
+
+# One resizer call: pre + the resizer named in k (with the arguments after its first comma) on the source window.
+function uc_Resize(clip c, string pre, string k, int w, int h, float l, float t, float sw, float sh)
+{
+    i = FindStr(k, ",")
+    name = i > 0 ? LeftStr(k, i - 1) : k
+    extra = i > 0 ? MidStr(k, i) : ""
+    return Eval("c." + pre + name + "(w, h, src_left=l, src_top=t, src_width=sw, src_height=sh" + extra + ")")
 }
 
 # Progressive frames at field rate -> interlaced: a 9-tap vertical low-pass filter on the
@@ -512,6 +553,9 @@ function uc_Scale(clip c, int w, int h, float s_left, float s_top, float s_w, fl
 # and subsampled per field, so the chroma of each field comes from that field's lines.
 function uc_Interlace(clip c, bool tff, bool "gpu")
 {
+    # GPU chain: token frames go straight into CudaConvolution; every other way reads normal frames
+    bits = c.BitsPerComponent
+    c = Default(gpu, false) && (c.Is420 || c.IsY || bits == 14 || bits == 32 || uc_interlace_kernel == "") ? c.CudaDownload() : c
     pt = c.PixelType
     x = c.Is420 ? c.z_ConvertFormat(pixel_type=uc_PT422(pt), resample_filter="spline36") : c
     f = Default(gpu, false) && uc_interlace_kernel != "" ? uc_Order(uc_InterlaceGpu(x, tff), tff).SeparateFields()
