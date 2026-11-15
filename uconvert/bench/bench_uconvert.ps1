@@ -21,7 +21,7 @@ param(
   [switch]$KeepScripts
 )
 $ErrorActionPreference = "Stop"
-$BenchVersion = 3
+$BenchVersion = 5
 $here = $PSScriptRoot
 $ucDir = Split-Path $here -Parent
 $ucAvsi = Join-Path $ucDir "uconvert.avsi"
@@ -179,25 +179,82 @@ try {
 } catch { $host_.cpu_features_error = $_.Exception.Message }
 
 $gpus = @()
+$smiPath = $null
 $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
-if (-not $smi) { $c = Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe"; if (Test-Path $c) { $smi = Get-Item $c } }
-if ($smi) {
-  $q = & $smi.Source --query-gpu=name,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.current,power.limit --format=csv,noheader,nounits 2>$null
+if ($smi) { $smiPath = $smi.Source }
+else { $c = Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI\nvidia-smi.exe"; if (Test-Path $c) { $smiPath = $c } }
+if ($smiPath) {
+  # link maximum here; the link a GPU actually runs at is sampled during each stage (an idle GPU parks its link
+  # at gen 1 and its clocks low, so idle readings say nothing about a run)
+  $q = & $smiPath --query-gpu=name,driver_version,memory.total,pcie.link.gen.max,pcie.link.width.max,power.limit --format=csv,noheader,nounits 2>$null
   foreach ($l in $q) {
     $f = $l -split ',\s*'
     if ($f.Count -ge 3) {
-      $gpus += [ordered]@{ name = $f[0]; driver = $f[1]; vram_mb = [int]$f[2]; pcie_gen = $f[3]; pcie_width = $f[4]; power_limit_w = $f[5] }
+      $gpus += [ordered]@{ name = $f[0]; driver = $f[1]; vram_mb = [int]$f[2]; pcie_gen_max = $f[3]; pcie_width_max = $f[4]; power_limit_w = $f[5] }
     }
   }
   # separate query: older drivers do not know these fields (one unknown field fails the whole query)
-  $q2 = @(& $smi.Source --query-gpu=compute_cap,clocks.max.sm,clocks.max.mem --format=csv,noheader,nounits 2>$null)
+  $q2 = @(& $smiPath --query-gpu=compute_cap,clocks.max.sm,clocks.max.mem --format=csv,noheader,nounits 2>$null)
   for ($i = 0; $i -lt $gpus.Count -and $i -lt $q2.Count; $i++) {
     $f = $q2[$i] -split ',\s*'
     if ($f.Count -ge 3 -and $f[0] -match '^\d+\.\d+$') { $gpus[$i].compute_capability = $f[0]; $gpus[$i].max_sm_mhz = $f[1]; $gpus[$i].max_mem_mhz = $f[2] }
   }
-  $smiOut = (& $smi.Source 2>$null) | Out-String
+  $smiOut = (& $smiPath 2>$null) | Out-String
   if ($smiOut -match 'CUDA (?:UMD )?Version:\s*([\d.]+)') { $host_.cuda_driver_api = $Matches[1] }
 }
+# hardware-accelerated GPU scheduling (HAGS): with it off, Windows schedules the GPU work of all programs on the CPU,
+# which can keep the GPU work of the parallel frames from running at the same time. The state in force is asked
+# from the graphics kernel per adapter (Windows 10 2004 or newer); the registry value (HwSchMode 2 = on, 1 = off)
+# only says what was chosen and takes effect after a restart.
+try {
+  Add-Type -Namespace UcBench -Name Kmt -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct ADAPTERINFO { public uint hAdapter; public uint LuidLow; public int LuidHigh; public uint NumOfSources; public int bPrecisePresentRegionsPreferred; }
+[StructLayout(LayoutKind.Sequential)] public struct ENUMADAPTERS2 { public uint NumAdapters; public System.IntPtr pAdapters; }
+[StructLayout(LayoutKind.Sequential)] public struct QUERYADAPTERINFO { public uint hAdapter; public int Type; public System.IntPtr pPrivateDriverData; public uint PrivateDriverDataSize; }
+[StructLayout(LayoutKind.Sequential)] public struct CLOSEADAPTER { public uint hAdapter; }
+[DllImport("gdi32.dll")] public static extern int D3DKMTEnumAdapters2(ref ENUMADAPTERS2 e);
+[DllImport("gdi32.dll")] public static extern int D3DKMTQueryAdapterInfo(ref QUERYADAPTERINFO q);
+[DllImport("gdi32.dll")] public static extern int D3DKMTCloseAdapter(ref CLOSEADAPTER c);
+// one line per adapter: name | hardware scheduling supported | enabled | enabled by default (or "?" when unknown)
+public static string[] HwSch() {
+  var e = new ENUMADAPTERS2();
+  if (D3DKMTEnumAdapters2(ref e) != 0 || e.NumAdapters == 0) return new string[0];
+  int sz = Marshal.SizeOf(typeof(ADAPTERINFO));
+  e.pAdapters = Marshal.AllocHGlobal(sz * (int)e.NumAdapters);
+  var res = new System.Collections.Generic.List<string>();
+  try {
+    if (D3DKMTEnumAdapters2(ref e) != 0) return new string[0];
+    for (int i = 0; i < e.NumAdapters; i++) {
+      var a = (ADAPTERINFO)Marshal.PtrToStructure(new System.IntPtr(e.pAdapters.ToInt64() + i * sz), typeof(ADAPTERINFO));
+      string name = "?", caps = "?|?|?";
+      System.IntPtr buf = Marshal.AllocHGlobal(4 * 260 * 2);
+      try {
+        var q = new QUERYADAPTERINFO { hAdapter = a.hAdapter, Type = 8, pPrivateDriverData = buf, PrivateDriverDataSize = 4 * 260 * 2 };  // ADAPTERREGISTRYINFO
+        if (D3DKMTQueryAdapterInfo(ref q) == 0) name = Marshal.PtrToStringUni(buf);
+        q = new QUERYADAPTERINFO { hAdapter = a.hAdapter, Type = 70, pPrivateDriverData = buf, PrivateDriverDataSize = 4 };  // WDDM_2_7_CAPS
+        if (D3DKMTQueryAdapterInfo(ref q) == 0) { int v = Marshal.ReadInt32(buf); caps = (v & 1) + "|" + ((v >> 1) & 1) + "|" + ((v >> 2) & 1); }
+      } finally { Marshal.FreeHGlobal(buf); }
+      res.Add(name + "|" + caps);
+      var c = new CLOSEADAPTER { hAdapter = a.hAdapter };
+      D3DKMTCloseAdapter(ref c);
+    }
+  } finally { Marshal.FreeHGlobal(e.pAdapters); }
+  return res.ToArray();
+}
+'@
+  $sch = @()
+  foreach ($l in [UcBench.Kmt]::HwSch()) {
+    $f = $l -split '\|'
+    if ($f[0] -notmatch 'NVIDIA') { continue }
+    $st = if ($f[1] -eq '?') { "unknown (Windows too old to report it)" } elseif ($f[1] -eq '0') { "not supported" } elseif ($f[2] -eq '1') { "on" } else { "off" }
+    $sch += "$($f[0]): $st"
+  }
+  $host_.hw_gpu_scheduling = @($sch | Select-Object -Unique)
+} catch { $host_.hw_gpu_scheduling_error = $_.Exception.Message }
+try {
+  $hs = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name HwSchMode -ErrorAction Stop).HwSchMode
+  $host_.hw_gpu_scheduling_setting = switch ([int]$hs) { 2 { "on" } 1 { "off" } default { "HwSchMode $hs" } }
+} catch { $host_.hw_gpu_scheduling_setting = "not set" }
 if (-not $gpus.Count) {
   foreach ($v in (Get-CimInstance Win32_VideoController)) { $gpus += [ordered]@{ name = $v.Name; driver = $v.DriverVersion } }
 }
@@ -216,22 +273,35 @@ $host_.avisynth = $avsVersion
 # src: MovingPattern arguments; target: UConvertClip arguments after the clip; pre: UConvert settings for the run;
 # nvof / nvenc: a comparison stage with motion vectors from the NVIDIA optical flow accelerator / the NVENC encoder's
 # motion estimation, skipped where UConvert's plan shows it is not used (GPU without it, nvencmv.dll missing)
-$src_i25 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=25, fps_den=1, scan="tff"'
-$src_p50 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=50, fps_den=1, scan="p"'
+# The worst case of UConvert's 1080 broadcast conversions: 1080i29.97 -> 1080i25. The deinterlacer makes 59.94
+# pictures per second (more than for 25i -> 29.97i) and nearly every output picture of the frame-rate conversion is
+# a new one. The single stages are the parts of that chain; rate: output frames per second of video (realtime = rate).
+$src_i2997 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=30000, fps_den=1001, scan="tff"'
 $src_p5994 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=60000, fps_den=1001, scan="p"'
-$src_uhd50 = 'width=3840, height=2160, pixel_type="YUV422P10", fps_num=50, fps_den=1, scan="p", period=50'
+$src_p50 = 'width=1920, height=1080, pixel_type="YUV422P10", fps_num=50, fps_den=1, scan="p"'
+$src_i25sd = 'width=720, height=576, pixel_type="YUV422P10", fps_num=25, fps_den=1, scan="tff"'
+$src_uhd50 ='width=3840, height=2160, pixel_type="YUV422P10", fps_num=50, fps_den=1, scan="p", period=50'
+$t_deint = '1080, 1920, out_rate_nom=60000, out_rate_den=1001'
+$t_frc = '1080, 1920, out_rate_nom=50, out_rate_den=1'
+$t_deint_sd = '576, 720, out_rate_nom=50, out_rate_den=1'
+$t_i25 = '1080, 1920, out_interlace="tff", out_rate_nom=25, out_rate_den=1'
 $all = @(
-  [ordered]@{ name = "deint";       desc = "deinterlace 1080i25 -> 1080p50";                src = $src_i25;   target = '1080, 1920, out_rate_nom=50, out_rate_den=1' },
-  [ordered]@{ name = "deint_nvof";  desc = "deinterlace 1080i25 -> 1080p50, NVOFA vectors"; src = $src_i25;   target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_nvof = true'; nvof = $true },
-  [ordered]@{ name = "deint_wave";  desc = "deinterlace 1080i25 -> 1080p50, wavefront search"; src = $src_i25; target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_wavefront = true' },
-  [ordered]@{ name = "deint_nvenc"; desc = "deinterlace 1080i25 -> 1080p50, NVENC vectors"; src = $src_i25;  target = '1080, 1920, out_rate_nom=50, out_rate_den=1'; pre = 'global uc_qtgmc_nvenc = true'; nvenc = $true },
-  [ordered]@{ name = "frc";         desc = "frame-rate conversion 1080p50 -> 1080p59.94";   src = $src_p50;   target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001' },
-  [ordered]@{ name = "frc_nvof";    desc = "frame-rate conversion 1080p50 -> 1080p59.94, NVOFA vectors"; src = $src_p50; target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001'; pre = 'global uc_frc_nvof = true'; nvof = $true },
-  [ordered]@{ name = "frc_nvenc";   desc = "frame-rate conversion 1080p50 -> 1080p59.94, NVENC vectors"; src = $src_p50; target = '1080, 1920, out_rate_nom=60000, out_rate_den=1001'; pre = 'global uc_frc_nvenc = true'; nvenc = $true },
-  [ordered]@{ name = "interlace";   desc = "interlace 1080p59.94 -> 1080i29.97";            src = $src_p5994; target = '1080, 1920, out_interlace="tff", out_rate_nom=30000, out_rate_den=1001' },
-  [ordered]@{ name = "scale";       desc = "scale 2160p50 -> 1080p50";                      src = $src_uhd50; target = '1080, 1920, out_rate_nom=50, out_rate_den=1' },
-  [ordered]@{ name = "chain_gpu";   desc = "whole chain 1080i25 -> 1080i29.97 (GPU)";       src = $src_i25;   target = '1080, 1920, out_interlace="tff", out_rate_nom=30000, out_rate_den=1001' },
-  [ordered]@{ name = "chain_cpu";   desc = "whole chain 1080i25 -> 1080i29.97 (CPU only)";  src = $src_i25;   target = '1080, 1920, out_interlace="tff", out_rate_nom=30000, out_rate_den=1001, gpu=false' }
+  [ordered]@{ name = "deint";       rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94";                    src = $src_i2997; target = $t_deint },
+  [ordered]@{ name = "deint_nvof";  rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, NVOFA vectors";     src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_nvof = true'; nvof = $true },
+  [ordered]@{ name = "deint_wave";  rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, wavefront search";  src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_wavefront = true' },
+  [ordered]@{ name = "deint_nvenc"; rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, NVENC vectors";     src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_nvenc = true'; nvenc = $true },
+  # SD: one picture's motion search fills only a small part of a GPU, so the speed depends on the searches of the
+  # frames in flight running at the same time
+  [ordered]@{ name = "deint_sd";    rate = 50;    desc = "deinterlace 576i25 -> 576p50";                            src = $src_i25sd; target = $t_deint_sd },
+  [ordered]@{ name = "deint_sd_wave"; rate = 50;  desc = "deinterlace 576i25 -> 576p50, wavefront search";         src = $src_i25sd; target = $t_deint_sd; pre = 'global uc_qtgmc_wavefront = true' },
+  [ordered]@{ name = "frc";         rate = 50;   desc = "frame-rate conversion 1080p59.94 -> 1080p50";             src = $src_p5994; target = $t_frc },
+  [ordered]@{ name = "frc_nvof";    rate = 50;    desc = "frame-rate conversion 1080p59.94 -> 1080p50, NVOFA vectors"; src = $src_p5994; target = $t_frc; pre = 'global uc_frc_nvof = true'; nvof = $true },
+  [ordered]@{ name = "frc_nvenc";   rate = 50;    desc = "frame-rate conversion 1080p59.94 -> 1080p50, NVENC vectors"; src = $src_p5994; target = $t_frc; pre = 'global uc_frc_nvenc = true'; nvenc = $true },
+  [ordered]@{ name = "interlace";   rate = 25;    desc = "interlace 1080p50 -> 1080i25";                            src = $src_p50;   target = $t_i25 },
+  [ordered]@{ name = "scale";       rate = 50;    desc = "scale 2160p50 -> 1080p50";                                src = $src_uhd50; target = $t_frc },
+  [ordered]@{ name = "chain_gpu";   rate = 25;    desc = "whole chain 1080i29.97 -> 1080i25 (GPU)";                 src = $src_i2997; target = $t_i25 },
+  [ordered]@{ name = "chain_gpu_nvof"; rate = 25; desc = "whole chain 1080i29.97 -> 1080i25 (GPU), NVOFA vectors for the deinterlacer"; src = $src_i2997; target = $t_i25; pre = 'global uc_qtgmc_nvof = true'; nvof = $true },
+  [ordered]@{ name = "chain_cpu";   rate = 25;    desc = "whole chain 1080i29.97 -> 1080i25 (CPU only)";            src = $src_i2997; target = ($t_i25 + ', gpu=false') }
 )
 $run = $all
 if ($Stages) { $want = $Stages -split ','; $run = $all | Where-Object { $want -contains $_.name } }
@@ -253,6 +323,76 @@ function Stage-Script($s, [bool]$info) {
   return $path
 }
 
+function Median($v) {
+  $s = @($v | Sort-Object)
+  if (-not $s.Count) { return $null }
+  $m = [int][math]::Floor($s.Count / 2)
+  if ($s.Count % 2) { return $s[$m] } else { return ($s[$m - 1] + $s[$m]) / 2 }
+}
+function Range-Text($v, [string]$pre) {
+  $lo = ($v | Measure-Object -Minimum).Minimum; $hi = ($v | Measure-Object -Maximum).Maximum
+  if ($lo -eq $hi) { return "$pre$lo" } else { return "$pre$lo-$hi" }
+}
+
+# GPU state during a stage: nvidia-smi logs every 0.5 s in its own (light) process; only the samples of the timed
+# part count. Returns the GPU that worked the most: PCIe link, power state, clocks, load, power, temperature.
+$smiFields = "timestamp,index,pcie.link.gen.current,pcie.link.width.current,pstate,clocks.sm,clocks.mem,utilization.gpu,power.draw,temperature.gpu"
+function Start-GpuLog {
+  if (-not $smiPath) { return $null }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $smiPath
+    $psi.Arguments = "--query-gpu=$smiFields --format=csv,noheader,nounits -lms 500"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    return @{ p = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync() }
+  } catch { return $null }
+}
+function Stop-GpuLog($g, $from, $to) {
+  if (-not $g) { return $null }
+  try { $g.p.Kill() } catch {}
+  [void]$g.p.WaitForExit(5000)
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  $num = { param($x) $d = 0.0; if ([double]::TryParse($x, [System.Globalization.NumberStyles]::Float, $inv, [ref]$d)) { $d } else { $null } }
+  $rows = @()
+  foreach ($l in ($g.out.Result -split "`r?`n")) {
+    $f = $l -split ',\s*'
+    if ($f.Count -lt 10) { continue }
+    $t = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($f[0].Trim(), 'yyyy/MM/dd HH:mm:ss.fff', $inv, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+    $rows += [pscustomobject]@{ t = $t; gpu = $f[1]; gen = (& $num $f[2]); width = (& $num $f[3]); pstate = $f[4].Trim()
+      sm = (& $num $f[5]); mem = (& $num $f[6]); util = (& $num $f[7]); power = (& $num $f[8]); temp = (& $num $f[9]) }
+  }
+  $win = @($rows | Where-Object { $from -and $to -and $_.t -ge $from -and $_.t -le $to })
+  if ($win.Count -lt 2) { $win = $rows }
+  if (-not $win.Count) { return $null }
+  $best = $win | Group-Object gpu | Sort-Object { Median @($_.Group | Where-Object { $null -ne $_.util } | ForEach-Object { $_.util }) } | Select-Object -Last 1
+  $r = @($best.Group)
+  $sel = { param($k) @($r | Where-Object { $null -ne $_.$k } | ForEach-Object { $_.$k }) }
+  $o = [ordered]@{ gpu = [int]$best.Name; samples = $r.Count }
+  $v = & $sel 'gen';   if ($v.Count) { $o.pcie = (Range-Text $v "gen") + " " + (Range-Text (& $sel 'width') "x") }
+  $o.pstate = ($r | Group-Object pstate | Sort-Object Count | Select-Object -Last 1).Name
+  $v = & $sel 'sm';    if ($v.Count) { $o.sm_mhz = [int](Median $v) }
+  $v = & $sel 'mem';   if ($v.Count) { $o.mem_mhz = [int](Median $v) }
+  $v = & $sel 'util';  if ($v.Count) { $o.util_pct = [int](Median $v) }
+  $v = & $sel 'power'; if ($v.Count) { $o.power_w_max = [int]($v | Measure-Object -Maximum).Maximum }
+  $v = & $sel 'temp';  if ($v.Count) { $o.temp_c_max = [int]($v | Measure-Object -Maximum).Maximum }
+  return $o
+}
+
+# GPU memory of the ffmpeg process (Windows counters "GPU Process Memory", Windows 10 1709 or newer). "Dedicated
+# Usage" is the memory on the GPU; "Non Local Usage" is system RAM the GPU reaches over PCIe: the pinned transfer
+# buffers a program allocates on purpose (a few hundred MiB here is normal), plus GPU memory that Windows moved out
+# without an error because the GPU's memory was full. Growth far beyond a stage's usual value while the GPU's memory
+# is nearly full points to the second, and then the GPU reads part of its working set over PCIe.
+$memCat = $null
+try {
+  if ([System.Diagnostics.PerformanceCounterCategory]::Exists("GPU Process Memory")) { $memCat = New-Object System.Diagnostics.PerformanceCounterCategory("GPU Process Memory") }
+} catch {}
+
 # time-boxed run: ffmpeg renders to null and reports progress every 0.25 s; stopped with q after $Seconds of frames
 function Time-Stage([string]$avs) {
   $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -263,6 +403,7 @@ function Time-Stage([string]$avs) {
   $psi.RedirectStandardError = $true
   $psi.RedirectStandardInput = $true
   $psi.CreateNoWindow = $true
+  $gpuLog = Start-GpuLog
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $p = [System.Diagnostics.Process]::Start($psi)
   try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High } catch {}
@@ -271,6 +412,10 @@ function Time-Stage([string]$avs) {
   $frame = 0
   $tFirst = $null
   $quit = $false
+  $wFrom = $null; $wTo = $null
+  # GPU memory counters of this process: looked up until the timed part starts (they appear when it first uses
+  # the GPU), read once per second; peak per GPU (counter instance)
+  $memCtr = @{}; $memPeak = @{}; $tMem = 0.0; $memLookup = [bool]$memCat
   while ($true) {
     $line = $p.StandardOutput.ReadLine()
     if ($null -eq $line) { break }
@@ -278,17 +423,47 @@ function Time-Stage([string]$avs) {
     elseif ($line -match '^progress=') {
       $t = $sw.Elapsed.TotalSeconds
       if ($frame -gt 0) {
-        if ($null -eq $tFirst) { $tFirst = $t }
+        if ($null -eq $tFirst) { $tFirst = $t; $wFrom = (Get-Date).AddSeconds(1.0) }
         [void]$samples.Add(@($t, $frame))
-        if (-not $quit -and $t - $tFirst -ge $Seconds) { try { $p.StandardInput.Write("q"); $p.StandardInput.Flush() } catch {}; $quit = $true }
+        if (-not $quit -and $t - $tFirst -ge $Seconds) { try { $p.StandardInput.Write("q"); $p.StandardInput.Flush() } catch {}; $quit = $true; $wTo = Get-Date }
+      }
+      if ($t -ge $tMem -and ($memLookup -or $memCtr.Count)) {
+        $tMem = $t + 1.0
+        if ($memLookup) {
+          try {
+            foreach ($n in $memCat.GetInstanceNames()) {
+              if ($n -like "pid_$($p.Id)_*" -and -not $memCtr.ContainsKey($n)) {
+                $memCtr[$n] = @((New-Object System.Diagnostics.PerformanceCounter("GPU Process Memory", "Dedicated Usage", $n, $true)),
+                                (New-Object System.Diagnostics.PerformanceCounter("GPU Process Memory", "Non Local Usage", $n, $true)))
+                $memPeak[$n] = @(0.0, 0.0)
+              }
+            }
+          } catch { $memLookup = $false }
+          if ($null -ne $tFirst -and $t -ge $tFirst + 1.0) { $memLookup = $false }
+        }
+        foreach ($n in @($memCtr.Keys)) {
+          try {
+            $d = $memCtr[$n][0].NextValue(); $nl = $memCtr[$n][1].NextValue()
+            if ($d -gt $memPeak[$n][0]) { $memPeak[$n][0] = $d }
+            if ($nl -gt $memPeak[$n][1]) { $memPeak[$n][1] = $nl }
+          } catch { $memCtr.Remove($n) }
+        }
       }
       if ($line -eq 'progress=end') { break }
     }
     if ($sw.Elapsed.TotalSeconds -gt $Seconds + 120) { try { $p.Kill() } catch {}; break }
   }
+  if (-not $wTo) { $wTo = Get-Date }
   if (-not $p.WaitForExit(15000)) { try { $p.Kill() } catch {} }
   $p.WaitForExit()
+  $gpuState = Stop-GpuLog $gpuLog $wFrom $wTo
   $res = [ordered]@{ startup_s = $null; fps = $null; fps_min = $null; fps_max = $null; frames = $frame; windows = 0 }
+  if ($gpuState) { $res.gpu_under_load = $gpuState }
+  # the GPU this process used the most memory on
+  $top = $memPeak.Keys | Sort-Object { $memPeak[$_][0] } | Select-Object -Last 1
+  if ($top -and $memPeak[$top][0] -ge 1MB) {
+    $res.gpu_memory_mib = [ordered]@{ dedicated_peak = [int]($memPeak[$top][0] / 1MB); non_local_peak = [int]($memPeak[$top][1] / 1MB) }
+  }
   if ($null -ne $tFirst) { $res.startup_s = [math]::Round($tFirst, 2) }
   # 1 s windows after the first second of frames (warm-up)
   $fps = @()
@@ -323,18 +498,20 @@ foreach ($s in $run) {
   if (-not $plan) {
     $res.ok = $false
     $res.error = Error-Text $r.err
-    Write-Host ("  {0,-11} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red
+    Write-Host ("  {0,-14} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red
   } elseif (($s.nvof -and $plan -notmatch 'nvof') -or ($s.nvenc -and $plan -notmatch 'nvenc')) {
     $res.ok = $false
     $res.skipped = if ($s.nvof) { "no NVIDIA optical flow accelerator on this GPU (Turing or newer)" }
                    else { "no NVENC motion estimation (nvencmv.dll missing, or a GPU older than Pascal)" }
-    Write-Host ("  {0,-11} skipped: {1}" -f $s.name, $res.skipped) -ForegroundColor Yellow
+    Write-Host ("  {0,-14} skipped: {1}" -f $s.name, $res.skipped) -ForegroundColor Yellow
   } else {
-    Write-Host ("  {0,-11} {1} ..." -f $s.name, $s.desc)
+    Write-Host ("  {0,-14} {1} ..." -f $s.name, $s.desc)
     $m = Time-Stage (Stage-Script $s $false)
     foreach ($k in $m.Keys) { $res[$k] = $m[$k] }
-    if ($res.ok) { Write-Host ("  {0,-11} {1,7:N1} fps   (start-up {2} s)" -f $s.name, $res.fps, $res.startup_s) -ForegroundColor Green }
-    else { Write-Host ("  {0,-11} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red }
+    $res.rate = $s.rate
+    if ($res.ok) { $res.realtime = [math]::Round($res.fps / $s.rate, 2) }
+    if ($res.ok) { Write-Host ("  {0,-14} {1,7:N1} fps = {2,5:N2}x realtime   (start-up {3} s)" -f $s.name, $res.fps, $res.realtime, $res.startup_s) -ForegroundColor Green }
+    else { Write-Host ("  {0,-14} FAILED: {1}" -f $s.name, $res.error) -ForegroundColor Red }
   }
   $results += $res
 }
@@ -359,11 +536,25 @@ $pe = if ($host_.cpu_p_cores) { " = $($host_.cpu_p_cores) P + $($host_.cpu_e_cor
 $txt = @("UConvert benchmark v$BenchVersion  $($doc.date)",
   "CPU: $($host_.cpu) ($($host_.cpu_cores) cores$pe, $($host_.cpu_threads) threads), RAM $($host_.ram_gb) GB",
   "CPU features: $($host_.cpu_features)",
-  $gpuLine, "OS: $($host_.os); $($host_.avisynth); $($host_.ffmpeg)", "")
+  $gpuLine)
+if ($host_.hw_gpu_scheduling -or $host_.hw_gpu_scheduling_setting) {
+  $hs = if ($host_.hw_gpu_scheduling) { $host_.hw_gpu_scheduling -join '; ' } else { "unknown" }
+  $txt += "Hardware-accelerated GPU scheduling: $hs; setting: $($host_.hw_gpu_scheduling_setting)"
+}
+$txt += @("OS: $($host_.os); $($host_.avisynth); $($host_.ffmpeg)", "")
 foreach ($r in $results) {
-  if ($r.ok) { $txt += ("{0,-11} {1,8:N1} fps   {2}" -f $r.stage, $r.fps, $r.what) }
-  elseif ($r.skipped) { $txt += ("{0,-11}  skipped   {1}: {2}" -f $r.stage, $r.what, $r.skipped) }
-  else { $txt += ("{0,-11}   FAILED   {1}: {2}" -f $r.stage, $r.what, $r.error) }
+  if ($r.ok) {
+    $txt += ("{0,-14} {1,8:N1} fps {2,6:N2}x realtime   {3}" -f $r.stage, $r.fps, $r.realtime, $r.what)
+    $g = $r.gpu_under_load; $mm = $r.gpu_memory_mib
+    $parts = @()
+    if ($g) {
+      $parts += "GPU $($g.gpu): $($g.pcie) $($g.pstate), sm $($g.sm_mhz) / mem $($g.mem_mhz) MHz, load $($g.util_pct) %, max $($g.power_w_max) W $($g.temp_c_max) C"
+    }
+    if ($mm) { $parts += "GPU memory $($mm.dedicated_peak) MiB, non-local (system RAM) $($mm.non_local_peak) MiB" }
+    if ($parts.Count) { $txt += ("{0,-14} {1}" -f "", ($parts -join '; ')) }
+  }
+  elseif ($r.skipped) { $txt += ("{0,-14}  skipped   {1}: {2}" -f $r.stage, $r.what, $r.skipped) }
+  else { $txt += ("{0,-14}   FAILED   {1}: {2}" -f $r.stage, $r.what, $r.error) }
 }
 [System.IO.File]::WriteAllLines([System.IO.Path]::ChangeExtension($json, ".txt"), [string[]]$txt, $utf8)
 Write-Host ""
