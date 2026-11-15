@@ -518,6 +518,13 @@ LanczosResize runs on the CPU, the analysis on the GPU), `pscrn` 2..4. `xflateMa
 they change on the CPU. No GPU path (creation error unless `cuda_cpu_fallback`): `temporal=true` (MAnalyse) and
 `pscrn` 0 / 1 (NNEDI3). `temporal=true` is not reproducible run to run with stock CPU QTGMC either.
 
+QTGMC returns normal frames. With `global QTGMC_gpu_out_tokens = true` (and `QTGMC_gpu_out`) it returns token frames
+instead, for a chain that goes on with Cuda* filters: the download after QTGMC and the upload of the next GPU filter
+are saved. It does so only where the output side ran on the GPU and nothing after it reads pixels; with `ShutterBlur`,
+`Border`, `ShowNoise`, `keep_tv_range` or `ShowSettings`, or when the GPU output side does not cover the settings,
+QTGMC still returns normal frames. Either way the result can go straight into any Cuda* filter (normal frames are
+uploaded), and `CudaDownload()` gives normal frames from both. Do not give the token frames to CPU filters.
+
 The Windows release bundle wraps this: `QTGMC_gpu_load.avsi` (source: `qtgmc\bundle\`) loads every DLL and script from
 its own folder and defines `QTGMC_gpu_on()` / `QTGMC_gpu_off()`, which set all the QTGMC GPU switches (`QTGMC_gpu`,
 `QTGMC_gpu_search`, `QTGMC_gpu_tokens`, `QTGMC_gpu_edi`, `QTGMC_gpu_out`) at once. `qtgmc\bundle\examples\` has example

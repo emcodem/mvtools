@@ -38,6 +38,8 @@ Import(QTGMC_gpu_bundle + "scripts\QTGMC_gpu.avsi")
 # QTGMC_gpu_nvenc (global QTGMC_gpu_nvenc = true after QTGMC_gpu_on()): the vectors come from the video encoder's motion
 # estimation (CudaNVENCAnalyse of nvencmv.dll, also on cards without NVOFA); not exact; further arguments in
 # QTGMC_gpu_nvenc_args, e.g. global QTGMC_gpu_nvenc_args = """, channels="yuv" """
+# QTGMC_gpu_out_tokens (global QTGMC_gpu_out_tokens = true after QTGMC_gpu_on()): QTGMC returns token frames (device
+# frames) for a chain that goes on with Cuda* filters; CudaDownload() at the end gives normal frames
 function QTGMC_gpu_on()
 {
 	global QTGMC_gpu = true
@@ -56,5 +58,6 @@ function QTGMC_gpu_off()
 	global QTGMC_gpu_tokens = false
 	global QTGMC_gpu_edi = false
 	global QTGMC_gpu_out = false
+	global QTGMC_gpu_out_tokens = false
 	return true
 }

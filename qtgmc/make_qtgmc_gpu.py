@@ -96,7 +96,13 @@ def main():
         '\t                                              "x x y - "+ string(sharpAdj) + " * +", rgBlur, Sovs, Rep2, RepChroma, finalNoise, \\\n'
         '\t                                              "x " + noiseCentre + " scalef - " + string(GrainRestore) + " * range_half +", \\\n'
         '\t                                              "x " + noiseCentre + " scalef - " + string(NoiseRestore) + " * range_half +", \\\n'
-        '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ).CudaDownload() : addNoise2\n', 1)
+        '\t                                              GrainRestore, NoiseRestore, CNmt1, CNmt2, w+epsilon, h+epsilon ) : addNoise2\n'
+        # QTGMC_gpu_out_tokens: the device frames are returned as they are where nothing after this point reads pixels
+        # (shutter blur, the Border crop, ShowNoise, the TV-range limiter and ShowSettings do; SelectEvery and the
+        # property changes do not); else, and always without the option, they are downloaded here as before
+        '\tQTGMC_gpuTokOut = QTGMC_gpuOut && QTGMC_gpu_out_tokens && ShutterBlur == 0 && !Border && ShowNoise == 0.0 \\\n'
+        '\t                  && !keep_tv_range && !ShowSettings\n'
+        '\taddNoise2 = QTGMC_gpuOut && !QTGMC_gpuTokOut ? addNoise2.CudaDownload() : addNoise2\n', 1)
     text = ('global QTGMC_gpu = false # set to true after Import to run the mvtools motion analysis on the GPU (profile\\qtgmc\\make_qtgmc_gpu.py)\n'
             'global QTGMC_gpu_meander = true # with QTGMC_gpu: true = as stock QTGMC (slice search, byte-identical to the CPU-mt result), false = wavefront search (meander=false, single slice: faster on the GPU, slightly different vectors)\n'
             'global QTGMC_gpu_nvof = false # with QTGMC_gpu: MAnalyse vectors from the optical flow accelerator (CudaNVOFAnalyse, not bit-exact; MRecalculate refines them); pel 4 and GPUs without NVOFA use the exact search\n'
@@ -107,6 +113,7 @@ def main():
             'global QTGMC_gpu_tokens = true # with QTGMC_gpu_search: the search clip stays on the device, MSuper / MAnalyse read it there\n'
             'global QTGMC_gpu_edi = false # with QTGMC_gpu: NNEDI3 by cudafilters.dll CudaNNEDI3 (needs LoadPlugin of it)\n'
             'global QTGMC_gpu_out = false # with QTGMC_gpu: the output side (MCompensate, MDegrain, resharp, limits, back blend, repair, noise restore) on the GPU\n'
+            'global QTGMC_gpu_out_tokens = false # with QTGMC_gpu_out: QTGMC returns token frames (device frames for the Cuda* filters; CudaDownload makes normal frames) where the output side ran on the GPU and nothing after it reads pixels (no ShutterBlur, Border, ShowNoise, keep_tv_range, ShowSettings); else normal frames, as always without it\n'
             'global QTGMC_gpu_edi_token = false # internal: the interpolated clip stays on the device (set by QTGMC for the GPU output side)\n'
             + text)
     # the analysis wrappers: every parameter of the mvtools2 filter, passed on by name (an argument the caller leaves out
