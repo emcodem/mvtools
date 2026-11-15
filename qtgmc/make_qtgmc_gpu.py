@@ -57,11 +57,25 @@ def main():
         lambda m: m.group(1) + '\tsrchClip    = (QTGMC_gpu && QTGMC_gpu_search && !srchcheck && InputType == 0 && UseEdiExt == 0 && TR0 >= 0 && TR0 <= 2 \\\n'
         '\t               && SrchClipPP >= 0 && SrchClipPP <= 3 && !yuy2 && !Border && !tv_range \\\n'
         '\t               && !(Is420(planarClip) && ChromaMotion) && !CRTSoft && !(xflateMaTo && Rep0 > 0)) \\\n'
-        '\t               ? QTGMC_gpu_srchclip( planarClip, TR0, Rep0, SrchClipPP, ChromaMotion, RepChroma, w, h, epsilon, \\\n'
+        '\t               ? QTGMC_gpu_srchclip( QTGMC_gpu_in, TR0, Rep0, SrchClipPP, ChromaMotion, RepChroma, w, h, epsilon, \\\n'
         '\t               !QTGMC_gpu_tokens || MEus || ProgSADMask > 0.0 || (ShutterBlur > 0 && SBlurLimit > 0) || (sbpc > 8 && FastMA) ) : srchClip\n', 1)
     # NNEDI3 interpolation (both calls) through QTGMC_gpu_nnedi3: CudaNNEDI3 (bit-exact port of plugins_JPSDR nnedi3, falls
-    # back to the plugin itself where it is not exact) with QTGMC_gpu_edi
-    sub('nnedi3', r'Input\.NNEDI3\(', 'Input.QTGMC_gpu_nnedi3(', 2)
+    # back to the plugin itself where it is not exact) with QTGMC_gpu_edi. It reads the shared upload of the input
+    # (QTGMC_gpu_in, below) where QTGMC_Interpolate gets the plain input (gpuInUse)
+    sub('nnedi3', r'Input\.NNEDI3\(', '(gpuInUse && QTGMC_gpu && QTGMC_gpu_edi ? gpuIn : Input).QTGMC_gpu_nnedi3(', 2)
+    sub('interp_args', r'(function QTGMC_Interpolate\( clip Input, [^\n]*clip "Fallback", \\\n\s*string "ChromaEdi")( \)\n\{\n)',
+        lambda m: m.group(1) + ', clip "gpuIn", bool "gpuInUse"' + m.group(2)
+        + '\tgpuIn = Default( gpuIn, Input )\n\tgpuInUse = Default( gpuInUse, false )\n', 1)
+    sub('interp_call', r'QTGMC_Interpolate\( ediInput, InputType, EdiMode, NNSize, NNeurons, EdiQual, EdiMaxD, EdiThreads, pscrn, bobbed, ChromaEdi \)',
+        lambda m: 'QTGMC_Interpolate( ediInput, InputType, EdiMode, NNSize, NNeurons, EdiQual, EdiMaxD, EdiThreads, pscrn, bobbed, ChromaEdi, \\\n'
+        '\t                         gpuIn=QTGMC_gpu_in, gpuInUse=QTGMC_gpu_in_ok && NoiseProcess != 1 )', 1)
+    # The input uploaded once for every GPU filter that reads it (CudaBob of the search clip, CudaNNEDI3): each of them
+    # would otherwise upload the source frame itself, for each of the two output frames made from it. Only where the
+    # input is the plain clip both read (InputType 0, no Border, not YUY2) and CudaUpload takes the format.
+    sub('gpu_in', r'(\n\tplanarClip = yuy2 \? clip\.nonyuy2clipin\(true\) : clip\n)',
+        lambda m: m.group(1) + '\tQTGMC_gpu_in_ok = QTGMC_gpu && (QTGMC_gpu_search || QTGMC_gpu_edi) && InputType == 0 && !Border && !yuy2 \\\n'
+        '\t                  && (Is420(Input) || Is422(Input) || Is444(Input) || IsY(Input)) && BitsPerComponent(Input) <= 16 && Width(Input) >= 68\n'
+        '\tQTGMC_gpu_in = QTGMC_gpu_in_ok ? Input.CudaUpload() : Input\n', 1)
 
     # GPU output side: with QTGMC_gpu_out, for the structures it reproduces
     # (every preset's defaults: TR1 0..2, TR2 0..3, SMode 0..2 incl. Precise, SLMode 0 / 2 with SLRad 1 / 3, Sbb 0..3,
