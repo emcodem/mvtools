@@ -20,6 +20,7 @@ REPO = os.path.dirname(HERE)
 # licence / readme files of a plugin's own distribution that are not next to the DLL, relative to its folder
 EXTRA = {
     "LSMASHSource": ["../AviSynth/LICENSE", "../AviSynth/README.md"],
+    "ffms2": ["../COPYING", "../COPYING.GPLv3"],
 }
 # licence / documentation from this repository (paths relative to the repository root)
 MVTOOLS_DOCS = ["Documentation/gpl.txt"]
@@ -44,6 +45,7 @@ SOURCES = {
     "QTGMC_gpu": AVS_STUFF + "QTGMC.avsi (QTGMC 3.393s), patched by qtgmc/make_qtgmc_gpu.py of " + MVTOOLS_URL,
     "Zs_RF_Shared": AVS_STUFF + "Zs_RF_Shared.avsi",
     "mxfsource": "https://github.com/emcodem/avisynth_mxfsource",
+    "ffms2": "https://github.com/FFMS/ffms2 (release 5.0)",
 }
 # DLLs a plugin loads at run time from its own folder (not in its import table): copied next to it
 RUNTIME_DLLS = {

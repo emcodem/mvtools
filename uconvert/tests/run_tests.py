@@ -42,7 +42,7 @@ Assert(false, "INFO " + string(c.Width) + "x" + string(c.Height) + " fb=" + fb +
 def bc(fmt, w=1920, h=1080, fps="25", n=100, props=""):
     """Synthetic moving clip: a probe file converted to the given format (colour values irrelevant here)."""
     num, den = (fps.split("/") + ["1"])[:2]
-    return (f'LWLibavVideoSource("{P}frc_probe_5994p.mov", cachefile="{ROOT}/work/frc_probe_5994p.mov.lwi")'
+    return (f'LSMASHVideoSource("{P}frc_probe_5994p.mov")'
             f'.Trim(0, {n - 1}).AssumeFPS({num}, {den}).ConvertBits(8).ConvertToYV24()'
             f'.z_ConvertFormat(width={w}, height={h}, resample_filter="bilinear").{fmt_conv(fmt)}{props}')
 
@@ -75,10 +75,10 @@ CASES = {
     "mpg_sd576i_to_1080i25": f'UConvert("{SD}scaling_test_SD_PAL_25_576i.mpg", 1080, 1920, "tff", 25, 1, cachedir="{ROOT}/work", sar_num=16, sar_den=15, threads=8)',
     "mpg_sd576i_to_576p25_same_raster": f'UConvert("{SD}scaling_test_SD_PAL_25_576i.mpg", 576, 720, "", 25, 1, cachedir="{ROOT}/work", threads=8)',
     "mxf_xdcam_50i_to_1080p50": f'UConvert("{SD}xdcam_50i.mxf", 1080, 1920, "", 50, 1, cachedir="{ROOT}/work", threads=8)',
-    "mxf_forced_lwlibav": f'UConvert("{SD}xdcam_50i.mxf", 1080, 1920, "tff", 25, 1, source="lwlibav", cachedir="{ROOT}/work", threads=8)',
-    # not an MXF despite the name: MxfSource fails to open -> LWLibav for video and audio
+    "mxf_forced_ffms2": f'UConvert("{SD}xdcam_50i.mxf", 1080, 1920, "tff", 25, 1, source="ffms2", cachedir="{ROOT}/work", threads=8)',
+    # not an MXF despite the name: MxfSource fails to open -> ffms2 for video and audio
     "mxf_fallback_not_mxf": f'UConvert("{WORK}/fake_mpeg_ps.mxf", 576, 720, "tff", 25, 1, cachedir="{ROOT}/work", threads=8)',
-    # 16 + 24 bit audio tracks: MxfSource(use_audio="always") refuses -> MxfSource video, LWLibav audio (merged to 24 bit)
+    # 16 + 24 bit audio tracks: MxfSource(use_audio="always") refuses -> MxfSource video, ffms2 audio (merged to 24 bit)
     "mxf_fallback_mixed_audio": f'UConvert("{WORK}/mixed_audio.mxf", 576, 720, "tff", 25, 1, cachedir="{ROOT}/work", threads=8)',
     # --- aspect handling
     "aspect_4x3_pillar": bc("YV16", 1440, 1080, "25") + '.UConvertClip(1080, 1920, out_rate_nom=25, out_rate_den=1, sar_num=1, sar_den=1)',

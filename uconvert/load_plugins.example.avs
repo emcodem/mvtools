@@ -11,6 +11,7 @@ G  = "C:/path/to/gpu_package"   # plugins/ (mvtools2, mvtools_cuda, cudafilters,
 CC = "C:/path/to/CudaConvolution"
 LoadPlugin("C:/path/to/mxfsource.dll")
 LoadPlugin(T + "/lsmash/x64/LSMASHSource.dll")
+LoadPlugin(FF + "/ffms2/x64/ffms2.dll")
 LoadPlugin(G + "/plugins/mvtools2.dll")
 LoadPlugin(G + "/plugins/cudafilters.dll")
 LoadPlugin(G + "/plugins/splatfps.dll")

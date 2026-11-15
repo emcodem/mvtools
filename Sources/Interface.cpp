@@ -58,6 +58,8 @@
 
 #include <avisynth.h>
 #include <stdint.h>
+#include <cstdlib>
+#include <string>
 
 // user_data bit of the MDegrain1..6 registrations: the CudaMDegrain1..6 names (the other filters: user_data != nullptr)
 static constexpr intptr_t CUDA_FLAG = 0x100;
@@ -725,6 +727,26 @@ AVSValue __cdecl Create_MScaleVect(AVSValue args, void*, IScriptEnvironment* env
     env);
 }
 
+// MTempDir(): the operating system's temp folder, with a trailing separator, for scripts that need a place for
+// index or cache files (AviSynth scripts cannot read environment variables). Windows: GetTempPath (TMP, TEMP,
+// USERPROFILE, Windows folder), in the ANSI code page like other script strings; elsewhere TMPDIR, else /tmp/.
+AVSValue __cdecl Create_MTempDir(AVSValue args, void*, IScriptEnvironment* env)
+{
+#ifdef _WIN32
+  char buf[MAX_PATH + 1];
+  const DWORD n = GetTempPathA(MAX_PATH + 1, buf);
+  if (n == 0 || n > MAX_PATH)
+    env->ThrowError("MTempDir: the temp folder could not be determined");
+  return env->SaveString(buf);
+#else
+  const char* t = getenv("TMPDIR");
+  std::string s = (t && *t) ? t : "/tmp";
+  if (s.back() != '/')
+    s += '/';
+  return env->SaveString(s.c_str());
+#endif
+}
+
 
 #ifdef AVISYNTH_PLUGIN_25
 extern "C" __declspec(dllexport) const char* __stdcall AvisynthPluginInit2(IScriptEnvironment* env) {
@@ -779,6 +801,7 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
     Create_MSplatVectors, 0);
   env->AddFunction("MRestoreVect", "c[index]i", Create_MRestoreVect, 0);
   env->AddFunction("MScaleVect", "c[scale]f[scaleV]f[mode]i[flip]b[adjustSubPel]b[bits]i", Create_MScaleVect, 0);
+  env->AddFunction("MTempDir", "", Create_MTempDir, 0);
   //	env->AddFunction("MVFinest",     "c[isse]b", Create_MVFinest, 0);
   return("MVTools : set of tools based on a motion estimation engine");
 }

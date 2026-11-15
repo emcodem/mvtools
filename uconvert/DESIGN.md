@@ -42,13 +42,25 @@ and `_uc_plan` (the chosen chain), e.g.
 
 | input | video | audio | fallback |
 |---|---|---|---|
-| `.mxf` | `MxfSource` | `MxfSource(use_audio="always")`: all tracks merged in track order | audio fails: video from MxfSource, audio from LWLibav; open fails: LWLibav for both |
-| `.mov`, `.mp4`, `.m4v` | `LSMASHVideoSource` (container sample tables, no index) | `LSMASHAudioSource`, one call per track, merged | open fails: LWLibav for both; no audio track L-SMASH can open: audio from LWLibav |
-| everything else | `LWLibavVideoSource` (index file in `cachedir`, never next to the source; no `cachedir`: not written) | `LWLibavAudioSource`, one call per stream, merged in stream order | - |
+| `.mxf` | `MxfSource` | `MxfSource(use_audio="always")`: all tracks merged in track order | audio fails: video from MxfSource, audio from ffms2; open fails: ffms2 for both |
+| `.mov`, `.mp4`, `.m4v` | `LSMASHVideoSource` (container sample tables, no index) | `LSMASHAudioSource`, one call per track, merged | open fails: ffms2 for both; no audio track L-SMASH can open (e.g. big-endian PCM in some cameras' MP4): audio from ffms2 |
+| everything else | `FFVideoSource` (index file); `.ts` `.m2ts` `.mts` `.mpg` `.mpeg` `.vob` `.m2v`: no `Prefetch` on the source | `FFAudioSource`, one call per stream, merged in stream order | - |
 
-- `source=` forces one of `"mxf"`, `"lsmash"`, `"lwlibav"`.
-- LWLibav re-indexes the whole file for every stream index it probes that is not audio, so the audio search assumes
-  contiguous audio streams: from stream 1 up to the first gap, stream 0 only if streams 1 and 2 are not audio.
+- `source=` forces one of `"mxf"`, `"lsmash"`, `"ffms2"`. LWLibav is not used.
+- Index files (ffms2 `.ffindex`) go to `cachedir=` of the call, else the global `uc_index_dir`,
+  else the OS temp folder (`MTempDir()` of mvtools2; AviSynth scripts cannot read environment variables). They are
+  named after the full source path, never written next to the source, and reused while the file is unchanged.
+  ffms2 indexes video and all audio tracks in one pass (`FFIndex(indexmask=-1)`); every ffms2 call reads that file.
+- Why ffms2 and not LWLibav (2026-11-15, per-frame md5 against a linear decode, read linear / under `Prefetch(3)` /
+  in shuffled 13-frame segments): MxfSource and L-SMASH were exact everywhere; ffms2 was exact on MXF, MP4/MOV and
+  MKV; LWLibav served wrong frames on H.264 whose container timestamps disagree with the picture order (MXF written
+  by ffmpeg, and MP4/TS/MOV copies of it: 875 of 1500 wrong even read linearly) and after any seek in an all-intra
+  interlaced MPEG-2 stream in MXF and MKV (exact in TS/MOV/M2V). ffms2 serves wrong frames on MPEG-2 in TS/PS
+  after a seek (read in order it is exact; `seekmode=0` is exact but decodes from the start on every backward
+  request: 43-166 s instead of 2.5-4 s for 1500 frames under `Prefetch(3)`), so those files get no `Prefetch` on the
+  source and are read in order.
+- Audio search: every stream index from 0 is tried until 4 in a row are not audio (with the index file a probe only
+  reads that file).
 - Audio is handled as plain PCM streams: never mixed or gain-changed. Streams with different sample types are merged
   losslessly (wider integer, or float); streams with different sample rates are all resampled to 48 kHz.
 - Open errors are caught in the script and trigger the fallbacks. Decode errors while frames are fetched cannot be
@@ -166,7 +178,7 @@ All verified bit-exact as round trips (`tests/run_tests.py exact_`):
 
 ## Threading
 
-`UConvert` puts the source in `Prefetch(3)` and passes `threads` (default -1: automatic) to `UConvertClip`, which
+`UConvert` puts the source in `Prefetch(3)` (not MPEG-2 TS/PS files, see 1.) and passes `threads` (default -1: automatic) to `UConvertClip`, which
 places the thread pool itself. Automatic means `uc_gpu_threads` (10) on the GPU chain and 3 on the CPU chain. The GPU
 needs many frames in flight: one picture's QTGMC motion search (`CudaMAnalyse`, 95 % of the GPU time of deinterlacing)
 occupies only about 24 of an RTX 5090's 170 SMs at 1080p, so with 3 threads most of the chip idles although
@@ -179,11 +191,12 @@ threads), whole GPU chain 75 -> 131 fps; the deinterlaced output is identical fo
 - GPU MC frame-rate conversion: `CudaSplatFps` takes one frame at a time and wants its frames in order, so the pool
   sits in front of it, with `Prefetch(1)` after it and at the end.
 
-Callers must not add a large `Prefetch` after UConvert. LWLibav index files belong on a local disk (`cachedir`),
-not on network shares.
+Callers must not add a large `Prefetch` after UConvert. Index files belong on a local disk (`cachedir` /
+`uc_index_dir`), not on network shares. Two jobs that open the same never-indexed file at the same moment both
+write its index file.
 
 ## Not handled
 
 - VFR, pulldown / telecine, content-based scan detection, active-area (704) handling.
-- MXF with MxfSource video but LWLibav audio (audio fallback): MxfSource trims the pre-roll (Origin), LWLibav does
-  not; whether the audio then lines up is untested.
+- MXF with MxfSource video but ffms2 audio (audio fallback): MxfSource trims the pre-roll (Origin), ffms2 may not;
+  whether the audio then lines up is untested.

@@ -15,7 +15,7 @@
 # runs the CPU chain (QTGMC, MVTools MBlockFps, mt_convolution). Inside the GPU chain, single stages that have no GPU
 # path for a format (e.g. greyscale or alpha in QTGMC) run on the CPU with the same result (cuda_cpu_fallback).
 #
-# Required plugins: MxfSource, LSMASHSource, MVTools fork gpu_work (mvtools2 + mvtools_cuda + avstp, cudafilters,
+# Required plugins: MxfSource, LSMASHSource, ffms2, MVTools fork gpu_work (mvtools2 + mvtools_cuda + avstp, cudafilters,
 # splatfps; one build, one folder), CudaConvolution 0.10+, masktools2, RgTools, plugins_JPSDR, NNEDI3CL, avsresize,
 # QTGMC_gpu.avsi + Zs_RF_Shared.avsi. In the redistributable folder (build_dist.py) they sit in dlls\ next to this
 # file and are loaded from there; otherwise the caller loads them (load_plugins.avs). uc_interlace.json must sit next
@@ -49,6 +49,11 @@ global uc_frc_nvof = false
 global uc_qtgmc_nvenc = false
 global uc_frc_nvenc = false
 
+# Folder for the source index files (ffms2 .ffindex; one per source file, named after its full path,
+# reused while the file is unchanged). "" = the OS temp folder. The cachedir argument of a call overrides it.
+# Index files belong on a local disk, not on a network share.
+global uc_index_dir = ""
+
 # QTGMC preset of the deinterlacer (both chains). "Super Fast" is about 1.5x faster on the GPU chain, at lower quality.
 global uc_qtgmc_preset = "Fast"
 
@@ -78,7 +83,7 @@ function UConvert(string file, int out_h, int out_w, string "out_interlace", int
 {
     threads = Default(threads, -1)
     c = uc_Source(file, source, cachedir)
-    c = threads != 0 ? c.Prefetch(3) : c
+    c = threads != 0 && !uc_InOrderOnly(file) ? c.Prefetch(3) : c
     return UConvertClip(c, out_h, out_w, out_interlace, out_rate_nom, out_rate_den, scan_in=scan_in,
     \                   sar_num=sar_num, sar_den=sar_den, out_sar_num=out_sar_num, out_sar_den=out_sar_den,
     \                   aspect_mode=aspect_mode, frc_8bit=frc_8bit, threads=threads, gpu=gpu)
@@ -258,17 +263,19 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 1. Source stage: MXF -> MxfSource, MOV/MP4 -> L-SMASH (no index), everything else -> LWLibav; with fallbacks.
+# 1. Source stage: MXF -> MxfSource, MOV/MP4 -> L-SMASH (no index), everything else and wherever MxfSource or
+#    L-SMASH fail -> ffms2 (one index file per source, video and all audio streams).
 #    Records what was used in the frame property _uc_source.
 
 function uc_Source(string file, string "source", string "cachedir")
 {
     source = LCase(Default(source, "auto"))
-    Assert(source == "auto" || source == "mxf" || source == "lsmash" || source == "lwlibav",
-    \      "UConvert: source must be 'auto', 'mxf', 'lsmash' or 'lwlibav'")
+    Assert(source == "auto" || source == "mxf" || source == "lsmash" || source == "ffms2",
+    \      "UConvert: source must be 'auto', 'mxf', 'lsmash' or 'ffms2'")
     ext = LCase(uc_Ext(file))
-    kind = source != "auto" ? source : ext == "mxf" ? "mxf" : ext == "mov" || ext == "mp4" || ext == "m4v" ? "lsmash" : "lwlibav"
-    cf = Defined(cachedir) ? uc_CacheFile(file, cachedir) : ""
+    kind = source != "auto" ? source : ext == "mxf" ? "mxf" : ext == "mov" || ext == "mp4" || ext == "m4v" ? "lsmash" : "ffms2"
+    dir = uc_IndexDir(cachedir)
+    ff = dir != "" ? uc_CacheFile(file, dir) : ""
     info = ""
 
     if (kind == "mxf") {
@@ -287,11 +294,11 @@ function uc_Source(string file, string "source", string "cachedir")
                 ok = false
             }
             if (ok) {
-                a = uc_LWAudio(file, cf)
+                a = uc_FFAudio(file, ff)
                 c = IsClip(a) ? AudioDub(c, a) : c
-                info = "video=mxfsource audio=" + (IsClip(a) ? "lwlibav" : "none") + " (MxfSource audio: " + e1 + ")"
+                info = "video=mxfsource audio=" + (IsClip(a) ? "ffms2" : "none") + " (MxfSource audio: " + e1 + ")"
             } else {
-                kind = "lwlibav"
+                kind = "ffms2"
                 info = " (MxfSource: " + e2 + ")"
             }
         }
@@ -304,55 +311,32 @@ function uc_Source(string file, string "source", string "cachedir")
             ok = false
         }
         if (ok) {
-            # no audio track L-SMASH can open (e.g. big-endian PCM of some cameras): the audio from LWLibav
+            # no audio track L-SMASH can open (e.g. big-endian PCM in some cameras' MP4): the audio from ffms2
             a = uc_LSAudio(file)
             la = IsClip(a)
-            a = la ? a : uc_LWAudio(file, cf)
+            a = la ? a : uc_FFAudio(file, ff)
             c = IsClip(a) ? AudioDub(c, a) : c
-            info = "video=lsmash audio=" + (la ? "lsmash" : IsClip(a) ? "lwlibav (none from L-SMASH)" : "none")
+            info = "video=lsmash audio=" + (la ? "lsmash" : IsClip(a) ? "ffms2 (none from L-SMASH)" : "none")
         } else {
-            kind = "lwlibav"
+            kind = "ffms2"
             info = " (L-SMASH: " + e3 + ")"
         }
     }
-    if (kind == "lwlibav") {
-        c = cf != "" ? LWLibavVideoSource(file, cachefile=cf) : LWLibavVideoSource(file, cache=false)
-        a = uc_LWAudio(file, cf)
+    if (kind == "ffms2") {
+        c = uc_FFIndexed(file, ff) && ff != "" ? FFVideoSource(file, cachefile=ff) : FFVideoSource(file, cache=false)
+        a = uc_FFAudio(file, ff)
         c = IsClip(a) ? AudioDub(c, a) : c
-        info = "video=lwlibav audio=" + (IsClip(a) ? "lwlibav" : "none") + info
+        info = "video=ffms2 audio=" + (IsClip(a) ? "ffms2" : "none") + info
     }
     return c.propSet("_uc_source", uc_OneLine(info))
 }
 
-# All audio streams of a file via LWLibav, merged in stream order; "none" if there is no audio.
-# Every probe of a stream index that is not audio makes LWLibav re-index the file (without cachedir every call
-# indexes it), so the search assumes contiguous audio streams: from stream 1 up to the first gap, stream 0 only if
-# 1 and 2 are not audio.
-function uc_LWAudio(string file, string cf)
+# true for MPEG-2 program / transport stream files. ffms2 serves wrong frames there when frames are requested out of
+# order (after a seek); UConvert puts no Prefetch on such a source, so it is read in order.
+function uc_InOrderOnly(string file)
 {
-    acc = "none"
-    miss = 0
-    i = 1
-    done = false
-    while (i < 32 && !done) {
-        a = uc_LWAudioStream(file, cf, i)
-        acc = IsClip(a) ? (IsClip(acc) ? uc_AudioJoin(acc, a) : a) : acc
-        miss = IsClip(a) ? miss : miss + 1
-        done = !IsClip(a) && (IsClip(acc) || miss >= 2)
-        i = i + 1
-    }
-    return IsClip(acc) ? acc : uc_LWAudioStream(file, cf, 0)
-}
-
-function uc_LWAudioStream(string file, string cf, int i)
-{
-    try {
-        a = cf != "" ? LWLibavAudioSource(file, stream_index=i, cachefile=cf, av_sync=true)
-        \            : LWLibavAudioSource(file, stream_index=i, cache=false, av_sync=true)
-    } catch (e) {
-        a = "none"
-    }
-    return a
+    ext = LCase(uc_Ext(file))
+    return ext == "ts" || ext == "m2ts" || ext == "mts" || ext == "mpg" || ext == "mpeg" || ext == "vob" || ext == "m2v"
 }
 
 # All audio tracks of a QuickTime/MP4 file via L-SMASH (track numbers start at 1).
@@ -390,12 +374,62 @@ function uc_AudioJoin(clip a, clip b)
     return MergeChannels(a, b)
 }
 
-# LWLibav index file in cachedir, named after the full source path (never next to the source).
+# Folder for index files: cachedir= of the call, else uc_index_dir, else the OS temp folder (MTempDir of mvtools2).
+# "" (only with an mvtools2 without MTempDir): no index file is written.
+function uc_IndexDir(string "cachedir")
+{
+    dir = Defined(cachedir) && cachedir != "" ? cachedir : uc_index_dir
+    try {
+        dir = dir != "" ? dir : MTempDir()
+    } catch (e) {
+        dir = ""
+    }
+    return dir
+}
+
+# ffms2 index file in that folder, named after the full source path (never next to the source).
 function uc_CacheFile(string file, string cachedir)
 {
     name = ReplaceStr(ReplaceStr(ReplaceStr(ReplaceStr(file, ":", "_"), "\", "_"), "/", "_"), " ", "_")
     dir = RightStr(cachedir, 1) == "\" || RightStr(cachedir, 1) == "/" ? cachedir : cachedir + "\"
-    return dir + name + ".lwi"
+    return dir + name + ".ffindex"
+}
+
+# ffms2 index with the video and every audio track, written once to ff (one pass over the file); without ff
+# nothing is written and each ffms2 call indexes the file itself. Returns true.
+function uc_FFIndexed(string file, string ff)
+{
+    n = ff != "" ? FFIndex(file, cachefile=ff, indexmask=-1) : 0
+    return true
+}
+
+# All audio streams of a file via ffms2, merged in stream order; "none" if there is no audio. With the index file a
+# probe only reads that file, so every stream is tried up to 4 non-audio streams in a row (without ff every probe
+# indexes the file again). adjustdelay=-1: aligned to the first video track.
+function uc_FFAudio(string file, string ff)
+{
+    ok = uc_FFIndexed(file, ff)
+    acc = "none"
+    miss = 0
+    i = 0
+    while (i < 32 && miss < 4) {
+        a = uc_FFAudioStream(file, ff, i)
+        acc = IsClip(a) ? (IsClip(acc) ? uc_AudioJoin(acc, a) : a) : acc
+        miss = IsClip(a) ? 0 : miss + 1
+        i = i + 1
+    }
+    return acc
+}
+
+function uc_FFAudioStream(string file, string ff, int i)
+{
+    try {
+        a = ff != "" ? FFAudioSource(file, track=i, cachefile=ff, adjustdelay=-1)
+        \            : FFAudioSource(file, track=i, cache=false, adjustdelay=-1)
+    } catch (e) {
+        a = "none"
+    }
+    return a
 }
 
 

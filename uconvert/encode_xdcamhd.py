@@ -34,8 +34,9 @@ def main():
     script = f'''Import("{AVSI}")
 c = uc_Source("{src}", cachedir="{avs_path(a.cachedir)}")
 {("c = " + a.pre) if a.pre else ""}
-# after --pre: Prefetch reads ahead, it must not touch frames that --pre replaces
-c = c.Prefetch(2)
+# after --pre: Prefetch reads ahead, it must not touch frames that --pre replaces. None for MPEG-2 TS/PS files:
+# their source must be read in order (uc_InOrderOnly)
+c = uc_InOrderOnly("{src}") ? c : c.Prefetch(2)
 scan = uc_ScanOf(c)
 # XDCAM HD422 is 4:2:2: 4:2:0 -> 4:2:2 before UConvert (per field for interlaced material)
 c = c.Is420 ? to422(c, scan) : c
