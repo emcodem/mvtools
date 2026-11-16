@@ -112,6 +112,18 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
     \      "UConvert: aspect_mode must be 'pillar', 'crop' or 'stretch'")
     frc_8bit = Default(frc_8bit, true)
 
+    # ---- display window (MxfSource: MxfDisplayLeft/Top/Width/Height, set only when the MXF picture descriptor's
+    # display rectangle is smaller than the frame, e.g. the 32 VBI lines of D-10 720x608): cropped to it, so the
+    # SAR applies to the picture alone. Not when the output has the full frame's size (D-10 -> D-10 stays intact).
+    win = propGetType(c, "MxfDisplayHeight") == 1 && !(c.Width == out_w && c.Height == out_h)
+    wl = win ? propGetInt(c, "MxfDisplayLeft") : 0
+    wt = win ? propGetInt(c, "MxfDisplayTop") : 0
+    ww = win ? propGetInt(c, "MxfDisplayWidth") : c.Width
+    wh = win ? propGetInt(c, "MxfDisplayHeight") : c.Height
+    win = win && wl >= 0 && wt >= 0 && ww > 0 && wh > 0 && wl + ww <= c.Width && wt + wh <= c.Height
+    crop_plan = win ? " | crop=" + string(ww) + "x" + string(wh) + "+" + string(wl) + "+" + string(wt) : ""
+    c = win ? c.Crop(wl, wt, ww, wh) : c
+
     # ---- probe (caller overrides win); a missing or invalid input SAR counts as square pixels
     src = c
     scan = Defined(scan_in) ? LCase(scan_in) : uc_ScanOf(c)
@@ -126,7 +138,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
     osar_d = Defined(out_sar_den) ? out_sar_den : same_raster ? sar_d : 1
     Assert(osar_n > 0 && osar_d > 0, "UConvert: out_sar_num and out_sar_den must be greater than 0")
     plan = "in=" + string(c.Width) + "x" + string(c.Height) + " " + scan + " " + string(c.FrameRateNumerator) + "/" +
-    \      string(c.FrameRateDenominator) + " " + c.PixelType + " sar " + string(sar_n) + ":" + string(sar_d)
+    \      string(c.FrameRateDenominator) + " " + c.PixelType + " sar " + string(sar_n) + ":" + string(sar_d) + crop_plan
 
     # ---- work format: lossless detour for formats the stage plugins cannot take, no audio, no colour props
     orig_pt = c.PixelType

@@ -73,7 +73,11 @@ and `_uc_plan` (the chosen chain), e.g.
 - Scan from `_FieldBased` (2 = TFF, 1 = BFF, 0 = progressive) at up to five frames spread over the clip; the first
   interlaced one wins. No property = progressive. Override: `scan_in`.
 - SAR from `_SARNum` / `_SARDen`; missing or invalid = square pixels. Override: `sar_num` / `sar_den` (metadata is
-  often wrong, e.g. SD files flagged 1:1).
+  often wrong, e.g. SD files flagged 1:1). MxfSource derives it from the MXF picture descriptor's AspectRatio and
+  display rectangle (D-10 PAL 16:9: 64:45, 4:3: 16:15; at 720 lines and more only 16:9 is taken).
+- Display window: MxfSource's `MxfDisplayLeft` / `Top` / `Width` / `Height` (set only when the descriptor's display
+  rectangle is smaller than the frame, e.g. the 32 VBI lines of D-10 720x608) are cropped first, so the SAR applies to
+  the picture alone (plan: `crop=720x576+0+32`). Not when the output has the full frame's size (D-10 -> D-10).
 - Output SAR: the input SAR if the frame size is unchanged, else 1:1. Override: `out_sar_num` / `out_sar_den`.
 
 ### 3. Plan
