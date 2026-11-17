@@ -302,3 +302,43 @@ against his code yet.
     src blocks per expected vector from a coarse-level field. Wait until it settles in his fork; builds on item 16.
 18. Global-motion predictor clip (#18, planned in his fork, not built): a predictor that follows camera pans. Same
     mechanism as item 12 (extra predictor clip); do them together.
+
+## DTL posts #21-#23: UConvert downscalers (doom9 t=187172, 16-17 Nov 2026)
+
+#21 (DTL): for broadcast production replace Spline36Resize in `uc_scale_down_h`, `uc_scale_down_v` and
+`uc_scale_down_v_interlaced` by UserDefined2Resize (more linear kernel) or at least SinPowerResize (one parameter).
+Default b,c for a flat / film look, b=80, c=-20 for a sharper "video" look. For the vertical downscale before
+interlacing b,c balance sharpness against aliasing (examples: doom9 t=186356). These resizers are anti-alias and
+anti-ringing filters at once, so a vertical low-pass after them has to be tuned together with b,c.
+#22 (us): the P->i blur is a separate convolution (`uc_interlace_kernel`, CudaConvolution / mt_convolution), also so
+blur stays its own decision (P->P downscale, P->i with or without scaling); the scaler should not add its own
+filtering. #23 (DTL): then use a long sinc-based kernel (e.g. LanczosResize(taps=20)): it only removes frequencies
+above the new Nyquist limit and leaves the in-band response and ringing control to our convolution. Interlace taps
+tuned together with Spline36 can work, but Spline36 for general downscaling (UHD -> HD progressive) gives ringing in
+later sinc-based upscalers (displays) and its stop band may pass more aliasing. UserDefined2Resize is not precise at
+small ratios (about 2:1 and below). Longer-term ideas from him: a "broadcast downsizer" with look presets (film ->
+video, keep look, video -> film, auto-analysed), one sharpness knob, more than 2 coefficients for ringing control,
+better 4:4:4 -> 4:2:x chroma downsampling, scaling-domain (gamma vs linear) aware filtering. Only (1)-(3) and (6)
+fit our no-AI rule as classical work.
+
+### State today
+
+- The kernel is already a setting: any AviSynth+ core resizer with arguments (`"SinPowerResize, p=3.0"`,
+  `"UserDefined2Resize, b=80, c=-20"`, `"LanczosResize, taps=20"`), on the GPU as CudaUserDefined2Resize,
+  CudaSinPowerResize, CudaLanczosResize, CudaSincResize (bit-identical with the CPU resizers). Nothing to build to
+  try his suggestions; only the defaults are in question.
+- Order: scale first, then the interlace low-pass (`uc_interlace_kernel` 9 taps) on the scaled frame. The taps were
+  chosen without regard to the scaler in front.
+
+### TODO
+
+19. Downscale defaults (#21, #23). Compare on real material (UHD -> HD p, HD -> SD p, HD p -> SD i, HD p -> HD i):
+    Spline36 (today), LanczosResize taps=20 / SincResize (his "neutral" choice for our separate-filter design),
+    UserDefined2Resize default and b=80 c=-20, SinPowerResize. Look at ringing (also after a display-style sinc
+    upscale of the output), aliasing (zone plate / moving fine texture), sharpness; frequency response of each
+    kernel plus our interlace taps measured on a sweep. User's eye decides (no PSNR-only claims). Decide whether
+    the separate convolution stays the design or the interlace scaler takes over the vertical low-pass for i output.
+20. If the long sinc kernel wins: check the cost of taps=20 on the GPU at UHD -> HD (CudaLanczosResize) and the
+    edge behaviour (ringing at picture borders / pillarbox edges).
+21. "Broadcast downsizer" (#23 list, 1-3 and 6): research only, not planned. Ask him which of his doom9 t=186356
+    kernels he would use as the reference for HD -> SD i.
