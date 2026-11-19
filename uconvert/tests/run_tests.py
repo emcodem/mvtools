@@ -122,13 +122,13 @@ EXACT = {
     "exact_pairs_24p_50p": (SRC_BC("YV16", fps="24"), 's.UConvertClip(720, 1280, out_rate_nom=50, out_rate_den=1)',
                             's.UConvertClip(720, 1280, out_rate_nom=50, out_rate_den=1).SelectEven().SelectEvery(1, 0, 0)'),
     "exact_psf_25p_25i": (SRC_BC("YV16"), 's.UConvertClip(720, 1280, "tff", 25, 1, gpu=false)',
-                          's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=4096, Y=3, U=3, V=3)'),
-    # GPU interlace (CudaConvolution + uc_interlace.json) = mt_convolution from 10 bit up (8 bit: +-1 on ~0.05 %,
-    # 10-bit arithmetic)
+                          's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=uc_interlace_divisor, Y=3, U=3, V=3)'),
+    # GPU interlace (CudaConvolution, built-in balanced) = mt_convolution from 10 bit up. 8 bit: +-1 where the 10-bit
+    # arithmetic rounds twice (~0.05 % of samples on camera material, ~8 % on sharp synthetic patterns)
     "exact_psf_gpu_10bit": (SRC_BC("YUV422P10"), 's.UConvertClip(720, 1280, "tff", 25, 1, gpu=true)',
-                            's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=4096, Y=3, U=3, V=3)'),
+                            's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=uc_interlace_divisor, Y=3, U=3, V=3)'),
     "exact_psf_gpu_16bit_444": (SRC_BC("YUV444P16"), 's.UConvertClip(720, 1280, "tff", 25, 1, gpu=true)',
-                                's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=4096, Y=3, U=3, V=3)'),
+                                's.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=uc_interlace_divisor, Y=3, U=3, V=3)'),
     # GPU QTGMC with the exact search (uc_qtgmc_nvof = false) = CPU QTGMC
     "exact_deint_gpu_eq_cpu": (SRC_BC("YUV422P10", 1920, 1080, n=30) + "s = s.AssumeTFF()\n",
                                's.UConvertClip(1080, 1920, out_rate_nom=50, out_rate_den=1, scan_in="tff", frc_8bit=false, gpu=true)',

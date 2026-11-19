@@ -53,7 +53,7 @@ RUNTIME_DLLS = {
     "nvencmv": ["mvtools_cuda.dll"],
 }
 # files uconvert.avsi reads from its own folder
-SIDE_FILES = ["uc_interlace.json"]
+SIDE_FILES = []
 # the benchmark: these files of bench/ plus MovingPattern.dll go to <out>/bench/
 BENCH_FILES = ["bench_uconvert.cmd", "bench_uconvert.ps1", "README.md"]
 # readme-like files next to a plugin that are not licences (the GPU bench package's own instructions)

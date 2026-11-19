@@ -18,18 +18,19 @@
 # Required plugins: MxfSource, LSMASHSource, ffms2, MVTools fork gpu_work (mvtools2 + mvtools_cuda + avstp, cudafilters,
 # splatfps; one build, one folder), CudaConvolution 0.10+, masktools2, RgTools, plugins_JPSDR, NNEDI3CL, avsresize,
 # QTGMC_gpu.avsi + Zs_RF_Shared.avsi. In the redistributable folder (build_dist.py) they sit in dlls\ next to this
-# file and are loaded from there; otherwise the caller loads them (load_plugins.avs). uc_interlace.json must sit next
-# to this file.
+# file and are loaded from there; otherwise the caller loads them (load_plugins.avs).
 
 global uc_dir = ScriptDir()
 Exist(uc_dir + "dlls\uc_load.avs") ? Import(uc_dir + "dlls\uc_load.avs") : NOP()
 
-# 9-tap vertical low-pass kernel of the interlace step, as integers / 4096.
-# Set to "" after the Import to take the fields without filtering. The GPU path reads the same taps from
-# uc_interlace.json (uc_interlace_preset); a changed kernel string needs a matching preset file there.
-global uc_interlace_kernel = "31 -66 -235 1075 2486 1075 -235 -66 31"
-global uc_interlace_preset = uc_dir + "uc_interlace.json"
-global uc_interlace_preset_kernel = "31 -66 -235 1075 2486 1075 -235 -66 31"   # the taps in uc_interlace.json
+# Vertical low-pass kernel of the interlace step: CudaConvolution's built-in "balanced" preset, factor 1 (9 taps,
+# integers / uc_interlace_divisor). Set uc_interlace_kernel to "" after the Import to take the fields without
+# filtering. The GPU path runs CudaConvolution with uc_interlace_preset ("" = its built-in balanced preset); for
+# other taps give a preset file with the same taps in uc_interlace_preset and the taps in uc_interlace_preset_kernel.
+global uc_interlace_kernel = "43 -195 -765 4211 9796 4211 -765 -195 43"
+global uc_interlace_divisor = 16384
+global uc_interlace_preset = ""
+global uc_interlace_preset_kernel = "43 -195 -765 4211 9796 4211 -765 -195 43"   # the factor-1 taps of uc_interlace_preset
 
 # GPU QTGMC motion vectors from the NVIDIA optical flow accelerator (faster, not identical to the CPU search).
 # false: the GPU search gives the same vectors as the CPU QTGMC.
@@ -182,7 +183,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
     m_d = out_rate_den
     r = float(r_n) / r_d
     m = float(m_n) / m_d
-    half = r < 0.75 * m && !uc_IsInt(m / r)
+    half = r < 0.5 * m && !uc_IsInt(m / r)
     p_n = m_n
     p_d = half ? 2 * m_d : m_d
     p = float(p_n) / p_d
@@ -594,7 +595,7 @@ function uc_Resize(clip c, string pre, string k, int w, int h, float l, float t,
     return Eval("c." + pre + name + "(w, h, src_left=l, src_top=t, src_width=sw, src_height=sh" + extra + ")")
 }
 
-# Progressive frames at field rate -> interlaced: a 9-tap vertical low-pass filter on the
+# Progressive frames at field rate -> interlaced: a vertical low-pass filter (uc_interlace_kernel) on the
 # progressive picture, then each field's lines (first field from the earlier frame). 4:2:0 is filtered at 4:2:2
 # and subsampled per field, so the chroma of each field comes from that field's lines.
 function uc_Interlace(clip c, bool tff, bool "gpu")
@@ -614,22 +615,25 @@ function uc_Interlace(clip c, bool tff, bool "gpu")
 # CPU: filter (mt_convolution; none with uc_interlace_kernel = ""), then the two fields of each output frame.
 function uc_FieldsCpu(clip c, bool tff)
 {
-    x = uc_interlace_kernel == "" ? c : c.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=4096, Y=3, U=3, V=3, A=3)
+    x = uc_interlace_kernel == "" ? c : c.mt_convolution(horizontal="1", vertical=uc_interlace_kernel, total=uc_interlace_divisor, Y=3, U=3, V=3, A=3)
     return uc_Order(x, tff).SeparateFields().SelectEvery(4, 0, 3)
 }
 
-# GPU: CudaConvolution with uc_interlace.json filters and takes the fields in one step (same taps; 10-bit
-# arithmetic, so 8-bit results can differ from mt_convolution by one code). Formats it does not take are prepared
-# losslessly where possible: greyscale as 4:4:4, 14 bit / float via 16 bit, alpha as a separate greyscale clip.
+# GPU: CudaConvolution (preset uc_interlace_preset, "" = built-in balanced) filters and takes the fields in one step
+# (same taps; 10-bit arithmetic, so 8-bit results can differ from mt_convolution by one code). Formats it does not
+# take are prepared losslessly where possible: greyscale as 4:4:4, 14 bit / float via 16 bit, alpha as a separate
+# greyscale clip.
 function uc_InterlaceGpu(clip c, bool tff)
 {
-    Assert(uc_interlace_kernel == uc_interlace_preset_kernel, "UConvert: uc_interlace_kernel differs from the taps in " +
-    \      uc_interlace_preset + " (uc_interlace_preset_kernel); change both, or use gpu=false")
+    Assert(uc_interlace_kernel == uc_interlace_preset_kernel, "UConvert: uc_interlace_kernel differs from the taps of " +
+    \      (uc_interlace_preset == "" ? "the built-in balanced preset" : uc_interlace_preset) +
+    \      " (uc_interlace_preset_kernel); change both, or use gpu=false")
     m = c.HasAlpha ? c.RemoveAlphaPlane() : c
     bits = m.BitsPerComponent
     x = m.IsY ? m.ConvertToYUV444() : m
     x = bits == 14 || bits == 32 ? x.ConvertBits(16) : x
-    w = x.CudaConvolution(preset=uc_interlace_preset, field_order=tff ? "tff" : "bff", convert=false)
+    w = uc_interlace_preset == "" ? x.CudaConvolution(field_order=tff ? "tff" : "bff", convert=false)
+    \                             : x.CudaConvolution(preset=uc_interlace_preset, field_order=tff ? "tff" : "bff", convert=false)
     w = m.IsY ? w.ExtractY() : w
     w = w.BitsPerComponent != bits ? w.ConvertBits(bits) : w
     return c.HasAlpha ? w.AddAlphaPlane(uc_InterlaceGpu(c.ExtractA(), tff)) : w

@@ -36,7 +36,7 @@ decision tables below.
 
 The output carries the frame properties `_uc_source` (which source filters were used, and why a fallback was taken)
 and `_uc_plan` (the chosen chain), e.g.
-`in=1920x1080 tff 30000/1001 YUV422P10 sar 1:1 | deint=qtgmc-gpu tff | frc=splat 25/1 | pictures x2 | interlace=tff | out=1920x1080 tff 25/1 YUV422P10`.
+`in=1920x1080 tff 30000/1001 YUV422P10 sar 1:1 | deint=qtgmc-gpu tff | frc=splat 50/1 | interlace=tff | out=1920x1080 tff 25/1 YUV422P10`.
 
 ### 1. Source
 
@@ -90,7 +90,7 @@ Definitions (all rates exact as num/den):
   always deinterlaced to full field-rate progressive first, so all rate decisions see progressive input at `r`.
 - output motion rate `m` = frame rate (progressive output) or 2 x frame rate (interlaced output).
 - picture rate `p`: the rate at which distinct pictures are made. `p = m / 2` ("pictures x2": each picture shown
-  twice) when `r < 0.75 x m` and `m / r` is not an integer, else `p = m`. Only x1 or x2, never more: 12p -> 50p
+  twice) when `r < m / 2` and `m / r` is not an integer, else `p = m`. Only x1 or x2, never more: 12p -> 50p
   makes 25 Hz pictures, each shown twice.
 
 Frame-rate conversion from `r` to `p`:
@@ -102,9 +102,11 @@ Frame-rate conversion from `r` to `p`:
 | `p / r` integer | repeat: each frame n times, no motion compensation | 25p -> 50p, 25p -> 75p (x3) |
 | otherwise | motion-compensated (MC) | 59.94i -> 50i, 24p -> 25p, 50p -> 23.976p |
 
-Low picture rates: 24p -> 50p gives MC 24 -> 25 then pictures x2; 29.97p -> 25i gives MC 29.97 -> 25 then
-pictures x2, then interlace. The 0.75 boundary sits between the cases that make full-rate pictures (`r` close to
-`m`) and those that make half-rate ones (`r` near or below `m / 2`).
+Low picture rates: 24p -> 50p gives MC 24 -> 25 then pictures x2; 24p -> 25i the same, then interlace (each
+output frame holds one picture in both fields). The output never has fewer distinct pictures than the source: a
+source faster than `m / 2` is converted to the full motion rate, so 29.97p -> 25i gives MC 29.97 -> 50 and fields
+from 50 different pictures, and 29.97p -> 50p gives MC 29.97 -> 50. A source at or below `m / 2` is not given
+motion it does not have: 24p keeps its film look in 25i / 50p (MC to 25, each picture twice).
 
 Timing and cuts:
 - Output picture k is taken at input time `k x r / p` exactly, without latency.
@@ -146,7 +148,7 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
 | deinterlace | QTGMC (`QTGMC_gpu.avsi`) with its GPU switches; motion vectors optionally from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) or NVENC's motion estimation (`uc_qtgmc_nvenc`, nvencmv) | QTGMC; preset `uc_qtgmc_preset` (default "Fast") in both chains |
 | frame-rate conversion (MC) | `CudaSplatFps`; candidates optionally from the NVIDIA optical flow accelerator (`uc_frc_nvof`: `CudaNVOFAnalyse` via `MSplatVectors`) or NVENC's motion estimation (`uc_frc_nvenc`: `CudaNVENCAnalyse`) | MVTools `MSuper` / `MAnalyse` (truemotion) / `MBlockFps(mode=3, blend=false)`; up to 2.5 Mpixel pel 4 / 16x16, above pel 2 / 32x32 |
 | scale | `Cuda*Resize` (cudafilters, bit-identical with the CPU resizer); borders on the CPU | the AviSynth+ core resizer (`uc_scale_*`) |
-| interlace | `CudaConvolution` with `uc_interlace.json` | `mt_convolution` |
+| interlace | `CudaConvolution`, built-in preset `balanced` | `mt_convolution` with the same taps |
 
 - GPU chain frames: QTGMC (`QTGMC_gpu_out_tokens`, not with alpha) and the Cuda resizers keep the pictures on the GPU
   as token frames up to the next stage that reads normal frames (borders, bit-depth change, CudaSplatFps, 4:2:0 /
@@ -155,11 +157,15 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
   (e.g. greyscale or alpha in QTGMC) run on the CPU with the same result (`cuda_cpu_fallback`).
 - Deinterlacing and MC frame-rate conversion run in 8 bit by default (`frc_8bit=true`) and are converted back to the
   input bit depth afterwards; `frc_8bit=false` keeps the source bit depth (32-bit float: 16 bit).
-- Interlace step: a 9-tap vertical low-pass filter on the progressive picture (taps
-  `31 -66 -235 1075 2486 1075 -235 -66 31` / 4096, `uc_interlace_kernel`; `""` takes the fields without
-  filtering), then each output frame's fields from two consecutive progressive frames. 4:2:0 is filtered at 4:2:2
-  and subsampled per field, so each field's chroma comes from that field's lines. The GPU path reads the same taps
-  from `uc_interlace.json`; a changed kernel needs a matching preset file.
+- Interlace step: CudaConvolution's built-in preset `balanced`. The preset holds one filter set per scale factor
+  (input size / output size): factor 1 (same size) is a 9-tap vertical low-pass filter and no horizontal filter;
+  factors 2..8 downscale and filter in one step (e.g. factor 2: 31 taps horizontal, 17 vertical). UConvert scales
+  first (scale step) and runs the interlace step at the output size, so it always uses factor 1, also for
+  UHD -> HD: taps `43 -195 -765 4211 9796 4211 -765 -195 43` / 16384 (`uc_interlace_kernel` /
+  `uc_interlace_divisor`; `""` takes the fields without filtering) on the progressive picture, then each output
+  frame's fields from two consecutive progressive frames. 4:2:0 is filtered at 4:2:2 and subsampled per field, so
+  each field's chroma comes from that field's lines. Other taps: a CudaConvolution preset file with the same taps in
+  `uc_interlace_preset` and the taps in `uc_interlace_preset_kernel`.
 
 ### 5. Output
 
