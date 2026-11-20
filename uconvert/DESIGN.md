@@ -150,6 +150,14 @@ SD -> HD after it). Repetition runs after the scaling, so identical frames are s
 | scale | `Cuda*Resize` (cudafilters, bit-identical with the CPU resizer); borders on the CPU | the AviSynth+ core resizer (`uc_scale_*`) |
 | interlace | `CudaConvolution`, built-in preset `balanced` | `mt_convolution` with the same taps |
 
+One-step scale + interlace (GPU chain, `uc_cc_onestep`): progressive input at the output's field rate (no frame-rate
+conversion), interlaced output, no crop or borders, an integer ratio of 1..8 per axis (e.g. UHD 50p -> 1080i25), 4:2:2 /
+4:4:4 / planar RGB without alpha, up to 16 bit. The scale step and the interlace step are replaced by one
+`CudaConvolution(width, height, preset=balanced_halfup.json)`; `_uc_plan` shows `scale+interlace=cc`. The preset is
+CudaConvolution's `balanced` with `round_half_up` in the measured profile: the stock `f32_fma_trunc` rounding adds +1 code
+to every sample below mid-grey (flat areas, 10 bit). Against the original (UHD 50p scaled to HD, Carmen clip, PSNR Y/U/V):
+halfup 42.7 / 49.0 / 46.5 dB, stock 42.6 / 48.6 / 46.5 dB, alch 37.6 / 40.8 / 43.8 dB.
+
 - GPU chain frames: QTGMC (`QTGMC_gpu_out_tokens`, not with alpha) and the Cuda resizers keep the pictures on the GPU
   as token frames up to the next stage that reads normal frames (borders, bit-depth change, CudaSplatFps, 4:2:0 /
   greyscale interlacing, the output); there a `CudaDownload()` is inserted. CudaConvolution reads token frames itself.
