@@ -69,7 +69,7 @@ def expected_chain(c, src, plan):
     fps, ofps = Fraction(fn, fd), Fraction(on, od)
     r = 2 * fps if scan != "p" else fps
     m = 2 * ofps if oi else ofps
-    half = r < Fraction(3, 4) * m and not is_int(float(m / r))
+    half = r < Fraction(1, 2) * m and not is_int(float(m / r))
     p = m / 2 if half else m
     if same(float(r), float(p)):
         frc = None
