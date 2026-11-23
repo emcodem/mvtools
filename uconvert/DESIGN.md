@@ -197,7 +197,7 @@ All verified bit-exact as round trips (`tests/run_tests.py exact_`):
 ## Threading
 
 `UConvert` puts the source in `Prefetch(3)` (not MPEG-2 TS/PS files, see 1.) and passes `threads` (default -1: automatic) to `UConvertClip`, which
-places the thread pool itself. Automatic means `uc_gpu_threads` (10) on the GPU chain and 3 on the CPU chain. The GPU
+places the thread pool itself. Automatic means, on the GPU chain, `uc_gpu_threads` (10) when the plan deinterlaces, 1 thread with GPU frame-rate conversion and 0 threads (source `Prefetch(1)` only) otherwise; 3 on the CPU chain. Measured 2026-11-23 on an RTX 5050, median of 3, steady-state fps, old fixed 10 -> new: UHD 50p -> 25i 2.4 -> 44, HD 50p -> 25i 9 -> 89, 50p -> 29.97i 12 -> 48, UHD 50p -> 29.97i 3 -> 36; deinterlacing unchanged (about 25-50; one thread without a pool is 2-3x slower there); 25p -> 25i 169 -> 107 (both far above real time). One thread on a plain scale + interlace plan is much slower than none (UHD 50p -> 25i: 3.8 vs 27). The GPU
 needs many frames in flight: one picture's QTGMC motion search (`CudaMAnalyse`, 95 % of the GPU time of deinterlacing)
 occupies only about 24 of an RTX 5090's 170 SMs at 1080p, so with 3 threads most of the chip idles although
 `nvidia-smi` shows it 99 % busy. Measured on the RTX 5090: deinterlacing 1080i25 -> 1080p50 147 -> 353 fps (3 -> 10

@@ -84,6 +84,11 @@ global uc_gpu_default = true
 # whole chain 75 -> 131 fps). The deinterlaced output does not depend on it. Costs about 60 MB RAM per thread.
 global uc_gpu_threads = 10
 
+# Without deinterlacing the pool of 10 is slower than a small one (RTX 5050, median of 3, steady-state fps):
+# scale + interlace, UHD 50p -> 25i: 0 threads 26.9, 1 thread 3.8; HD 50p -> 25i: 66 vs 10; 50p -> 29.97i (frame-rate
+# conversion): 35 vs 45; UHD 50p -> 29.97i: 17 vs 27. So automatic = 0 threads (source Prefetch(1) only) without
+# deinterlacing and without frame-rate conversion, 1 thread with GPU frame-rate conversion, uc_gpu_threads with deinterlacing.
+
 
 function UConvert(string file, int out_h, int out_w, string "out_interlace", int "out_rate_nom", int "out_rate_den",
 \                 string "source", string "cachedir", string "scan_in", int "sar_num", int "sar_den",
@@ -92,14 +97,16 @@ function UConvert(string file, int out_h, int out_w, string "out_interlace", int
 {
     threads = Default(threads, -1)
     c = uc_Source(file, source, cachedir)
-    c = threads != 0 && !uc_InOrderOnly(file) ? c.Prefetch(3) : c
+    # automatic threads on the GPU chain without deinterlacing: the source gets Prefetch(1) (see uc_gpu_threads)
+    nodeint = threads < 0 && Default(gpu, uc_gpu_default) && (Defined(scan_in) ? LCase(scan_in) : uc_ScanOf(c)) == "p"
+    c = threads != 0 && !uc_InOrderOnly(file) ? c.Prefetch(nodeint ? 1 : 3) : c
     return UConvertClip(c, out_h, out_w, out_interlace, out_rate_nom, out_rate_den, scan_in=scan_in,
     \                   sar_num=sar_num, sar_den=sar_den, out_sar_num=out_sar_num, out_sar_den=out_sar_den,
     \                   aspect_mode=aspect_mode, frc_8bit=frc_8bit, threads=threads, gpu=gpu)
 }
 
 
-# threads < 0: automatic (GPU chain uc_gpu_threads, CPU chain 3; UConvert's default). threads = 0: no thread pool.
+# threads < 0: automatic (GPU chain: uc_gpu_threads with deinterlacing, else 1 with frame-rate conversion / 0; CPU chain 3; UConvert's default). threads = 0: no thread pool.
 # threads > 0: UConvertClip places the thread pool itself - Prefetch(threads) on the progressive chain before the
 # interlace step and Prefetch(3) at the end. Do not add a large Prefetch after it: with the pool behind the
 # interlace step, threads compute the same deint/FRC frames twice (measured: 25i output at half speed).
@@ -111,7 +118,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
 {
     threads = Default(threads, 0)
     gpu = Default(gpu, uc_gpu_default)
-    threads = threads < 0 ? (gpu ? uc_gpu_threads : 3) : threads
+    threads_auto = threads < 0
     Assert(Defined(out_rate_nom) && Defined(out_rate_den) && out_rate_nom > 0 && out_rate_den > 0,
     \      "UConvert: out_rate_nom and out_rate_den are required")
     oi = LCase(Default(out_interlace, ""))
@@ -198,6 +205,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
     frc = uc_Same(r, p) ? "none" : r > p && uc_IsInt(r / p) ? "drop" : p > r && uc_IsInt(p / r) ? "repeat" : "mc"
     passthrough = !spatial && uc_Same(float(c.FrameRateNumerator) / c.FrameRateDenominator,
     \             float(out_rate_nom) / out_rate_den) && scan == (i_out ? oi : "p")
+    threads = threads_auto ? (gpu ? (i_in ? uc_gpu_threads : frc == "mc" ? 1 : 0) : 3) : threads
     wbits = frc_8bit ? 8 : bits == 32 ? 16 : bits   # bit depth for deinterlacing and MC frame-rate conversion
 
     # ---- execute
