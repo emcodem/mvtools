@@ -563,9 +563,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
       );
     }
   }
-  // Standard MDegrainN
-  if (!degrain && cuda)
-    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD and thSADC2 = thSADC").decide(env);
+  // Standard MDegrainN (CudaMDegrainN: its own GPU path, tr up to 10)
   if (!degrain)
     degrain = new MDegrainN(
     source,                  // source
@@ -585,6 +583,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
     args[16].AsBool(true),   // mt
     out16 || lsb,            // out16
     skip_frame,              // SkipFrame
+    cuda,                    // CudaMDegrainN
     env
   );
   if (lsb)

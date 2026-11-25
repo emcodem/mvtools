@@ -108,9 +108,10 @@ public:
   template <class Op>
   int with_inputs(Input *in, int count, IScriptEnvironment *env, Op op)
   {
-    unsigned long long tk[16];
-    bool pinned[16] = {};
-    if (count > 16)
+    // up to 24 inputs: CudaMDegrainN tr 10 = source + 20 references
+    unsigned long long tk[24];
+    bool pinned[24] = {};
+    if (count > 24)
       return -4;
     for (int i = 0; i < count; i++)
     {

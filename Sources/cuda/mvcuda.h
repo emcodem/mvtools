@@ -502,7 +502,7 @@ MVCUDA_API int mvcuda_nnedi3(void *net, unsigned long long src, int field_n, int
 // clamped coordinates; the pel-2 one (sharp = 2) adds the three Wiener sub-pel planes of the padded picture, made once per
 // device frame and kept with it (mvc::frame_subpel). Per-block tables are made by the host with mvtools' own code
 // (vectors, usable flags, weights).
-#define MVCUDA_MAX_DEGRAIN 6
+#define MVCUDA_MAX_DEGRAIN 10 // CudaMDegrain1..6 and CudaMDegrainN up to tr 10 (API 34)
 typedef struct
 {
   int blk_x, blk_y, ov_x, ov_y;  // luma block size and overlap

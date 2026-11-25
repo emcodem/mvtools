@@ -11,8 +11,10 @@
 #include "overlap.h"
 #include "SharedPtr.h"
 #include "def.h"
+#include "GpuBackend.h"
 
 #include	<memory>
+#include	<mutex>
 #include	<vector>
 
 
@@ -32,7 +34,7 @@ public:
     ::PClip child, ::PClip super, ::PClip mvmulti, int trad,
     sad_t thsad, sad_t thsadc, int yuvplanes, float nlimit, float nlimitc,
     sad_t nscd1, int nscd2, bool isse_flag,
-    sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, int skip_frame, ::IScriptEnvironment* env_ptr
+    sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, int skip_frame, bool gpu_flag, ::IScriptEnvironment* env_ptr
   );
   ~MDegrainN();
 
@@ -173,6 +175,17 @@ private:
   // of the block grid size (edge_ext), else only the blocks inside the frame (nBlkXP x nBlkYP).
   bool edge_ext;
   int nWidthP, nHeightP;
+
+  // GPU path (CudaMDegrainN with tr above the MDegrain1-6 range, see MVDegrainX): the same kernel, the per-block weights
+  // computed here with this filter's own weighting, token frames out
+  bool _super_lite = false;  // super clip made by CudaMSuper (picture only): the CPU path completes its frames
+  bool _gpu_ok = false;
+  int _gpu_hpad = 0, _gpu_vpad = 0;
+  unsigned long long _producer = 0;
+  std::mutex _gpu_mutex;
+  int gpu_make(int n, ::IScriptEnvironment *env, MvCudaTokenHeader &h, ::PVideoFrame *props_src);
+  static int gpu_regen(void *user, int frame, void *env, MvCudaTokenHeader *out);
+  ::PVideoFrame cpu_frame(int n, ::IScriptEnvironment *env);
   int nBlkXP, nBlkYP;
   VideoInfo vi_src_ext, vi_dst_ext;
 

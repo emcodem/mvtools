@@ -85,6 +85,12 @@ normal meander=false path keeps its static shared memory; meander=true + predict
   (deterministic, differs from the chain without clips; 8 / 10 bit, trymany, mt, luma, pel 4, meander off).
   CudaMAnalyse with predictor clips / pglobal_coarse != pglobal and CudaMDegrainN with SkipFrame refuse (D8) for now.
   Note: CudaMAnalyse also refuses multi=true, which his chain uses for the zero / global clips.
-- [ ] CUDA MDegrainN SkipFrame (+ tr > 6?)
+- [x] CUDA steps 1-3 (f7c5b31): pglobal_coarse per level (API 34), MDegrain1-6 class with skip_frame (CPU + GPU,
+  MDegrainN tr <= 6 with SkipFrame uses it again), CudaMAnalyse multi=true. run_s234 S8 15 / 15, run_partm 66 / 66
+  (degrainN_skip / _skip2).
+- [x] CUDA step 4: CudaMDegrainN tr > 6 - own GPU path in MDegrainN (same kernel as MDegrain1-6, MVCUDA_MAX_DEGRAIN 10,
+  with_inputs up to 24), weights from MDegrainN's own use_block / norm_weights (generic MDegrainN == MDegrain1-6 class
+  on luma, tr 3 / 6, checked), lite supers in the CPU path (CompleteLite). run_partm 75 / 75 incl. tr 10 + SkipFrame
+  and tr 8 + thSAD2.
 - [ ] CUDA MAnalyse predictor clips
 - [ ] tests, build for DTL
