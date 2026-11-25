@@ -92,5 +92,12 @@ normal meander=false path keeps its static shared memory; meander=true + predict
   with_inputs up to 24), weights from MDegrainN's own use_block / norm_weights (generic MDegrainN == MDegrain1-6 class
   on luma, tr 3 / 6, checked), lite supers in the CPU path (CompleteLite). run_partm 75 / 75 incl. tr 10 + SkipFrame
   and tr 8 + thSAD2.
-- [ ] CUDA MAnalyse predictor clips
+- [x] CUDA step 5: CudaMAnalyse predictor clips in the wavefront kernel (meander=false; meander=true refuses, D8). The
+  clip's block is loaded into g_wsrc while its candidate is measured / refined, then the source block again (no extra
+  shared memory; the clip planes per level in WaveCall, not in LevelArgs); predictor clips force the general (GEN)
+  kernel; trymany: the clip refines after trymany_par replace slot 0 / 1, then the selection again. Tokens + SADadj in
+  MvCudaAnalyseParams (API 34). The predictor supers need the super clip's rfilter on the GPU.
+  Tests: run_s234 S9 24 / 24 (GPU == CPU: zero / zero+global, trymany, trymanyall, hex, luma, auto SADadj with
+  pglobal_coarse; meander=true refused), full run_s234 243 / 243, run_partm 75 / 75, run_frc_pel4 6 / 6,
+  run_cf_regression 86 / 86.
 - [ ] tests, build for DTL

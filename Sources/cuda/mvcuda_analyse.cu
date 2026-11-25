@@ -122,6 +122,11 @@ namespace
     int *state;
     unsigned *finished; // device: CTAs done (in the state)
     int state_words, bad_word;
+    // temporal predictor clips (MAnalyse super_przero / super_prglobal): per level the source planes of clip k, null where
+    // the clip is not used on that level; their SADadj. Here and not in LevelArgs: the per-level copy in shared memory
+    // (g_ws.a) keeps its size.
+    const pix *pr[MVCUDA_MAX_LEVELS][2][3];
+    float pr_adj[2];
   };
 
   __device__ __forceinline__ unsigned long long global_ns()
@@ -4046,6 +4051,69 @@ namespace
 #define WPH(i) do {} while (0)
 #endif
 
+  // ---- temporal predictor clips (MAnalyse super_przero / super_prglobal, see PlaneOfBlocks::PseudoEPZSearch) ----------
+  // The clip's block of the current position replaces the source block in g_wsrc while its candidate is measured or
+  // refined, then the source block is loaded again: the SAD and refine code stays as it is and the shared memory of the
+  // kernel does not grow.
+
+  // a block of planes (the source or a predictor clip, same geometry) into g_wsrc with plain loads; barriers before (every
+  // lane is done with the buffer) and after
+  __device__ __noinline__ void wave_load_block(int lane, const pix *py, const pix *pu, const pix *pv, int x0, int y0, int x1,
+    int y1)
+  {
+    const LevelArgs &a = g_ws.a;
+    pix *const s_y = g_wsrc, *const s_u = g_wsrc + a.bs_x * a.bs_y, *const s_v = s_u + a.cw * a.ch;
+    __syncthreads();
+    for (int i = lane; i < a.bs_x * a.bs_y; i += WAVE_NT)
+    {
+      const int r = i / a.bs_x, c = i - r * a.bs_x;
+      s_y[i] = py[(size_t)(y0 + r) * a.ew[0] + x0 + c];
+    }
+    for (int i = lane; i < a.cw * a.ch; i += WAVE_NT)
+    {
+      const int r = i / a.cw, c = i - r * a.cw;
+      s_u[i] = pu[(size_t)(y1 + r) * a.ew[1] + x1 + c];
+      s_v[i] = pv[(size_t)(y1 + r) * a.ew[2] + x1 + c];
+    }
+    __syncthreads();
+  }
+
+  // SAD (luma + chroma) of vector (vx, vy) with the block of planes pl as the source block (g_wsrc holds that block after)
+  template <int GW, int BSY, int CHH>
+  __device__ __forceinline__ int wave_pr_sad(int lane, const pix *const *pl, int x0, int y0, int x1, int y1, int vx, int vy)
+  {
+    wave_load_block(lane, pl[0], pl[1], pl[2], x0, y0, x1, y1);
+    if (lane == 0)
+    {
+      g_ws.xs[0] = vx;
+      g_ws.ys[0] = vy;
+      g_ws.n = 1;
+    }
+    __syncthreads();
+    wave_eval_inl<GW, BSY, CHH>(lane, false); // ends with a barrier
+    return g_ws.sl[0] + g_ws.sc[0];
+  }
+
+  // the SAD of a predictor clip corrected by its SADadj: (int)(sad * adj) in float, truncated, as the CPU
+  __device__ __forceinline__ int pr_adj_sad(int sad, float adj)
+  {
+    return __float2int_rz(__fmul_rn(__int2float_rn(sad), adj));
+  }
+
+  // PlaneOfBlocks::PrClipScale: the result of a refine on a predictor clip corrected by adj; the cost recomputed with the
+  // candidate's penalty when the vector is still the candidate (ax, ay), else only the SAD part changes
+  __device__ __forceinline__ void pr_scale(int bx, int by, int &sad, int &cost, float adj, int ax, int ay, int penalty)
+  {
+    if (adj == 1.0f)
+      return;
+    const int old_sad = sad, new_sad = pr_adj_sad(old_sad, adj);
+    sad = new_sad;
+    if (bx == ax && by == ay)
+      cost = new_sad + (int)(((long long)penalty * new_sad) >> 8);
+    else
+      cost += new_sad - old_sad;
+  }
+
   // GEN = false: only the fixed batches of wave_plan (no mvc_refine code: small and fast to compile);
   // GEN = true: every search type through mvc_refine.
   // The body of the k_wave kernels: k_wave takes the WaveCall by value (__grid_constant__, 7.0+: about 8 KB of kernel
@@ -4352,13 +4420,64 @@ namespace
         wave_eval_inl<GW, BSY, CHH>(lane, false);
         WPH(3);
 
+        // Temporal predictor clips: the zero and the global candidate with the clip's block as the source block. The global
+        // clip is skipped where the global vector is zero and a zero clip is given (GroupOfPlanes::SearchMVs).
+        const pix *const *prz = c.pr[level][0];
+        const pix *const *prg = c.pr[level][1];
+        const bool use_pz = GEN && prz[0] != nullptr;
+        const bool use_pg = GEN && prg[0] != nullptr && !(use_pz && __ldcg(a.glob) == 0 && __ldcg(a.glob + 1) == 0);
+        int s_pz = 0, s_pg = 0;
+        if (use_pz || use_pg)
+        {
+          int sl7[7], sc7[7]; // the phase A SADs (the evaluations below overwrite them)
+          for (int i = 0; i < 7; i++)
+          {
+            sl7[i] = g_ws.sl[i];
+            sc7[i] = g_ws.sc[i];
+          }
+          if (use_pz)
+            s_pz = wave_pr_sad<GW, BSY, CHH>(lane, prz, x0[0], y0[0], x0[1], y0[1], 0, 0);
+          if (use_pg)
+            s_pg = wave_pr_sad<GW, BSY, CHH>(lane, prg, x0[0], y0[0], x0[1], y0[1], glob.x, glob.y);
+          wave_load_block(lane, a.src[0], a.src[1], a.src[2], x0[0], y0[0], x0[1], y0[1]); // the source block again
+          if (lane < 7)
+          {
+            g_ws.sl[lane] = sl7[lane];
+            g_ws.sc[lane] = sc7[lane];
+          }
+          __syncthreads();
+        }
+
         int best_x, best_y, best_sad, min_cost;
+        // predictor clip k (0 zero, 1 global) whose candidate is the current best without trymany (-1: none), its corrected
+        // cost and uncorrected values (the final refine runs on the clip); tm_pr: with trymany, the refine on clip k runs
+        int pr_k = -1, pr_cost_adj = 0, pr_raw_sad[2] = { 0, 0 }, pr_raw_cost[2] = { 0, 0 };
+        bool tm_pr[2] = { false, false };
         {
           const int sad = g_ws.sl[0] + g_ws.sc[0];
           best_x = 0;
           best_y = 0;
           best_sad = sad;
           min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
+          const int cost_zero = min_cost;
+          if (use_pz)
+          {
+            const int s_adj = pr_adj_sad(s_pz, c.pr_adj[0]);
+            const int cost_adj = s_adj + (int)(((long long)a.pzero * s_adj) >> 8);
+            pr_raw_sad[0] = s_pz;
+            pr_raw_cost[0] = s_pz + (int)(((long long)a.pzero * s_pz) >> 8);
+            if (cost_adj < cost_zero)
+            {
+              tm_pr[0] = true;
+              if (!a.try_many)
+              {
+                best_sad = s_adj; // the vector stays zero
+                min_cost = cost_adj;
+                pr_k = 0;
+                pr_cost_adj = cost_adj;
+              }
+            }
+          }
           const int sadg = g_ws.sl[1] + g_ws.sc[1];
           const int costg = sadg + (int)(((long long)a.pglobal * sadg) >> 8);
           if (costg < min_cost)
@@ -4367,6 +4486,28 @@ namespace
             best_y = glob.y;
             best_sad = sadg;
             min_cost = costg;
+          }
+          if (use_pg)
+          {
+            const int s_adj = pr_adj_sad(s_pg, c.pr_adj[1]);
+            const int cost_adj = s_adj + (int)(((long long)a.pglobal * s_adj) >> 8);
+            pr_raw_sad[1] = s_pg;
+            pr_raw_cost[1] = s_pg + (int)(((long long)a.pglobal * s_pg) >> 8);
+            // with trymany against the global vector's own cost, else against the current best
+            const int target = a.try_many ? costg : min(costg, min_cost);
+            if (cost_adj < target)
+            {
+              tm_pr[1] = true;
+              if (!a.try_many)
+              {
+                best_x = glob.x;
+                best_y = glob.y;
+                best_sad = s_adj;
+                min_cost = cost_adj;
+                pr_k = 1;
+                pr_cost_adj = cost_adj;
+              }
+            }
           }
           const int sadp = g_ws.sl[2] + g_ws.sc[2];
           if (sadp < min_cost)
@@ -4403,7 +4544,36 @@ namespace
         // the barrier after that batch's candidate list
         WPH(4);
 
-        if (!GEN || (plan != WP_GEN && !a.try_many))
+        // a predictor clip's candidate that is still the best (no later candidate was strictly better): the final refine
+        // runs on that clip from its uncorrected values, then the correction (PseudoEPZSearch without trymany)
+        const bool pr_refine = pr_k >= 0 && min_cost == pr_cost_adj && best_x == (pr_k == 0 ? 0 : glob.x)
+          && best_y == (pr_k == 0 ? 0 : glob.y);
+        if (pr_refine)
+        {
+          if constexpr (GEN)
+          {
+            const pix *const *pp = c.pr[level][pr_k];
+            wave_load_block(lane, pp[0], pp[1], pp[2], x0[0], y0[0], x0[1], y0[1]);
+            WaveChecker<GW, BSY, CHH> ck;
+            ck.bx = best_x;
+            ck.by = best_y;
+            ck.min_cost = pr_raw_cost[pr_k];
+            ck.best_sad = pr_raw_sad[pr_k];
+            ck.pred_x = pred.x;
+            ck.pred_y = pred.y;
+            ck.nlambda = nlambda;
+            ck.lane = lane;
+            mvc_refine::refine(ck, a.search_type, a.radius);
+            pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[pr_k], pr_k == 0 ? 0 : glob.x, pr_k == 0 ? 0 : glob.y,
+              pr_k == 0 ? a.pzero : a.pglobal);
+            best_x = ck.bx;
+            best_y = ck.by;
+            best_sad = ck.best_sad;
+            min_cost = ck.min_cost;
+            wave_load_block(lane, a.src[0], a.src[1], a.src[2], x0[0], y0[0], x0[1], y0[1]); // the source block again
+          }
+        }
+        else if (!GEN || (plan != WP_GEN && !a.try_many))
         {
           // fixed batches (wave_plan), one SAD call site: [WP_UMH: cross + hex grid] [WP_HEX, WP_UMH: hexagon] rings
           // around the vector found so far (all rings of an exhaustive level in one batch: the hot path of every coarse
@@ -4484,6 +4654,58 @@ namespace
             best_y = o.by;
             best_sad = o.sad;
             min_cost = o.cost;
+            if (tm_pr[0] || tm_pr[1])
+            {
+              // predictor clips: the refine around the zero / global candidate on the clip, corrected; it replaces that
+              // Refine's result if its cost is lower; then the selection of trymany_par again (first strict minimum, else
+              // the last Refine's result)
+              __syncthreads(); // every lane has the slot table of trymany_par
+              int tm[7][4];
+              for (int m = 0; m < 7; m++)
+                for (int j = 0; j < 4; j++)
+                  tm[m][j] = g_ws.tm[m][j];
+              for (int k = 0; k < 2; k++)
+              {
+                if (!tm_pr[k])
+                  continue;
+                const pix *const *pp = c.pr[level][k];
+                wave_load_block(lane, pp[0], pp[1], pp[2], x0[0], y0[0], x0[1], y0[1]);
+                WaveChecker<GW, BSY, CHH> ck;
+                ck.bx = k == 0 ? 0 : glob.x;
+                ck.by = k == 0 ? 0 : glob.y;
+                ck.min_cost = pr_raw_cost[k];
+                ck.best_sad = pr_raw_sad[k];
+                ck.pred_x = pred.x;
+                ck.pred_y = pred.y;
+                ck.nlambda = nlambda;
+                ck.lane = lane;
+                mvc_refine::refine(ck, a.search_type, a.radius);
+                pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[k], k == 0 ? 0 : glob.x, k == 0 ? 0 : glob.y,
+                  k == 0 ? a.pzero : a.pglobal);
+                if (ck.min_cost < tm[k][3])
+                {
+                  tm[k][0] = ck.bx;
+                  tm[k][1] = ck.by;
+                  tm[k][2] = ck.best_sad;
+                  tm[k][3] = ck.min_cost;
+                }
+              }
+              wave_load_block(lane, a.src[0], a.src[1], a.src[2], x0[0], y0[0], x0[1], y0[1]); // the source block again
+              const int verybig = 3 * a.bs_x * a.bs_y << a.bits; // PlaneOfBlocks::verybigSAD
+              best_x = tm[6][0];
+              best_y = tm[6][1];
+              best_sad = tm[6][2];
+              int sel_cost = verybig + 1;
+              for (int m = 0; m < 7; m++)
+                if (tm[m][3] < sel_cost)
+                {
+                  best_x = tm[m][0];
+                  best_y = tm[m][1];
+                  best_sad = tm[m][2];
+                  sel_cost = tm[m][3];
+                }
+              min_cost = sel_cost;
+            }
           }
           else
           {
@@ -4751,8 +4973,9 @@ namespace
 // The search on two device frames (source and reference picture); their super frames are kept with them (frame_super).
 // Issued by the pipeline submitter on a leased stream ordered after the ops that made the frames (leased_call).
 static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const std::shared_ptr<mvc::DevFrame> &fs,
-  const std::shared_ptr<mvc::DevFrame> &fr, int *payload, int payload_words)
+  const std::shared_ptr<mvc::DevFrame> &fr, int *payload, int payload_words, const std::shared_ptr<mvc::DevFrame> *fpr = nullptr)
 {
+  const bool use_pr = fpr && (fpr[0] || fpr[1]); // temporal predictor clips (wavefront kernel only)
   if (!sp || !ap || !fs || !fr || !payload)
     return -4;
   // supported: luma only or luma + chroma, pel 1 or 2, field shift 0, every search type of mvcuda_refine.cuh
@@ -4814,6 +5037,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // forms (k_search: the 7 Refines one after the other with the whole CTA; meander=false: k_search in one slice)
   static const bool tm_par_allowed = [] { const char *e = getenv("MVCUDA_TM_PAR"); return !(e && e[0] == '0'); }();
   const bool wave = !ap->meander && wave_allowed && (!ap->try_many || tm_par_allowed);
+  if (use_pr && !wave)
+    return MVCUDA_NEEDS_CPU;
   int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
   for (int l = 0; l < nl; l++)
   {
@@ -4830,6 +5055,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     if (ap->blk_x * ap->blk_y + 2 * cw * ch > WAVE_SRC_MAX)
       return -4;
 #ifdef MVC_DEV_FASTONLY
+    if (use_pr)
+      return -4; // no general kernels in this build
     for (int l = 0; l < nl; l++)
       if (wave_plan(lvl_type[l], l == 0 ? ap->pel_search : ap->search_param) == WP_GEN)
         return -4;
@@ -4848,7 +5075,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
 
   int rc = 0;
   cudaStream_t st = nullptr; // the leased stream of the call (leased_call)
-  std::shared_ptr<mvc::DevSuper> s_src, s_ref;
+  std::shared_ptr<mvc::DevSuper> s_src, s_ref, s_pr[2];
   int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr, *d_wave = nullptr;
   WaveCall *d_wc = nullptr, *h_wc = nullptr; // devices below 7.0: the wavefront call in device memory (k_wave_p)
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
@@ -4880,6 +5107,9 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     int r = mvc::frame_super(&MVC_NS::super_build_dev, fs, *sp, st, s_src);
     if (!r)
       r = mvc::frame_super(&MVC_NS::super_build_dev, fr, *sp, st, s_ref);
+    for (int k = 0; k < 2 && !r; k++)
+      if (use_pr && fpr[k])
+        r = mvc::frame_super(&MVC_NS::super_build_dev, fpr[k], *sp, st, s_pr[k]);
     if (r)
       return r;
   }
@@ -5020,8 +5250,16 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         a.prog = d_wave + row_off[l];
         a.rowbad = d_wave + w_rowbad + row_off[l];
         a.bad_range = ap->bad_range;
-        wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN || a.try_many;
+        // the predictor clips need the general kernel (WaveChecker refines on the clip's block)
+        wave_gen = wave_gen || wave_plan(a.search_type, a.radius) == WP_GEN || a.try_many || use_pr;
         wc.lv[l] = a;
+        // predictor clips (GroupOfPlanes::SearchMVs): the zero clip on every level, the global clip not on the coarsest
+        // level (the global vector is still zero there)
+        for (int k = 0; k < 2; k++)
+          for (int p = 0; p < 3; p++)
+            wc.pr[l][k][p] = (s_pr[k] && (k == 0 || l < nl - 1) && (p == 0 || sp->chroma)) ? (const pix *)s_pr[k]->pl[l * 3 + p].sub[0] : nullptr;
+        wc.pr_adj[0] = ap->pr_adj[0];
+        wc.pr_adj[1] = ap->pr_adj[1];
         continue; // launched once for all levels below
       }
 
@@ -5286,6 +5524,8 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
 {
   if (!sp || !ap || !src || !ref || !src_pitch_bytes || !ref_pitch_bytes || !payload)
     return -4;
+  if (ap->pr_token[0] || ap->pr_token[1]) // predictor clips: device frames only (mvcuda_analyse_token)
+    return -4;
   if (!mvc::use_device())
     return -1;
   auto fs = mvc::upload_picture(*sp, (int)sizeof(mvc_pix), src, src_pitch_bytes);
@@ -5310,7 +5550,17 @@ extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const 
   // the frames must be the pictures the super parameters describe
   if (!mvc::super_fits(*fs, *sp, (int)sizeof(mvc_pix)) || !mvc::super_fits(*fr, *sp, (int)sizeof(mvc_pix)))
     return -4;
-  return analyse_dev(sp, ap, fs, fr, payload, payload_words);
+  std::shared_ptr<mvc::DevFrame> fpr[2];
+  for (int k = 0; k < 2; k++)
+    if (ap->pr_token[k])
+    {
+      fpr[k] = mvc::frame_get(ap->pr_token[k]);
+      if (!fpr[k])
+        return MVCUDA_TOKEN_GONE;
+      if (!mvc::super_fits(*fpr[k], *sp, (int)sizeof(mvc_pix)))
+        return -4;
+    }
+  return analyse_dev(sp, ap, fs, fr, payload, payload_words, fpr);
 }
 #endif // MVC_ANALYSE_PART == 0
 

@@ -501,6 +501,13 @@ MVAnalyse::MVAnalyse(
     const bool super_ok = super_param_gpu_rebuildable(params);
     _gpu_rfilter = super_ok ? super_param_rfilter(params) : 0;
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
+    // a predictor clip's super: the GPU rebuilds its levels with the super clip's rfilter (they must match for CPU == GPU)
+    auto pr_super_ok = [&](int k) {
+      if (!_pr_clip[k])
+        return true;
+      const SuperParams pp = GetSuperParams(_pr_clip[k]->GetVideoInfo());
+      return super_param_gpu_rebuildable(pp) && super_param_rfilter(pp) == _gpu_rfilter;
+    };
     GpuCheck c("CudaMAnalyse", "MAnalyse");
     c.need(super_ok, "the super clip must come from CudaMSuper (or MSuper of this build) with rfilter 2 or 4, sharp 2 and no pelclip")
       .need(params.nEdgePadX == 0 && params.nEdgePadY == 0, "super clips with edgepad are not supported")
@@ -509,7 +516,9 @@ MVAnalyse::MVAnalyse(
       .need(!divideExtra, "divide is not supported")
       .need(!_dctmode, "dct is not supported")
       .need(!temporal_flag, "temporal=true is not supported")
-      .need(!_pr_clip[0] && !_pr_clip[1], "temporal predictor clips (super_przero, super_prglobal) are not supported yet")
+      .need((!_pr_clip[0] && !_pr_clip[1]) || !meander, "temporal predictor clips (super_przero, super_prglobal) need meander=false")
+      .need(pr_super_ok(0) && pr_super_ok(1),
+        "the predictor clips' supers must come from CudaMSuper (or MSuper of this build) with the super clip's rfilter, sharp 2 and no pelclip")
       .need(GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse),
         "search radius too large (exhaustive up to 64, other search types up to 24)")
       .need(nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4, "only pel 1, 2 or 4")
@@ -859,11 +868,23 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
-  GpuBackend::Input in[2];
+  GpuBackend::Input in[4];
   const VideoInfo &svi = child->GetVideoInfo();
   if (!GpuBackend::super_input(src, svi, (const void *)child.operator->(), nsrc, in[0])
     || !GpuBackend::super_input(ref, svi, (const void *)child.operator->(), nref, in[1]))
     return false;
+  // temporal predictor clips: their frame nsrc (inputs 2 and 3 when given)
+  int n_in = 2, pr_in[2] = { -1, -1 };
+  PVideoFrame pr_frame[2];
+  for (int k = 0; k < 2; k++)
+  {
+    if (!_pr_clip[k])
+      continue;
+    pr_frame[k] = _pr_clip[k]->GetFrame(nsrc, env);
+    if (!GpuBackend::super_input(pr_frame[k], _pr_clip[k]->GetVideoInfo(), (const void *)_pr_clip[k].operator->(), nsrc, in[n_in]))
+      return false;
+    pr_in[k] = n_in++;
+  }
 
   MvCudaSuperParams sp = {};
   sp.width = a.nWidth;
@@ -912,7 +933,12 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   try
   {
     GpuScope sc_call("analyse: analyse_token call");
-    rc = gpu.with_inputs(in, 2, env, [&](const unsigned long long *tk) {
+    rc = gpu.with_inputs(in, n_in, env, [&](const unsigned long long *tk) {
+      for (int k = 0; k < 2; k++)
+      {
+        ap.pr_token[k] = pr_in[k] >= 0 ? tk[pr_in[k]] : 0;
+        ap.pr_adj[k] = _pr_adj[k];
+      }
       return gpu.analyse_token(&sp, &ap, tk[0], tk[1], payload, words);
     });
   }

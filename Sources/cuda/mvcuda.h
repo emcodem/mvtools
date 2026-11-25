@@ -129,6 +129,10 @@ typedef struct
   int search_type_coarse;                 // MAnalyse search_coarse as a SearchType.h value; 0 = exhaustive (the default, API 19)
   int try_many_all;                       // MAnalyse trymanyall: with try_many, the finest level too (if there are 2+ levels, API 19)
   int pglobal_coarse;                     // MAnalyse pglobal_coarse: pglobal of the coarse levels (pglobal: level 0) (API 34)
+  // temporal predictor clips (MAnalyse super_przero / super_prglobal, API 34): device frames of the clips' frame n (the
+  // source frame), 0 = not used, and their SADadj. Wavefront search only (meander=false), else MVCUDA_NEEDS_CPU.
+  unsigned long long pr_token[2];
+  float pr_adj[2];
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are
