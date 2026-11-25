@@ -122,6 +122,13 @@ protected:
     pSrcGOF;
   bool           isPelClipPadded;
 
+  // edgepad: the super is laid out for nWidth x nHeight = real size + edge padding, the edge padding area is part
+  // of the right / bottom border of the planes
+  int            nEdgePadX;
+  int            nEdgePadY;
+  int            nRealWidth;
+  int            nRealHeight;
+
   bool           _mt_flag; // PF maybe 2.6.0.5
   bool           _lite;    // CudaMSuper: only the picture (level 0, no padding / pyramid / sub-pel planes)
 
@@ -130,7 +137,7 @@ public:
   MVSuper(
     PClip _child, int _hpad, int _vpad, int pel, int _levels, bool _chroma,
     int _sharp, int _rfilter, PClip _pelclip, bool _isse,
-    bool mt_flag, bool yuy2_source, bool gpu_flag, IScriptEnvironment* env
+    bool mt_flag, bool yuy2_source, int _edgepad, int _edgepadV, bool gpu_flag, IScriptEnvironment* env
   );
   ~MVSuper();
 

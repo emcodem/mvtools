@@ -22,7 +22,7 @@
 #include "MVFlowInter.h"
 #include "MaskFun.h"
 #include "MVFinest.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 //#include "Time256ProviderCst.h"
 //#include "Time256ProviderPlane.h"
 #include "commonfunctions.h"
@@ -30,7 +30,7 @@
 MVFlowInter::MVFlowInter(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int _time256, double _ml,
   bool _blend, sad_t nSCD1, int nSCD2, bool _isse, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
-  MVFilter(_mvfw, "MFlowInter", env, 1, 0),
+  MVFilter(_mvfw, "MFlowInter", env, 1, 0, true), // edge blocks: the upsized vector field covers the block grid, the vectors are limited to the frame
   mvClipB(_mvbw, nSCD1, nSCD2, env, 1, 0),
   mvClipF(_mvfw, nSCD1, nSCD2, env, 1, 0)
 {
@@ -49,8 +49,7 @@ MVFlowInter::MVFlowInter(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, in
   if (mvClipB.GetDeltaFrame() <= 0 || mvClipB.GetDeltaFrame() <= 0)
     env->ThrowError("MFlowInter: cannot use motion vectors with absolute frame references.");
 
-  SuperParams64Bits params;
-  memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super->GetVideoInfo());
   MV_REJECT_LITE_SUPER(params, "MFlowInter", env);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
@@ -58,14 +57,13 @@ MVFlowInter::MVFlowInter(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, in
   int nSuperPel = params.nPel;
   int nSuperModeYUV = params.nModeYUV;
   int nSuperLevels = params.nLevels;
-  int nSuperWidth = super->GetVideoInfo().width; // really super
-  //int nSuperHeight = super->GetVideoInfo().height;
 
   if (!super->GetVideoInfo().IsSameColorspace(child->GetVideoInfo()))
     env->ThrowError("MFlowInter: input and super clip format is different");
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nPel != nSuperPel)
   {
     env->ThrowError("MFlowInter : wrong super frame clip");

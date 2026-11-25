@@ -21,14 +21,15 @@
 #include "MaskFun.h"
 #include "MVFinest.h"
 #include "MVFlowBlur.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
+#include <algorithm>
 #include "commonfunctions.h"
 
 
 MVFlowBlur::MVFlowBlur(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int _blur256, int _prec,
   int nSCD1, int nSCD2, bool _isse, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
-  MVFilter(_mvfw, "MFlowBlur", env, 1, 0),
+  MVFilter(_mvfw, "MFlowBlur", env, 1, 0, true), // edge blocks: the upsized vector field covers the block grid, the vectors are limited to the frame
   mvClipB(_mvbw, nSCD1, nSCD2, env, 1, 0),
   mvClipF(_mvfw, nSCD1, nSCD2, env, 1, 0)
 {
@@ -46,8 +47,7 @@ MVFlowBlur::MVFlowBlur(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int 
   if (mvClipB.GetDeltaFrame() <= 0 || mvClipF.GetDeltaFrame() <= 0)
     env->ThrowError("MFlowBlur: cannot use motion vectors with absolute frame references.");
 
-  SuperParams64Bits params;
-  memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super->GetVideoInfo());
   MV_REJECT_LITE_SUPER(params, "MFlowBlur", env);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
@@ -55,14 +55,13 @@ MVFlowBlur::MVFlowBlur(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int 
   int nSuperPel = params.nPel;
   //int nSuperModeYUV = params.nModeYUV;
   //int nSuperLevels = params.nLevels;
-  int nSuperWidth = super->GetVideoInfo().width; // really super
-  //int nSuperHeight = super->GetVideoInfo().height;
 
   if (!super->GetVideoInfo().IsSameColorspace(child->GetVideoInfo()))
     env->ThrowError("MFlowBlur: input and super clip format is different");
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nPel != nSuperPel)
   {
     env->ThrowError("MFlowBlur : wrong super frame clip");
@@ -106,55 +105,65 @@ MVFlowBlur::MVFlowBlur(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, int 
   nHPaddingUV = nHPadding / xRatioUVs[1];
   nVPaddingUV = nVPadding / yRatioUVs[1]; // up to 2.7.47 (already in Fizick's 2.5.11.3): nHPadding was used, wrong chroma offset when hpad != vpad
 
-  VPitchY = nWidth;
-  VPitchUV = nWidthUV;
+  // The small vector fields are upsized to full resolution (bilinear, one value per block centre). The upsized
+  // field must have the size of the block grid, else the block centres are moved: with a grid ending left of / above
+  // the frame edge the vectors would be stretched over the frame (each block shifted right / down a bit, towards
+  // the uncovered strip). So the grid is padded with extra block columns / rows until it covers the frame
+  // (nBlkXP, nBlkYP; CheckAndPadSmallY repeats the vectors of the last real column / row, with the component
+  // pointing out of the frame clamped to 0, so the blur reads stay inside the frame), as in MFlow,
+  // MFlowInter and MFlowFps; the upsized field is then nWidthP x nHeightP and only its frame part is used.
+  // With edge blocks (MSuper edgepad) the grid already covers the frame: nBlkXP == nBlkX, nWidthP >= nWidth.
+  nBlkXP = nBlkX;
+  while (nBlkXP * (nBlkSizeX - nOverlapX) + nOverlapX < nWidth)
+    nBlkXP++;
+  nBlkYP = nBlkY;
+  while (nBlkYP * (nBlkSizeY - nOverlapY) + nOverlapY < nHeight)
+    nBlkYP++;
+
+  nWidthP = nBlkXP * (nBlkSizeX - nOverlapX) + nOverlapX;
+  nHeightP = nBlkYP * (nBlkSizeY - nOverlapY) + nOverlapY;
+  nWidthPUV = nWidthP / xRatioUVs[1];
+  nHeightPUV = nHeightP / yRatioUVs[1];
+
+  VPitchY = nWidthP;
+  VPitchUV = nWidthPUV;
 
   is444 = vi.Is444();
   isGrey = ClipFnc::is_grey(vi);
   isRGB = vi.IsPlanarRGB() || vi.IsPlanarRGBA(); // planar only
   //needDistinctChroma = !is444 && !isGrey && !isRGB;
 
-  VXFullYB = (short*)_aligned_malloc(2 * nHeight*VPitchY + 128, 128);
-  VYFullYB = (short*)_aligned_malloc(2 * nHeight*VPitchY + 128, 128);
+  VXFullYB = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
+  VYFullYB = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
   if (!isGrey) {
-    VXFullUVB = (short*)_aligned_malloc(2 * nHeightUV*VPitchUV + 128, 128);
-    VYFullUVB = (short*)_aligned_malloc(2 * nHeightUV*VPitchUV + 128, 128);
+    VXFullUVB = (short*)_aligned_malloc(2 * nHeightPUV*VPitchUV + 128, 128);
+    VYFullUVB = (short*)_aligned_malloc(2 * nHeightPUV*VPitchUV + 128, 128);
   }
 
-  VXFullYF = (short*)_aligned_malloc(2 * nHeight*VPitchY + 128, 128);
-  VYFullYF = (short*)_aligned_malloc(2 * nHeight*VPitchY + 128, 128);
+  VXFullYF = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
+  VYFullYF = (short*)_aligned_malloc(2 * nHeightP*VPitchY + 128, 128);
   if (!isGrey) {
-    VXFullUVF = (short*)_aligned_malloc(2 * nHeightUV*VPitchUV + 128, 128);
-    VYFullUVF = (short*)_aligned_malloc(2 * nHeightUV*VPitchUV + 128, 128);
+    VXFullUVF = (short*)_aligned_malloc(2 * nHeightPUV*VPitchUV + 128, 128);
+    VYFullUVF = (short*)_aligned_malloc(2 * nHeightPUV*VPitchUV + 128, 128);
   }
 
-  VXSmallYB = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
-  VYSmallYB = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
+  VXSmallYB = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
+  VYSmallYB = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
   if (!isGrey) {
-    VXSmallUVB = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
-    VYSmallUVB = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
+    VXSmallUVB = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
+    VYSmallUVB = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
   }
 
-  VXSmallYF = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
-  VYSmallYF = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
+  VXSmallYF = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
+  VYSmallYF = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
   if (!isGrey) {
-    VXSmallUVF = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
-    VYSmallUVF = (short*)_aligned_malloc(2 * nBlkX*nBlkY + 128, 128);
+    VXSmallUVF = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
+    VYSmallUVF = (short*)_aligned_malloc(2 * nBlkXP*nBlkYP + 128, 128);
   }
 
-  MaskSmallB = (unsigned char*)_aligned_malloc(nBlkX*nBlkY + 128, 128);
-  MaskFullYB = (unsigned char*)_aligned_malloc(nHeight*VPitchY + 128, 128);
-  if (!isGrey)
-    MaskFullUVB = (unsigned char*)_aligned_malloc(nHeightUV*VPitchUV + 128, 128);
-
-  MaskSmallF = (unsigned char*)_aligned_malloc(nBlkX*nBlkY + 128, 128);
-  MaskFullYF = (unsigned char*)_aligned_malloc(nHeight*VPitchY + 128, 128);
-  if (!isGrey)
-    MaskFullUVF = (unsigned char*)_aligned_malloc(nHeightUV*VPitchUV + 128, 128);
-
-  upsizer = new SimpleResize(nWidth, nHeight, nBlkX, nBlkY, cpuFlags);
+  upsizer = new SimpleResize(nWidthP, nHeightP, nBlkXP, nBlkYP, cpuFlags);
   if (!isGrey) 
-    upsizerUV = new SimpleResize(nWidthUV, nHeightUV, nBlkX, nBlkY, cpuFlags);
+    upsizerUV = new SimpleResize(nWidthPUV, nHeightPUV, nBlkXP, nBlkYP, cpuFlags);
 
 }
 
@@ -189,14 +198,6 @@ MVFlowBlur::~MVFlowBlur()
     _aligned_free(VXSmallUVF);
     _aligned_free(VYSmallUVF);
   }
-  _aligned_free(MaskSmallB);
-  _aligned_free(MaskFullYB);
-  if (!isGrey)
-    _aligned_free(MaskFullUVB);
-  _aligned_free(MaskSmallF);
-  _aligned_free(MaskFullYF);
-  if (!isGrey)
-    _aligned_free(MaskFullUVF);
 }
 
 template<typename pixel_t, int nLOGPEL>
@@ -325,34 +326,34 @@ PVideoFrame __stdcall MVFlowBlur::GetFrame(int n, IScriptEnvironment* env)
 
 
     // make  vector vx and vy small masks
-    MakeVectorSmallMasks(mvClipB, nBlkX, nBlkY, VXSmallYB, nBlkX, VYSmallYB, nBlkX);
-    if (!isGrey) {
-      VectorSmallMaskYToHalfUV(VXSmallYB, nBlkX, nBlkY, VXSmallUVB, xRatioUVs[1]);
-      VectorSmallMaskYToHalfUV(VYSmallYB, nBlkX, nBlkY, VYSmallUVB, yRatioUVs[1]);
-    }
+    // (row pitch nBlkXP: the padding columns / rows beyond the real grid are filled by CheckAndPadSmallY_BF)
+    MakeVectorSmallMasks(mvClipB, nBlkX, nBlkY, VXSmallYB, nBlkXP, VYSmallYB, nBlkXP);
+    MakeVectorSmallMasks(mvClipF, nBlkX, nBlkY, VXSmallYF, nBlkXP, VYSmallYF, nBlkXP);
+    CheckAndPadSmallY_BF(VXSmallYB, VXSmallYF, VYSmallYB, VYSmallYF, nBlkXP, nBlkYP, nBlkX, nBlkY);
 
-    MakeVectorSmallMasks(mvClipF, nBlkX, nBlkY, VXSmallYF, nBlkX, VYSmallYF, nBlkX);
     if (!isGrey) {
-      VectorSmallMaskYToHalfUV(VXSmallYF, nBlkX, nBlkY, VXSmallUVF, xRatioUVs[1]);
-      VectorSmallMaskYToHalfUV(VYSmallYF, nBlkX, nBlkY, VYSmallUVF, yRatioUVs[1]);
+      VectorSmallMaskYToHalfUV(VXSmallYB, nBlkXP, nBlkYP, VXSmallUVB, xRatioUVs[1]);
+      VectorSmallMaskYToHalfUV(VYSmallYB, nBlkXP, nBlkYP, VYSmallUVB, yRatioUVs[1]);
+      VectorSmallMaskYToHalfUV(VXSmallYF, nBlkXP, nBlkYP, VXSmallUVF, xRatioUVs[1]);
+      VectorSmallMaskYToHalfUV(VYSmallYF, nBlkXP, nBlkYP, VYSmallUVF, yRatioUVs[1]);
     }
 
       // analyse vectors field to detect occlusion
 
       // upsize (bilinear interpolate) vector masks to fullframe size
 
-    upsizer->SimpleResizeDo_int16(VXFullYB, nWidth, nHeight, VPitchY, VXSmallYB, nBlkX, nBlkX, nPel, true, nWidth, nHeight);
-    upsizer->SimpleResizeDo_int16(VYFullYB, nWidth, nHeight, VPitchY, VYSmallYB, nBlkX, nBlkX, nPel, false, nWidth, nHeight);
+    upsizer->SimpleResizeDo_int16(VXFullYB, nWidthP, nHeightP, VPitchY, VXSmallYB, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
+    upsizer->SimpleResizeDo_int16(VYFullYB, nWidthP, nHeightP, VPitchY, VYSmallYB, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
     if (!isGrey) {
-      upsizerUV->SimpleResizeDo_int16(VXFullUVB, nWidthUV, nHeightUV, VPitchUV, VXSmallUVB, nBlkX, nBlkX, nPel, true, nWidthUV, nHeightUV);
-      upsizerUV->SimpleResizeDo_int16(VYFullUVB, nWidthUV, nHeightUV, VPitchUV, VYSmallUVB, nBlkX, nBlkX, nPel, false, nWidthUV, nHeightUV);
+      upsizerUV->SimpleResizeDo_int16(VXFullUVB, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVB, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
+      upsizerUV->SimpleResizeDo_int16(VYFullUVB, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVB, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
     }
 
-    upsizer->SimpleResizeDo_int16(VXFullYF, nWidth, nHeight, VPitchY, VXSmallYF, nBlkX, nBlkX, nPel, true, nWidth, nHeight);
-    upsizer->SimpleResizeDo_int16(VYFullYF, nWidth, nHeight, VPitchY, VYSmallYF, nBlkX, nBlkX, nPel, false, nWidth, nHeight);
+    upsizer->SimpleResizeDo_int16(VXFullYF, nWidthP, nHeightP, VPitchY, VXSmallYF, nBlkXP, nBlkXP, nPel, true, nWidth, nHeight);
+    upsizer->SimpleResizeDo_int16(VYFullYF, nWidthP, nHeightP, VPitchY, VYSmallYF, nBlkXP, nBlkXP, nPel, false, nWidth, nHeight);
     if (!isGrey) {
-      upsizerUV->SimpleResizeDo_int16(VXFullUVF, nWidthUV, nHeightUV, VPitchUV, VXSmallUVF, nBlkX, nBlkX, nPel, true, nWidthUV, nHeightUV);
-      upsizerUV->SimpleResizeDo_int16(VYFullUVF, nWidthUV, nHeightUV, VPitchUV, VYSmallUVF, nBlkX, nBlkX, nPel, false, nWidthUV, nHeightUV);
+      upsizerUV->SimpleResizeDo_int16(VXFullUVF, nWidthPUV, nHeightPUV, VPitchUV, VXSmallUVF, nBlkXP, nBlkXP, nPel, true, nWidthUV, nHeightUV);
+      upsizerUV->SimpleResizeDo_int16(VYFullUVF, nWidthPUV, nHeightPUV, VPitchUV, VYSmallUVF, nBlkXP, nBlkXP, nPel, false, nWidthUV, nHeightUV);
     }
 
     if (pixelsize_super == 1) {

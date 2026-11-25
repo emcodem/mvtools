@@ -42,16 +42,13 @@ private:
    short *VYSmallYF;
    short *VYSmallUVF;
 
-   BYTE *MaskSmallB;
-   BYTE *MaskFullYB;
-   BYTE *MaskFullUVB;
-   BYTE *MaskSmallF;
-   BYTE *MaskFullYF;
-   BYTE *MaskFullUVF;
-
    int nWidthUV;
    int nHeightUV;
    int VPitchY, VPitchUV;
+   // block grid padded to cover the whole frame and its size: the size of the small / upsized vector fields,
+   // see the constructor
+   int nBlkXP, nBlkYP;
+   int nWidthP, nHeightP, nWidthPUV, nHeightPUV;
 
    int nHPaddingUV;
    int nVPaddingUV;

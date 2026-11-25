@@ -29,7 +29,7 @@
 #include "MVGroupOfFrames.h"
 #include "MVRecalculate.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "MVSuper.h"
 #include "GoldenDump.h"
 #include "GpuBackend.h"
@@ -100,8 +100,7 @@ MVRecalculate::MVRecalculate(
 
   smooth = _smooth;
 
-  SuperParams64Bits	params;
-  memcpy(&params, &child->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(child->GetVideoInfo());
   const int nHeight = params.nHeight;
   const int nSuperHPad = params.nHPad;
   const int nSuperVPad = params.nVPad;
@@ -151,20 +150,22 @@ MVRecalculate::MVRecalculate(
 
   analysisData.chromaSADScale = _chromaSADScale;
 
+  // the super planes are built for the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
   pSrcGOF = new MVGroupOfFrames(
-    nSuperLevels, analysisData.nWidth, analysisData.nHeight,
+    nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
     nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
-    cpuFlags, analysisData.xRatioUV, analysisData.yRatioUV, analysisData.pixelsize, analysisData.bits_per_pixel, mt_flag
+    cpuFlags, analysisData.xRatioUV, analysisData.yRatioUV, analysisData.pixelsize, analysisData.bits_per_pixel, mt_flag,
+    params.nWidth, params.nHeight // the real frame size: search limits
   );
   pRefGOF = new MVGroupOfFrames(
-    nSuperLevels, analysisData.nWidth, analysisData.nHeight,
+    nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
     nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
-    cpuFlags, analysisData.xRatioUV, analysisData.yRatioUV, analysisData.pixelsize, analysisData.bits_per_pixel, mt_flag
+    cpuFlags, analysisData.xRatioUV, analysisData.yRatioUV, analysisData.pixelsize, analysisData.bits_per_pixel, mt_flag,
+    params.nWidth, params.nHeight // the real frame size: search limits
   );
-  const int nSuperWidth = child->GetVideoInfo().width;
-
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != analysisData.nHeight
-    || nSuperWidth - 2 * nSuperHPad != analysisData.nWidth)
+    || params.nWidth != analysisData.nWidth)
   {
     env->ThrowError("MRecalculate : wrong frame size");
   }
@@ -251,18 +252,19 @@ MVRecalculate::MVRecalculate(
   analysisData.nOverlapX = _overlapx;
   analysisData.nOverlapY = _overlapy;
 
-  int		nBlkX = (analysisData.nWidth - analysisData.nOverlapX)
-    / (analysisData.nBlkSizeX - analysisData.nOverlapX);
-  int		nBlkY = (analysisData.nHeight - analysisData.nOverlapY)
-    / (analysisData.nBlkSizeY - analysisData.nOverlapY);
+  // block grid; with an edge padding in the super clip (MSuper edgepad) it covers the whole frame (BlockCount)
+  bool beyondX, beyondY;
+  int		nBlkX = BlockCount(analysisData.nWidth, analysisData.nBlkSizeX, analysisData.nOverlapX, params.nEdgePadX, beyondX);
+  int		nBlkY = BlockCount(analysisData.nHeight, analysisData.nBlkSizeY, analysisData.nOverlapY, params.nEdgePadY, beyondY);
 
   // 2.7.36: fallback to no overlap when either nBlk count is less than 2
   if (nBlkX < 2 || nBlkY < 2) {
     analysisData.nOverlapX = 0;
     analysisData.nOverlapY = 0;
-    nBlkX = analysisData.nWidth / analysisData.nBlkSizeX;
-    nBlkY = analysisData.nHeight / analysisData.nBlkSizeY;
+    nBlkX = BlockCount(analysisData.nWidth, analysisData.nBlkSizeX, 0, params.nEdgePadX, beyondX);
+    nBlkY = BlockCount(analysisData.nHeight, analysisData.nBlkSizeY, 0, params.nEdgePadY, beyondY);
   }
+  const bool edge_blocks = beyondX || beyondY;
 
   analysisData.nBlkX = nBlkX;
   analysisData.nBlkY = nBlkY;
@@ -330,6 +332,7 @@ MVRecalculate::MVRecalculate(
   analysisData.nFlags |= (_isse) ? MOTION_USE_ISSE : 0;
   analysisData.nFlags |= (analysisData.isBackward) ? MOTION_IS_BACKWARD : 0;
   analysisData.nFlags |= (chroma) ? MOTION_USE_CHROMA_MOTION : 0;
+  analysisData.nFlags |= edge_blocks ? MOTION_EDGE_BLOCKS : 0;
   analysisData.nFlags |= conv_cpuf_flags_to_cpu(env->GetCPUFlags());
 
   _vectorfields_aptr = std::unique_ptr <GroupOfPlanes>(new GroupOfPlanes(
@@ -434,6 +437,7 @@ MVRecalculate::MVRecalculate(
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     GpuCheck c("CudaMRecalculate", "MRecalculate");
     c.need(super_ok, "the super clip must come from CudaMSuper (or MSuper of this build) with rfilter 2 or 4, sharp 2 and no pelclip")
+      .need(params.nEdgePadX == 0 && params.nEdgePadY == 0, "super clips with edgepad are not supported")
       .need(pixelsize == 1 || pixelsize == 2, "only 8 to 16 bit integer formats")
       .need(!child->GetVideoInfo().IsYUY2() && child->GetVideoInfo().IsPlanar(), "only planar formats")
       .need(!divideExtra, "divide is not supported")

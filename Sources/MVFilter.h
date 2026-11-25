@@ -80,7 +80,14 @@ protected:
 //   std::string name;
    const char * name; //v1.8 replaced std::string (why it was used?)
 
-  MVFilter(const ::PClip &vector, const char *filterName, ::IScriptEnvironment *env, int group_len, int group_ofs);
+  // the vectors have blocks beyond the right / bottom frame edge (MOTION_EDGE_BLOCKS, MSuper edgepad); the Cuda*
+  // filters do not handle them yet and fall back to the CPU
+  bool _edge_blocks;
+
+  // edge_blocks_supported: the filter handles a block grid reaching beyond the right / bottom frame edge
+  // (MOTION_EDGE_BLOCKS, MSuper edgepad); other filters reject such vectors
+  MVFilter(const ::PClip &vector, const char *filterName, ::IScriptEnvironment *env, int group_len, int group_ofs,
+    bool edge_blocks_supported = false);
 
   void CheckSimilarity(const MVClip &vector, const char *vectorName, ::IScriptEnvironment *env);
 };

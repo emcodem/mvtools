@@ -44,7 +44,7 @@ static void golden_dump_vectors(const char *name, MVClip &clip, int blk_x, int b
   golden::write_bin(name, v.data(), v.size() * sizeof(int));
 }
 #endif
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "info.h"
 #include "GpuBackend.h"
 
@@ -54,7 +54,7 @@ static void golden_dump_vectors(const char *name, MVClip &clip, int blk_x, int b
 MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsigned int _num, unsigned int _den, int _maskmode, double _ml,
   bool _blend, sad_t nSCD1, int nSCD2, bool _isse, int _optDebug, bool mt_flag, bool gpu_flag, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
-  MVFilter(_mvfw, "MFlowFps", env, 1, 0),
+  MVFilter(_mvfw, "MFlowFps", env, 1, 0, true), // edge blocks: the upsized vector field covers the block grid, the vectors are limited to the frame
   mvClipB(_mvbw, nSCD1, nSCD2, env, 1, 0),
   mvClipF(_mvfw, nSCD1, nSCD2, env, 1, 0),
   optDebug(_optDebug),
@@ -115,26 +115,25 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
     env->ThrowError("MFlowFps: inconsistent source and vector frame size");
 
 
-  if (!((nWidth + nHPadding * 2) == super->GetVideoInfo().width && (nHeight + nVPadding * 2) <= super->GetVideoInfo().height))
-    env->ThrowError("MFlowFps: inconsistent clips frame size!");
-
     // get parameters of prepared super clip - v2.0
-  SuperParams64Bits params;
-  memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super->GetVideoInfo());
+
+  // the super clip is the layout size (frame + edgepad extension) plus the padding
+  if (!((params.LayoutWidth() + nHPadding * 2) == super->GetVideoInfo().width && (params.LayoutHeight() + nVPadding * 2) <= super->GetVideoInfo().height))
+    env->ThrowError("MFlowFps: inconsistent clips frame size!");
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
   //int nSuperVPad = params.nVPad;
   int nSuperPel = params.nPel;
   //int nSuperModeYUV = params.nModeYUV;
   //int nSuperLevels = params.nLevels;
-  int nSuperWidth = super->GetVideoInfo().width; // really super
-  //int nSuperHeight = super->GetVideoInfo().height;
 
   if (!super->GetVideoInfo().IsSameColorspace(child->GetVideoInfo()))
     env->ThrowError("MFlowFPS: input and super clip format is different");
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nPel != nSuperPel)
   {
     env->ThrowError("MFlowFps : wrong super frame clip");
@@ -209,6 +208,8 @@ MVFlowFps::MVFlowFps(PClip _child, PClip super, PClip _mvbw, PClip _mvfw, unsign
   {
     GpuCheck c("CudaMFlowFps", "MFlowFps");
     c.need(super_param_valid(params), "the super clip must come from CudaMSuper or MSuper of this build")
+      .need(params.nEdgePadX == 0 && params.nEdgePadY == 0, "super clips with edgepad are not supported")
+      .need(!_edge_blocks, "vectors of an MSuper with edgepad are not supported")
       .need(super_param_sharp(params) == 2 && !super_param_pelclip(params), "the super clip must use sharp=2 and no pelclip")
       .need(maskmode == 2, "only mask=2")
       .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")

@@ -39,7 +39,7 @@
 #include "MVDegrain3.h"
 #include "MDegrainN.h"
 #include "Stacked16.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "Yuy2Planar.h"
 #include "MVBlockFps.h"
 
@@ -83,8 +83,7 @@ AVSValue __cdecl Create_MVShow(AVSValue args, void* user_data, IScriptEnvironmen
   int sil = 0;
   int tol = 20000;
   // a super clip made from a YUY2 source is YV16: the result goes back to YUY2 (Yuy2Planar.h)
-  SuperParams64Bits params;
-  memcpy(&params, &args[0].AsClip()->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(args[0].AsClip()->GetVideoInfo());
   const bool yuy2 = (params.param & SUPER_PARAM_YUY2_SOURCE) != 0;
   const bool planar = args[10].AsBool(false);
   PClip show = new MVShow(
@@ -665,6 +664,8 @@ AVSValue __cdecl Create_MVSuper(AVSValue args, void* user_data, IScriptEnvironme
     args[9].AsBool(true),   // isse2
     args[11].AsBool(true), // mt
     args[0].AsClip()->GetVideoInfo().IsYUY2(), // yuy2_source
+    args[12].AsInt(0),     // edgepad
+    args[13].AsInt(args[12].AsInt(0)), // edgepadV
     user_data != nullptr,   // CudaMSuper
     env
   );
@@ -794,8 +795,8 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   env->AddFunction("MRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, 0);
   env->AddFunction("CudaMRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, (void *)1);
   env->AddFunction("MBlockFps", "cccc[num]i[den]i[mode]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b", Create_MVBlockFps, 0);
-  env->AddFunction("MSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, 0);
-  env->AddFunction("CudaMSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b", Create_MVSuper, (void *)1);
+  env->AddFunction("MSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b[edgepad]i[edgepadV]i", Create_MVSuper, 0);
+  env->AddFunction("CudaMSuper", "c[hpad]i[vpad]i[pel]i[levels]i[chroma]b[sharp]i[rfilter]i[pelclip]c[isse]b[planar]b[mt]b[edgepad]i[edgepadV]i", Create_MVSuper, (void *)1);
   env->AddFunction("MStoreVect", "c+[vccs]s", Create_MStoreVect, 0);
   env->AddFunction("MSplatVectors", "cc[refine]b[thSCD1]i[thSCD2]i[me_scale]i[pad_x]i[pad_y]i[pyramid_levels]i",
     Create_MSplatVectors, 0);

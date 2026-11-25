@@ -27,7 +27,9 @@
 #include "MVPlane.h"
 #include "MVSuper.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
+#include "PlaneExtend.h"
+#include <algorithm>
 #include "Time256ProviderCst.h"
 
 #include "types.h"
@@ -44,7 +46,7 @@ MVCompensate::MVCompensate(
   IScriptEnvironment* env_ptr
 )
   : GenericVideoFilter(_child)
-  , MVFilter(vectors, "MCompensate", env_ptr, 1, 0)
+  , MVFilter(vectors, "MCompensate", env_ptr, 1, 0, true) // edge blocks supported
   , _mv_clip_arr(1)
   , super(_super)
   , _trad(trad)
@@ -201,8 +203,7 @@ MVCompensate::MVCompensate(
 
 
   // get parameters of prepared super clip - v2.0
-  SuperParams64Bits params;
-  memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super->GetVideoInfo());
   // a lite super (CudaMSuper): the GPU path reads its token pictures, the CPU path completes the frames
   _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
@@ -215,34 +216,61 @@ MVCompensate::MVCompensate(
   if (!vi.IsSameColorspace(_super->GetVideoInfo()))
     env_ptr->ThrowError("MCompensate : source and super clip video format is different!");
 
-  pRefGOF = new MVGroupOfFrames(nSuperLevels, nWidth, nHeight, nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUVs[1], yRatioUVs[1], pixelsize_super, bits_per_pixel_super, mt_flag);
-  pSrcGOF = new MVGroupOfFrames(nSuperLevels, nWidth, nHeight, nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUVs[1], yRatioUVs[1], pixelsize_super, bits_per_pixel_super, mt_flag);
+  // the super planes are built for the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
+  pRefGOF = new MVGroupOfFrames(nSuperLevels, params.LayoutWidth(), params.LayoutHeight(), nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUVs[1], yRatioUVs[1], pixelsize_super, bits_per_pixel_super, mt_flag);
+  pSrcGOF = new MVGroupOfFrames(nSuperLevels, params.LayoutWidth(), params.LayoutHeight(), nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUVs[1], yRatioUVs[1], pixelsize_super, bits_per_pixel_super, mt_flag);
   nSuperWidth = super->GetVideoInfo().width;
   nSuperHeight = super->GetVideoInfo().height;
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
     || nHeight != vi.height
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nWidth != vi.width
     || nPel != nSuperPel)
   {
     env_ptr->ThrowError("MCompensate : wrong source or super frame size");
   }
 
+  // Blocks beyond the frame edge (MOTION_EDGE_BLOCKS): their reference and current-frame blocks reach into the edge
+  // padding of the super clip; without enough padding only the blocks inside the frame are processed.
+  {
+    const int grid_w = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
+    const int grid_h = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+    edge_ext = false;
+    nBlkXP = nBlkX;
+    nBlkYP = nBlkY;
+    if (grid_w > nWidth || grid_h > nHeight)
+    {
+      if (params.nEdgePadX >= grid_w - nWidth && params.nEdgePadY >= grid_h - nHeight)
+        edge_ext = true;
+      else
+      {
+        nBlkXP = std::min(nBlkX, (nWidth - nOverlapX) / (nBlkSizeX - nOverlapX));
+        nBlkYP = std::min(nBlkY, (nHeight - nOverlapY) / (nBlkSizeY - nOverlapY));
+      }
+    }
+    nWidthP = edge_ext ? grid_w : nWidth;
+    nHeightP = edge_ext ? grid_h : nHeight;
+    vi_dst_ext = vi;
+    vi_dst_ext.width = nWidthP;
+    vi_dst_ext.height = nHeightP;
+  }
+
 
   // pitch: not byte* but short* or int*/float* granurality, no need pixelsize correction
-  dstShortPitch = AlignNumber(nWidth, 16);
-  dstShortPitchUV = AlignNumber(nWidth >> nLogxRatioUVs[1], 16);
+  dstShortPitch = AlignNumber(nWidthP, 16);
+  dstShortPitchUV = AlignNumber(nWidthP >> nLogxRatioUVs[1], 16);
   if (nOverlapX > 0 || nOverlapY > 0)
   {
     OverWins = new OverlapWindows(nBlkSizeX, nBlkSizeY, nOverlapX, nOverlapY);
     if (!ClipFnc::is_grey(vi))
       OverWinsUV = new OverlapWindows(nBlkSizeX >> nLogxRatioUVs[1], nBlkSizeY >> nLogyRatioUVs[1], nOverlapX >> nLogxRatioUVs[1], nOverlapY >> nLogyRatioUVs[1]);
 
-    DstShort = (BYTE *)_aligned_malloc(dstShortPitch * nHeight *  ovrBufferElementSize, 32);
+    DstShort = (BYTE *)_aligned_malloc(dstShortPitch * nHeightP *  ovrBufferElementSize, 32);
     if (!ClipFnc::is_grey(vi)) {
-      DstShortU = (BYTE *)_aligned_malloc(dstShortPitchUV * nHeight * ovrBufferElementSize, 32);
-      DstShortV = (BYTE *)_aligned_malloc(dstShortPitchUV * nHeight * ovrBufferElementSize, 32);
+      DstShortU = (BYTE *)_aligned_malloc(dstShortPitchUV * nHeightP * ovrBufferElementSize, 32);
+      DstShortV = (BYTE *)_aligned_malloc(dstShortPitchUV * nHeightP * ovrBufferElementSize, 32);
     }
   }
 
@@ -257,6 +285,7 @@ MVCompensate::MVCompensate(
   {
     GpuCheck c("CudaMCompensate", "MCompensate");
     c.need(_super_lite, "the super clip must come from CudaMSuper")
+      .need(!_edge_blocks, "vectors of an MSuper with edgepad are not supported")
       .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")
       .need(nPel == 1 || nPel == 2, "only pel 1 or 2")
       .need(recursion == 0, "recursion is not supported")
@@ -450,8 +479,8 @@ PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
   _mv_clip_ptr = info._clip_sptr.get();
   _thsad = info._thsad;
 
-  int nWidth_B = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
-  int nHeight_B = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+  int nWidth_B = nBlkXP * (nBlkSizeX - nOverlapX) + nOverlapX;
+  int nHeight_B = nBlkYP * (nBlkSizeY - nOverlapY) + nOverlapY;
 
   const BYTE *pRef[3];
   int nRefPitches[3];
@@ -481,12 +510,18 @@ PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
   if (usable_flag)
   {
     if (has_at_least_v8) env_ptr->copyFrameProps(src, dst); // frame property copy V8
+    // edge_ext: the blocks are written into a frame of the block grid size, cropped back into dst below.
+    // A reference, not a copy: a second PVideoFrame of dst would make it non-writable (GetWritePtr returns 0).
+    PVideoFrame dstExt;
+    if (edge_ext)
+      dstExt = env_ptr->NewVideoFrame(vi_dst_ext);
+    const PVideoFrame& target = edge_ext ? dstExt : dst;
     for (int p = 0; p < planecount; ++p) {
       const int plane = planes[p];
       pSrc[p] = src->GetReadPtr(plane);
       nSrcPitches[p] = src->GetPitch(plane);
-      pDst[p] = dst->GetWritePtr(plane);
-      nDstPitches[p] = dst->GetPitch(plane);
+      pDst[p] = target->GetWritePtr(plane);
+      nDstPitches[p] = target->GetPitch(plane);
     }
 
     PVideoFrame ref = super->GetFrame(nref, env_ptr);
@@ -551,7 +586,7 @@ PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
     // No overlap
     if (nOverlapX == 0 && nOverlapY == 0)
     {
-      slicer.start(nBlkY, *this, &MVCompensate::compensate_slice_normal);
+      slicer.start(nBlkYP, *this, &MVCompensate::compensate_slice_normal);
       slicer.wait();
     }
 
@@ -573,7 +608,7 @@ PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
       if (pPlanes[2])
         MemZoneSet(reinterpret_cast<unsigned char*>(DstShortV), 0, (nWidth_B * ovrBufferElementSize) >> nLogxRatioUVs[2], nHeight_B >> nLogyRatioUVs[2], 0, 0, dstShortPitchUV * ovrBufferElementSize);
 
-      slicer.start(nBlkY, *this, &MVCompensate::compensate_slice_overlap, 2);
+      slicer.start(nBlkYP, *this, &MVCompensate::compensate_slice_overlap, 2);
       slicer.wait();
 
       if (pixelsize_super == 1) {
@@ -654,12 +689,19 @@ PVideoFrame MVCompensate::cpu_frame(int n, IScriptEnvironment* env_ptr)
     PROFILE_STOP(MOTION_PROFILE_COMPENSATION);
 
     // if we're in in-loop recursive mode, we copy the frame
+    // (edge_ext: the whole block grid area, the edge blocks are compensated from the loop frame too)
     if (recursion > 0)
     {
       for (int i = 0; i < planecount; i++) {
         if (pLoop[i])
-          env_ptr->BitBlt(pLoop[i] + nOffset[i], nLoopPitches[i], pDst[i], nDstPitches[i], (nWidth >> nLogxRatioUVs[i]) << pixelsize_super_shift, nHeight >> nLogyRatioUVs[i]);
+          env_ptr->BitBlt(pLoop[i] + nOffset[i], nLoopPitches[i], pDst[i], nDstPitches[i], (nWidthP >> nLogxRatioUVs[i]) << pixelsize_super_shift, nHeightP >> nLogyRatioUVs[i]);
       }
+    }
+
+    if (edge_ext)
+    {
+      const int ext_planecount = ClipFnc::is_grey(vi) ? 1 : 3;
+      crop_frame_into(dst, dstExt, nWidth, nHeight, ext_planecount, nLogxRatioUVs[1], nLogyRatioUVs[1], pixelsize_super, env_ptr);
     }
 
   }
@@ -736,7 +778,7 @@ void	MVCompensate::compensate_slice_normal(Slicer::TaskData &td)
   for (int by = td._y_beg; by < td._y_end; ++by)
   {
     int xx = 0; // pixelsize-aware, no need to multiply inside
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       const int index = by * nBlkX + bx;
       const FakeBlockData &block = _mv_clip_ptr->GetBlock(0, index);
@@ -798,7 +840,7 @@ void	MVCompensate::compensate_slice_overlap(Slicer::TaskData &td)
   assert(&td != 0);
 
   if (nOverlapY == 0
-    || (td._y_beg == 0 && td._y_end == nBlkY))
+    || (td._y_beg == 0 && td._y_end == nBlkYP))
   {
     compensate_slice_overlap(td._y_beg, td._y_end);
   }
@@ -821,7 +863,7 @@ void	MVCompensate::compensate_slice_overlap(Slicer::TaskData &td)
     }
 
     int cnt_bot = 2;
-    if (td._y_end < nBlkY)
+    if (td._y_end < nBlkYP)
     {
       cnt_bot = conc::AtomicIntOp::exec_new(
         _boundary_cnt_arr[td._y_end],
@@ -872,13 +914,13 @@ void	MVCompensate::compensate_slice_overlap(int y_beg, int y_end)
     6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
     */
 
-    int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
+    int wby = (by == 0) ? 0 * 3 : (by == nBlkYP - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
     int xx = 0; // xx is pixelsize-aware
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       // select window
       // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-      int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
+      int wbx = (bx == 0) ? 0 : (bx == nBlkXP - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
 
       const int index = by * nBlkX + bx;
       const FakeBlockData & block = _mv_clip_ptr->GetBlock(0, index);

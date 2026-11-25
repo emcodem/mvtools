@@ -22,13 +22,13 @@
 #include "MaskFun.h"
 #include "MVFinest.h"
 #include "MVFlow.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "commonfunctions.h"
 
 MVFlow::MVFlow(PClip _child, PClip super, PClip _mvec, int _time256, int _mode, bool _fields,
   sad_t nSCD1, int nSCD2, bool _isse, PClip _timeclip, IScriptEnvironment* env) :
   GenericVideoFilter(_child),
-  MVFilter(_mvec, "MFlow", env, 1, 0),
+  MVFilter(_mvec, "MFlow", env, 1, 0, true), // edge blocks: the upsized vector field covers the block grid, the vectors are limited to the frame
   mvClip(_mvec, nSCD1, nSCD2, env, 1, 0)
 {
   has_at_least_v8 = true;
@@ -41,8 +41,7 @@ MVFlow::MVFlow(PClip _child, PClip super, PClip _mvec, int _time256, int _mode, 
   cpuFlags = _isse ? env->GetCPUFlags() : 0;
   fields = _fields;
 
-  SuperParams64Bits params;
-  memcpy(&params, &super->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super->GetVideoInfo());
   MV_REJECT_LITE_SUPER(params, "MFlow", env);
   int nHeightS = params.nHeight;
   int nSuperHPad = params.nHPad;
@@ -50,14 +49,13 @@ MVFlow::MVFlow(PClip _child, PClip super, PClip _mvec, int _time256, int _mode, 
   int nSuperPel = params.nPel;
   //int nSuperModeYUV = params.nModeYUV;
   //int nSuperLevels = params.nLevels;
-  int nSuperWidth = super->GetVideoInfo().width; // really super
-  //int nSuperHeight = super->GetVideoInfo().height;
 
   if (!super->GetVideoInfo().IsSameColorspace(child->GetVideoInfo()))
     env->ThrowError("MFlow: input and super clip format is different");
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nPel != nSuperPel)
   {
     env->ThrowError("MFlow : wrong super frame clip");

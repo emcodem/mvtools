@@ -59,16 +59,17 @@ inline unsigned char super_param_make(bool yuy2_source, int rfilter, int sharp, 
     | (((rfilter * 3 + sharp) << SUPER_PARAM_FILTER_SHIFT) & SUPER_PARAM_FILTER_MASK)
     | (pelclip ? SUPER_PARAM_PELCLIP : 0) | (lite ? SUPER_PARAM_LITE : 0) | SUPER_PARAM_OURS);
 }
-inline bool super_param_valid(const SuperParams64Bits &p)
+template<class P> inline bool super_param_valid(const P &p)
 {
   return (p.param & SUPER_PARAM_OURS) && ((p.param & SUPER_PARAM_FILTER_MASK) >> SUPER_PARAM_FILTER_SHIFT) < 15;
 }
+// P: SuperParams64Bits or SuperParams (SuperParams.h), both carry param
 // only meaningful when super_param_valid
-inline int super_param_rfilter(const SuperParams64Bits &p) { return ((p.param & SUPER_PARAM_FILTER_MASK) >> SUPER_PARAM_FILTER_SHIFT) / 3; }
-inline int super_param_sharp(const SuperParams64Bits &p) { return ((p.param & SUPER_PARAM_FILTER_MASK) >> SUPER_PARAM_FILTER_SHIFT) % 3; }
-inline bool super_param_pelclip(const SuperParams64Bits &p) { return (p.param & SUPER_PARAM_PELCLIP) != 0; }
+template<class P> inline int super_param_rfilter(const P &p) { return ((p.param & SUPER_PARAM_FILTER_MASK) >> SUPER_PARAM_FILTER_SHIFT) / 3; }
+template<class P> inline int super_param_sharp(const P &p) { return ((p.param & SUPER_PARAM_FILTER_MASK) >> SUPER_PARAM_FILTER_SHIFT) % 3; }
+template<class P> inline bool super_param_pelclip(const P &p) { return (p.param & SUPER_PARAM_PELCLIP) != 0; }
 // the GPU can rebuild this super clip's sub-pel planes itself: rfilter 2 or 4, sharp 2, no pelclip
-inline bool super_param_gpu_rebuildable(const SuperParams64Bits &p)
+template<class P> inline bool super_param_gpu_rebuildable(const P &p)
 {
   if (!super_param_valid(p)) return false;
   const int rf = super_param_rfilter(p);

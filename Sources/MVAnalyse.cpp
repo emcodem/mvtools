@@ -30,7 +30,7 @@
 #include "MVGroupOfFrames.h"
 #include "MVSuper.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "MVSuper.h"
 #include "GoldenDump.h"
 #include "GpuBackend.h"
@@ -103,8 +103,7 @@ MVAnalyse::MVAnalyse(
     chroma = false; // silent fallback
 
   // get parameters of super clip - v2.0
-  SuperParams64Bits	params;
-  memcpy(&params, &child->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(child->GetVideoInfo());
   const int		nHeight = params.nHeight;
   const int		nSuperHPad = params.nHPad;
   const int		nSuperVPad = params.nVPad;
@@ -126,7 +125,8 @@ MVAnalyse::MVAnalyse(
     env->ThrowError("MAnalyse: wrong super clip (pseudoaudio) parameters");
   }
 
-  analysisData.nWidth = vi.width - nSuperHPad * 2;
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
+  analysisData.nWidth = params.nWidth;
   analysisData.nHeight = nHeight;
   analysisData.pixelType = vi.pixel_type;
   if (!ClipFnc::is_grey(vi)) {
@@ -147,15 +147,18 @@ MVAnalyse::MVAnalyse(
 
   analysisData.chromaSADScale = _chromaSADScale;
 
+  // the super planes are built for the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
   pSrcGOF = new MVGroupOfFrames(
-    nSuperLevels, analysisData.nWidth, analysisData.nHeight,
+    nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
     nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
-    _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag
+    _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
+    params.nWidth, params.nHeight // the real frame size: search limits
   );
   pRefGOF = new MVGroupOfFrames(
-    nSuperLevels, analysisData.nWidth, analysisData.nHeight,
+    nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
     nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
-    _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag
+    _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
+    params.nWidth, params.nHeight // the real frame size: search limits
   );
 
   analysisData.nBlkSizeX = _blksizex;
@@ -247,18 +250,19 @@ MVAnalyse::MVAnalyse(
   analysisData.nOverlapX = _overlapx;
   analysisData.nOverlapY = _overlapy;
 
-  int		nBlkX = (analysisData.nWidth - analysisData.nOverlapX)
-    / (analysisData.nBlkSizeX - analysisData.nOverlapX);
-  int		nBlkY = (analysisData.nHeight - analysisData.nOverlapY)
-    / (analysisData.nBlkSizeY - analysisData.nOverlapY);
+  // block grid; with an edge padding in the super clip (MSuper edgepad) it covers the whole frame (BlockCount)
+  bool beyondX, beyondY;
+  int		nBlkX = BlockCount(analysisData.nWidth, analysisData.nBlkSizeX, analysisData.nOverlapX, params.nEdgePadX, beyondX);
+  int		nBlkY = BlockCount(analysisData.nHeight, analysisData.nBlkSizeY, analysisData.nOverlapY, params.nEdgePadY, beyondY);
 
   // 2.7.36: fallback to no overlap when either nBlk count is less that 2
   if (nBlkX < 2 || nBlkY < 2) {
     analysisData.nOverlapX = 0;
     analysisData.nOverlapY = 0;
-    nBlkX = analysisData.nWidth / analysisData.nBlkSizeX;
-    nBlkY = analysisData.nHeight / analysisData.nBlkSizeY;
+    nBlkX = BlockCount(analysisData.nWidth, analysisData.nBlkSizeX, 0, params.nEdgePadX, beyondX);
+    nBlkY = BlockCount(analysisData.nHeight, analysisData.nBlkSizeY, 0, params.nEdgePadY, beyondY);
   }
+  const bool edge_blocks = beyondX || beyondY;
 
   analysisData.nBlkX = nBlkX;
   analysisData.nBlkY = nBlkY;
@@ -381,6 +385,7 @@ MVAnalyse::MVAnalyse(
   analysisData.nFlags |= (_isse) ? MOTION_USE_ISSE : 0;
   analysisData.nFlags |= (analysisData.isBackward) ? MOTION_IS_BACKWARD : 0;
   analysisData.nFlags |= (chroma) ? MOTION_USE_CHROMA_MOTION : 0;
+  analysisData.nFlags |= edge_blocks ? MOTION_EDGE_BLOCKS : 0;
 
   analysisData.nFlags |= conv_cpuf_flags_to_cpu(env->GetCPUFlags());
   // cpu flags has different layout that Avisynth's CPUF_xxx layout.
@@ -456,6 +461,7 @@ MVAnalyse::MVAnalyse(
     const int xr = analysisData.xRatioUV, yr = analysisData.yRatioUV;
     GpuCheck c("CudaMAnalyse", "MAnalyse");
     c.need(super_ok, "the super clip must come from CudaMSuper (or MSuper of this build) with rfilter 2 or 4, sharp 2 and no pelclip")
+      .need(params.nEdgePadX == 0 && params.nEdgePadY == 0, "super clips with edgepad are not supported")
       .need(pixelsize == 1 || pixelsize == 2, "only 8 to 16 bit integer formats")
       .need(!vi.IsYUY2() && vi.IsPlanar(), "only planar formats")
       .need(!divideExtra, "divide is not supported")
@@ -503,9 +509,8 @@ MVAnalyse::MVAnalyse(
 
   if (_temporal_flag)
   {
-    _srd_arr[0]._vec_prev.resize(_vectorfields_aptr->GetArraySize()); // array for prev vectors
+    _srd_arr[0]._vec_prev.init(TEMPORAL_CACHE_SLOTS, _vectorfields_aptr->GetArraySize()); // vectors of the previous frames
   }
-  _srd_arr[0]._vec_prev_frame = -2;
 
   // From this point, analysisData and analysisDataDivided references will
   // become invalid, because of the _srd_arr.resize(). Don't use them any more.
@@ -696,17 +701,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       fwrite(&n, sizeof(int), 1, outfile);	// write frame number
     }
 
-    // temporal predictor dst if prev frame was really prev
-    int *pVecPrevOrNull = nullptr;
-    // FIXME: Why this check is needed: we have exactly one 'previous' data, so a
-    // RequestLinear-like access pattern is heavily expected.
-    // But in multithreading this is rare; even in single-threaded mode it is not guaranteed.
-    // Maybe we would consider using a circular buffer of previous vectors,
-    // to allow more freedom in access pattern and to increase the chance of temporal prediction.
-    if (_temporal_flag && srd._vec_prev_frame == nsrc - 1)
-    {
-      pVecPrevOrNull = &srd._vec_prev[0];
-    }
+    // temporal predictor: the vectors of the previous frame, if it was analysed recently (see PrevVectorCache)
+    int *pVecPrevOrNull = _temporal_flag ? srd._vec_prev.find(nsrc - 1) : nullptr;
 
 #ifdef MV_GOLDEN_DUMP
     const bool golden_on = golden::begin("MAnalyse", nsrc, srd._analysis_data.isBackward);
@@ -786,13 +782,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
   if (_temporal_flag)
   {
-    // store previous vectors for use as predictor in next frame
-    memcpy(
-      &srd._vec_prev[0],
-      reinterpret_cast <int *> (pDst),
-      _vectorfields_aptr->GetArraySize()
-    );
-    srd._vec_prev_frame = nsrc;
+    // keep the vectors as predictor for the next frame
+    srd._vec_prev.store(nsrc, reinterpret_cast<const int *>(pDst));
   }
 
   _RPT3(0, "MAnalyze GetFrame END, frame_nsrc=%d nref=%d id=%d\n", nsrc, nref, _instance_id);

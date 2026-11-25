@@ -1,7 +1,7 @@
 #include "AvstpWrapper.h"
 #include "GpuBackend.h"
 #include "MVPlaneSet.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "cuda/dyn_lib.h"
 
 #include <cctype>
@@ -185,11 +185,10 @@ bool GpuBackend::lite_token(const PVideoFrame &f, const VideoInfo &super_vi, MvC
 {
   if (!super_vi.IsPlanar())
     return false;
-  int64_t packed;
-  std::memcpy(&packed, &super_vi.num_audio_samples, 8);
-  const unsigned char hpad = (unsigned char)((packed >> 16) & 0xff), vpad = (unsigned char)((packed >> 24) & 0xff);
+  const SuperParams sp = GetSuperParams(super_vi);
+  const int hpad = sp.nHPad, vpad = sp.nVPad;
   const int pixelsize = super_vi.ComponentSize();
-  const int pic_row = (super_vi.width - 2 * hpad) * pixelsize;
+  const int pic_row = sp.nWidth * pixelsize;
   return read_token(f->GetReadPtr(PLANAR_Y) + (size_t)vpad * f->GetPitch(PLANAR_Y) + (size_t)hpad * pixelsize, pic_row, h);
 }
 
@@ -246,11 +245,10 @@ namespace
 
 bool GpuBackend::super_input(const PVideoFrame &f, const VideoInfo &super_vi, const void *clip, int n, Input &in)
 {
-  SuperParams64Bits params;
-  std::memcpy(&params, &super_vi.num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(super_vi);
   in = Input();
   // the picture's chroma planes exist in the super frame only when MSuper processed them
-  if (!make_format(super_vi, super_vi.width - 2 * params.nHPad, params.nHeight, (params.nModeYUV & UPLANE) != 0, in.fmt))
+  if (!make_format(super_vi, params.nWidth, params.nHeight, (params.nModeYUV & UPLANE) != 0, in.fmt))
     return false;
   const int planes_l[3] = { PLANAR_Y, PLANAR_U, PLANAR_V };
   for (int p = 0; p < in.fmt.planes; p++)

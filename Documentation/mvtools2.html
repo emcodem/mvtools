@@ -12,7 +12,7 @@
     <h2>Abstract</h2>
     <table class="n">
         <tr><td class="n"><b>Authors:      </b></td><td class="n">&nbsp;</td><td class="n">Manao, Tsp, TSchniede, SEt, Fizick (Alexander Balakhnin), Vit, Firesledge, pinterf</td></tr>
-        <tr><td class="n"><b>Version:      </b></td><td class="n">&nbsp;</td><td class="n">2.7.48</td></tr>
+        <tr><td class="n"><b>Version:      </b></td><td class="n">&nbsp;</td><td class="n">2.7.49</td></tr>
         <tr><td class="n"><b>git:          </b></td><td class="n">&nbsp;</td><td class="n"><a href="https://github.com/pinterf/mvtools/tree/mvtools-pfmod">https://github.com/pinterf/mvtools/tree/mvtools-pfmod</a></td></tr>
         <tr><td class="n"><b>Forum:        </b></td><td class="n">&nbsp;</td><td class="n"><a href="https://forum.doom9.org/showthread.php?t=173356">https://forum.doom9.org/showthread.php?t=173356</a></td></tr>
         <tr><td class="n"><b>Base versions:</b></td><td class="n">&nbsp;</td><td class="n">2.6.0.5 + 2.5.11.22</td></tr>
@@ -294,7 +294,9 @@
 	bool isse,
 	bool planar,
 	bool mt (true),
-	bool gpu (false)
+	bool gpu (false),
+	int  edgepad (0),
+	int  edgepadV (edgepad)
 )</pre>
     <p>
         Get source clip and prepare special "super" clip with multilevel
@@ -322,12 +324,12 @@
     <p class="var">vpad</p>
     <p>It is vertical padding added to source frame (both top and bottom).</p>
     <p>
-        Note for subsampled formats: the chroma planes get <var>hpad</var> and <var>vpad</var> divided by the
-        chroma subsampling, rounded down (e.g. 4:2:0 with vpad=3: chroma vpad 1; 4:1:1 with hpad=2: chroma hpad 0).
-        Near the frame edges a vector may then point to a chroma area which is not padded.
-        Recommended: multiples of the subsampling, i.e. 4:2:0: both even, 4:2:2: hpad even,
-        4:1:1: hpad multiple of 4, 4:1:0: both multiples of 4, 4:4:0: vpad even. The default 8 is fine for all formats.
-        With 4:1:1 and 4:1:0 an odd hpad is rejected (width + 2 * hpad must be a multiple of 4).
+        Subsampled formats: the chroma planes get <var>hpad</var> and <var>vpad</var> divided by the chroma
+        subsampling, so they must be multiples of it: 4:2:0: both even, 4:2:2: hpad even,
+        4:1:1: hpad multiple of 4, 4:1:0: both multiples of 4, 4:4:0: vpad even. Other values are rejected
+        (since 2.7.49; before, the chroma padding was rounded down and a vector near the frame edge could point to
+        a chroma area which is not padded). Not checked with <var>chroma</var>=false, except that with 4:1:1 and
+        4:1:0 hpad must be even (width + 2 * hpad must be a multiple of 4). The default 8 is fine for all formats.
     </p>
     <p class="var">pel</p>
     <p>
@@ -406,6 +408,55 @@
     <p>Other useful example is EEDI2 edge-directed resampler.</p>
     <p class="var">mt</p>
     <p>Enables internal multi-threading (through avstp.dll).</p>
+    <p class="var">edgepad, edgepadV</p>
+    <p>
+        Since 2.7.49. Extra padding on the right (<var>edgepad</var>) and at the bottom (<var>edgepadV</var>),
+        0..64 pixels, rounded up to whole chroma pixels. Default 0: off.
+    </p>
+    <p>
+        <b>Why:</b> motion analysis works on whole blocks. When (<var>width</var>&nbsp;-&nbsp;<var>overlap</var>) is not a
+        multiple of (<var>blksize</var>&nbsp;-&nbsp;<var>overlap</var>) (the height likewise), the last columns (rows) of the
+        frame are not covered by any block, and the filters leave them unprocessed: e.g. MDegrain copies them from the
+        source (at 1920x1080 with <var>blksize</var>=16 the last 8 rows).
+    </p>
+    <p>
+        <b>How:</b> with <var>edgepad</var> the super clip gets a wider right / bottom border (the repeated edge pixels, as
+        in the <var>hpad</var>/<var>vpad</var> padding). <code>MAnalyse</code> and <code>MRecalculate</code> then add one
+        more block column (row) which covers the rest of the frame and reaches into this border; the filters process
+        these edge blocks and output only the part inside the frame. Inside the frame the super clip is the same as
+        without <var>edgepad</var>, so a frame which is already covered by whole blocks gives the same vectors and output.
+    </p>
+    <p>
+        <b>How much:</b> the extra block reaches at most <var>blksize</var>&nbsp;-&nbsp;<var>overlap</var>&nbsp;-&nbsp;1 pixels
+        beyond the frame. <var>edgepad</var>=64 is enough for any block size; smaller values save some memory
+        (e.g. 16 for <var>blksize</var>=16). Cost: the super clip planes are larger by the edge padding.
+    </p>
+    <p>
+        <b>When:</b> give the edge padding to every super clip of the chain: the one for <code>MAnalyse</code> and the one
+        for the compensating filter, if it is a different clip (e.g. <code>MSuper(levels=1)</code> for MDegrain).
+    </p>
+    <table>
+        <tr><td><b>Filter</b></td><td><b>Edge blocks processed when</b></td><td><b>Otherwise</b></td></tr>
+        <tr><td><code>MAnalyse</code>, <code>MRecalculate</code></td>
+            <td>its super clip has enough edge padding (per direction) for the extra block</td>
+            <td>whole blocks inside the frame (as before)</td></tr>
+        <tr><td><code>MDegrain1</code>..<code>6</code>, <code>MDegrainN</code>, <code>MCompensate</code>, <code>MBlockFps</code></td>
+            <td>the vectors have edge blocks and the super clip given to the filter has enough edge padding</td>
+            <td>only the blocks inside the frame, the rest as before (copied or blended)</td></tr>
+        <tr><td><code>MFlow</code>, <code>MFlowInter</code>, <code>MFlowFps</code>, <code>MFlowBlur</code></td>
+            <td>the vectors have edge blocks (no edge padding needed: the vectors are limited to the frame)</td>
+            <td>the edge vectors are extrapolated (as before)</td></tr>
+        <tr><td><code>MMask</code>, <code>MSCDetection</code>, <code>MShow</code>, <code>MDepan</code>, <code>MScaleVect</code></td>
+            <td>the vectors have edge blocks</td>
+            <td>-</td></tr>
+    </table>
+    <p>
+        Vector clips with and without edge blocks cannot be mixed in one filter (error: block count is incorrect).
+    </p>
+<pre class="src">super = MSuper(edgepad=64)
+bv = MAnalyse(super, isb=true, blksize=16, overlap=4)
+fv = MAnalyse(super, isb=false, blksize=16, overlap=4)
+MDegrain1(super, bv, fv, thSAD=400)</pre>
 
     <h3>MAnalyse</h3>
 <pre class="proto">MAnalyse (
@@ -757,9 +808,12 @@
     <p class="var">temporal</p>
     <p>
         Use temporal predictors from previous frame motion vectors.
-        Not compatible with <code>SetMTMode</code> (classic Avisynth) or other than MT_SERIALIZED mode for Avisynth+, and requires a linear access to
-        work correctly.
-        Note: Since 2.7.32 the filter registers itself automatically MT_SERIALIZED instead of MT_MULTI_INSTANCE under Avisynth+ when temporal=true is given.
+        Not compatible with <code>SetMTMode</code> (classic Avisynth) or other than MT_SERIALIZED mode for Avisynth+.
+        Note: Since 2.7.32 the filter registers itself automatically MT_SERIALIZED instead of MT_MULTI_INSTANCE under Avisynth+ when temporal=true is given.<br>
+        Since 2.7.49 the vectors of the last 8 analysed frames are kept, so the previous frame is found also when the
+        frames are not requested in order (Prefetch, several MAnalyse in one MDegrain). A frame analysed before its
+        previous frame (seeking, threads overtaking each other) gets no temporal predictor: with multithreading the
+        output may differ slightly from run to run (MDegrain6, Prefetch(16): about 2% of the analysed frames).
     </p>
     <p class="var">trymany, trymanyall</p>
     <p>
@@ -809,7 +863,11 @@
         Unfortunately - for algorithmical reasons - this speedup results in different output as
         the single-thread case due to the fact that the unit boundaries are handled specially.
         A non-multithreaded approach is processing the whole frame in a single run, in one thread, having
-        only 2 (namely the top and bottom lines) boundary, while the N-thread version has N*2 boundary.
+        only 2 (namely the top and bottom lines) boundary, while the N-thread version has N*2 boundary.<br />
+        The number of slices is the avstp thread count: the number of logical processors, unless set with
+        <code>avstp_set_threads</code>. So with mt=true the result is the same in every run on one machine, but it may
+        differ on a machine with another processor count. (Before 2.7.49 it could also differ from run to run, rarely:
+        when many blocks are above <var>badSAD</var>.)
     </p>
     <p class="var">scaleCSAD</p>
     <p>
@@ -1208,6 +1266,9 @@
     <p>
         Shows the motion vectors on padded source by super clip opening
         (since v2.0.11).
+        The output is the finest level of the super clip with its padding: (width&nbsp;+&nbsp;2*<var>hpad</var>) x
+        (height&nbsp;+&nbsp;2*<var>vpad</var>), with an <code>MSuper</code> <var>edgepad</var> wider / higher by the edge padding,
+        where the blocks beyond the frame edge are drawn. Vector lines leaving the output are clipped.
     </p>
     <p class="var">scale</p>
     <p>
@@ -1717,7 +1778,9 @@
         E.g. at 1920x1080 with <var>blksize</var>=16, <var>overlap</var>=0 the last 8 rows,
         with <var>blksize</var>=32 the last 24 rows are not denoised;
         at 1280x720 with <var>blksize</var>=24, <var>overlap</var>=2 the last 2 columns and 14 rows.<br />
-        Workaround: pad the clip to a covered size before <code>MSuper</code>, crop the result:
+        Since 2.7.49 these pixels are denoised when the super clips have an edge padding
+        (<code>MSuper</code> <var>edgepad</var>, <var>edgepadV</var>).
+        Workaround for older versions: pad the clip to a covered size before <code>MSuper</code>, crop the result:
     </p>
     <pre>bs = 16
 ov = 4
@@ -2327,6 +2390,86 @@ Planar2Interleaved() # convert back to normal interleave YUY2
     </ul>
 
     <h2><a name="revisions"></a>VI) Revisions</h2>
+
+    <p>2.7.49 (20261114)</p>
+    <ul>
+        <li>
+            Fix: MScaleVect crashed (access violation) on vector clips made with divide&gt;0 (MAnalyse, MRecalculate), modes 0 and 1.
+            The length word 0xFFFFFFFF of the divided sub-block level (since 2.7.14.22) made the level walk step backwards
+            and run past the frame. Mode 2 stopped with "Internal error": it used the divided (halved) block geometry for
+            all levels, now the non-divided levels use the original block size, overlap and block count.
+            MScaleVect now checks the level lengths and block counts before writing (error instead of memory overrun).
+        </li>
+        <li>
+            Fix: MShow wrote outside the frame when the vector lines left it (scale&gt;1, or vectors with larger padding than
+            the super clip, e.g. after MScaleVect). The lines are now clipped to the frame. The horizontal offset now uses
+            the padding of the super clip (was the padding of the vectors, the vertical one was already the super clip's).
+        </li>
+        <li>
+            Fix: MShow number=(block count) read past the blocks, the number highlight had width and height swapped
+            (non-square blocks), and it is clipped to the frame.
+        </li>
+        <li>
+            New (#28): MSuper edgepad, edgepadV parameters: process the right / bottom pixels not covered by
+            whole blocks. With an edge padding in the super clip MAnalyse and MRecalculate add one block column
+            / row reaching beyond the frame edge into the padding (flagged in the vector clip); MDegrain1-6,
+            MDegrainN, MCompensate, MBlockFps, MFlow, MFlowInter, MFlowFps, MFlowBlur, MMask, MSCDetection,
+            MShow, MDepan and MScaleVect process these vectors. Without edgepad, and for frames covered by whole
+            blocks, the results are unchanged.
+        </li>
+        <li>
+            Mod: vector clips with different block counts are rejected in one filter ("block count is
+            incorrect"), e.g. vectors from super clips with and without edgepad.
+        </li>
+        <li>
+            Mod: MSuper: faster padding of the super planes (the top / bottom border is copied row by row).
+        </li>
+        <li>
+            Internal: the super clip parameters are kept in a process-wide registry, the super clip carries its
+            index (vi.sample_type); the legacy 8 bytes in num_audio_samples are still written.
+        </li>
+        <li>
+            Fix: MDepan with a mask clip: the motion data could differ from run to run. With range &gt; 0 it
+            also depended on the frame request order (seeking, multithreading), and the frames in the range were
+            estimated with the mask of the requested frame. Causes: the neighbour check of the blocks read
+            outside the block arrays for the top and bottom block rows (only with a mask, without it the border
+            blocks are skipped); the mask was fetched for the requested frame only; the sign of the near-zero
+            motion marker (0.011) was random. Now the mask of each estimated frame is used.
+        </li>
+        <li>
+            Fix: MFlowBlur: when the blocks do not cover the frame (frame size not fitting the block size and
+            overlap), a moving object on a still background got its blur "halo" offset towards the bottom-right
+            instead of on the object: the still background right of / below it was blurred, the object's left /
+            top edge stayed sharp. The offset grew from 0 at the left / top to almost one block step at the
+            right / bottom frame edge. Cause: the vector field of the blocks was stretched over the whole frame.
+            Now the block grid is extended by repeated edge vectors to cover the frame, as MFlow, MFlowInter and
+            MFlowFps do.
+        </li>
+        <li>
+            Fix: MSuper: hpad, vpad not a multiple of the chroma subsampling (e.g. hpad=1 with 4:2:0 or 4:2:2,
+            hpad=2 with 4:1:1) are rejected. The chroma padding was rounded down (hpad=1: no chroma padding), and a
+            vector near the frame edge could read chroma outside the padded area. Not checked with
+            chroma=false.
+        </li>
+        <li>
+            Fix: MAnalyse temporal=true did not work: on the finest level the temporal predictor was a zero vector.
+            Only a quarter of the previous frame's vector data was kept (the size in ints was used as a byte count,
+            already in 2.6.0.5). The whole vector data is used now; the output with temporal=true changes.
+        </li>
+        <li>
+            Mod: MAnalyse temporal=true: the vectors of the last 8 analysed frames are kept, so the temporal predictor
+            is also found when the frames are not requested in order (was: only when frame n-1 was the last analysed
+            frame, i.e. strictly linear access). E.g. MDegrain6 with Prefetch(16): no temporal predictor for 2.1% of
+            the analysed frames instead of 3.6%, with Prefetch(8) 0.5% instead of 1.8%.
+        </li>
+        <li>
+            Fix: MAnalyse mt=true (internal multithreading with avstp.dll): the output could differ from run to run
+            (rarely, when many blocks are above badSAD). The bad block counter, which raises the badSAD threshold of
+            the wide search (badrange), was shared by the parallel slices, so whether a block got the wide search
+            depended on the thread timing. It is counted per slice now: the result is the same in every run (for a
+            given avstp thread count).
+        </li>
+    </ul>
 
     <p>2.7.48 (20261029)</p>
     <ul>

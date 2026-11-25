@@ -27,7 +27,7 @@
 #include "MVPlane.h"
 #include "MVSuper.h"
 #include	"profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 #include "GpuBackend.h"
 #include <stdint.h>
 #include "CopyCode.h"
@@ -45,7 +45,7 @@ int64_t ProfCumulatedResults[MOTION_PROFILE_COUNT * 2];
 MVSuper::MVSuper(
   PClip _child, int _hPad, int _vPad, int _pel, int _levels, bool _chroma,
   int _sharp, int _rfilter, PClip _pelclip, bool _isse,
-  bool mt_flag, bool yuy2_source, bool gpu_flag, IScriptEnvironment* env
+  bool mt_flag, bool yuy2_source, int _edgepad, int _edgepadV, bool gpu_flag, IScriptEnvironment* env
 )
   : GenericVideoFilter(_child)
   , pelclip(_pelclip)
@@ -99,10 +99,38 @@ MVSuper::MVSuper(
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
 
+  // The chroma planes get hpad / xRatioUV and vpad / yRatioUV padding (MVFrame). Not divisible, it would be rounded
+  // down: the luma vectors are limited by the luma padding, a vector reaching +-hpad (+-vpad) scaled to chroma would
+  // then read beyond the chroma padding (neighbour row, or the super frame area outside the plane).
+  if (chroma && (nHPad % xRatioUV != 0 || nVPad % yRatioUV != 0))
+    env->ThrowError("MSuper: hpad and vpad must be multiples of the chroma subsampling (%dx%d), e.g. even hpad for 4:2:0 and 4:2:2, even vpad for 4:2:0",
+      xRatioUV, yRatioUV);
+
+  // Edge padding (edgepad, edgepadV).
+  // Motion analysis works on whole blocks. When (width - overlap) is not a multiple of (blksize - overlap), the
+  // block grid ends before the right frame edge and the remaining columns (rows) are not processed (#28).
+  // A block grid covering them reaches beyond the frame by at most (blksize - overlap - 1) pixels, and a search
+  // around such a block needs the usual hpad / vpad beyond that. So the super planes get a wider right / bottom
+  // border: the super is laid out for the frame size plus the edge padding (the "layout" size), every level and
+  // sub-pel plane is built from the real frame exactly as without edgepad, and its padding (repeated edge pixels)
+  // then reaches over the edge padding area too (MVPlane). Readers get the real size and the padding from
+  // SuperParams. Inside the hpad / vpad border the super is the same as without edgepad.
+  // 64: the largest blksize, so any blksize / overlap fits. Rounded up to whole chroma pixels.
+  if (_edgepad < 0 || _edgepad > 64 || _edgepadV < 0 || _edgepadV > 64)
+    env->ThrowError("MSuper: edgepad and edgepadV must be between 0 and 64");
+  nEdgePadX = AlignNumber(_edgepad, xRatioUV);
+  nEdgePadY = AlignNumber(_edgepadV, yRatioUV);
+  nRealWidth = nWidth;
+  nRealHeight = nHeight;
+  // from here nWidth / nHeight are the layout size
+  nWidth += nEdgePadX;
+  nHeight += nEdgePadY;
+
   nLevels = _levels;
   int nLevelsMax = 0;
-  while (PlaneHeightLuma(vi.height, nLevelsMax, yRatioUV, nVPad) >= yRatioUV * 2 &&
-    PlaneWidthLuma(vi.width, nLevelsMax, xRatioUV, nHPad) >= xRatioUV * 2) // at last two pixels width and height of chroma
+  // from the real size: the same levels as without edgepad
+  while (PlaneHeightLuma(nRealHeight, nLevelsMax, yRatioUV, nVPad) >= yRatioUV * 2 &&
+    PlaneWidthLuma(nRealWidth, nLevelsMax, xRatioUV, nHPad) >= xRatioUV * 2) // at last two pixels width and height of chroma
   {
     nLevelsMax++;
   }
@@ -127,6 +155,10 @@ MVSuper::MVSuper(
     {
       env->ThrowError("MSuper: pelclip frame size must be Pel of source!");
     }
+    // A padded pelclip is copied with its border as it is, its border cannot be widened. An unpadded pelclip is
+    // copied over the real area and padded like the source.
+    if (isPelClipPadded && (nEdgePadX > 0 || nEdgePadY > 0))
+      env->ThrowError("MSuper: with edgepad, pelclip must not be padded");
   }
 
   nSuperWidth = nWidth + 2 * nHPad;
@@ -146,6 +178,7 @@ MVSuper::MVSuper(
   {
     GpuCheck c("CudaMSuper", "MSuper");
     c.need(!usePelClip, "pelclip is not supported")
+      .need(nEdgePadX == 0 && nEdgePadY == 0, "edgepad is not supported")
       .need(sharp == 2, "only sharp=2")
       .need(rfilter == 4 || rfilter == 2, "only rfilter 2 or 4")
       .need(vi.IsPlanar() && vi.IsYUV() && !vi.IsY(), "only planar YUV formats")
@@ -159,9 +192,10 @@ MVSuper::MVSuper(
       vi.height = nHeight + 2 * nVPad;
   }
 
-  SuperParams64Bits params;
+  SuperParams params;
 
-  params.nHeight = nHeight;
+  params.nWidth = nRealWidth;
+  params.nHeight = nRealHeight;
   params.nHPad = nHPad;
   params.nVPad = nVPad;
   params.nPel = nPel;
@@ -169,15 +203,15 @@ MVSuper::MVSuper(
   params.nLevels = nLevels;
   // bit 0: YUY2 source (upstream); bits 1-7: our settings for the GPU paths and lite clips (SuperParams64Bits.h, D4)
   params.param = super_param_make(yuy2_source, rfilter, sharp, usePelClip, _lite);
+  params.nEdgePadX = nEdgePadX;
+  params.nEdgePadY = nEdgePadY;
 
-
-  // pack parameters to fake audio properties
-  memcpy(&vi.num_audio_samples, &params, 8); //nHeight + (nHPad<<16) + (nVPad<<24) + ((_int64)(nPel)<<32) + ((_int64)nModeYUV<<40) + ((_int64)nLevels<<48);
-  vi.audio_samples_per_second = 0; // kill audio
+  // parameters to the fake audio properties, kills audio
+  SetSuperParams(vi, params, env);
 
   // LDS: why not nModeYUV?
 //	pSrcGOF = new MVGroupOfFrames(nLevels, nWidth, nHeight, nPel, nHPad, nVPad, nModeYUV, isse, yRatioUV, mt_flag);
-  pSrcGOF = new MVGroupOfFrames(nLevels, nWidth, nHeight, nPel, nHPad, nVPad, YUVPLANES, cpuFlags, xRatioUV, yRatioUV, pixelsize, bits_per_pixel, mt_flag);
+  pSrcGOF = new MVGroupOfFrames(nLevels, nWidth, nHeight, nPel, nHPad, nVPad, YUVPLANES, cpuFlags, xRatioUV, yRatioUV, pixelsize, bits_per_pixel, mt_flag, nRealWidth, nRealHeight);
 
   pSrcGOF->set_interp(nModeYUV, rfilter, sharp);
 
@@ -260,6 +294,7 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
   int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
   int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
   planecount = ClipFnc::nbr_planes_processed(vi);
+
   for (int p = 0; p < planecount; ++p) {
     const int plane = planes[p];
     pSrc[p] = src->GetReadPtr(plane);
@@ -339,8 +374,7 @@ PVideoFrame __stdcall MVSuper::GetFrame(int n, IScriptEnvironment* env)
 // same GroupOfFrames code as GetFrame / the constructor, so the result is bit-identical.
 PVideoFrame MVSuper::ResolveToken(PVideoFrame lite, const VideoInfo &lite_vi, IScriptEnvironment* env)
 {
-  SuperParams64Bits params;
-  memcpy(&params, &lite_vi.num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(lite_vi);
   const int hpad = params.nHPad, vpad = params.nVPad;
   const int pixelsize = lite_vi.ComponentSize();
   const int xr = 1 << lite_vi.GetPlaneWidthSubsampling(PLANAR_U);
@@ -368,8 +402,7 @@ PVideoFrame MVSuper::ResolveToken(PVideoFrame lite, const VideoInfo &lite_vi, IS
 PVideoFrame MVSuper::CompleteLite(PVideoFrame lite, const VideoInfo &lite_vi, bool mt_flag, IScriptEnvironment* env)
 {
   lite = ResolveToken(lite, lite_vi, env);
-  SuperParams64Bits params;
-  memcpy(&params, &lite_vi.num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(lite_vi); // a lite super has no edge padding (CudaMSuper)
   const int rfilter = super_param_rfilter(params); // valid: MV_SUPER_IS_LITE checked by the caller
   const int sharp = super_param_sharp(params);
   const int hpad = params.nHPad, vpad = params.nVPad;

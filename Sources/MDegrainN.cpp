@@ -9,7 +9,9 @@
 #include "MVPlane.h"
 #include "MVFilter.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
+#include "PlaneExtend.h"
+#include <algorithm>
 
 #ifdef INTEL_INTRINSICS
 #include	<emmintrin.h>
@@ -477,7 +479,7 @@ MDegrainN::MDegrainN(
   sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, IScriptEnvironment* env_ptr
 )
   : GenericVideoFilter(child)
-  , MVFilter(mvmulti, "MDegrainN", env_ptr, 1, 0)
+  , MVFilter(mvmulti, "MDegrainN", env_ptr, 1, 0, true) // edge blocks supported
   , _mv_clip_arr()
   , _trad(trad)
   , _yuvplanes(yuvplanes)
@@ -568,8 +570,7 @@ MDegrainN::MDegrainN(
   _cpuFlags = isse_flag ? env_ptr->GetCPUFlags() : 0;
 
 // get parameters of prepared super clip - v2.0
-  SuperParams64Bits params;
-  memcpy(&params, &vi_super.num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(vi_super);
   MV_REJECT_LITE_SUPER(params, "MDegrainN", env_ptr);
   const int nHeightS = params.nHeight;
   const int nSuperHPad = params.nHPad;
@@ -590,10 +591,11 @@ MDegrainN::MDegrainN(
   {
     MvClipInfo &c_info = _mv_clip_arr[k];
 
+    // the super planes are built for the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
     c_info._gof_sptr = SharedPtr <MVGroupOfFrames>(new MVGroupOfFrames(
       nSuperLevels,
-      nWidth,
-      nHeight,
+      params.LayoutWidth(),
+      params.LayoutHeight(),
       nSuperPel,
       nSuperHPad,
       nSuperVPad,
@@ -615,16 +617,42 @@ MDegrainN::MDegrainN(
     c_info._thsadc_sq = double(c_info._thsadc) * double(c_info._thsadc);
   }
 
-  const int nSuperWidth = vi_super.width;
   pixelsize_super_shift = ilog2(pixelsize_super);
 
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
     || nHeight != vi.height
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nWidth != vi.width
     || nPel != nSuperPel)
   {
     env_ptr->ThrowError("MDegrainN : wrong source or super frame size");
+  }
+
+  // Blocks beyond the frame edge (MOTION_EDGE_BLOCKS): the reference blocks of the edge blocks reach into the edge
+  // padding of the super clip given here; without enough padding only the blocks inside the frame are processed.
+  {
+    const int grid_w = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
+    const int grid_h = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+    edge_ext = false;
+    nBlkXP = nBlkX;
+    nBlkYP = nBlkY;
+    if (grid_w > nWidth || grid_h > nHeight)
+    {
+      if (params.nEdgePadX >= grid_w - nWidth && params.nEdgePadY >= grid_h - nHeight)
+        edge_ext = true;
+      else
+      {
+        nBlkXP = std::min(nBlkX, (nWidth - nOverlapX) / (nBlkSizeX - nOverlapX));
+        nBlkYP = std::min(nBlkY, (nHeight - nOverlapY) / (nBlkSizeY - nOverlapY));
+      }
+    }
+    nWidthP = edge_ext ? grid_w : nWidth;
+    nHeightP = edge_ext ? grid_h : nHeight;
+    // source frame format, processing size
+    vi_src_ext = vi;
+    vi_src_ext.width = nWidthP;
+    vi_src_ext.height = nHeightP;
   }
 
   if (out16_flag) {
@@ -644,7 +672,7 @@ MDegrainN::MDegrainN(
     pixelsize_output_shift = ilog2(pixelsize_output);
   }
 
-  _dst_short_pitch = ((nWidth + 15) / 16) * 16;
+  _dst_short_pitch = ((nWidthP + 15) / 16) * 16;
   _dst_int_pitch = _dst_short_pitch;
   if (nOverlapX > 0 || nOverlapY > 0)
   {
@@ -657,11 +685,11 @@ MDegrainN::MDegrainN(
     ));
     if (pixelsize_output > 1)
     {
-      _dst_int.resize(_dst_int_pitch * nHeight);
+      _dst_int.resize(_dst_int_pitch * nHeightP);
     }
     else
     {
-      _dst_short.resize(_dst_short_pitch * nHeight);
+      _dst_short.resize(_dst_short_pitch * nHeightP);
     }
   }
   if (nOverlapY > 0)
@@ -752,6 +780,10 @@ MDegrainN::MDegrainN(
     else if (vi.IsYV24())
       vi.pixel_type = VideoInfo::CS_YUV444P16;
   }
+  // output frame format, processing size
+  vi_dst_ext = vi;
+  vi_dst_ext.width = nWidthP;
+  vi_dst_ext.height = nHeightP;
 }
 
 
@@ -775,8 +807,8 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 
 ::PVideoFrame __stdcall MDegrainN::GetFrame(int n, ::IScriptEnvironment* env_ptr)
 {
-  _covered_width = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
-  _covered_height = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+  _covered_width = nBlkXP * (nBlkSizeX - nOverlapX) + nOverlapX;
+  _covered_height = nBlkYP * (nBlkSizeY - nOverlapY) + nOverlapY;
 
   const BYTE * pRef[MAX_TEMP_RAD * 2][3];
   int nRefPitches[MAX_TEMP_RAD * 2][3];
@@ -809,6 +841,29 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
   _src_pitch_arr[0] = YPITCH(src);
   _src_pitch_arr[1] = UPITCH(src);
   _src_pitch_arr[2] = VPITCH(src);
+
+  // Blocks beyond the frame edge with enough super padding (edge_ext): the planes are processed on frames of the
+  // block grid size. The source frame is extended by repeating its edge pixels (as the super padding does), the
+  // result is cropped back into dst at the end. Everything else works as for a frame covered by whole blocks.
+  const int planecount = ClipFnc::is_grey(vi) ? 1 : 3;
+  PVideoFrame srcExt, dstExt;
+  if (edge_ext)
+  {
+    srcExt = extend_frame(src, vi_src_ext, nWidth, nHeight, planecount, nLogxRatioUV_super, nLogyRatioUV_super, env_ptr);
+    dstExt = env_ptr->NewVideoFrame(vi_dst_ext);
+    _dst_ptr_arr[0] = YWPLAN(dstExt);
+    _dst_ptr_arr[1] = UWPLAN(dstExt);
+    _dst_ptr_arr[2] = VWPLAN(dstExt);
+    _dst_pitch_arr[0] = YPITCH(dstExt);
+    _dst_pitch_arr[1] = UPITCH(dstExt);
+    _dst_pitch_arr[2] = VPITCH(dstExt);
+    _src_ptr_arr[0] = YRPLAN(srcExt);
+    _src_ptr_arr[1] = URPLAN(srcExt);
+    _src_ptr_arr[2] = VRPLAN(srcExt);
+    _src_pitch_arr[0] = YPITCH(srcExt);
+    _src_pitch_arr[1] = UPITCH(srcExt);
+    _src_pitch_arr[2] = VPITCH(srcExt);
+  }
 
   ::PVideoFrame ref[MAX_TEMP_RAD * 2];
 
@@ -871,13 +926,13 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
       // copy 8 bit source to 16bit target
       plane_copy_8_to_16_c(_dst_ptr_arr[0], _dst_pitch_arr[0],
         _src_ptr_arr[0], _src_pitch_arr[0],
-        nWidth, nHeight);
+        nWidthP, nHeightP);
     }
     else {
       BitBlt(
         _dst_ptr_arr[0], _dst_pitch_arr[0],
         _src_ptr_arr[0], _src_pitch_arr[0],
-        nWidth << pixelsize_super_shift, nHeight
+        nWidthP << pixelsize_super_shift, nHeightP
       );
     }
   }
@@ -888,7 +943,7 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
     if (nOverlapX == 0 && nOverlapY == 0)
     {
       slicer.start(
-        nBlkY,
+        nBlkYP,
         *this,
         &MDegrainN::process_luma_normal_slice
       );
@@ -926,7 +981,7 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
       }
 
       slicer.start(
-        nBlkY,
+        nBlkYP,
         *this,
         &MDegrainN::process_luma_overlap_slice,
         2
@@ -967,37 +1022,37 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
           _covered_width, _covered_height
         );
       }
-      if (_covered_width < nWidth)
+      if (_covered_width < nWidthP)
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(_dst_ptr_arr[0] + (_covered_width << pixelsize_output_shift), _dst_pitch_arr[0],
             _src_ptr_arr[0] + _covered_width, _src_pitch_arr[0],
-            nWidth - _covered_width, _covered_height
+            nWidthP - _covered_width, _covered_height
           );
         }
         else {
           BitBlt(
             _dst_ptr_arr[0] + (_covered_width << pixelsize_super_shift), _dst_pitch_arr[0],
             _src_ptr_arr[0] + (_covered_width << pixelsize_super_shift), _src_pitch_arr[0],
-            (nWidth - _covered_width) << pixelsize_super_shift, _covered_height
+            (nWidthP - _covered_width) << pixelsize_super_shift, _covered_height
           );
         }
       }
-      if (_covered_height < nHeight) // bottom noncovered region
+      if (_covered_height < nHeightP) // bottom noncovered region
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(_dst_ptr_arr[0] + _covered_height * _dst_pitch_arr[0], _dst_pitch_arr[0],
             _src_ptr_arr[0] + _covered_height * _src_pitch_arr[0], _src_pitch_arr[0],
-            nWidth, nHeight - _covered_height
+            nWidthP, nHeightP - _covered_height
           );
         }
         else {
           BitBlt(
             _dst_ptr_arr[0] + _covered_height * _dst_pitch_arr[0], _dst_pitch_arr[0],
             _src_ptr_arr[0] + _covered_height * _src_pitch_arr[0], _src_pitch_arr[0],
-            nWidth << pixelsize_super_shift, nHeight - _covered_height
+            nWidthP << pixelsize_super_shift, nHeightP - _covered_height
           );
         }
       }
@@ -1013,7 +1068,7 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
         realLimit = _nlimit / 255.0f;
       LimitFunction(_dst_ptr_arr[0], _dst_pitch_arr[0],
         _src_ptr_arr[0], _src_pitch_arr[0],
-        nWidth, nHeight,
+        nWidthP, nHeightP,
         realLimit
       );
     }
@@ -1036,6 +1091,8 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
 
   PROFILE_STOP(MOTION_PROFILE_COMPENSATION);
 
+  if (edge_ext)
+    crop_frame_into(dst, dstExt, nWidth, nHeight, planecount, nLogxRatioUV_super, nLogyRatioUV_super, pixelsize_output, env_ptr);
 
   ClipFnc::copy_alpha(dst, src, vi, env_ptr);
   return (dst);
@@ -1067,14 +1124,14 @@ void	MDegrainN::process_chroma(int plane_mask)
       // copy 8 bit source to 16bit target
       plane_copy_8_to_16_c(_dst_ptr_arr[P], _dst_pitch_arr[P],
         _src_ptr_arr[P], _src_pitch_arr[P],
-        nWidth >> nLogxRatioUV_super, nHeight >> nLogyRatioUV_super
+        nWidthP >> nLogxRatioUV_super, nHeightP >> nLogyRatioUV_super
       );
     }
     else {
       BitBlt(
         _dst_ptr_arr[P], _dst_pitch_arr[P],
         _src_ptr_arr[P], _src_pitch_arr[P],
-        (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, nHeight >> nLogyRatioUV_super
+        (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, nHeightP >> nLogyRatioUV_super
       );
     }
   }
@@ -1086,7 +1143,7 @@ void	MDegrainN::process_chroma(int plane_mask)
     if (nOverlapX == 0 && nOverlapY == 0)
     {
       slicer.start(
-        nBlkY,
+        nBlkYP,
         *this,
         &MDegrainN::process_chroma_normal_slice <P>
       );
@@ -1126,7 +1183,7 @@ void	MDegrainN::process_chroma(int plane_mask)
       }
 
       slicer.start(
-        nBlkY,
+        nBlkYP,
         *this,
         &MDegrainN::process_chroma_overlap_slice <P>,
         2
@@ -1168,37 +1225,37 @@ void	MDegrainN::process_chroma(int plane_mask)
         );
       }
 
-      if (_covered_width < nWidth)
+      if (_covered_width < nWidthP)
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(_dst_ptr_arr[P] + ((_covered_width >> nLogxRatioUV_super) << pixelsize_output_shift), _dst_pitch_arr[P],
             _src_ptr_arr[P] + (_covered_width >> nLogxRatioUV_super), _src_pitch_arr[P],
-            (nWidth - _covered_width) >> nLogxRatioUV_super, _covered_height >> nLogyRatioUV_super
+            (nWidthP - _covered_width) >> nLogxRatioUV_super, _covered_height >> nLogyRatioUV_super
           );
         }
         else {
           BitBlt(
             _dst_ptr_arr[P] + ((_covered_width >> nLogxRatioUV_super) << pixelsize_super_shift), _dst_pitch_arr[P],
             _src_ptr_arr[P] + ((_covered_width >> nLogxRatioUV_super) << pixelsize_super_shift), _src_pitch_arr[P],
-            ((nWidth - _covered_width) >> nLogxRatioUV_super) << pixelsize_super_shift, _covered_height >> nLogyRatioUV_super
+            ((nWidthP - _covered_width) >> nLogxRatioUV_super) << pixelsize_super_shift, _covered_height >> nLogyRatioUV_super
           );
         }
       }
-      if (_covered_height < nHeight) // bottom noncovered region
+      if (_covered_height < nHeightP) // bottom noncovered region
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(_dst_ptr_arr[P] + (_dst_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _dst_pitch_arr[P],
             _src_ptr_arr[P] + (_src_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _src_pitch_arr[P],
-            nWidth >> nLogxRatioUV_super, ((nHeight - _covered_height) >> nLogyRatioUV_super)
+            nWidthP >> nLogxRatioUV_super, ((nHeightP - _covered_height) >> nLogyRatioUV_super)
           );
         }
         else {
           BitBlt(
             _dst_ptr_arr[P] + (_dst_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _dst_pitch_arr[P],
             _src_ptr_arr[P] + (_src_pitch_arr[P] * (_covered_height >> nLogyRatioUV_super)), _src_pitch_arr[P],
-            (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, ((nHeight - _covered_height) >> nLogyRatioUV_super)
+            (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, ((nHeightP - _covered_height) >> nLogyRatioUV_super)
           );
         }
       }
@@ -1214,7 +1271,7 @@ void	MDegrainN::process_chroma(int plane_mask)
         realLimit = (float)_nlimitc / 255.0f;
       LimitFunction(_dst_ptr_arr[P], _dst_pitch_arr[P],
         _src_ptr_arr[P], _src_pitch_arr[P],
-        nWidth >> nLogxRatioUV_super, nHeight >> nLogyRatioUV_super,
+        nWidthP >> nLogxRatioUV_super, nHeightP >> nLogyRatioUV_super,
         realLimit
       );
     }
@@ -1234,7 +1291,7 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
   for (int by = td._y_beg; by < td._y_end; ++by)
   {
     int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       int i = by * nBlkX + bx;
       const BYTE *ref_data_ptr_arr[MAX_TEMP_RAD * 2];
@@ -1268,14 +1325,14 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
 
       xx += (nBlkSizeX); // xx: indexing offset
 
-      if (bx == nBlkX - 1 && _covered_width < nWidth) // right non-covered region
+      if (bx == nBlkXP - 1 && _covered_width < nWidthP) // right non-covered region
       {
         if (_out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(
             pDstCur + (_covered_width << pixelsize_output_shift), _dst_pitch_arr[0],
             pSrcCur + (_covered_width << pixelsize_super_shift), _src_pitch_arr[0],
-            nWidth - _covered_width, nBlkSizeY
+            nWidthP - _covered_width, nBlkSizeY
           );
         }
         else {
@@ -1283,7 +1340,7 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
           BitBlt(
             pDstCur + (_covered_width << pixelsize_super_shift), _dst_pitch_arr[0],
             pSrcCur + (_covered_width << pixelsize_super_shift), _src_pitch_arr[0],
-            (nWidth - _covered_width) << pixelsize_super_shift, nBlkSizeY);
+            (nWidthP - _covered_width) << pixelsize_super_shift, nBlkSizeY);
         }
       }
     }	// for bx
@@ -1291,7 +1348,7 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
     pDstCur += rowsize * _dst_pitch_arr[0];
     pSrcCur += rowsize * _src_pitch_arr[0];
 
-    if (by == nBlkY - 1 && _covered_height < nHeight) // bottom uncovered region
+    if (by == nBlkYP - 1 && _covered_height < nHeightP) // bottom uncovered region
     {
       // luma
       if (_out16_flag) {
@@ -1299,14 +1356,14 @@ void	MDegrainN::process_luma_normal_slice(Slicer::TaskData &td)
         plane_copy_8_to_16_c(
           pDstCur, _dst_pitch_arr[0],
           pSrcCur, _src_pitch_arr[0],
-          nWidth, nHeight - _covered_height
+          nWidthP, nHeightP - _covered_height
         );
       }
       else {
         BitBlt(
           pDstCur, _dst_pitch_arr[0],
           pSrcCur, _src_pitch_arr[0],
-          nWidth << pixelsize_super_shift, nHeight - _covered_height
+          nWidthP << pixelsize_super_shift, nHeightP - _covered_height
         );
       }
     }
@@ -1320,7 +1377,7 @@ void	MDegrainN::process_luma_overlap_slice(Slicer::TaskData &td)
   assert(&td != 0);
 
   if (nOverlapY == 0
-    || (td._y_beg == 0 && td._y_end == nBlkY))
+    || (td._y_beg == 0 && td._y_end == nBlkYP))
   {
     process_luma_overlap_slice(td._y_beg, td._y_end);
   }
@@ -1343,7 +1400,7 @@ void	MDegrainN::process_luma_overlap_slice(Slicer::TaskData &td)
     }
 
     int cnt_bot = 2;
-    if (td._y_end < nBlkY)
+    if (td._y_end < nBlkYP)
     {
       cnt_bot = conc::AtomicIntOp::exec_new(
         _boundary_cnt_arr[td._y_end],
@@ -1380,13 +1437,13 @@ void	MDegrainN::process_luma_overlap_slice(int y_beg, int y_end)
     6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
     */
 
-    int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
+    int wby = (by == 0) ? 0 * 3 : (by == nBlkYP - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
     int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       // select window
       // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-      int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
+      int wbx = (bx == 0) ? 0 : (bx == nBlkXP - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
       short *winOver = _overwins->GetWindow(wby + wbx);
 
       int i = by * nBlkX + bx;
@@ -1463,7 +1520,7 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
   for (int by = td._y_beg; by < td._y_end; ++by)
   {
     int xx = 0; // index
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       int i = by * nBlkX + bx;
       const BYTE *ref_data_ptr_arr[MAX_TEMP_RAD * 2]; // vs: const uint8_t *pointers[radius * 2]; // Moved by the degrain function. 
@@ -1501,7 +1558,7 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
       //xx += nBlkSizeX; // blksize of Y plane, that's why there is xx >> xRatioUVlog above
       xx += (nBlkSizeX >> nLogxRatioUV_super); // xx: indexing offset
 
-      if (bx == nBlkX - 1 && _covered_width < nWidth) // right non-covered region
+      if (bx == nBlkXP - 1 && _covered_width < nWidthP) // right non-covered region
       {
         // chroma
         if (_out16_flag) {
@@ -1509,14 +1566,14 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
           plane_copy_8_to_16_c(
             pDstCur + ((_covered_width >> nLogxRatioUV_super) << pixelsize_output_shift), _dst_pitch_arr[P],
             pSrcCur + ((_covered_width >> nLogxRatioUV_super) << pixelsize_super_shift), _src_pitch_arr[P],
-            (nWidth - _covered_width) >> nLogxRatioUV_super/* real row_size */, rowsize /* bad name. it's height = nBlkSizeY >> nLogyRatioUV_super*/
+            (nWidthP - _covered_width) >> nLogxRatioUV_super/* real row_size */, rowsize /* bad name. it's height = nBlkSizeY >> nLogyRatioUV_super*/
           );
         }
         else {
           BitBlt(
             pDstCur + ((_covered_width >> nLogxRatioUV_super) << pixelsize_super_shift), _dst_pitch_arr[P],
             pSrcCur + ((_covered_width >> nLogxRatioUV_super) << pixelsize_super_shift), _src_pitch_arr[P],
-            ((nWidth - _covered_width) >> nLogxRatioUV_super) << pixelsize_super_shift /* real row_size */, rowsize /* bad name. it's height = nBlkSizeY >> nLogyRatioUV_super*/
+            ((nWidthP - _covered_width) >> nLogxRatioUV_super) << pixelsize_super_shift /* real row_size */, rowsize /* bad name. it's height = nBlkSizeY >> nLogyRatioUV_super*/
           );
         }
       }
@@ -1525,7 +1582,7 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
     pDstCur += effective_nDstPitch;
     pSrcCur += effective_nSrcPitch;
 
-    if (by == nBlkY - 1 && _covered_height < nHeight) // bottom uncovered region
+    if (by == nBlkYP - 1 && _covered_height < nHeightP) // bottom uncovered region
     {
       // chroma
       if (_out16_flag) {
@@ -1533,14 +1590,14 @@ void	MDegrainN::process_chroma_normal_slice(Slicer::TaskData &td)
         plane_copy_8_to_16_c(
           pDstCur, _dst_pitch_arr[P],
           pSrcCur, _src_pitch_arr[P],
-          nWidth >> nLogxRatioUV_super, (nHeight - _covered_height) >> nLogyRatioUV_super /* height */
+          nWidthP >> nLogxRatioUV_super, (nHeightP - _covered_height) >> nLogyRatioUV_super /* height */
         );
       }
       else {
         BitBlt(
           pDstCur, _dst_pitch_arr[P],
           pSrcCur, _src_pitch_arr[P],
-          (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeight - _covered_height) >> nLogyRatioUV_super /* height */
+          (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeightP - _covered_height) >> nLogyRatioUV_super /* height */
         );
       }
     }
@@ -1555,7 +1612,7 @@ void	MDegrainN::process_chroma_overlap_slice(Slicer::TaskData &td)
   assert(&td != 0);
 
   if (nOverlapY == 0
-    || (td._y_beg == 0 && td._y_end == nBlkY))
+    || (td._y_beg == 0 && td._y_end == nBlkYP))
   {
     process_chroma_overlap_slice <P>(td._y_beg, td._y_end);
   }
@@ -1578,7 +1635,7 @@ void	MDegrainN::process_chroma_overlap_slice(Slicer::TaskData &td)
     }
 
     int				cnt_bot = 2;
-    if (td._y_end < nBlkY)
+    if (td._y_end < nBlkYP)
     {
       cnt_bot = conc::AtomicIntOp::exec_new(
         _boundary_cnt_arr[td._y_end],
@@ -1620,13 +1677,13 @@ void	MDegrainN::process_chroma_overlap_slice(int y_beg, int y_end)
     6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
     */
 
-    int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
+    int wby = (by == 0) ? 0 * 3 : (by == nBlkYP - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
     int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-    for (int bx = 0; bx < nBlkX; ++bx)
+    for (int bx = 0; bx < nBlkXP; ++bx)
     {
       // select window
       // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-      int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
+      int wbx = (bx == 0) ? 0 : (bx == nBlkXP - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
       short *winOverUV = _overwins_uv->GetWindow(wby + wbx);
 
       int i = by * nBlkX + bx;

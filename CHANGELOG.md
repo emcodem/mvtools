@@ -1,4 +1,52 @@
 Change log
+- 2.7.49 (20261114)
+  - Fix: MScaleVect crashed (access violation) on vector clips made with divide>0 (MAnalyse, MRecalculate), modes 0 and 1.
+    The length word 0xFFFFFFFF of the divided sub-block level (since 2.7.14.22) made the level walk step backwards
+    and run past the frame. Mode 2 stopped with "Internal error": it used the divided (halved) block geometry for
+    all levels, now the non-divided levels use the original block size, overlap and block count.
+    MScaleVect now checks the level lengths and block counts before writing (error instead of memory overrun).
+  - Fix: MShow wrote outside the frame when the vector lines left it (scale>1, or vectors with larger padding than
+    the super clip, e.g. after MScaleVect). The lines are now clipped to the frame. The horizontal offset now uses
+    the padding of the super clip (was the padding of the vectors, the vertical one was already the super clip's).
+  - Fix: MShow number=(block count) read past the blocks, the number highlight had width and height swapped
+    (non-square blocks), and it is clipped to the frame.
+  - New (#28): MSuper edgepad, edgepadV parameters: process the right / bottom pixels not covered by whole blocks.
+    With an edge padding in the super clip MAnalyse and MRecalculate add one block column / row reaching beyond the
+    frame edge into the padding (flagged in the vector clip); MDegrain1-6, MDegrainN, MCompensate, MBlockFps, MFlow,
+    MFlowInter, MFlowFps, MFlowBlur, MMask, MSCDetection, MShow, MDepan and MScaleVect process these vectors.
+    Without edgepad, and for frames covered by whole blocks, the results are unchanged.
+  - Mod: vector clips with different block counts are rejected in one filter ("block count is incorrect"), e.g.
+    vectors from super clips with and without edgepad.
+  - Mod: MSuper: faster padding of the super planes (the top / bottom border is copied row by row).
+  - Internal: the super clip parameters are kept in a process-wide registry, the super clip carries its index
+    (vi.sample_type); the legacy 8 bytes in num_audio_samples are still written.
+  - Fix: MDepan with a mask clip: the motion data could differ from run to run. With range > 0 it also depended on
+    the frame request order (seeking, multithreading), and the frames in the range were estimated with the mask of
+    the requested frame. Causes: the neighbour check of the blocks read outside the block arrays for the top and
+    bottom block rows (only with a mask, without it the border blocks are skipped); the mask was fetched for the
+    requested frame only; the sign of the near-zero motion marker (0.011) was random. Now the mask of each estimated
+    frame is used.
+  - Fix: MFlowBlur: when the blocks do not cover the frame (frame size not fitting the block size and overlap), a
+    moving object on a still background got its blur "halo" offset towards the bottom-right instead of on the
+    object: the still background right of / below it was blurred, the object's left / top edge stayed sharp. The
+    offset grew from 0 at the left / top to almost one block step at the right / bottom frame edge. Cause: the
+    vector field of the blocks was stretched over the whole frame. Now the block grid is extended by repeated edge
+    vectors to cover the frame, as MFlow, MFlowInter and MFlowFps do.
+  - Fix: MSuper: hpad, vpad not a multiple of the chroma subsampling (e.g. hpad=1 with 4:2:0 or 4:2:2, hpad=2 with
+    4:1:1) are rejected. The chroma padding was rounded down (hpad=1: no chroma padding), and a vector near the
+    frame edge could read chroma outside the padded area. Not checked with chroma=false.
+  - Fix: MAnalyse temporal=true did not work: on the finest level the temporal predictor was a zero vector. Only a
+    quarter of the previous frame's vector data was kept (the size in ints was used as a byte count, already in
+    2.6.0.5). The whole vector data is used now; the output with temporal=true changes.
+  - Mod: MAnalyse temporal=true: the vectors of the last 8 analysed frames are kept, so the temporal predictor is also
+    found when the frames are not requested in order (was: only when frame n-1 was the last analysed frame, i.e.
+    strictly linear access). E.g. MDegrain6 with Prefetch(16): no temporal predictor for 2.1% of the analysed frames
+    instead of 3.6%, with Prefetch(8) 0.5% instead of 1.8%.
+  - Fix: MAnalyse mt=true (internal multithreading with avstp.dll): the output could differ from run to run (rarely,
+    when many blocks are above badSAD). The bad block counter, which raises the badSAD threshold of the wide search
+    (badrange), was shared by the parallel slices, so whether a block got the wide search depended on the thread
+    timing. It is counted per slice now: the result is the same in every run (for a given avstp thread count).
+
 - 2.7.48 (20261029)
   - Feature request #68: adding search_coarse from SVP fork: MAnalyse: new parameters search_coarse.
   - MAnalyse: Add parameter trymanyall, which allows trymany for the finest level as well (default false to not decrease speed)

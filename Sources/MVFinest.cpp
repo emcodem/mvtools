@@ -26,7 +26,7 @@
 #include "MVGroupOfFrames.h"
 #include "MVPlane.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
 
 
 MVFinest::MVFinest(PClip _super, bool _isse, IScriptEnvironment* env, bool allow_lite) :
@@ -39,8 +39,7 @@ GenericVideoFilter(_super), _lite(false), _mt(true)
   cpuFlags = _isse ? env->GetCPUFlags() : 0;
 
   // get parameters of prepared super clip - v2.0
-  SuperParams64Bits params;
-  memcpy(&params, &child->GetVideoInfo().num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(child->GetVideoInfo());
   _lite = MV_SUPER_IS_LITE(params);
   if (_lite && !allow_lite)
     env->ThrowError("MFinest: the super clip was made with CudaMSuper (picture only, for the Cuda* filters); make a super clip with MSuper for this filter");
@@ -53,8 +52,9 @@ GenericVideoFilter(_super), _lite(false), _mt(true)
   nPel = nSuperPel;
   nSuperWidth = _super->GetVideoInfo().width;
   nSuperHeight = _super->GetVideoInfo().height;
-  int nWidth = nSuperWidth - 2*nSuperHPad;
-  int nHeight = nHeightS;
+  // the super planes are built for (the finest frame is made of them) the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
+  int nWidth = params.LayoutWidth();
+  int nHeight = params.LayoutHeight();
     int xRatioUV;
     int yRatioUV;
     if(!ClipFnc::is_grey(vi) && !vi.IsRGB()) {

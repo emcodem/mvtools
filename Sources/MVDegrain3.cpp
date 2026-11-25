@@ -26,7 +26,9 @@
 #include "MVPlane.h"
 #include "Padding.h"
 #include "profile.h"
-#include "SuperParams64Bits.h"
+#include "SuperParams.h"
+#include "PlaneExtend.h"
+#include <algorithm>
 #include "CopyCode.h"
 #include "overlap.h"
 #include <stdint.h>
@@ -223,7 +225,8 @@ MVDegrainX::MVDegrainX(
   _level == 1 ? "MDegrain1" : (_level == 2 ? "MDegrain2" : (_level == 3 ? "MDegrain3" : (_level == 4 ? "MDegrain4" : (_level == 5 ? "MDegrain5" : "MDegrain6")))),
   env_ptr,
   (!_mvfw) ? _level * 2 : 1, 
-  (!_mvfw) ? _level * 2 - 1 : 0) // 1/3/5
+  (!_mvfw) ? _level * 2 - 1 : 0, // 1/3/5
+  true) // edge blocks supported
   , super(_super)
   , out16_flag(_out16_flag)
   , level( _level )
@@ -337,8 +340,7 @@ MVDegrainX::MVDegrainX(
   thSADC_sq = (double)thSADC * thSADC;
 
   // get parameters of prepared super clip - v2.0
-  SuperParams64Bits params;
-  memcpy(&params, &vi_super.num_audio_samples, 8);
+  const SuperParams params = GetSuperParams(vi_super);
   // a lite super (CudaMSuper): the GPU path reads its token pictures, the CPU path completes the frames
   _super_lite = MV_SUPER_IS_LITE(params);
   int nHeightS = params.nHeight;
@@ -347,19 +349,45 @@ MVDegrainX::MVDegrainX(
   int nSuperPel = params.nPel;
   nSuperModeYUV = params.nModeYUV;
   int nSuperLevels = params.nLevels;
+  // the super planes are built for the layout size: the frame plus the MSuper edgepad extension (SuperParams.h)
   for (int i = 0; i < level; i++) {
-    pRefBGOF[i] = new MVGroupOfFrames(nSuperLevels, nWidth, nHeight, nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUV_super, yRatioUV_super, pixelsize_super, bits_per_pixel_super, _mt_flag);
-    pRefFGOF[i] = new MVGroupOfFrames(nSuperLevels, nWidth, nHeight, nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUV_super, yRatioUV_super, pixelsize_super, bits_per_pixel_super, _mt_flag);
+    pRefBGOF[i] = new MVGroupOfFrames(nSuperLevels, params.LayoutWidth(), params.LayoutHeight(), nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUV_super, yRatioUV_super, pixelsize_super, bits_per_pixel_super, _mt_flag);
+    pRefFGOF[i] = new MVGroupOfFrames(nSuperLevels, params.LayoutWidth(), params.LayoutHeight(), nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV, cpuFlags, xRatioUV_super, yRatioUV_super, pixelsize_super, bits_per_pixel_super, _mt_flag);
   }
-  int nSuperWidth = vi_super.width;
-
+  // params.nWidth / nHeight: the real frame size, without the edgepad extension of the super planes
   if (nHeight != nHeightS
     || nHeight != vi.height
-    || nWidth != nSuperWidth - nSuperHPad * 2
+    || nWidth != params.nWidth
     || nWidth != vi.width
     || nPel != nSuperPel) // PF180227 why to check this one?
   {
     env_ptr->ThrowError("MDegrainX : wrong source or super frame size");
+  }
+
+  // Blocks beyond the frame edge (MOTION_EDGE_BLOCKS): the reference blocks of the edge blocks reach into the edge
+  // padding of the super clip given here; without enough padding only the blocks inside the frame are processed.
+  {
+    const int grid_w = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
+    const int grid_h = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+    edge_ext = false;
+    nBlkXP = nBlkX;
+    nBlkYP = nBlkY;
+    if (grid_w > nWidth || grid_h > nHeight)
+    {
+      if (params.nEdgePadX >= grid_w - nWidth && params.nEdgePadY >= grid_h - nHeight)
+        edge_ext = true;
+      else
+      {
+        nBlkXP = std::min(nBlkX, (nWidth - nOverlapX) / (nBlkSizeX - nOverlapX));
+        nBlkYP = std::min(nBlkY, (nHeight - nOverlapY) / (nBlkSizeY - nOverlapY));
+      }
+    }
+    nWidthP = edge_ext ? grid_w : nWidth;
+    nHeightP = edge_ext ? grid_h : nHeight;
+    // source frame format, processing size
+    vi_src_ext = vi;
+    vi_src_ext.width = nWidthP;
+    vi_src_ext.height = nHeightP;
   }
 
   if (out16_flag) {
@@ -379,7 +407,7 @@ MVDegrainX::MVDegrainX(
     pixelsize_output_shift = ilog2(pixelsize_output);
   }
 
-  dstShortPitch = ((nWidth + 15) / 16) * 16;  // short (2 byte) granularity
+  dstShortPitch = ((nWidthP + 15) / 16) * 16;  // short (2 byte) granularity
   dstIntPitch = dstShortPitch; // int (4 byte) granularity, 4*16
   if (nOverlapX > 0 || nOverlapY > 0)
   {
@@ -387,11 +415,11 @@ MVDegrainX::MVDegrainX(
     OverWinsUV = new OverlapWindows(nBlkSizeX >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super, nOverlapX >> nLogxRatioUV_super, nOverlapY >> nLogyRatioUV_super);
     if (pixelsize_output > 1)
     {
-      DstInt = (int *)_aligned_malloc(dstIntPitch * nHeight * sizeof(int), 32); // also for float sizeof(int)==sizeof(float)
+      DstInt = (int *)_aligned_malloc(dstIntPitch * nHeightP * sizeof(int), 32); // also for float sizeof(int)==sizeof(float)
     }
     else
     {
-      DstShort = (uint16_t *)_aligned_malloc(dstShortPitch * nHeight * sizeof(short), 32); 
+      DstShort = (uint16_t *)_aligned_malloc(dstShortPitch * nHeightP * sizeof(short), 32); 
     }
   }
 
@@ -491,6 +519,7 @@ MVDegrainX::MVDegrainX(
     GpuCheck c(names[ni], cpu_names[ni]);
     c.need(level >= 1 && level <= MVCUDA_MAX_DEGRAIN, "only radius 1 to 6")
       .need(_super_lite, "the super clip must come from CudaMSuper")
+      .need(!_edge_blocks, "vectors of an MSuper with edgepad are not supported")
       .need(pixelsize_super == 1 || pixelsize_super == 2, "only 8 to 16 bit integer formats")
       .need(nPel == 1 || nPel == 2, "only pel 1 or 2")
       .need(!out16_flag, "out16 / lsb are not supported")
@@ -516,6 +545,10 @@ MVDegrainX::MVDegrainX(
     else if (vi.IsYV24())
       vi.pixel_type = VideoInfo::CS_YUV444P16;
   }
+  // output frame format, processing size
+  vi_dst_ext = vi;
+  vi_dst_ext.width = nWidthP;
+  vi_dst_ext.height = nHeightP;
 }
 
 
@@ -721,8 +754,8 @@ PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
 // MDegrain's own (CPU) frame n
 PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
 {
-  int nWidth_B = nBlkX*(nBlkSizeX - nOverlapX) + nOverlapX;
-  int nHeight_B = nBlkY*(nBlkSizeY - nOverlapY) + nOverlapY;
+  int nWidth_B = nBlkXP*(nBlkSizeX - nOverlapX) + nOverlapX;
+  int nHeight_B = nBlkYP*(nBlkSizeY - nOverlapY) + nOverlapY;
 
   BYTE *pDst[3], *pDstCur[3];
   const BYTE *pSrcCur[3];
@@ -771,6 +804,29 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
   nSrcPitches[0] = YPITCH(src);
   nSrcPitches[1] = UPITCH(src);
   nSrcPitches[2] = VPITCH(src);
+
+  // Blocks beyond the frame edge with enough super padding (edge_ext): the planes are processed on frames of the
+  // block grid size. The source frame is extended by repeating its edge pixels (as the super padding does), the
+  // result is cropped back into dst at the end. Everything else works as for a frame covered by whole blocks.
+  const int planecount = ClipFnc::is_grey(vi) ? 1 : 3;
+  PVideoFrame srcExt, dstExt;
+  if (edge_ext)
+  {
+    srcExt = extend_frame(src, vi_src_ext, nWidth, nHeight, planecount, nLogxRatioUV_super, nLogyRatioUV_super, env);
+    dstExt = env->NewVideoFrame(vi_dst_ext);
+    pDst[0] = YWPLAN(dstExt);
+    pDst[1] = UWPLAN(dstExt);
+    pDst[2] = VWPLAN(dstExt);
+    nDstPitches[0] = YPITCH(dstExt);
+    nDstPitches[1] = UPITCH(dstExt);
+    nDstPitches[2] = VPITCH(dstExt);
+    pSrc[0] = YRPLAN(srcExt);
+    pSrc[1] = URPLAN(srcExt);
+    pSrc[2] = VRPLAN(srcExt);
+    nSrcPitches[0] = YPITCH(srcExt);
+    nSrcPitches[1] = UPITCH(srcExt);
+    nSrcPitches[2] = VPITCH(srcExt);
+  }
 
   PVideoFrame refB[MAX_DEGRAIN], refF[MAX_DEGRAIN];
 
@@ -861,10 +917,10 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
   {
     if (out16_flag) {
       // copy 8 bit source to 16bit target
-      plane_copy_8_to_16_c(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidth, nHeight);
+      plane_copy_8_to_16_c(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidthP, nHeightP);
     }
     else {
-      BitBlt(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidth << pixelsize_super_shift, nHeight);
+      BitBlt(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidthP << pixelsize_super_shift, nHeightP);
     }
   }
 
@@ -875,10 +931,10 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
 
     if (nOverlapX == 0 && nOverlapY == 0)
     {
-      for (int by = 0; by < nBlkY; by++)
+      for (int by = 0; by < nBlkYP; by++)
       {
         int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-        for (int bx = 0; bx < nBlkX; bx++)
+        for (int bx = 0; bx < nBlkXP; bx++)
         {
           int i = by*nBlkX + bx;
           const BYTE * pB[MAX_DEGRAIN], *pF[MAX_DEGRAIN];
@@ -901,17 +957,17 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
 
           xx += nBlkSizeX; // xx: indexing offset
 
-          if (bx == nBlkX - 1 && nWidth_B < nWidth) // right non-covered region
+          if (bx == nBlkXP - 1 && nWidth_B < nWidthP) // right non-covered region
           {
             if (out16_flag) {
               // copy 8 bit source to 16bit target
               plane_copy_8_to_16_c(pDstCur[0] + (nWidth_B << pixelsize_output_shift), nDstPitches[0], 
-                pSrcCur[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0], (nWidth - nWidth_B), nBlkSizeY);
+                pSrcCur[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0], (nWidthP - nWidth_B), nBlkSizeY);
             }
             else {
               // luma
               BitBlt(pDstCur[0] + (nWidth_B << pixelsize_super_shift), nDstPitches[0],
-                pSrcCur[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0], (nWidth - nWidth_B) << pixelsize_super_shift, nBlkSizeY);
+                pSrcCur[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0], (nWidthP - nWidth_B) << pixelsize_super_shift, nBlkSizeY);
             }
           }
         }	// for bx
@@ -919,15 +975,15 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
         pDstCur[0] += (nBlkSizeY) * (nDstPitches[0]);
         pSrcCur[0] += (nBlkSizeY) * (nSrcPitches[0]);
 
-        if (by == nBlkY - 1 && nHeight_B < nHeight) // bottom uncovered region
+        if (by == nBlkYP - 1 && nHeight_B < nHeightP) // bottom uncovered region
         {
           if (out16_flag) {
             // copy 8 bit source to 16bit target
-            plane_copy_8_to_16_c(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidth, nHeight - nHeight_B);
+            plane_copy_8_to_16_c(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidthP, nHeightP - nHeight_B);
           }
           else {
             // luma
-            BitBlt(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidth << pixelsize_super_shift, nHeight - nHeight_B);
+            BitBlt(pDstCur[0], nDstPitches[0], pSrcCur[0], nSrcPitches[0], nWidthP << pixelsize_super_shift, nHeightP - nHeight_B);
           }
         }
       }	// for by
@@ -952,7 +1008,7 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
           nWidth_B * sizeof(short), nHeight_B, 0, 0, dstShortPitch * sizeof(short));
       }
 
-      for (int by = 0; by < nBlkY; by++)
+      for (int by = 0; by < nBlkYP; by++)
       {
         // indexing overlap windows weighting table: top=0 middle=3 bottom=6
         /*
@@ -961,13 +1017,13 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
         6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
         */
 
-        int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
+        int wby = (by == 0) ? 0 * 3 : (by == nBlkYP - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
         int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-        for (int bx = 0; bx < nBlkX; ++bx)
+        for (int bx = 0; bx < nBlkXP; ++bx)
         {
           // select window
           // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-          int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
+          int wbx = (bx == 0) ? 0 : (bx == nBlkXP - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
           short* winOver = OverWins->GetWindow(wby + wbx);
 
           int i = by * nBlkX + bx;
@@ -1047,32 +1103,32 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
         Short2Bytes_FloatInInt32ArrayToFloat((float *)(pDst[0]), nDstPitches[0], (float *)DstInt, dstIntPitch, nWidth_B, nHeight_B);
       }
 
-      if (nWidth_B < nWidth) // right side non-covered region
+      if (nWidth_B < nWidthP) // right side non-covered region
       {
         if (out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(pDst[0] + (nWidth_B << pixelsize_output_shift), nDstPitches[0],
             pSrc[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0],
-            (nWidth - nWidth_B), nHeight_B);
+            (nWidthP - nWidth_B), nHeight_B);
         }
         else {
           BitBlt(pDst[0] + (nWidth_B << pixelsize_super_shift), nDstPitches[0],
             pSrc[0] + (nWidth_B << pixelsize_super_shift), nSrcPitches[0],
-            (nWidth - nWidth_B) << pixelsize_super_shift, nHeight_B);
+            (nWidthP - nWidth_B) << pixelsize_super_shift, nHeight_B);
         }
       }
-      if (nHeight_B < nHeight) // bottom noncovered region
+      if (nHeight_B < nHeightP) // bottom noncovered region
       {
         if (out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(pDst[0] + nHeight_B * nDstPitches[0], nDstPitches[0],
             pSrc[0] + nHeight_B * nSrcPitches[0], nSrcPitches[0],
-            nWidth, nHeight - nHeight_B);
+            nWidthP, nHeightP - nHeight_B);
         }
         else {
           BitBlt(pDst[0] + nHeight_B * nDstPitches[0], nDstPitches[0],
             pSrc[0] + nHeight_B * nSrcPitches[0], nSrcPitches[0],
-            nWidth << pixelsize_super_shift, nHeight - nHeight_B);
+            nWidthP << pixelsize_super_shift, nHeightP - nHeight_B);
         }
       }
     }	// overlap end
@@ -1087,7 +1143,7 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
       else
         realLimit = nLimit / 255.0f;
 
-      LimitFunction(pDst[0], nDstPitches[0], pSrc[0], nSrcPitches[0], nWidth, nHeight, realLimit);
+      LimitFunction(pDst[0], nDstPitches[0], pSrc[0], nSrcPitches[0], nWidthP, nHeightP, realLimit);
     }
   }
 
@@ -1125,6 +1181,8 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
 
   PROFILE_STOP(MOTION_PROFILE_COMPENSATION);
 
+  if (edge_ext)
+    crop_frame_into(dst, dstExt, nWidth, nHeight, planecount, nLogxRatioUV_super, nLogyRatioUV_super, pixelsize_output, env);
 
   ClipFnc::copy_alpha(dst, src, vi, env);
   return dst;
@@ -1140,10 +1198,10 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
   {
     if (out16_flag) {
       // copy 8 bit source to 16bit target
-      plane_copy_8_to_16_c(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidth >> nLogxRatioUV_super), nHeight >> nLogyRatioUV_super);
+      plane_copy_8_to_16_c(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidthP >> nLogxRatioUV_super), nHeightP >> nLogyRatioUV_super);
     }
     else {
-      BitBlt(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, nHeight >> nLogyRatioUV_super);
+      BitBlt(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, nHeightP >> nLogyRatioUV_super);
     }
   }
 
@@ -1156,10 +1214,10 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
       int effective_nSrcPitch = (nBlkSizeY >> nLogyRatioUV_super) * nSrcPitch; // pitch is byte granularity
       int effective_nDstPitch = (nBlkSizeY >> nLogyRatioUV_super) * nDstPitch; // pitch is short granularity
 
-      for (int by = 0; by < nBlkY; by++)
+      for (int by = 0; by < nBlkYP; by++)
       {
         int xx = 0; // index
-        for (int bx = 0; bx < nBlkX; bx++)
+        for (int bx = 0; bx < nBlkXP; bx++)
         {
           int i = by*nBlkX + bx;
           const BYTE * pBV[MAX_DEGRAIN], *pFV[MAX_DEGRAIN];
@@ -1181,17 +1239,17 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
 
           xx += (nBlkSizeX >> nLogxRatioUV_super); // xx: indexing offset
 
-          if (bx == nBlkX - 1 && nWidth_B < nWidth) // right non-covered region
+          if (bx == nBlkXP - 1 && nWidth_B < nWidthP) // right non-covered region
           {
             if (out16_flag) {
               // copy 8 bit source to 16bit target
               plane_copy_8_to_16_c(pDstCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_output_shift), nDstPitch,
-                pSrcCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch, (nWidth - nWidth_B) >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super);
+                pSrcCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch, (nWidthP - nWidth_B) >> nLogxRatioUV_super, nBlkSizeY >> nLogyRatioUV_super);
             }
             else {
               // chroma
               BitBlt(pDstCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nDstPitch,
-                pSrcCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch, ((nWidth - nWidth_B) >> nLogxRatioUV_super) << pixelsize_super_shift, nBlkSizeY >> nLogyRatioUV_super);
+                pSrcCur + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch, ((nWidthP - nWidth_B) >> nLogxRatioUV_super) << pixelsize_super_shift, nBlkSizeY >> nLogyRatioUV_super);
             }
           }
         }	// for bx
@@ -1199,15 +1257,15 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
         pDstCur += effective_nDstPitch;
         pSrcCur += effective_nSrcPitch;
 
-        if (by == nBlkY - 1 && nHeight_B < nHeight) // bottom uncovered region
+        if (by == nBlkYP - 1 && nHeight_B < nHeightP) // bottom uncovered region
         {
           if (out16_flag) {
             // copy 8 bit source to 16bit target
-            plane_copy_8_to_16_c(pDstCur, nDstPitch, pSrcCur, nSrcPitch, nWidth >> nLogxRatioUV_super , (nHeight - nHeight_B) >> nLogyRatioUV_super);
+            plane_copy_8_to_16_c(pDstCur, nDstPitch, pSrcCur, nSrcPitch, nWidthP >> nLogxRatioUV_super , (nHeightP - nHeight_B) >> nLogyRatioUV_super);
           }
           else {
             // chroma
-            BitBlt(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeight - nHeight_B) >> nLogyRatioUV_super);
+            BitBlt(pDstCur, nDstPitch, pSrcCur, nSrcPitch, (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeightP - nHeight_B) >> nLogyRatioUV_super);
           }
         }
       }	// for by
@@ -1236,7 +1294,7 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
       int effective_dstShortPitch = ((nBlkSizeY - nOverlapY) >> nLogyRatioUV_super) * dstShortPitch; // pitch is short granularity
       int effective_dstIntPitch = ((nBlkSizeY - nOverlapY) >> nLogyRatioUV_super) * dstIntPitch; // pitch is int granularity
 
-      for (int by = 0; by < nBlkY; by++)
+      for (int by = 0; by < nBlkYP; by++)
       {
         // indexing overlap windows weighting table: top=0 middle=3 bottom=6
         /*
@@ -1245,13 +1303,13 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
         6 = Bottom Left 7 = Bottom Middle 8 = Bottom Right
         */
 
-        int wby = (by == 0) ? 0 * 3 : (by == nBlkY - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
+        int wby = (by == 0) ? 0 * 3 : (by == nBlkYP - 1) ? 2 * 3 : 1 * 3; // 0 for very first, 2*3 for very last, 1*3 for all others in the middle
         int xx = 0; // logical offset. Mul by 2 for pixelsize_super==2. Don't mul for indexing int* array
-        for (int bx = 0; bx < nBlkX; ++bx)
+        for (int bx = 0; bx < nBlkXP; ++bx)
         {
           // select window
           // indexing overlap windows weighting table: left=+0 middle=+1 rightmost=+2
-          int wbx = (bx == 0) ? 0 : (bx == nBlkX - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
+          int wbx = (bx == 0) ? 0 : (bx == nBlkXP - 1) ? 2 : 1; // 0 for very first, 2 for very last, 1 for all others in the middle
           short* winOverUV = OverWinsUV->GetWindow(wby + wbx);
 
           int i = by * nBlkX + bx;
@@ -1329,32 +1387,32 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
       {
         Short2Bytes_FloatInInt32ArrayToFloat((float *)(pDst), nDstPitch, (float *)DstInt, dstIntPitch, nWidth_B >> nLogxRatioUV_super, nHeight_B >> nLogyRatioUV_super);
       }      
-      if (nWidth_B < nWidth)
+      if (nWidth_B < nWidthP)
       {
         if (out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(pDst + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_output_shift), nDstPitch,
             pSrc + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch,
-            (nWidth - nWidth_B) >> nLogxRatioUV_super, nHeight_B >> nLogyRatioUV_super);
+            (nWidthP - nWidth_B) >> nLogxRatioUV_super, nHeight_B >> nLogyRatioUV_super);
         }
         else {
           BitBlt(pDst + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nDstPitch,
             pSrc + ((nWidth_B >> nLogxRatioUV_super) << pixelsize_super_shift), nSrcPitch,
-            ((nWidth - nWidth_B) >> nLogxRatioUV_super) << pixelsize_super_shift, nHeight_B >> nLogyRatioUV_super);
+            ((nWidthP - nWidth_B) >> nLogxRatioUV_super) << pixelsize_super_shift, nHeight_B >> nLogyRatioUV_super);
         }
       }
-      if (nHeight_B < nHeight) // bottom noncovered region
+      if (nHeight_B < nHeightP) // bottom noncovered region
       {
         if (out16_flag) {
           // copy 8 bit source to 16bit target
           plane_copy_8_to_16_c(pDst + (nDstPitch * (nHeight_B >> nLogyRatioUV_super)), nDstPitch,
             pSrc + (nSrcPitch * (nHeight_B >> nLogyRatioUV_super)), nSrcPitch,
-            (nWidth >> nLogxRatioUV_super), (nHeight - nHeight_B) >> nLogyRatioUV_super);
+            (nWidthP >> nLogxRatioUV_super), (nHeightP - nHeight_B) >> nLogyRatioUV_super);
         }
         else {
           BitBlt(pDst + (nDstPitch * (nHeight_B >> nLogyRatioUV_super)), nDstPitch,
             pSrc + (nSrcPitch * (nHeight_B >> nLogyRatioUV_super)), nSrcPitch,
-            (nWidth >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeight - nHeight_B) >> nLogyRatioUV_super);
+            (nWidthP >> nLogxRatioUV_super) << pixelsize_super_shift, (nHeightP - nHeight_B) >> nLogyRatioUV_super);
         }
       }
     }	// overlap - end
@@ -1367,7 +1425,7 @@ void MVDegrainX::process_chroma(int plane_mask, BYTE *pDst, BYTE *pDstCur, int n
         realLimit = nLimitC * (1 << (bits_per_pixel_output - 8));
       else
         realLimit = nLimitC / 255.0f;
-      LimitFunction(pDst, nDstPitch, pSrc, nSrcPitch, nWidth >> nLogxRatioUV_super, nHeight >> nLogyRatioUV_super, realLimit);
+      LimitFunction(pDst, nDstPitch, pSrc, nSrcPitch, nWidthP >> nLogxRatioUV_super, nHeightP >> nLogyRatioUV_super, realLimit);
     }
   }
 }

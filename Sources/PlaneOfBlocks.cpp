@@ -262,6 +262,20 @@ PlaneOfBlocks::PlaneOfBlocks(int _nBlkX, int _nBlkY, int _nBlkSizeX, int _nBlkSi
 
 
 
+int PlaneOfBlocks::search_area_width(MVFrame *pFrame) const
+{
+  const int grid_end = nBlkX * (nBlkSizeX - nOverlapX) + nOverlapX;
+  return std::max(pFrame->GetPlane(YPLANE)->GetRealWidth(), grid_end);
+}
+
+int PlaneOfBlocks::search_area_height(MVFrame *pFrame) const
+{
+  const int grid_end = nBlkY * (nBlkSizeY - nOverlapY) + nOverlapY;
+  return std::max(pFrame->GetPlane(YPLANE)->GetRealHeight(), grid_end);
+}
+
+
+
 PlaneOfBlocks::~PlaneOfBlocks()
 {
   // Nothing
@@ -357,7 +371,6 @@ void PlaneOfBlocks::SearchMVs(
 
   penaltyZero = _pzero;
   pglobal = _pglobal;
-  badcount = 0;
   tryMany = _tryMany;
   planeSAD = 0;
   sumLumaChange = 0;
@@ -384,7 +397,13 @@ void PlaneOfBlocks::SearchMVs(
     (int)searchType, nSearchParam, _meander_flag ? 1 : 0, temporal ? 1 : 0, tryMany ? 1 : 0,
     _glob_mv_pred_def.x, _glob_mv_pred_def.y, (int)_glob_mv_pred_def.sad, zeroMVfieldShifted.y);
 
-  Slicer			slicer(_mt_flag); // fixme: mt bug
+  // Internal multithreading (mt=true, avstp.dll found): the block rows are cut into horizontal slices, one per avstp
+  // thread (MTSlicer: nBlkY rows split evenly, the thread count is the number of logical CPUs unless set by
+  // avstp_set_threads), and the slices are searched in parallel. A slice uses only data of its own rows (see
+  // FetchPredictors, nLambda in search_mv_slice, badcount in PseudoEPZSearch), so the result does not depend on the
+  // order the threads run: it is the same in every run on one machine. It does depend on where the slice borders are:
+  // the vectors differ from mt=false (one slice) and between machines with a different avstp thread count.
+  Slicer			slicer(_mt_flag);
   if(bits_per_pixel == 8)
     slicer.start(nBlkY, *this, &PlaneOfBlocks::search_mv_slice<uint8_t>, 4);
   else
@@ -714,12 +733,13 @@ void PlaneOfBlocks::FetchPredictors(WorkingArea &workarea)
     workarea.predictors[1] = ClipMV(workarea, zeroMVfieldShifted); // v1.11.1 - values instead of pointer
   }
 
-  // fixme note:
-  // MAnalyze mt-inconsistency reason #1
-  // this is _not_ internal mt friendly, since here up or bottom predictors
-  // are omitted for top/bottom data. Not non-mt case this happens only for
-  // the most top and bottom blocks.
-  // In vertically sliced multithreaded case it happens an _each_ top/bottom of the sliced block
+  // Up / bottom-right predictors: only from the rows of this slice (internal mt, see SearchMVs).
+  // The row above the slice is searched by another thread at the same time (its vectors may or may not be written
+  // yet), the row below the slice too (it holds the prediction from the coarser level until that thread overwrites
+  // it with its result). Reading them would make the result depend on the thread timing: different in each run.
+  // So the first / last row of each slice is handled like the top / bottom row of the frame (no up / bottom-right
+  // predictor). This depends only on the slice borders: the same in every run on one machine, but different from
+  // mt=false (there only the top / bottom row of the frame) and between machines with a different avstp thread count.
   const bool isTop = workarea.blky == workarea.blky_beg;
   const bool isBottom = workarea.blky == workarea.blky_end - 1;
     // Up predictor
@@ -737,6 +757,9 @@ void PlaneOfBlocks::FetchPredictors(WorkingArea &workarea)
     // and restarting again four times. Nasty bug it was.
     // !smallestPlane: use bottom right only if a coarser level exists or else we get random
     // crap from a previous frame.
+    // Why: the not yet searched row below holds the prediction from the coarser level (copied in before the
+    // search). The smallest plane has no coarser level, its vector array still holds the results of the frame this
+    // plane searched before, which depends on the frame request order (seeking, Prefetch) even without internal mt.
   // bottom-right predictor (from coarse level)
   if (!isBottom && 
     !smallestPlane && // v2.7.44
@@ -1022,19 +1045,18 @@ void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
 
   const int		BADCOUNT_LIMIT = 16;
 
-  // fixme note:
-  // MAnalyze mt-inconsistency reason #2
-  // 'badcount' can be increased in different order when multithreaded
-  // (processing vertically sliced vector data parallel)
-  // so the expression in the condition below can be different for each run
-  // depending on the order the parallel tasks increase badcount
+  // badcount: the number of bad blocks given the wide search so far. Each one raises the threshold (a soft limit on
+  // the time spent on wide searches). Counted per slice (workarea): with internal multithreading (mt=true, avstp)
+  // a counter shared by the slices would be increased in a different order in each run, and the same block could
+  // get the wide search in one run and not in the other (results differing from run to run). Per slice the result
+  // depends only on the slicing (the avstp thread count); with one slice it is the whole plane, as before.
 
   // bad vector, try wide search
   if (workarea.blkIdx > 1 + workarea.blky_beg * nBlkX
-    && foundSAD > (badSAD + badSAD*badcount / BADCOUNT_LIMIT))
+    && foundSAD > (badSAD + badSAD*workarea.badcount / BADCOUNT_LIMIT))
   {
     // with some soft limit (BADCOUNT_LIMIT) of bad cured vectors (time consumed)
-    ++badcount;
+    ++workarea.badcount;
 
     DebugPrintf(
       "bad  blk=%d x=%d y=%d sad=%d mean=%d iter=%d",
@@ -2924,6 +2946,7 @@ void	PlaneOfBlocks::search_mv_slice(Slicer::TaskData &td)
 
   workarea.planeSAD = 0; // for debug, plus fixme outer planeSAD is not used
   workarea.sumLumaChange = 0;
+  workarea.badcount = 0;
 
   int nBlkSizeX_Ovr[3] = { (nBlkSizeX - nOverlapX), (nBlkSizeX - nOverlapX) >> nLogxRatioUV, (nBlkSizeX - nOverlapX) >> nLogxRatioUV };
   int nBlkSizeY_Ovr[3] = { (nBlkSizeY - nOverlapY), (nBlkSizeY - nOverlapY) >> nLogyRatioUV, (nBlkSizeY - nOverlapY) >> nLogyRatioUV };
@@ -2991,12 +3014,10 @@ void	PlaneOfBlocks::search_mv_slice(Slicer::TaskData &td)
       }
 #endif	// ALIGN_SOURCEBLOCK
 
-      // fixme note:
-      // MAnalyze mt-inconsistency reason #3
-      // this is _not_ internal mt friendly
-      // because workarea.nLambda is set to 0 differently:
-      // In vertically sliced multithreaded case it happens an _each_ top of the sliced block
-      // In non-mt: only for the most top blocks
+      // No lambda (vector coherence penalty) for the first row: it has no up predictor, the predictor is not
+      // reliable enough to penalize the deviation from it. With internal mt this is the first row of each slice
+      // (see FetchPredictors: no rows of other slices are read): the same in every run on one machine, but
+      // different from mt=false and between machines with a different avstp thread count (see SearchMVs).
 
       if (workarea.blky == workarea.blky_beg)
       {
@@ -3018,8 +3039,12 @@ void	PlaneOfBlocks::search_mv_slice(Slicer::TaskData &td)
       int nHPaddingScaled = pSrcFrame->GetPlane(YPLANE)->GetHPadding() >> nLogScale;
       int nVPaddingScaled = pSrcFrame->GetPlane(YPLANE)->GetVPadding() >> nLogScale;
       /* computes search boundaries */
-      workarea.nDxMax = nPel * (pSrcFrame->GetPlane(YPLANE)->GetExtendedWidth() - workarea.x[0] - nBlkSizeX - pSrcFrame->GetPlane(YPLANE)->GetHPadding() + nHPaddingScaled);
-      workarea.nDyMax = nPel * (pSrcFrame->GetPlane(YPLANE)->GetExtendedHeight() - workarea.y[0] - nBlkSizeY - pSrcFrame->GetPlane(YPLANE)->GetVPadding() + nVPaddingScaled);
+      // right / bottom: measured from the search area width / height (the real plane area or the end of the block
+      // grid, see search_area_width), not from the whole plane, which may hold an edge padding (MSuper edgepad)
+      const int nSearchExtWidth = search_area_width(pSrcFrame) + 2 * pSrcFrame->GetPlane(YPLANE)->GetHPadding();
+      const int nSearchExtHeight = search_area_height(pSrcFrame) + 2 * pSrcFrame->GetPlane(YPLANE)->GetVPadding();
+      workarea.nDxMax = nPel * (nSearchExtWidth - workarea.x[0] - nBlkSizeX - pSrcFrame->GetPlane(YPLANE)->GetHPadding() + nHPaddingScaled);
+      workarea.nDyMax = nPel * (nSearchExtHeight - workarea.y[0] - nBlkSizeY - pSrcFrame->GetPlane(YPLANE)->GetVPadding() + nVPaddingScaled);
       workarea.nDxMin = -nPel * (workarea.x[0] - pSrcFrame->GetPlane(YPLANE)->GetHPadding() + nHPaddingScaled);
       workarea.nDyMin = -nPel * (workarea.y[0] - pSrcFrame->GetPlane(YPLANE)->GetVPadding() + nVPaddingScaled);
 
@@ -3163,6 +3188,7 @@ void	PlaneOfBlocks::recalculate_mv_slice(Slicer::TaskData &td)
 
   workarea.planeSAD = 0; // for debug, plus fixme outer planeSAD is not used
   workarea.sumLumaChange = 0;
+  workarea.badcount = 0;
 
   // get old vectors plane
   const FakePlaneOfBlocks &plane = _mv_clip_ptr->GetPlane(0);
@@ -3245,6 +3271,7 @@ void	PlaneOfBlocks::recalculate_mv_slice(Slicer::TaskData &td)
       }
 #endif	// ALIGN_SOURCEBLOCK
 
+      // no lambda for the first row of the slice: see search_mv_slice
       if (workarea.blky == workarea.blky_beg)
       {
         workarea.nLambda = 0;
@@ -3262,8 +3289,11 @@ void	PlaneOfBlocks::recalculate_mv_slice(Slicer::TaskData &td)
       // may be they must be scaled by nPel ?
 
       /* computes search boundaries */
-      workarea.nDxMax = nPel * (pSrcFrame->GetPlane(YPLANE)->GetExtendedWidth() - workarea.x[0] - nBlkSizeX);
-      workarea.nDyMax = nPel * (pSrcFrame->GetPlane(YPLANE)->GetExtendedHeight() - workarea.y[0] - nBlkSizeY);
+      // right / bottom: see search_area_width
+      const int nSearchExtWidth = search_area_width(pSrcFrame) + 2 * pSrcFrame->GetPlane(YPLANE)->GetHPadding();
+      const int nSearchExtHeight = search_area_height(pSrcFrame) + 2 * pSrcFrame->GetPlane(YPLANE)->GetVPadding();
+      workarea.nDxMax = nPel * (nSearchExtWidth - workarea.x[0] - nBlkSizeX);
+      workarea.nDyMax = nPel * (nSearchExtHeight - workarea.y[0] - nBlkSizeY);
       workarea.nDxMin = -nPel * workarea.x[0];
       workarea.nDyMin = -nPel * workarea.y[0];
 

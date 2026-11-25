@@ -131,6 +131,13 @@ CHAINS = {
     'show': ('hd420p8', ANA[0] + 'out = MShow(sup, fv)\n', ANA[1] + 'out = mv.MShow(sup, fv)\n'),
     'scalevect': ('hd420p8', ANA[0] + 'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0))\n',
                   ANA[1] + 'out = mv.MCompensate(c, sup, mv.MScaleVect(fv, scale=1.0))\n'),
+    # MSuper edgepad (upstream 2.7.49): 1080 is not covered by 32-pixel blocks (33 rows end 24 pixels before the edge),
+    # one more block row reaches into the edge padding; the super parameters travel through the bridge's VideoInfo
+    'edgepad': ('hd420p8',
+                'sup = MSuper(c, pel=2, edgepad=16)\nbv = MAnalyse(sup, isb=true, blksize=32)\n'
+                'fv = MAnalyse(sup, isb=false, blksize=32)\nout = MDegrain1(c, sup, bv, fv, thSAD=400)\n',
+                'sup = mv.MSuper(c, pel=2, edgepad=16)\nbv = mv.MAnalyse(sup, isb=True, blksize=32)\n'
+                'fv = mv.MAnalyse(sup, isb=False, blksize=32)\nout = mv.MDegrain1(c, sup, bv, fv, thSAD=400)\n'),
     # MScaleVect on divide > 0 vectors (divided level stored with the length marker 0xFFFFFFFF: crashed before the fix)
     'scalevect_divide': ('hd420p8', 'sup = MSuper(c, pel=2)\nfv = MAnalyse(sup, isb=false, blksize=16, overlap=8, divide=2)\n'
                          'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0))\n',

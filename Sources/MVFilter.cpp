@@ -25,12 +25,19 @@
 
 
 
-MVFilter::MVFilter(const PClip &vector, const char *filterName, IScriptEnvironment *env, int group_len, int group_ofs)
+MVFilter::MVFilter(const PClip &vector, const char *filterName, IScriptEnvironment *env, int group_len, int group_ofs,
+  bool edge_blocks_supported)
 {
   if (vector == 0)
     env->ThrowError("Error in %s : vector clip must be specified", filterName); //v1.8
 
   MVClip mvClip(vector, 0, 0, env, group_len, group_ofs);
+
+  // Vectors of a block grid reaching beyond the frame edge (MSuper edgepad): a filter not prepared for it would
+  // compute the area right of / below the grid (nWidth - nWidth_B) as negative
+  if ((mvClip.GetFlags() & MOTION_EDGE_BLOCKS) && !edge_blocks_supported)
+    env->ThrowError("%s: vectors of an MSuper with edgepad (blocks beyond the frame edge) are not supported", filterName);
+  _edge_blocks = (mvClip.GetFlags() & MOTION_EDGE_BLOCKS) != 0;
 
    nWidth = mvClip.GetWidth();
    nHeight = mvClip.GetHeight();
@@ -74,6 +81,10 @@ void MVFilter::CheckSimilarity(const MVClip &vector, const char *vectorName, ISc
    if ( nPel != vector.GetPel() )
       env->ThrowError("Error in %s : %s's pel precision is incorrect", name, vectorName);
 //      env->ThrowError("Error in %s : %s's pel precision is incorrect", name.c_str(), vectorName);
+
+   // the same frame and block size give different block counts with and without edge blocks (MSuper edgepad)
+   if ( nBlkX != vector.GetBlkX() || nBlkY != vector.GetBlkY() )
+      env->ThrowError("Error in %s : %s's block count is incorrect (vectors of supers with different edgepad?)", name, vectorName);
 
    if ( nOverlapX != vector.GetOverlapX() ||  nOverlapY != vector.GetOverlapY())
       env->ThrowError("Error in %s : %s's overlap size is incorrect", name, vectorName);
