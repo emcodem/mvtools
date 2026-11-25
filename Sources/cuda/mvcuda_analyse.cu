@@ -4997,7 +4997,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       a.lsad = ap->lsad;
       a.pnew = ap->pnew;
       a.pzero = ap->pzero;
-      a.pglobal = ap->use_global ? ap->pglobal : ap->pzero;
+      a.pglobal = ap->use_global ? (l == 0 ? ap->pglobal : ap->pglobal_coarse) : ap->pzero; // as GroupOfPlanes::SearchMVs
       a.bits = sp->bits_per_pixel;
       a.chroma_scale = ap->chroma_sad_scale;
       a.radius = (l == 0) ? ap->pel_search : ap->search_param;

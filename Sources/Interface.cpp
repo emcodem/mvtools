@@ -526,7 +526,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
   PClip degrain;
 
   // Switch to MDegrain1/2/3/4/5/6 when possible (faster)
-  if (thSAD2 == thSAD && thSADC == thSADC2 && skip_frame == 0)
+  if (thSAD2 == thSAD && thSADC == thSADC2)
   {
     if (tr <= MAX_DEGRAIN) // up to MDegrain5 160926, MDegrain6 170105
     {
@@ -558,13 +558,14 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
         out16 || lsb,            // out16
         cuda,                    // CudaMDegrainN
         tr, // PF: level
-        env
+        env,
+        skip_frame               // SkipFrame
       );
     }
   }
   // Standard MDegrainN
   if (!degrain && cuda)
-    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD, thSADC2 = thSADC and SkipFrame = 0").decide(env);
+    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD and thSADC2 = thSADC").decide(env);
   if (!degrain)
     degrain = new MDegrainN(
     source,                  // source

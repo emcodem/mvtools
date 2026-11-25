@@ -509,9 +509,7 @@ MVAnalyse::MVAnalyse(
       .need(!divideExtra, "divide is not supported")
       .need(!_dctmode, "dct is not supported")
       .need(!temporal_flag, "temporal=true is not supported")
-      .need(!multi_flag, "multi=true is not supported")
       .need(!_pr_clip[0] && !_pr_clip[1], "temporal predictor clips (super_przero, super_prglobal) are not supported yet")
-      .need(pglobal_coarse == pglobal, "pglobal_coarse different from pglobal is not supported yet")
       .need(GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse),
         "search radius too large (exhaustive up to 64, other search types up to 24)")
       .need(nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4, "only pel 1, 2 or 4")
@@ -895,6 +893,7 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   ap.pnew = pnew;
   ap.pzero = pzero;
   ap.pglobal = pglobal;
+  ap.pglobal_coarse = pglobal_coarse;
   ap.plevel = plevel;
   ap.use_global = global ? 1 : 0;
   ap.meander = meander ? 1 : 0;

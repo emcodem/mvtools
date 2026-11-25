@@ -51,6 +51,26 @@ pinterf's. We port the logic; our CPU path is the reference, the GPU must match 
   today (MDegrain1-6 path) - tr up to 10 needed for his script to stay on the GPU.
 - pglobal_coarse in the GPU search arguments.
 
+## CUDA steps (survey 2026-11-25, line numbers of d8ade6a)
+
+User decisions 2026-11-25: steps 1-5 including tr up to 10. Predictor clips in the wavefront kernel (meander=false: the
+faster GPU path, meander=true was never faster on the GPU and DTL does not need it), as a separate kernel variant so the
+normal meander=false path keeps its static shared memory; meander=true + predictor clips refuse (D8).
+
+1. pglobal_coarse: per level in LevelArgs.pglobal (filled mvcuda_analyse.cu ~4999-5005, today one value for all).
+2. CudaMDegrain SkipFrame: MVDegrainX::gpu_make sets usableB/F (MVDegrain3.cpp ~614-627); unusable = src token
+   + weight 0 + NORMWEIGHTS, no kernel change. MVDegrainX CPU path needs SkipFrame too (CPU == GPU), then
+   CudaMDegrainN tr <= 6 with SkipFrame can use it.
+3. CudaMAnalyse multi=true: refusal at MVAnalyse.cpp ~512 without a technical reason found (gpu_search takes nsrc /
+   nref, geometry the same for all deltas); lift and test interleaved output vs CPU.
+4. CudaMDegrainN tr > 6: MVDegrainX fixed to 6 (ctor args, NORMWEIGHTS<1..6>, MAXR arrays in mvcuda_comp.cu,
+   with_inputs <= 16 inputs); kernel loops over L at runtime. Needs a GPU path in MDegrainN. Optional.
+5. CudaMAnalyse predictor clips: pr supers via super_input / with_inputs (in[2..3]), device super per clip
+   (frame_super); slice kernel k_search<TM>: second / third source block in dynamic shared memory next to s_y/s_u/s_v
+   (issue_src), zero / global candidates and their refines (trymany_par start states st_x/st_c[0..1], dedup key must
+   include the source; sequential mx/mc; final refine via AnaChecker with swapped s_y/s_u/s_v). Refuse (D8) for now:
+   meander=false (k_wave: g_wsrc hard-wired) and k_search_fix.
+
 ## Tests (new cases in all suites)
 
 - CPU: arguments off == gpu_work md5 (whole run_m249_cpu-style set); on: deterministic, mt=true/false.

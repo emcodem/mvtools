@@ -19,7 +19,7 @@ extern "C"
 {
 #endif
 
-#define MVCUDA_API_VERSION 33
+#define MVCUDA_API_VERSION 34
 
 // version of this interface; the caller must refuse a library that reports another one
 MVCUDA_API int mvcuda_api_version();
@@ -128,6 +128,7 @@ typedef struct
   int try_many;                           // MAnalyse trymany: refine around every predictor at the coarse levels (API 18)
   int search_type_coarse;                 // MAnalyse search_coarse as a SearchType.h value; 0 = exhaustive (the default, API 19)
   int try_many_all;                       // MAnalyse trymanyall: with try_many, the finest level too (if there are 2+ levels, API 19)
+  int pglobal_coarse;                     // MAnalyse pglobal_coarse: pglobal of the coarse levels (pglobal: level 0) (API 34)
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are

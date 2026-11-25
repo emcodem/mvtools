@@ -93,6 +93,7 @@ private:
   int dstIntPitch;
 
   const int level;
+  const int skip_frame; // MDegrainN SkipFrame: signed offset of the reference frame left out, 0 = none
   int framenumber;
 
   // Processing size and block counts. Normally the frame and the vector block grid. With blocks beyond the frame
@@ -113,7 +114,7 @@ public:
     sad_t _nSCD1, int _nSCD2, bool _isse2,
     bool _mt_flag, bool _out16_flag, bool _gpu_flag,
     int _level, 
-    IScriptEnvironment* env_ptr);
+    IScriptEnvironment* env_ptr, int _skip_frame = 0);
   ~MVDegrainX();
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 

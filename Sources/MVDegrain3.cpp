@@ -216,7 +216,7 @@ MVDegrainX::MVDegrainX(
   sad_t _nSCD1, int _nSCD2, bool _isse2,
   bool _mt_flag, bool _out16_flag, bool _gpu_flag,
   int _level, 
-  IScriptEnvironment* env_ptr
+  IScriptEnvironment* env_ptr, int _skip_frame
 ) : GenericVideoFilter(_child)
 , MVFilter(
   // mvfw/mvfw2/mvfw3/mvfw4/mvfw5/mvfw6
@@ -230,6 +230,7 @@ MVDegrainX::MVDegrainX(
   , super(_super)
   , out16_flag(_out16_flag)
   , level( _level )
+  , skip_frame(_skip_frame)
 {
 
   has_at_least_v8 = true;
@@ -617,13 +618,13 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
   {
     PVideoFrame mv = mvClipF[j]->GetFrame(n, env);
     mvClipF[j]->Update(mv, env);
-    usableF[j] = mvClipF[j]->IsUsable();
+    usableF[j] = mvClipF[j]->IsUsable() && skip_frame != j + 1; // SkipFrame (MDegrainN): +k = frame n - k
   }
   for (int j = 0; j < L; j++)
   {
     PVideoFrame mv = mvClipB[j]->GetFrame(n, env);
     mvClipB[j]->Update(mv, env);
-    usableB[j] = mvClipB[j]->IsUsable();
+    usableB[j] = mvClipB[j]->IsUsable() && skip_frame != -(j + 1); // SkipFrame: -k = frame n + k
   }
   PVideoFrame src = child->GetFrame(n, env);
   if (props_src)
@@ -775,14 +776,14 @@ PVideoFrame MVDegrainX::cpu_frame(int n, IScriptEnvironment* env)
   {
     mvF[j] = mvClipF[j]->GetFrame(n, env);
     mvClipF[j]->Update(mvF[j], env);
-    isUsableF[j] = mvClipF[j]->IsUsable();
+    isUsableF[j] = mvClipF[j]->IsUsable() && skip_frame != j + 1; // SkipFrame (MDegrainN): +k = frame n - k
     mvF[j] = 0; // v2.0.9.2 -  it seems, we do not need in vectors clip anymore when we finished copiing them to fakeblockdatas
   }
   for (int j = 0; j < level; j++)
     {
     mvB[j] = mvClipB[j]->GetFrame(n, env);
     mvClipB[j]->Update(mvB[j], env);
-    isUsableB[j] = mvClipB[j]->IsUsable();
+    isUsableB[j] = mvClipB[j]->IsUsable() && skip_frame != -(j + 1); // SkipFrame: -k = frame n + k
     mvB[j] = 0;
   }
 
