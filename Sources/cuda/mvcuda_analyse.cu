@@ -97,6 +97,9 @@ namespace
     int exh_fast;      // k_search: exhaustive radius > 3 through AnaChecker::exhaustive_fast (MVCUDA_EXH_FAST=0: off)
     int win_cap;       // k_search: samples of dynamic shared memory after the source buffers (reference window)
     int tm_par;        // k_search trymany: the 7 Refines in parallel warps (WarpChecker; MVCUDA_TM_PAR=0: one after the other)
+    // MAnalyse on separated fields (level 0 only, else 0): the zero vector is (0, fshift), the global predictor is shifted
+    // by it, and the zero candidate's chroma SAD is taken at (0, 0) (PlaneOfBlocks: zeroMVfieldShifted, ChromaSAD(0, 0))
+    int fshift;
   };
 
   // One whole analysis call for the wavefront kernel (one launch for all levels): the rows of all levels, coarsest level
@@ -1728,7 +1731,7 @@ namespace
     int nu_out = 0;
     {
       int sad = sl7[0] + sc7[0];
-      st_x[0] = 0; st_y[0] = 0; st_s[0] = sad; st_c[0] = sad + (int)(((long long)a.pzero * sad) >> 8);
+      st_x[0] = 0; st_y[0] = a.fshift; st_s[0] = sad; st_c[0] = sad + (int)(((long long)a.pzero * sad) >> 8);
       sad = sl7[1] + sc7[1];
       st_x[1] = glob.x; st_y[1] = glob.y; st_s[1] = sad; st_c[1] = sad + (int)(((long long)a.pglobal * sad) >> 8);
       sad = sl7[2] + sc7[2];
@@ -2229,7 +2232,7 @@ namespace
         const bool side_ok = (dir == 1 && blkx < a.n_blk_x - 1) || (dir == -1 && blkx > 0);
         (void)side_ok;
         const Vec own_c = clip_mv(dx_min, dx_max, dy_min, dy_max, own_v[0], own_v[1], own_v[2]);
-        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0); // field shift 0
+        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, a.fshift, 0);
         Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
         if (it > 0)
           p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, b.prev_x, b.prev_y, b.prev_sad);
@@ -2260,24 +2263,26 @@ namespace
           }
           b.nlambda = nlambda;
         }
-        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel, 0);
+        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, a.glob[0] * a.pel, a.glob[1] * a.pel + a.fshift, 0);
         __syncthreads(); // source block and nLambda in shared memory; the previous block's result is visible
         const int nlambda = row_nl ? s_nl[blkx] : b.nlambda;
         PH(0);
 
-        // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
-        for (int c = warp; c < 7; c += nwarps)
+        // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each; with a field
+        // shift an 8th: (0, 0), whose chroma SAD is the zero candidate's
+        for (int c = warp; c < (a.fshift ? 8 : 7); c += nwarps)
         {
           int cx, cy;
           switch (c)
           {
-          case 0: cx = 0; cy = 0; break;
+          case 0: cx = 0; cy = a.fshift; break;
           case 1: cx = glob.x; cy = glob.y; break;
           case 2: cx = pred.x; cy = pred.y; break;
           case 3: cx = p0.x; cy = p0.y; break;
           case 4: cx = p1.x; cy = p1.y; break;
           case 5: cx = p2.x; cy = p2.y; break;
-          default: cx = p3.x; cy = p3.y; break;
+          case 6: cx = p3.x; cy = p3.y; break;
+          default: cx = 0; cy = 0; break;
           }
           int sl, sc;
           eval_dispatch(a, s_y, s_u, s_v, x0[0], y0[0], x0[1], y0[1], cx, cy, lane, pair_chroma, sl, sc);
@@ -2289,20 +2294,24 @@ namespace
         }
         __syncthreads();
         PH(1);
+        const int sc_zero = a.fshift ? b.sc[7] : b.sc[0]; // field shift: the zero candidate's chroma at (0, 0)
 
         // ---- fold phase A (every thread, identical): same order and comparisons as PseudoEPZSearch
         int best_x, best_y, best_sad, min_cost;
         int sl7[7], sc7[7]; // tryMany: the phase A SADs, kept for the refines (their batches overwrite b.sl / b.sc)
         if (TM)
+        {
           for (int i = 0; i < 7; i++)
           {
             sl7[i] = b.sl[i];
             sc7[i] = b.sc[i];
           }
+          sc7[0] = sc_zero;
+        }
         {
-          const int sad = b.sl[0] + b.sc[0];
+          const int sad = b.sl[0] + sc_zero;
           best_x = 0;
-          best_y = 0;
+          best_y = a.fshift;
           best_sad = sad;
           min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
           const int sadg = b.sl[1] + b.sc[1];
@@ -2443,7 +2452,7 @@ namespace
               {
                 const int sad = sl7[0] + sc7[0];
                 ck.bx = 0;
-                ck.by = 0;
+                ck.by = a.fshift;
                 ck.best_sad = sad;
                 ck.min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
               }
@@ -4078,20 +4087,25 @@ namespace
     __syncthreads();
   }
 
-  // SAD (luma + chroma) of vector (vx, vy) with the block of planes pl as the source block (g_wsrc holds that block after)
+  // SAD of the luma at vector (vx, vy) plus the chroma at (cvx, cvy) (they differ only for the zero vector with a field
+  // shift) with the block of planes pl as the source block (g_wsrc holds that block after)
   template <int GW, int BSY, int CHH>
-  __device__ __forceinline__ int wave_pr_sad(int lane, const pix *const *pl, int x0, int y0, int x1, int y1, int vx, int vy)
+  __device__ __forceinline__ int wave_pr_sad(int lane, const pix *const *pl, int x0, int y0, int x1, int y1, int vx, int vy,
+    int cvx, int cvy)
   {
     wave_load_block(lane, pl[0], pl[1], pl[2], x0, y0, x1, y1);
+    const bool two = cvx != vx || cvy != vy;
     if (lane == 0)
     {
       g_ws.xs[0] = vx;
       g_ws.ys[0] = vy;
-      g_ws.n = 1;
+      g_ws.xs[1] = cvx;
+      g_ws.ys[1] = cvy;
+      g_ws.n = two ? 2 : 1;
     }
     __syncthreads();
     wave_eval_inl<GW, BSY, CHH>(lane, false); // ends with a barrier
-    return g_ws.sl[0] + g_ws.sc[0];
+    return g_ws.sl[0] + g_ws.sc[two ? 1 : 0];
   }
 
   // the SAD of a predictor clip corrected by its SADadj: (int)(sad * adj) in float, truncated, as the CPU
@@ -4363,7 +4377,7 @@ namespace
 
         // predictors (FetchPredictors), identical in every lane
         const Vec own_c = clip_mv(dx_min, dx_max, dy_min, dy_max, v[0], v[1], v[2]);
-        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, 0, 0);
+        const Vec zero_shifted = clip_mv(dx_min, dx_max, dy_min, dy_max, 0, a.fshift, 0);
         Vec p1 = zero_shifted, p2 = zero_shifted, p3 = zero_shifted, p0;
         if (blkx > 0)
           p1 = clip_mv(dx_min, dx_max, dy_min, dy_max, left_x, left_y, left_sad);
@@ -4391,20 +4405,22 @@ namespace
           nlambda = g_ws.bc[11];
         }
         // the global estimate was written by another CTA of this launch (level_ready orders it before this row)
-        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, __ldcg(a.glob) * a.pel, __ldcg(a.glob + 1) * a.pel, 0);
+        const Vec glob = clip_mv(dx_min, dx_max, dy_min, dy_max, __ldcg(a.glob) * a.pel, __ldcg(a.glob + 1) * a.pel + a.fshift, 0);
 
         WPH(2);
         // phase A: zero, global, predictor, predictors[0..3], all evaluated without a range test as in the slice
         // kernel (the CPU uses the first three unconditionally; CheckMV0 below tests the other four)
-        if (lane < 7)
+        // (with a field shift an 8th candidate, (0, 0): its chroma SAD is the zero candidate's, as on the CPU)
+        if (lane < 8)
         {
-          const Vec cv = lane == 0 ? Vec{ 0, 0, 0 } : lane == 1 ? glob : lane == 2 ? pred : lane == 3 ? p0 : lane == 4 ? p1 : lane == 5 ? p2 : p3;
+          const Vec cv = lane == 0 ? Vec{ 0, a.fshift, 0 } : lane == 1 ? glob : lane == 2 ? pred : lane == 3 ? p0 : lane == 4 ? p1
+            : lane == 5 ? p2 : lane == 6 ? p3 : Vec{ 0, 0, 0 };
           g_ws.xs[lane] = cv.x;
           g_ws.ys[lane] = cv.y;
         }
         if (lane == 0)
         {
-          g_ws.n = 7;
+          g_ws.n = a.fshift ? 8 : 7;
           g_ws.x0 = x0[0];
           g_ws.y0 = y0[0];
           g_ws.x1 = x0[1];
@@ -4419,6 +4435,7 @@ namespace
         __syncthreads(); // source block, candidate list and geometry visible to every lane
         wave_eval_inl<GW, BSY, CHH>(lane, false);
         WPH(3);
+        const int sc_zero = a.fshift ? g_ws.sc[7] : g_ws.sc[0]; // field shift: the zero candidate's chroma at (0, 0)
 
         // Temporal predictor clips: the zero and the global candidate with the clip's block as the source block. The global
         // clip is skipped where the global vector is zero and a zero clip is given (GroupOfPlanes::SearchMVs).
@@ -4436,9 +4453,9 @@ namespace
             sc7[i] = g_ws.sc[i];
           }
           if (use_pz)
-            s_pz = wave_pr_sad<GW, BSY, CHH>(lane, prz, x0[0], y0[0], x0[1], y0[1], 0, 0);
+            s_pz = wave_pr_sad<GW, BSY, CHH>(lane, prz, x0[0], y0[0], x0[1], y0[1], 0, a.fshift, 0, 0);
           if (use_pg)
-            s_pg = wave_pr_sad<GW, BSY, CHH>(lane, prg, x0[0], y0[0], x0[1], y0[1], glob.x, glob.y);
+            s_pg = wave_pr_sad<GW, BSY, CHH>(lane, prg, x0[0], y0[0], x0[1], y0[1], glob.x, glob.y, glob.x, glob.y);
           wave_load_block(lane, a.src[0], a.src[1], a.src[2], x0[0], y0[0], x0[1], y0[1]); // the source block again
           if (lane < 7)
           {
@@ -4454,9 +4471,9 @@ namespace
         int pr_k = -1, pr_cost_adj = 0, pr_raw_sad[2] = { 0, 0 }, pr_raw_cost[2] = { 0, 0 };
         bool tm_pr[2] = { false, false };
         {
-          const int sad = g_ws.sl[0] + g_ws.sc[0];
+          const int sad = g_ws.sl[0] + sc_zero;
           best_x = 0;
-          best_y = 0;
+          best_y = a.fshift;
           best_sad = sad;
           min_cost = sad + (int)(((long long)a.pzero * sad) >> 8);
           const int cost_zero = min_cost;
@@ -4547,7 +4564,7 @@ namespace
         // a predictor clip's candidate that is still the best (no later candidate was strictly better): the final refine
         // runs on that clip from its uncorrected values, then the correction (PseudoEPZSearch without trymany)
         const bool pr_refine = pr_k >= 0 && min_cost == pr_cost_adj && best_x == (pr_k == 0 ? 0 : glob.x)
-          && best_y == (pr_k == 0 ? 0 : glob.y);
+          && best_y == (pr_k == 0 ? a.fshift : glob.y);
         if (pr_refine)
         {
           if constexpr (GEN)
@@ -4564,7 +4581,7 @@ namespace
             ck.nlambda = nlambda;
             ck.lane = lane;
             mvc_refine::refine(ck, a.search_type, a.radius);
-            pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[pr_k], pr_k == 0 ? 0 : glob.x, pr_k == 0 ? 0 : glob.y,
+            pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[pr_k], pr_k == 0 ? 0 : glob.x, pr_k == 0 ? a.fshift : glob.y,
               pr_k == 0 ? a.pzero : a.pglobal);
             best_x = ck.bx;
             best_y = ck.by;
@@ -4641,6 +4658,7 @@ namespace
                 g_ws.tmin.sl7[i] = g_ws.sl[i];
                 g_ws.tmin.sc7[i] = g_ws.sc[i];
               }
+              g_ws.tmin.sc7[0] = sc_zero;
               g_ws.tmin.glob = glob;
               g_ws.tmin.pred = pred;
               g_ws.tmin.pv[0] = p0;
@@ -4672,7 +4690,7 @@ namespace
                 wave_load_block(lane, pp[0], pp[1], pp[2], x0[0], y0[0], x0[1], y0[1]);
                 WaveChecker<GW, BSY, CHH> ck;
                 ck.bx = k == 0 ? 0 : glob.x;
-                ck.by = k == 0 ? 0 : glob.y;
+                ck.by = k == 0 ? a.fshift : glob.y;
                 ck.min_cost = pr_raw_cost[k];
                 ck.best_sad = pr_raw_sad[k];
                 ck.pred_x = pred.x;
@@ -4680,7 +4698,7 @@ namespace
                 ck.nlambda = nlambda;
                 ck.lane = lane;
                 mvc_refine::refine(ck, a.search_type, a.radius);
-                pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[k], k == 0 ? 0 : glob.x, k == 0 ? 0 : glob.y,
+                pr_scale(ck.bx, ck.by, ck.best_sad, ck.min_cost, c.pr_adj[k], k == 0 ? 0 : glob.x, k == 0 ? a.fshift : glob.y,
                   k == 0 ? a.pzero : a.pglobal);
                 if (ck.min_cost < tm[k][3])
                 {
@@ -5227,6 +5245,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       a.lsad = ap->lsad;
       a.pnew = ap->pnew;
       a.pzero = ap->pzero;
+      a.fshift = l == 0 ? ap->field_shift : 0; // separated fields: the zero vector of the finest level
       a.pglobal = ap->use_global ? (l == 0 ? ap->pglobal : ap->pglobal_coarse) : ap->pzero; // as GroupOfPlanes::SearchMVs
       a.bits = sp->bits_per_pixel;
       a.chroma_scale = ap->chroma_sad_scale;
@@ -5322,7 +5341,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         {
           // the fixed-batch plans without trymany: the leaner kernel (same result); MVCUDA_SEARCH_FIX=0: k_search
           static const bool fix_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
-          const bool fixed = !a.exh_fast && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || wave_plan(a.search_type, a.radius) != WP_GEN);
+          const bool fixed = !a.exh_fast && a.fshift == 0 && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || wave_plan(a.search_type, a.radius) != WP_GEN);
           if (fix_allowed && fixed)
           {
             switch (fix_eval_id(a))

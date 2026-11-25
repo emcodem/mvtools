@@ -133,6 +133,7 @@ typedef struct
   // source frame), 0 = not used, and their SADadj. Wavefront search only (meander=false), else MVCUDA_NEEDS_CPU.
   unsigned long long pr_token[2];
   float pr_adj[2];
+  int field_shift;                        // MAnalyse on separated fields: the zero vector of level 0 is (0, field_shift) (API 34)
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are

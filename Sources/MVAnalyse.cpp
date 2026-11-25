@@ -777,9 +777,9 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 #endif
 
     bool gpu_done = false;
-    if (_gpu_ok && fieldShift == 0 && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
+    if (_gpu_ok && pVecPrevOrNull == 0 && outfile == NULL && srd._analysis_data.nDeltaFrame > 0)
     {
-      gpu_done = gpu_search(src, ref, nsrc, nref, reinterpret_cast<int*>(pDst), env);
+      gpu_done = gpu_search(src, ref, nsrc, nref, fieldShift, reinterpret_cast<int*>(pDst), env);
     }
     if (!gpu_done)
     {
@@ -860,7 +860,7 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 
 // Runs the whole search on the GPU for the super frames src / ref (their level-0 pictures: device frames, or host
 // pictures uploaded once per super frame). Returns false (nothing written that matters) when the CPU has to do it.
-bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int nsrc, int nref, int *payload, IScriptEnvironment *env)
+bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int nsrc, int nref, int field_shift, int *payload, IScriptEnvironment *env)
 {
   if (GpuBackend::force_fallback())
     return false;
@@ -915,6 +915,7 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   ap.pzero = pzero;
   ap.pglobal = pglobal;
   ap.pglobal_coarse = pglobal_coarse;
+  ap.field_shift = field_shift;
   ap.plevel = plevel;
   ap.use_global = global ? 1 : 0;
   ap.meander = meander ? 1 : 0;

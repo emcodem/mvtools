@@ -100,4 +100,45 @@ normal meander=false path keeps its static shared memory; meander=true + predict
   Tests: run_s234 S9 24 / 24 (GPU == CPU: zero / zero+global, trymany, trymanyall, hex, luma, auto SADadj with
   pglobal_coarse; meander=true refused), full run_s234 243 / 243, run_partm 75 / 75, run_frc_pel4 6 / 6,
   run_cf_regression 86 / 86.
-- [ ] tests, build for DTL
+- [x] End to end (profile\run_predclip_dtl.ps1): DTL's a.32 release script (MDegrain3, zero clips tr 10, global clips tr
+  6, pglobal_coarse=0 instead of his pglobal < -256) on his DV clip, progressive (SeparateFields: odd deltas get a field
+  shift, which the GPU search has always left to the CPU), 50 frames: CPU == GPU md5. Times: CPU 14.0 s / GPU 19.2 s
+  without Prefetch, CPU 4.1 s / GPU 6.8 s with Prefetch(4) - the GPU chain is slower on SD here; not profiled yet.
+- [x] Profile 2026-11-26 (run_predclip_dtl.ps1 -Variant, DV clip progressive, Prefetch(4), 300 frames, RTX 5090; all
+  variants CPU == GPU):
+
+  | variant | CPU s | GPU s |
+  |---|---|---|
+  | full (his script: trymany, predictor clips) | 23.0 | 40.9 |
+  | nopr (same MDegrain3 chain without clips: no generation) | 10.1 | 17.2 |
+  | cheappr (clips = the super itself: search with clips, no generation), 50 frames vs nopr | 1.7 vs 1.8 | 3.4 vs 3.3 |
+  | nopr, trymany=false | 5.9 | 3.3 (~91 fps) |
+  | nopr, meander=true mt=true (slice kernel) | 5.9 | 15.4 |
+  | nopr, trymany=false, meander=true | 5.0 | 5.6 |
+  | full, trymany=false | 18.3 | 28.2 |
+
+  nsys (full, 100 frames): k_wave GEN (6 main MAnalyse, trymany + clips) 54 % of the kernel time, 36 ms per call;
+  k_wave fast (the generation's multi MAnalyse with forced zero / global vectors) 44 %, 5.3 ms per call; k_blocks
+  (MDegrain / MDegrainN tr 10) 1.4 %; super builds ~0.3 %.
+  Conclusions: the predictor clips in the search cost ~nothing; the GPU loses on (1) trymany (36 ms per SD call, the
+  trymany wavefront / slice paths), (2) the generation's searches for forced vectors (~25 s of 28 s with trymany off).
+  Built-in generation (item 23) removes (2); (1) is a separate GPU trymany optimisation (QTGMC trymany presets too).
+
+## Next (user decisions 2026-11-26)
+
+1. [x] DONE - field shift on the GPU (LevelArgs.fshift, level 0 only; MvCudaAnalyseParams.field_shift, API 34): zero
+   vector (0, fshift) in the zero candidate, the default predictors, the trymany start states (trymany_par and the
+   sequential form) and the predictor clip anchors; global predictor y + fshift; the zero candidate's chroma SAD from an
+   extra (0, 0) candidate (8th phase A candidate) as the CPU's ChromaSAD(0, 0); k_search_fix is not used on a level with
+   a field shift (the general slice kernel takes it). MVAnalyse calls the GPU for fieldShift != 0. Tests: run_s234 S10
+   36 / 36 (separated fields, odd deltas, every kernel, trymany, hex, pel 1 / 4, global=false, multi, predictor clips;
+   CPU frames 0), full run_s234 279 / 279, run_partm 75 / 75, run_frc_pel4 6 / 6, run_cf_regression 86 / 86.
+   Was: MAnalyse on SeparateFields clips (odd delta: zero vector y = fieldShift at the finest level,
+   global predictor y + fieldShift, the default predictors and the "not the zero vector" checks of the searches) in the
+   slice and the wavefront kernel, so such frames no longer fall back to the CPU (gpu_search requires fieldShift == 0).
+2. trymany on the GPU: 36 ms per SD call (wavefront and slice kernel) - find the cause, speed it up.
+3. Built-in predictor clip generation, the simpler variant (not bit-identical to his MDegrainN chain): MAnalyse computes
+   the predictor block itself. Proposal: zero clip = plain average of the current frame and its neighbours n-r..n+r at
+   the same position without the reference frame of the delta (sum once per frame, minus the reference); global clip =
+   the same along the global vector to each neighbour (source of those vectors still to decide). The separate-filter
+   form (super_przero / super_prglobal, SkipFrame) stays.
