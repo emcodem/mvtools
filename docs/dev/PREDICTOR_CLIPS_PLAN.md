@@ -137,6 +137,15 @@ normal meander=false path keeps its static shared memory; meander=true + predict
    global predictor y + fieldShift, the default predictors and the "not the zero vector" checks of the searches) in the
    slice and the wavefront kernel, so such frames no longer fall back to the CPU (gpu_search requires fieldShift == 0).
 2. trymany on the GPU: 36 ms per SD call (wavefront and slice kernel) - find the cause, speed it up.
+   Diagnosis 2026-11-26 (profile\run_tm_speed.ps1: one CudaMAnalyse, DV clip, 100 frames; dev build of mvtools_cuda.dll
+   with -DMVC_PHASE_PROF via Sources\cuda\build_dev.ps1 -Flags:-DMVC_PHASE_PROF, its unit list fixed for nvenc):
+   8x8 / ov 4: no trymany 7.2 ms per frame, trymany (coarse levels) 20.3, trymanyall 38.8; 16x16: 4.7 / 8.1.
+   Wavefront phases (cycles per block): refine phase 53k-114k with trymany vs ~5k without (growing with the level
+   size: co-resident CTAs), all of it in trymany_par's eval (37k-104k; starts / syncs / fold / select ~10k): the
+   exhaustive batch of every distinct start vector's 24 ring candidates (radius 2) in eval_multi groups of 4 per warp.
+   Tried: groups of 8 (eval_multi<8>, half the rounds): no gain (19.4 vs 20.3 ms), reverted - the rounds are not the
+   limit. Next ideas: the reference window of each distinct start in shared memory (as exhaustive_fast of k_search),
+   or all 7 Refines' candidates as one CTA-wide batch; needs a closer look at eval_multi_pk's memory pattern first.
 3. Built-in predictor clip generation, the simpler variant (not bit-identical to his MDegrainN chain): MAnalyse computes
    the predictor block itself. Proposal: zero clip = plain average of the current frame and its neighbours n-r..n+r at
    the same position without the reference frame of the delta (sum once per frame, minus the reference); global clip =

@@ -33,6 +33,7 @@ $units = [ordered]@{
   'mvcuda_analyse_8_p2.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh'); 'mvcuda_analyse_16_p2.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh')
   'mvcuda_analyse_8_p3.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh'); 'mvcuda_analyse_16_p3.cu' = @('mvcuda_analyse.cu', 'mvcuda_refine.cuh')
   'mvcuda_nvof_vec_8.cu' = @('mvcuda_nvof_vec.cu', 'mvcuda_nvofa.h'); 'mvcuda_nvof_vec_16.cu' = @('mvcuda_nvof_vec.cu', 'mvcuda_nvofa.h')
+'mvcuda_nvenc.cu' = @(); 'mvcuda_nvenc_vec_8.cu' = @('mvcuda_nvenc_vec.cu'); 'mvcuda_nvenc_vec_16.cu' = @('mvcuda_nvenc_vec.cu')
   'mvcuda_flow_8.cu' = @('mvcuda_flow.cu'); 'mvcuda_flow_16.cu' = @('mvcuda_flow.cu')
   'mvcuda_splat.cu' = @('mvcuda_splat_ctx.h'); 'mvcuda_splat_exact.cu' = @('mvcuda_splat.cuh', 'mvcuda_splat_ctx.cuh', 'mvcuda_splat_ctx.h', 'mvcuda_splat_me.cuh', 'mvcuda_splat_mo.cuh', '..\..\splatfps\core\splat_const.h', '..\..\splatfps\core\splat_phase_pull.h', '..\..\splatfps\third_party\pocketfft\fftp_pow2.h'); 'mvcuda_splat_fast.cu' = @('mvcuda_splat.cuh', 'mvcuda_splat_ctx.cuh', 'mvcuda_splat_ctx.h', 'mvcuda_splat_me.cuh', 'mvcuda_splat_mo.cuh', '..\..\splatfps\core\splat_const.h', '..\..\splatfps\core\splat_phase_pull.h', '..\..\splatfps\third_party\pocketfft\fftp_pow2.h')
 }
