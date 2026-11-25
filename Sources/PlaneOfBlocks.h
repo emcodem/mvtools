@@ -85,7 +85,8 @@ public:
     int stp, int lambda, sad_t lsad, int pnew, int plevel,
     int flags, sad_t *out, const VECTOR *globalMVec, short * outfilebuf, int fieldShiftCur,
     int * meanLumaChange, int divideExtra,
-    int _pzero, int _pglobal, sad_t _badSAD, int _badrange, bool meander, int *vecPrev, bool _tryMany);
+    int _pzero, int _pglobal, sad_t _badSAD, int _badrange, bool meander, int *vecPrev, bool _tryMany,
+    MVFrame *prZeroFrame = nullptr, float prZeroSADadj = 1.0f, MVFrame *prGlobalFrame = nullptr, float prGlobalSADadj = 1.0f);
 
 
   /* plane initialisation */
@@ -209,6 +210,12 @@ private:
   bool temporal;              // use temporal predictor
   bool tryMany;               // try refine around many predictors
 
+  // Temporal predictor clips (MAnalyse super_przero / super_prglobal): source planes of a temporally averaged clip,
+  // tried as an alternative source block for the zero (0) and the global (1) candidate; nullptr = not used.
+  // prSADadj: factor on their SAD, for the lower noise of the averaged clip.
+  MVFrame *pPrFrame[2] = { nullptr, nullptr };
+  float prSADadj[2] = { 1.0f, 1.0f };
+
   // PF todo this should be float or double for float format??
   // it is not AtomicInt anymore
   std::atomic <bigsad_t> planeSAD;      // summary SAD of plane
@@ -282,7 +289,10 @@ private:
 #if (ALIGN_SOURCEBLOCK > 1)
     TmpDataArray pSrc_temp_base;// stores base memory pointer to non _base pointer
     uint8_t* pSrc_temp[3];      //for easy WRITE access to temp block
+    TmpDataArray pPr_temp_base; // aligned copies of the predictor clips' blocks, same layout and pitch as pSrc_temp
+    uint8_t* pPr_temp[2][3];
 #endif	// ALIGN_SOURCEBLOCK
+    const uint8_t* pPrSrc[2][3]; // current block of the predictor clips (zero, global)
 
     WorkingArea(int nBlkSizeX, int nBlkSizeY, int dctpitch, int nLogxRatioUV, int nLogyRatioUV, int pixelsize, int bits_per_pixel);
     virtual			~WorkingArea();
@@ -359,6 +369,15 @@ private:
   /* performs an epz search */
   template<typename pixel_t>
   void PseudoEPZSearch(WorkingArea &workarea);
+
+  // Temporal predictor clips (see pPrFrame): the metric of vector (vx, vy) with the block of predictor clip k as the
+  // source block, a Refine with it, and the SADadj correction of the best vector found that way
+  template<typename pixel_t>
+  sad_t PrClipSAD(WorkingArea &workarea, int k, int vx, int vy, int cvx, int cvy); // luma vector, chroma vector
+  template<typename pixel_t>
+  void PrClipRefine(WorkingArea &workarea, int k);
+  template<typename pixel_t>
+  void PrClipScale(WorkingArea &workarea, float adj, const VECTOR &anchor, int penalty);
 
   //	void PhaseShiftSearch(int vx, int vy);
 

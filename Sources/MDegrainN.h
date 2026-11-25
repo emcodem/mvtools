@@ -32,7 +32,7 @@ public:
     ::PClip child, ::PClip super, ::PClip mvmulti, int trad,
     sad_t thsad, sad_t thsadc, int yuvplanes, float nlimit, float nlimitc,
     sad_t nscd1, int nscd2, bool isse_flag,
-    sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, ::IScriptEnvironment* env_ptr
+    sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, int skip_frame, ::IScriptEnvironment* env_ptr
   );
   ~MDegrainN();
 
@@ -112,6 +112,7 @@ private:
   MvClipArray _mv_clip_arr;
 
   int _trad;// Temporal radius (nbr frames == _trad * 2 + 1)
+  int _skip_frame; // SkipFrame: signed offset of the reference frame left out, 0 = none
   int _yuvplanes;
   float _nlimit;
   float _nlimitc;

@@ -476,12 +476,13 @@ MDegrainN::MDegrainN(
   PClip child, PClip super, PClip mvmulti, int trad,
   sad_t thsad, sad_t thsadc, int yuvplanes, float nlimit, float nlimitc,
   sad_t nscd1, int nscd2, bool isse_flag,
-  sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, IScriptEnvironment* env_ptr
+  sad_t thsad2, sad_t thsadc2, bool mt_flag, bool out16_flag, int skip_frame, IScriptEnvironment* env_ptr
 )
   : GenericVideoFilter(child)
   , MVFilter(mvmulti, "MDegrainN", env_ptr, 1, 0, true) // edge blocks supported
   , _mv_clip_arr()
   , _trad(trad)
+  , _skip_frame(skip_frame)
   , _yuvplanes(yuvplanes)
   , _nlimit(nlimit)
   , _nlimitc(nlimitc)
@@ -824,6 +825,11 @@ static void plane_copy_8_to_16_c(uint8_t *dstp, int dstpitch, const uint8_t *src
     ::PVideoFrame mv = mv_clip.GetFrame(n, env_ptr);
     mv_clip.Update(mv, env_ptr);
     _usable_flag_arr[k] = mv_clip.IsUsable();
+    // SkipFrame: vector clip k of the multi clip is the isb (backward) one of delta k / 2 + 1 for even k (reference
+    // frame n + delta, offset -delta), the forward one for odd k (offset +delta)
+    const int offset = ((k & 1) ? 1 : -1) * (1 + (k >> 1));
+    if (_skip_frame != 0 && offset == _skip_frame)
+      _usable_flag_arr[k] = false;
   }
 
   PVideoFrame src = child->GetFrame(n, env_ptr);

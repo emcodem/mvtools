@@ -48,7 +48,8 @@ MVAnalyse::MVAnalyse(
   int _overlapx, int _overlapy, const char* _outfilename, int _dctmode,
   int _divide, int _sadx264, sad_t _badSAD, int _badrange, bool _isse,
   bool _meander, bool temporal_flag, bool _tryMany, bool multi_flag,
-  bool mt_flag, int _chromaSADScale, int st_coarse, bool _tryManyAll, bool gpu_flag, IScriptEnvironment* env
+  bool mt_flag, int _chromaSADScale, int st_coarse, bool _tryManyAll, bool gpu_flag, const PredictorArgs &pr,
+  IScriptEnvironment* env
 )
   : ::GenericVideoFilter(_child)
   , _srd_arr(1)
@@ -160,6 +161,47 @@ MVAnalyse::MVAnalyse(
     _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
     params.nWidth, params.nHeight // the real frame size: search limits
   );
+
+  // Temporal predictor clips: supers with the same parameters as the super clip (their frames go into GOFs of the
+  // same layout); SADadj <= 0: automatic, from the number of averaged frames N (> 1: the current frame not included,
+  // < -1: included): sqrt(2N / (N + 1)) or sqrt(2|N| / (|N| - 1))
+  pglobal_coarse = pr.pglobal_coarse;
+  for (int k = 0; k < 2; k++)
+  {
+    _pr_clip[k] = pr.clip[k];
+    _pr_lite[k] = false;
+    _pr_adj[k] = 1.0f;
+    _pr_gof[k] = nullptr;
+    if (!_pr_clip[k])
+      continue;
+    const char *name = k == 0 ? "super_przero" : "super_prglobal";
+    const VideoInfo &pvi = _pr_clip[k]->GetVideoInfo();
+    const SuperParams pp = GetSuperParams(pvi);
+    if (!vi.IsSameColorspace(pvi) || pvi.width != vi.width || pvi.height != vi.height || pvi.num_frames != vi.num_frames
+      || pp.nWidth != params.nWidth || pp.nHeight != params.nHeight || pp.nHPad != params.nHPad || pp.nVPad != params.nVPad
+      || pp.nPel != params.nPel || pp.nLevels != params.nLevels || pp.nModeYUV != params.nModeYUV
+      || pp.nEdgePadX != params.nEdgePadX || pp.nEdgePadY != params.nEdgePadY)
+      env->ThrowError("MAnalyse: %s must be a super clip with the same format, frame count and MSuper parameters as the super clip", name);
+    const int n = pr.nframes[k];
+    if (n >= -1 && n <= 1)
+      env->ThrowError("MAnalyse: Nframes_%s must be given with %s and cannot be -1, 0 or 1", k == 0 ? "przero" : "prglobal", name);
+    if (_dctmode != 0)
+      env->ThrowError("MAnalyse: %s cannot be used with dct", name);
+    float adj = pr.adj[k];
+    if (adj <= 0.0f)
+    {
+      const float nf = (float)(n > 0 ? n : -n);
+      adj = n > 0 ? std::sqrt(2.0f * nf / (nf + 1.0f)) : std::sqrt(2.0f * nf / (nf - 1.0f));
+    }
+    _pr_adj[k] = adj;
+    _pr_lite[k] = MV_SUPER_IS_LITE(pp);
+    _pr_gof[k] = new MVGroupOfFrames(
+      nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
+      nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
+      _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
+      params.nWidth, params.nHeight
+    );
+  }
 
   analysisData.nBlkSizeX = _blksizex;
   analysisData.nBlkSizeY = _blksizey;
@@ -468,6 +510,8 @@ MVAnalyse::MVAnalyse(
       .need(!_dctmode, "dct is not supported")
       .need(!temporal_flag, "temporal=true is not supported")
       .need(!multi_flag, "multi=true is not supported")
+      .need(!_pr_clip[0] && !_pr_clip[1], "temporal predictor clips (super_przero, super_prglobal) are not supported yet")
+      .need(pglobal_coarse == pglobal, "pglobal_coarse different from pglobal is not supported yet")
       .need(GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse),
         "search radius too large (exhaustive up to 64, other search types up to 24)")
       .need(nSuperPel == 1 || nSuperPel == 2 || nSuperPel == 4, "only pel 1, 2 or 4")
@@ -592,6 +636,8 @@ MVAnalyse::~MVAnalyse()
   pSrcGOF = 0;
   delete pRefGOF;
   pRefGOF = 0;
+  for (int k = 0; k < 2; k++)
+    delete _pr_gof[k];
   _RPT1(0, "MAnalyze destroyed %d\n",_instance_id);
 
 }
@@ -738,12 +784,24 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
       ref = MVSuper::CompleteLite(ref, child->GetVideoInfo(), _mt_flag, env);
       load_src_frame(*pRefGOF, ref, srd._analysis_data);
     }
+    // temporal predictor clips: frame nsrc (the current frame), loaded like the source
+    PVideoFrame pr_frame[2];
+    for (int k = 0; k < 2; k++)
+    {
+      if (!_pr_clip[k])
+        continue;
+      pr_frame[k] = _pr_clip[k]->GetFrame(nsrc, env);
+      if (_pr_lite[k])
+        pr_frame[k] = MVSuper::CompleteLite(pr_frame[k], _pr_clip[k]->GetVideoInfo(), _mt_flag, env);
+      load_src_frame(*_pr_gof[k], pr_frame[k], srd._analysis_data);
+    }
     _vectorfields_aptr->SearchMVs(
       pSrcGOF, pRefGOF,
       searchType, nSearchParam, nPelSearch, nLambda, lsad, pnew, plevel,
       global, srd._analysis_data.nFlags, reinterpret_cast<int*>(pDst),
       outfilebuf, fieldShift, pzero, pglobal, badSAD, badrange,
-      meander, pVecPrevOrNull, tryMany, searchTypeCoarse, tryManyAll
+      meander, pVecPrevOrNull, tryMany, searchTypeCoarse, tryManyAll,
+      pglobal_coarse, _pr_gof[0], _pr_adj[0], _pr_gof[1], _pr_adj[1]
     );
     }
 

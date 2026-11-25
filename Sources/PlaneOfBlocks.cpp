@@ -287,9 +287,15 @@ void PlaneOfBlocks::SearchMVs(
   SearchType st, int stp, int lambda, sad_t lsad, int pnew,
   int plevel, int flags, sad_t *out, const VECTOR * globalMVec,
   short *outfilebuf, int fieldShift, sad_t * pmeanLumaChange,
-  int divideExtra, int _pzero, int _pglobal, sad_t _badSAD, int _badrange, bool meander, int *vecPrev, bool _tryMany
+  int divideExtra, int _pzero, int _pglobal, sad_t _badSAD, int _badrange, bool meander, int *vecPrev, bool _tryMany,
+  MVFrame *prZeroFrame, float prZeroSADadj, MVFrame *prGlobalFrame, float prGlobalSADadj
 )
 {
+  pPrFrame[0] = prZeroFrame;
+  pPrFrame[1] = prGlobalFrame;
+  prSADadj[0] = prZeroSADadj;
+  prSADadj[1] = prGlobalSADadj;
+
   // -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
   // Frame- and plane-related data preparation
 
@@ -428,6 +434,8 @@ void PlaneOfBlocks::RecalculateMVs(
   short *outfilebuf, int fieldShift, sad_t thSAD, int divideExtra, int smooth, bool meander
 )
 {
+  pPrFrame[0] = pPrFrame[1] = nullptr; // no predictor clips in MRecalculate
+
   // -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
   // Frame- and plane-related data preparation
 
@@ -905,6 +913,48 @@ void PlaneOfBlocks::Refine(WorkingArea &workarea)
 
 
 
+// Temporal predictor clip k as the source block: workarea.pSrc is swapped for the clip's copy of the block (same
+// layout and pitch, see search_mv_slice), so the normal SAD and Refine code measures against it.
+template<typename pixel_t>
+sad_t PlaneOfBlocks::PrClipSAD(WorkingArea &workarea, int k, int vx, int vy, int cvx, int cvy)
+{
+  const uint8_t *src[3] = { workarea.pSrc[0], workarea.pSrc[1], workarea.pSrc[2] };
+  for (int p = 0; p < 3; p++)
+    workarea.pSrc[p] = workarea.pPrSrc[k][p];
+  const sad_t saduv = chroma ? ChromaSAD(workarea, cvx, cvy) : 0;
+  const sad_t sad = LumaSAD<pixel_t>(workarea, GetRefBlock(workarea, vx, vy)) + saduv;
+  for (int p = 0; p < 3; p++)
+    workarea.pSrc[p] = src[p];
+  return sad;
+}
+
+template<typename pixel_t>
+void PlaneOfBlocks::PrClipRefine(WorkingArea &workarea, int k)
+{
+  const uint8_t *src[3] = { workarea.pSrc[0], workarea.pSrc[1], workarea.pSrc[2] };
+  for (int p = 0; p < 3; p++)
+    workarea.pSrc[p] = workarea.pPrSrc[k][p];
+  Refine<pixel_t>(workarea);
+  for (int p = 0; p < 3; p++)
+    workarea.pSrc[p] = src[p];
+}
+
+// The SAD found on a predictor clip, corrected by adj (truncated). The cost: recomputed with the candidate's penalty
+// when the vector is still the candidate (anchor), else the motion cost of Refine is kept and only the SAD changes.
+template<typename pixel_t>
+void PlaneOfBlocks::PrClipScale(WorkingArea &workarea, float adj, const VECTOR &anchor, int penalty)
+{
+  typedef typename std::conditional < sizeof(pixel_t) == 1, sad_t, bigsad_t >::type safe_sad_t;
+  if (adj == 1.0f)
+    return;
+  const sad_t old_sad = workarea.bestMV.sad;
+  const sad_t new_sad = (sad_t)(old_sad * adj);
+  workarea.bestMV.sad = new_sad;
+  if (workarea.bestMV.x == anchor.x && workarea.bestMV.y == anchor.y)
+    workarea.nMinCost = new_sad + ((penalty * (safe_sad_t)new_sad) >> 8);
+  else
+    workarea.nMinCost += new_sad - old_sad;
+}
 template<typename pixel_t>
 void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
 {
@@ -939,6 +989,7 @@ void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
   sad += saduv;
   workarea.bestMV.sad = sad;
   workarea.nMinCost = sad + ((penaltyZero*(safe_sad_t)sad) >> 8); // v.1.11.0.2
+  const sad_t nMinCost_zero = workarea.nMinCost; // cost of the zero vector before the trymany refine
 
   VECTOR bestMVMany[8];
   int nMinCostMany[8];
@@ -951,16 +1002,63 @@ void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
     nMinCostMany[0] = workarea.nMinCost;
   }
 
+  // Temporal predictor clips (MAnalyse super_przero / super_prglobal). The zero and the global candidate are also
+  // measured with the block of a temporally averaged clip as the source block; its lower noise gives a lower SAD,
+  // corrected by prSADadj (> 1: the clip's candidate needs a clearly lower SAD to win). Without trymany a winning clip
+  // candidate is the current best and the final refine below runs on that clip (pr_raw_*: its uncorrected values);
+  // with trymany the refine around the candidate runs on the clip at once.
+  bool pr_best[2] = { false, false };  // the clip's candidate became the current best (no trymany)
+  sad_t pr_cost_adj[2] = { 0, 0 };     // its corrected cost
+  sad_t pr_raw_sad[2] = { 0, 0 };      // uncorrected SAD and cost, the start of the final refine
+  sad_t pr_raw_cost[2] = { 0, 0 };
+
+  if (pPrFrame[0] != nullptr)
+  {
+    // the same blocks as the zero candidate above (luma at the field-shifted zero, chroma at 0, 0)
+    const sad_t s = PrClipSAD<pixel_t>(workarea, 0, 0, zeroMVfieldShifted.y, 0, 0);
+    const sad_t s_adj = (sad_t)(s * prSADadj[0]);
+    const sad_t cost_raw = s + ((penaltyZero * (safe_sad_t)s) >> 8);
+    const sad_t cost_adj = s_adj + ((penaltyZero * (safe_sad_t)s_adj) >> 8);
+    if (cost_adj < nMinCost_zero)
+    {
+      if (tryMany)
+      {
+        workarea.bestMV.x = zeroMVfieldShifted.x;
+        workarea.bestMV.y = zeroMVfieldShifted.y;
+        workarea.bestMV.sad = s;
+        workarea.nMinCost = cost_raw;
+        PrClipRefine<pixel_t>(workarea, 0);
+        PrClipScale<pixel_t>(workarea, prSADadj[0], zeroMVfieldShifted, penaltyZero);
+        if (workarea.nMinCost < nMinCostMany[0])
+        {
+          bestMVMany[0] = workarea.bestMV;
+          nMinCostMany[0] = workarea.nMinCost;
+        }
+      }
+      else
+      {
+        // bestMV is the zero vector here (the zero candidate is the first one, no refine without trymany)
+        workarea.bestMV.sad = s_adj;
+        workarea.nMinCost = cost_adj;
+        pr_best[0] = true;
+        pr_cost_adj[0] = cost_adj;
+        pr_raw_sad[0] = s;
+        pr_raw_cost[0] = cost_raw;
+      }
+    }
+  }
+
   // Global MV predictor  - added by Fizick
   workarea.globalMVPredictor = ClipMV(workarea, workarea.globalMVPredictor);
 
   //	if ( workarea.IsVectorOK(workarea.globalMVPredictor.x, workarea.globalMVPredictor.y ) )
   {
-    saduv = (chroma) ? 
+    saduv = (chroma) ?
       ChromaSAD(workarea, workarea.globalMVPredictor.x, workarea.globalMVPredictor.y) : 0;
     sad = LumaSAD<pixel_t>(workarea, GetRefBlock(workarea, workarea.globalMVPredictor.x, workarea.globalMVPredictor.y));
     sad += saduv;
     sad_t cost = sad + ((pglobal*(safe_sad_t)sad) >> 8);
+    const sad_t nMinCost_global = cost; // cost of the global vector before the trymany refine
 
     if (cost < workarea.nMinCost || tryMany)
     {
@@ -975,6 +1073,44 @@ void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
       Refine<pixel_t>(workarea);    // reset bestMV
       bestMVMany[1] = workarea.bestMV;    // save bestMV
       nMinCostMany[1] = workarea.nMinCost;
+    }
+
+    if (pPrFrame[1] != nullptr)
+    {
+      const VECTOR &g = workarea.globalMVPredictor;
+      const sad_t s = PrClipSAD<pixel_t>(workarea, 1, g.x, g.y, g.x, g.y);
+      const sad_t s_adj = (sad_t)(s * prSADadj[1]);
+      const sad_t cost_raw = s + ((pglobal * (safe_sad_t)s) >> 8);
+      const sad_t cost_adj = s_adj + ((pglobal * (safe_sad_t)s_adj) >> 8);
+      // with trymany against the global vector's own cost, else against the current best
+      const sad_t target = tryMany ? nMinCost_global : std::min(nMinCost_global, workarea.nMinCost);
+      if (cost_adj < target)
+      {
+        workarea.bestMV.x = g.x;
+        workarea.bestMV.y = g.y;
+        if (tryMany)
+        {
+          workarea.bestMV.sad = s;
+          workarea.nMinCost = cost_raw;
+          PrClipRefine<pixel_t>(workarea, 1);
+          PrClipScale<pixel_t>(workarea, prSADadj[1], g, pglobal);
+          if (workarea.nMinCost < nMinCostMany[1])
+          {
+            bestMVMany[1] = workarea.bestMV;
+            nMinCostMany[1] = workarea.nMinCost;
+          }
+        }
+        else
+        {
+          workarea.bestMV.sad = s_adj;
+          workarea.nMinCost = cost_adj;
+          pr_best[0] = false; // the zero clip's candidate is no longer the best
+          pr_best[1] = true;
+          pr_cost_adj[1] = cost_adj;
+          pr_raw_sad[1] = s;
+          pr_raw_cost[1] = cost_raw;
+        }
+      }
     }
     //	}
     //	Then, the predictor :
@@ -1039,7 +1175,25 @@ void PlaneOfBlocks::PseudoEPZSearch(WorkingArea& workarea)
   else
   {
     // then, we refine, according to the search type
-    Refine<pixel_t>(workarea);
+    // A predictor clip's candidate that is still the best (no later candidate was strictly better): refine on that
+    // clip from its uncorrected values, then correct the result.
+    int k_best = -1;
+    for (int k = 0; k < 2; k++)
+    {
+      const VECTOR &anchor = (k == 0) ? zeroMVfieldShifted : workarea.globalMVPredictor;
+      if (pr_best[k] && workarea.nMinCost == pr_cost_adj[k] && workarea.bestMV.x == anchor.x && workarea.bestMV.y == anchor.y)
+        k_best = k;
+    }
+    if (k_best >= 0)
+    {
+      workarea.bestMV.sad = pr_raw_sad[k_best];
+      workarea.nMinCost = pr_raw_cost[k_best];
+      PrClipRefine<pixel_t>(workarea, k_best);
+      PrClipScale<pixel_t>(workarea, prSADadj[k_best], (k_best == 0) ? zeroMVfieldShifted : workarea.globalMVPredictor,
+        (k_best == 0) ? penaltyZero : pglobal);
+    }
+    else
+      Refine<pixel_t>(workarea);
   }
   sad_t foundSAD = workarea.bestMV.sad;
 
@@ -3014,6 +3168,29 @@ void	PlaneOfBlocks::search_mv_slice(Slicer::TaskData &td)
       }
 #endif	// ALIGN_SOURCEBLOCK
 
+      // Temporal predictor clips: their block at the same position, copied like the source block (same layout and
+      // pitch, so PrClipSAD / PrClipRefine only swap workarea.pSrc)
+      for (int k = 0; k < 2; k++)
+      {
+        if (pPrFrame[k] == nullptr)
+          continue;
+        const MVPlaneSet pl[3] = { YPLANE, UPLANE, VPLANE };
+        for (int p = 0; p < (chroma ? 3 : 1); p++)
+        {
+          const MVPlane *plane = pPrFrame[k]->GetPlane(pl[p]);
+          const uint8_t *ps = plane->GetAbsolutePelPointer(workarea.x[p], workarea.y[p]);
+#if (ALIGN_SOURCEBLOCK > 1)
+          if (p == 0)
+            BLITLUMA(workarea.pPr_temp[k][0], nSrcPitch[0], ps, plane->GetPitch());
+          else
+            BLITCHROMA(workarea.pPr_temp[k][p], nSrcPitch[p], ps, plane->GetPitch());
+          workarea.pPrSrc[k][p] = workarea.pPr_temp[k][p];
+#else	// ALIGN_SOURCEBLOCK
+          workarea.pPrSrc[k][p] = ps; // same pitch as the source super (same format, checked in MAnalyse)
+#endif	// ALIGN_SOURCEBLOCK
+        }
+      }
+
       // No lambda (vector coherence penalty) for the first row: it has no up predictor, the predictor is not
       // reliable enough to penalize the deviation from it. With internal mt this is the first row of each slice
       // (see FetchPredictors: no rows of other slices are read): the same in every run on one machine, but
@@ -3560,7 +3737,16 @@ PlaneOfBlocks::WorkingArea::WorkingArea(int nBlkSizeX, int nBlkSizeY, int dctpit
   pSrc_temp[0] = &pSrc_temp_base[0];
   pSrc_temp[1] = (uint8_t *)(pSrc_temp[0] + blocksize);
   pSrc_temp[2] = (uint8_t *)(pSrc_temp[1] + UVblocksize);
+  pPr_temp_base.resize(2 * sizeAlignedBlock);
+  for (int k = 0; k < 2; k++)
+  {
+    pPr_temp[k][0] = &pPr_temp_base[k * sizeAlignedBlock];
+    pPr_temp[k][1] = pPr_temp[k][0] + blocksize;
+    pPr_temp[k][2] = pPr_temp[k][1] + UVblocksize;
+  }
 #endif	// ALIGN_SOURCEBLOCK
+  for (int k = 0; k < 2; k++)
+    pPrSrc[k][0] = pPrSrc[k][1] = pPrSrc[k][2] = nullptr;
 }
 
 

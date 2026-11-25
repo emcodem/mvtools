@@ -114,7 +114,12 @@ void	GroupOfPlanes::SearchMVs(
   int *  vecPrev,
   bool   tryMany,
   SearchType searchTypeCoarse,
-  bool   tryManyAll
+  bool   tryManyAll,
+  int    pglobal_coarse,
+  MVGroupOfFrames *prZeroGOF,
+  float  prZeroSADadj,
+  MVGroupOfFrames *prGlobalGOF,
+  float  prGlobalSADadj
   )
 {
   nFlags |= flags;
@@ -143,7 +148,10 @@ void	GroupOfPlanes::SearchMVs(
   if (!global)
   {
     pglobal = pzero;
+    pglobal_coarse = pzero;
   }
+  // pglobal on the finest level, pglobal_coarse on the coarser ones
+  auto pglobal_of = [&](int level) { return level == 0 ? pglobal : pglobal_coarse; };
 
   int meanLumaChange = 0;
 
@@ -172,12 +180,16 @@ void	GroupOfPlanes::SearchMVs(
     &meanLumaChange,
     divideExtra,
     pzero,
-    pglobal,
+    pglobal_of(nLevelCount - 1),
     badSAD,
     badrange,
     meander,
     vecPrev,
-    tryManyLevel
+    tryManyLevel,
+    // temporal predictor clips: the zero clip on every level, the global clip not on the coarsest level (the global
+    // vector is still zero there)
+    prZeroGOF ? prZeroGOF->GetFrame(nLevelCount - 1) : nullptr, prZeroSADadj,
+    nullptr, prGlobalSADadj
   );
 
   GOLDEN_LOG("level %d done meanLumaChange_out %d", nLevelCount - 1, meanLumaChange);
@@ -241,12 +253,17 @@ void	GroupOfPlanes::SearchMVs(
       &meanLumaChange,
       divideExtra,
       pzero,
-      pglobal,
+      pglobal_of(i),
       badSAD,
       badrange,
       meander,
       vecPrev,
-      tryManyLevel
+      tryManyLevel,
+      prZeroGOF ? prZeroGOF->GetFrame(i) : nullptr, prZeroSADadj,
+      // the global clip is skipped where the global vector is the zero vector and a zero clip is given (the same
+      // candidate twice)
+      (prGlobalGOF && !(prZeroGOF && globalMV.x == 0 && globalMV.y == 0)) ? prGlobalGOF->GetFrame(i) : nullptr,
+      prGlobalSADadj
     );
 
     out += planes[i]->GetArraySize(divideExtra);

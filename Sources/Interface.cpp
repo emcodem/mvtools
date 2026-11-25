@@ -177,6 +177,16 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
     global = args[14].AsBool(false);
   }
 
+  // temporal predictor clips (super_przero / super_prglobal) and the coarse-level global penalty
+  MVAnalyse::PredictorArgs pr;
+  pr.clip[0] = args[35].Defined() ? args[35].AsClip() : nullptr;
+  pr.nframes[0] = args[36].AsInt(0);
+  pr.adj[0] = (float)args[37].AsFloat(0.0f);
+  pr.clip[1] = args[38].Defined() ? args[38].AsClip() : nullptr;
+  pr.nframes[1] = args[39].AsInt(0);
+  pr.adj[1] = (float)args[40].AsFloat(0.0f);
+  pr.pglobal_coarse = args[41].AsInt(args[17].AsInt(0)); // default: pglobal
+
   return new MVAnalyse(
     args[0].AsClip(),       // super
     blksize,
@@ -213,6 +223,7 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
     args[33].AsInt(3),   // search_coarse default EXHAUSTIVE - svp
     args[34].AsBool(false),   // trymanyall default false
     user_data != nullptr,     // CudaMAnalyse
+    pr,
     env
   );
 }
@@ -501,6 +512,9 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
   const int thSAD2 = args[14].AsInt(thSAD);  // thSAD2
   const int thSADC2 = args[15].AsInt(thSADC); // thSADC2
   const bool cuda = user_data != nullptr; // CudaMDegrainN
+  // SkipFrame: the reference frame at this signed offset is left out (-k: the isb vector of delta k, i.e. frame n + k;
+  // +k: frame n - k), e.g. for an average of the neighbours without the reference frame of one delta
+  const int skip_frame = args[18].AsInt(0);
   const bool lsb = args[13].AsBool(false);
   const bool out16 = args[17].AsBool(false);
   if (lsb)
@@ -512,7 +526,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
   PClip degrain;
 
   // Switch to MDegrain1/2/3/4/5/6 when possible (faster)
-  if (thSAD2 == thSAD && thSADC == thSADC2)
+  if (thSAD2 == thSAD && thSADC == thSADC2 && skip_frame == 0)
   {
     if (tr <= MAX_DEGRAIN) // up to MDegrain5 160926, MDegrain6 170105
     {
@@ -550,7 +564,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
   }
   // Standard MDegrainN
   if (!degrain && cuda)
-    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD and thSADC2 = thSADC").decide(env);
+    GpuCheck("CudaMDegrainN", "MDegrainN").need(false, "only tr 1 to 6 with thSAD2 = thSAD, thSADC2 = thSADC and SkipFrame = 0").decide(env);
   if (!degrain)
     degrain = new MDegrainN(
     source,                  // source
@@ -569,6 +583,7 @@ AVSValue __cdecl Create_MDegrainN(AVSValue args, void* user_data, IScriptEnviron
     thSADC2,                   // thSADC2
     args[16].AsBool(true),   // mt
     out16 || lsb,            // out16
+    skip_frame,              // SkipFrame
     env
   );
   if (lsb)
@@ -766,8 +781,8 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
 #endif
   env->AddFunction("MShow", "cc[scale]i[sil]i[tol]i[showsad]b[number]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVShow, 0);
-  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b", Create_MVAnalyse, 0);
-  env->AddFunction("CudaMAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b", Create_MVAnalyse, (void *)1);
+  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i", Create_MVAnalyse, 0);
+  env->AddFunction("CudaMAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i", Create_MVAnalyse, (void *)1);
   env->AddFunction("MMask", "cc[ml]f[gamma]f[kind]i[time]f[Ysc]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVMask, 0);
   env->AddFunction("MCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, 0);
   env->AddFunction("CudaMCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, (void *)1);
@@ -790,8 +805,8 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   env->AddFunction("CudaMDegrain5", "cccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(5 | CUDA_FLAG));
   env->AddFunction("MDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)6);
   env->AddFunction("CudaMDegrain6", "cccccccccccccc[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[mt]b[out16]b", Create_MVDegrainX, (void *)(6 | CUDA_FLAG));
-  env->AddFunction("MDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b", Create_MDegrainN, 0);
-  env->AddFunction("CudaMDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b", Create_MDegrainN, (void *)1);
+  env->AddFunction("MDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b[SkipFrame]i", Create_MDegrainN, 0);
+  env->AddFunction("CudaMDegrainN", "ccci[thSAD]i[thSADC]i[plane]i[limit]f[limitC]f[thSCD1]i[thSCD2]i[isse]b[planar]b[lsb]b[thsad2]i[thsadc2]i[mt]b[out16]b[SkipFrame]i", Create_MDegrainN, (void *)1);
   env->AddFunction("MRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, 0);
   env->AddFunction("CudaMRecalculate", "cc[thsad]i[smooth]i[blksize]i[blksizeV]i[search]i[searchparam]i[lambda]i[chroma]b[truemotion]b[pnew]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[isse]b[meander]b[tr]i[mt]b[scaleCSAD]i", Create_MVRecalculate, (void *)1);
   env->AddFunction("MBlockFps", "cccc[num]i[den]i[mode]i[ml]f[blend]b[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b", Create_MVBlockFps, 0);

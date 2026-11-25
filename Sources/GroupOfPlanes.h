@@ -59,7 +59,9 @@ public :
     SearchType searchType, int nSearchParam, int _PelSearch, int _nLambda,
     sad_t _lsad, int _pnew, int _plevel, bool _global, int flags, int *out,
     short * outfilebuf, int fieldShift, int _pzero, int _pglobal, sad_t badSAD,
-    int badrange, bool meander, int *vecPrev, bool tryMany, SearchType searchTypeCoarse, bool tryManyAll);
+    int badrange, bool meander, int *vecPrev, bool tryMany, SearchType searchTypeCoarse, bool tryManyAll,
+    int pglobal_coarse,
+    MVGroupOfFrames *prZeroGOF = nullptr, float prZeroSADadj = 1.0f, MVGroupOfFrames *prGlobalGOF = nullptr, float prGlobalSADadj = 1.0f);
   void           WriteDefaultToArray (int *array);
   int            GetArraySize ();
   void           ExtraDivide (int *out, int flags);

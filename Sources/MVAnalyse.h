@@ -169,7 +169,24 @@ protected:
   int _gpu_rfilter; // MSuper rfilter of the super clip (2 or 4 on the GPU)
   int _gpu_super_levels;
 
+  // Temporal predictor clips (super_przero / super_prglobal, index 0 / 1): supers of temporally averaged clips whose
+  // blocks are tried as the source block of the zero / global candidate (PlaneOfBlocks::PseudoEPZSearch)
+  PClip _pr_clip[2];
+  bool _pr_lite[2];
+  float _pr_adj[2];
+  MVGroupOfFrames *_pr_gof[2];
+  int pglobal_coarse; // global penalty on the coarse levels (pglobal: finest level)
+
 public:
+
+  // MAnalyse arguments of the temporal predictor clips and pglobal_coarse
+  struct PredictorArgs
+  {
+    PClip clip[2];     // super_przero, super_prglobal (nullptr: not used)
+    int nframes[2];    // Nframes_przero / _prglobal: frames averaged; < 0: the current frame is included
+    float adj[2];      // SADadj_przero / _prglobal; <= 0: automatic
+    int pglobal_coarse;
+  };
 
   MVAnalyse(
     PClip _child, int _blksizex, int _blksizey, int lv, int st /* search type */, int stp /* search type param */,
@@ -178,7 +195,8 @@ public:
     int _overlapx, int _overlapy, const char* _outfilename, int _dctmode,
     int _divide, int _sadx264, sad_t _badSAD, int _badrange, bool _isse,
     bool _meander, bool temporal_flag, bool _tryMany, bool multi_flag,
-    bool mt_flag, int _chromaSADScale, int st_coarse, bool _tryManyAll, bool gpu_flag, IScriptEnvironment* env);
+    bool mt_flag, int _chromaSADScale, int st_coarse, bool _tryManyAll, bool gpu_flag, const PredictorArgs &pr,
+    IScriptEnvironment* env);
   ~MVAnalyse();
 
   ::PVideoFrame __stdcall	GetFrame(int n, ::IScriptEnvironment* env) override;
