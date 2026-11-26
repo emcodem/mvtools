@@ -201,15 +201,19 @@ namespace
     return wiener6(s(t - 2), s(t - 1), s(t), s(t + 1), s(t + 2), s(t + 3), maxv);
   }
 
-  // blockIdx.z = plane * 3 + sub (0 horizontal, 1 vertical, 2 horizontal of vertical); padded-plane coordinates
+  // the three sub-pel planes of one padded-plane row segment: 0 horizontal, 1 vertical, 2 horizontal of vertical.
+  // blockIdx.z = plane, SUBPEL_NT threads per CTA. The segment's padded source row and its vertical pass (with the
+  // columns a horizontal pass reads on each side) go to shared memory once, so plane 2 takes the finished vertical
+  // values instead of recomputing the vertical pass for each of its six taps (same arithmetic).
+  constexpr int SUBPEL_NT = 128;
   template <class T>
-  __global__ void k_subpel(SubBuild b)
+  __global__ void __launch_bounds__(SUBPEL_NT) k_subpel(SubBuild b)
   {
-    const int p = blockIdx.z / 3, s = blockIdx.z % 3;
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+    const int p = blockIdx.z;
+    const int x0 = blockIdx.x * SUBPEL_NT, y = blockIdx.y;
     const int ew = b.ew[p], eh = b.eh[p];
-    if (x >= ew || y >= eh)
-      return;
+    if (x0 >= ew || y >= eh)
+      return; // the whole CTA
     const T *src = (const T *)b.src[p];
     const size_t ps = b.ps[p];
     const int w = b.w[p], h = b.h[p], hp = b.hp[p], vp = b.vp[p], maxv = b.maxv;
@@ -217,14 +221,24 @@ namespace
       const int cx = min(max(px_ - hp, 0), w - 1), cy = min(max(py_ - vp, 0), h - 1);
       return (int)src[(size_t)cy * ps + cx];
     };
-    int v;
-    if (s == 0)
-      v = wiener_at(x, ew, maxv, [&](int k) { return P(k, y); });
-    else if (s == 1)
-      v = wiener_at(y, eh, maxv, [&](int k) { return P(x, k); });
-    else
-      v = wiener_at(x, ew, maxv, [&](int k) { return wiener_at(y, eh, maxv, [&](int m) { return P(k, m); }); });
-    ((T *)b.dst[p][s])[(size_t)y * ew + x] = (T)v;
+    // tile entry i = column x0 - 2 + i; a horizontal pass at column x reads columns x - 2 .. x + 3, all inside the
+    // padded row, so the clamped entries outside it are never read
+    constexpr int TW = SUBPEL_NT + 5;
+    __shared__ int row[TW], col[TW];
+    for (int i = threadIdx.x; i < TW; i += SUBPEL_NT)
+    {
+      const int k = min(max(x0 - 2 + i, 0), ew - 1);
+      row[i] = P(k, y);
+      col[i] = wiener_at(y, eh, maxv, [&](int m) { return P(k, m); });
+    }
+    __syncthreads();
+    const int x = x0 + threadIdx.x;
+    if (x >= ew)
+      return;
+    const size_t o = (size_t)y * ew + x;
+    ((T *)b.dst[p][0])[o] = (T)wiener_at(x, ew, maxv, [&](int k) { return row[k - x0 + 2]; });
+    ((T *)b.dst[p][1])[o] = (T)col[threadIdx.x + 2];
+    ((T *)b.dst[p][2])[o] = (T)wiener_at(x, ew, maxv, [&](int k) { return col[k - x0 + 2]; });
   }
 
   bool frames_match(const mvc::DevFrame &a, const mvc::DevFrame &b)
@@ -420,11 +434,11 @@ namespace mvc
         s->sub[p][k] = b.dst[p][k];
       }
     }
-    const dim3 grid((max_ew + 127) / 128, max_eh, fr->f.planes * 3);
+    const dim3 grid((max_ew + SUBPEL_NT - 1) / SUBPEL_NT, max_eh, fr->f.planes);
     if (bps == 2)
-      pipe_submit([=](cudaStream_t st) { k_subpel<uint16_t><<<grid, 128, 0, st>>>(b); });
+      pipe_submit([=](cudaStream_t st) { k_subpel<uint16_t><<<grid, SUBPEL_NT, 0, st>>>(b); });
     else
-      pipe_submit([=](cudaStream_t st) { k_subpel<uint8_t><<<grid, 128, 0, st>>>(b); });
+      pipe_submit([=](cudaStream_t st) { k_subpel<uint8_t><<<grid, SUBPEL_NT, 0, st>>>(b); });
     fr->subpel = s;
     frame_account_extra(*fr, total);
     return s;
