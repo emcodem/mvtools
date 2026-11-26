@@ -342,3 +342,94 @@ fit our no-AI rule as classical work.
     edge behaviour (ringing at picture borders / pillarbox edges).
 21. "Broadcast downsizer" (#23 list, 1-3 and 6): research only, not planned. Ask him which of his doom9 t=186356
     kernels he would use as the reference for HD -> SD i.
+
+## DTL post: zero + global temporal predictor clips, worked example (r.2.7.46-a.32, received 2026-11-25)
+
+Pasted by the user 2026-11-25 (doom9 t=187172; post number not noted). Not run, not checked against his code yet.
+Follow-up to items 17 (zero predictor clip) and 18 (global predictor clip): both are now built in his fork and
+tested with MDegrain3 (up to MDegrain6, QTGMC's max tr). He thinks it also works with
+`Interleave(bv1, fv1, bv2, fv2, ...)` + MDegrainN for tr > 6 (not tested).
+
+### His script (summary)
+
+- Base: `MSuper(pel=4, chroma=true)`, thSAD 300, thSCD1 700, overlap 4, search=3 searchparam=2, trymany=true,
+  truemotion=false, pnew = pzero = pglobal = 0, global=true, tr=3.
+- **Zero predictor clips**: `MSuper(pel=1)` (pel 1 is enough for zero vectors), then
+  `MAnalyse(multi=true, delta=10, search=3, searchparam=1, levels=1, pzero=-1000, pnew=1000, pglobal=1000,
+  global=false)` (forces zero vectors), then one `MDegrainN(..., 10, SkipFrame=k)` per main delta k = -3..-1, 1..3:
+  an average of the 10-radius neighbourhood **without the ref frame of that delta** (this answers the correlation
+  question in items 16 / 17: he excludes the ref frame per delta, so each delta needs its own predictor clip).
+  Each result gets its own `MSuper(pel=4)`.
+- **Global predictor clips**: `MSuper(pel=4, hpad=8, vpad=8)`, `MAnalyse(multi=true, delta=6, blksize=8, overlap=4,
+  truemotion=true, global=true, pglobal=-1000, pnew=0, pzero=0)` (all levels, forces the global vector), then the
+  same per-delta `MDegrainN(..., 6, SkipFrame=k)` + `MSuper(pel=4)`. blksize 16 / overlap 8 would be better but
+  crashes in his build ("need debug").
+- **Main analysis**: one `MAnalyse(multi=false, isb, delta)` per direction and delta, with the new arguments
+  `super_przero`, `Nframes_przero`, `SADadj_przero` and `super_prglobal`, `Nframes_prglobal`, `SADadj_prglobal`.
+  Compared: zero predictor only, zero + global, stock `multi=true` + MDegrainN; output Weave'd (interlaced source)
+  and a difference clip.
+- `SkipFrame` is a parameter of MDegrainN in his fork (leave out one frame of the radius). We have neither SkipFrame
+  nor the predictor-clip arguments.
+
+### Reference code (local clone C:\dev\mvtools_dtl, cloned 2026-11-25)
+
+Tag `r.2.7.46-a.32` = 17dfdb5 on branch `mvtools-pfmod` (GitHub release "Release 25.11.26", asset
+Release_251126.zip, published 2026-11-25). Commits after a.31:
+
+- b91a5aa (13 Nov): przero fix for trymany=false (PlaneOfBlocks.cpp).
+- 62c3acd (24 Nov): `SkipFrame` in MDegrainN (MDegrainN.cpp/.h, Interface.cpp). Release notes: signed int, default
+  0, the frame at that offset is fully dropped from the average; valid range +-tr, not checked internally.
+- 4fbecaf, d6bf4b7, 033652a, 98397ea, 17dfdb5 (25 Nov): `super_prglobal` / `Nframes_prglobal` / `SADadj_prglobal`
+  in MAnalyse (MVAnalyse.cpp/.h, GroupOfPlanes.cpp/.h, PlaneOfBlocks.cpp/.h, Interface.cpp). Release notes:
+  **`pglobal < -256` = global predictor force mode** (the low value on level 0 only, 0 on all coarser levels, so
+  the global vector is still estimated correctly). 98397ea: the global predictor clip is not used on the starting
+  (coarsest) level, where the global vector is still zero, and not on other levels when global == zero vector.
+  17dfdb5: fix of the przero / prglobal cost save.
+
+The release notes also contain a short MDegrain1 version of the script (delta 1 only, tr 6 in the globals).
+
+### Parameters
+
+- The averaging radius of each predictor clip does not have to equal the main tr and can differ per clip (his
+  example: 10 for zero, 6 for global; "about 6..10" with main tr 6).
+- `SADadj_X`: metric correction for the lower noise of the averaged clip. 1.0 = most weight to the predictor's
+  vector. 0.0 = auto, slightly less preference: `N = Nframes_X`; N > 1 (current frame not in the average,
+  recommended): `sqrt(2N / (N + 1))`; N < -1 (current frame included, possible but not recommended):
+  `sqrt(2|N| / (|N| - 1))`. About 1.35 at N = 10 (he wrote "about 1.4..1.5"). 2.0 and more is expected to switch
+  the extra predictor off. Good values per footage type are expected between 1.0 and auto.
+
+### Cost
+
+- Full HD, tr 6, both predictor clips with radius 6..10, i5-9600K incl. x264: about 0.3 fps. He asks for help from
+  an accelerator; in script form it needs many intermediate super clips, which a built-in version could avoid
+  (and the per-delta `MDegrainN(SkipFrame)` could become a more compact form).
+
+### TODO
+
+22. Reproduce his script with his a.32 build on our material (Dancers / static texture + grain, plus a pan for the
+    global clip) and judge zero-only vs zero+global vs stock by eye (no PSNR-only claims). Also check his blksize 16
+    / overlap 8 crash on the global clip MAnalyse: is it in stock mvtools too, or only his fork?
+23. If it holds up: design a built-in version instead of the script chain. Ideas: one zero-vector averaged buffer
+    per frame with the per-delta ref frame subtracted out (sum - ref, divided by N - 1) instead of 2 x tr separate
+    MDegrainN runs; the global clip from the global vector per frame pair (MAnalyse already computes it) instead of a
+    second full analysis; super levels built on the GPU directly. Same opt-in rule as items 16 / 17 (stock output
+    with the arguments off). Builds on item 16 (second super input path in k_search / k_wave).
+    Decisions (user, 2026-11-25): (1) eye test with his a.32 DLL first, no code before that; (2) his `pglobal < -256`
+    convention is NOT taken over: a separate new MAnalyse argument forces the global vector on the finest level only
+    (his scripts need that one edit); (3) check whether pinterf would take a clean version upstream; (4) GPU phase 2
+    (CudaMAnalyse with predictor clips) only after phase 1 (CPU port, CudaMAnalyse refuses them by the D8 rule,
+    CudaMDegrainN supports SkipFrame) has proven itself in use. Design: new file PredictorClips.cpp/.h, small hooks
+    in MVAnalyse / GroupOfPlanes / PlaneOfBlocks, the predictor block copied to a second aligned source buffer (pointer
+    swap, no ALIGN_SOURCEBLOCK change), bit-exact with a.32 incl. its tie behaviour.
+    Upstream chances (checked 2026-11-25 on github pinterf/mvtools): pinterf takes DTL's ideas, but by hand in his
+    own form - #45 (2021, predictor modes + AVX2 SAD, still open) was cherry-picked and reworked ("really needs human
+    readable C implementation ... without any tricks inside"); #60 (2023) left open, he asked for clean commits
+    without the experimenting phase; #68 (Apr 2026) he added search_coarse / trymanyall himself, refused to give a
+    documented parameter a second meaning ("I don't want to abuse this parameter"), complained about the 34
+    MAnalyse parameters (DTL suggested a separate MAnalyse2). He insists on deterministic output (2.7.49 mt fix).
+    So: if the eye test is positive, open a feature request first (names, parameter count, maybe MAnalyse2), then
+    offer a clean CPU-only change (plain C, 2-space indent, CRLF, opt-in, deterministic, no GPU code).
+    Eye test clips: profile\dtl_a32\eye\cmp_*.mov (his a.32 DLL, left standard MDegrain3, right zero + global).
+24. Reference commit found (17dfdb5, see above); level handling answered by the release notes / 98397ea. Still
+    open: read the a.31..a.32 diff in PlaneOfBlocks.cpp before designing item 23 (how the predictor clip's src
+    block enters the refine, with ALIGN_SOURCE_BLOCK and trymany).
