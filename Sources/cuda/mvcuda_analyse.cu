@@ -100,6 +100,14 @@ namespace
     // MAnalyse on separated fields (level 0 only, else 0): the zero vector is (0, fshift), the global predictor is shifted
     // by it, and the zero candidate's chroma SAD is taken at (0, 0) (PlaneOfBlocks: zeroMVfieldShifted, ChromaSAD(0, 0))
     int fshift;
+    // slice path with k_search_fix on consecutive levels (no k_glob_interp launch between them): interp_head = this
+    // kernel's CTAs make the interpolated predictions of their own slice rows from the coarser level (coarse, c_blk_x,
+    // c_blk_y) first; glob_tail = the CTA that finishes last (ticket) makes the global vector of the next finer level from
+    // this level's vectors (freq: glob_estimate's scratch)
+    int interp_head, glob_tail;
+    const int *coarse;
+    int c_blk_x, c_blk_y;
+    int *freq;
   };
 
   // One whole analysis call for the wavefront kernel (one launch for all levels): the rows of all levels, coarsest level
@@ -2922,6 +2930,16 @@ namespace
         b.ring_dx[n] = r; b.ring_dy[n++] = r;
       }
     }
+    // the interpolated predictions of this slice's rows (k_glob_interp's, for these rows only: a slice reads no other
+    // slice's vectors of this level); published by the first row barrier below
+    if (a.interp_head)
+      for (int i = beg * a.n_blk_x + tid; i < end * a.n_blk_x; i += blockDim.x)
+      {
+        const Vec v = interp_pred(a, a.coarse, a.c_blk_x, a.c_blk_y, 0, i);
+        a.vec[3 * i + 0] = v.x;
+        a.vec[3 * i + 1] = v.y;
+        a.vec[3 * i + 2] = v.sad;
+      }
 
     for (int blky = beg; blky < end; blky++)
     {
@@ -3291,6 +3309,26 @@ namespace
         if (tid == 0)
           atomicAdd(&g_prof[bk][5], 1ull);
 #endif
+      }
+    }
+    // the global vector of the next finer level (k_glob_interp's CTA 0) by the CTA that finishes last: every CTA has read
+    // a.glob at its start, and thread 0 wrote all of its CTA's vectors (fenced before the ticket)
+    if (a.glob_tail)
+    {
+      __shared__ int s_last;
+      __syncthreads();
+      if (tid == 0)
+      {
+        __threadfence();
+        s_last = atomicAdd(a.ticket, 1) == (int)gridDim.x - 1;
+      }
+      __syncthreads();
+      if (s_last)
+      {
+        __threadfence();
+        glob_estimate(a.vec, a.n_blk_x * a.n_blk_y, a.freq, (int *)a.glob, a.use_global, tid, blockDim.x);
+        if (tid == 0)
+          *a.ticket = 0; // for the next level's kernel (stream order)
       }
     }
   }
@@ -5192,7 +5230,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // level][global estimate ready per level][global estimate (x, y) per level][bad flag]
   const size_t w_rowbad = rows_total, w_ticket = 2 * (size_t)rows_total, w_done = w_ticket + 1, w_ready = w_done + MVCUDA_MAX_LEVELS;
   const size_t w_glob = w_ready + MVCUDA_MAX_LEVELS, w_bad = w_glob + 2 * MVCUDA_MAX_LEVELS, w_fin = w_bad + 1, wave_words = w_fin + 1;
-  const size_t wave_bytes = wave ? wave_words * sizeof(int) : sizeof(int);
+  const size_t wave_bytes = wave ? wave_words * sizeof(int) : 2 * sizeof(int); // slice path: bad flag, glob_tail ticket
   // the wave state (slice kernel: the bad flag) follows the payload in one buffer, so one copy brings back the vectors and
   // the bad flag
   const size_t pay_alloc = pay_bytes + wave_bytes;
@@ -5300,6 +5338,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       AN_CHECK(cudaGetLastError());
     }
     bool wave_gen = false;
+    bool prev_fix = false; // slice path: the coarser level ran k_search_fix (with glob_tail)
 
     for (int l = nl - 1; l >= 0; l--)
     {
@@ -5403,12 +5442,6 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         continue; // launched once for all levels below
       }
 
-      if (l < nl - 1)
-      {
-        // global MV estimate from the coarser plane (doubled), then the interpolated prediction for this plane
-        const int total = a.n_blk_x * a.n_blk_y;
-        k_glob_interp<<<1 + (total + 1023) / 1024, 1024, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], d_freq, d_glob, ap->use_global);
-      }
       // (the coarsest level: the global vector is still the zero k_pay_init wrote)
       {
         size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
@@ -5450,6 +5483,32 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
             shm += need + 16; // 16: alignment of the window (AnaChecker::refine_any)
           }
         }
+        // the global vector and the interpolated predictions of this level: from the coarser level's k_search_fix (glob_tail)
+        // and this kernel's CTAs (interp_head) when both levels use k_search_fix, else k_glob_interp
+        static const bool fix_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
+        const bool fix_level = !a.try_many && fix_allowed && !a.exh_fast && a.fshift == 0
+          && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || wave_plan(a.search_type, a.radius) != WP_GEN);
+        a.ticket = d_bad + 1;
+        a.freq = d_freq;
+        a.glob_tail = (fix_level && l > 0) ? 1 : 0;
+        a.interp_head = 0;
+        if (l < nl - 1)
+        {
+          if (fix_level && prev_fix)
+          {
+            a.interp_head = 1;
+            a.coarse = d_pay + offs[l + 1];
+            a.c_blk_x = nbx[l + 1];
+            a.c_blk_y = nby[l + 1];
+          }
+          else
+          {
+            // global MV estimate from the coarser plane (doubled), then the interpolated prediction for this plane
+            const int total = a.n_blk_x * a.n_blk_y;
+            k_glob_interp<<<1 + (total + 1023) / 1024, 1024, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], d_freq, d_glob, ap->use_global);
+          }
+        }
+        prev_fix = fix_level;
         if (a.try_many)
 #if MVC_ANALYSE_SPLIT
           MVC_AN_PARTS::search_tm_launch(&a, a.n_slices, shm, st);
@@ -5459,9 +5518,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         else
         {
           // the fixed-batch plans without trymany: the leaner kernel (same result); MVCUDA_SEARCH_FIX=0: k_search
-          static const bool fix_allowed = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
-          const bool fixed = !a.exh_fast && a.fshift == 0 && ((a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3) || wave_plan(a.search_type, a.radius) != WP_GEN);
-          if (fix_allowed && fixed)
+          if (fix_level)
           {
             switch (fix_eval_id(a))
             {
