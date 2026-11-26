@@ -146,6 +146,13 @@ normal meander=false path keeps its static shared memory; meander=true + predict
    Tried: groups of 8 (eval_multi<8>, half the rounds): no gain (19.4 vs 20.3 ms), reverted - the rounds are not the
    limit. Next ideas: the reference window of each distinct start in shared memory (as exhaustive_fast of k_search),
    or all 7 Refines' candidates as one CTA-wide batch; needs a closer look at eval_multi_pk's memory pattern first.
+   DONE for the wavefront kernel (2026-11-26 night): the exhaustive trymany SAD table (every distinct start vector's
+   ring candidates) is made by the wavefront kernel itself with the whole CTA through wave_eval_inl (packed reads, in
+   batches of MAX_BATCH) before trymany_par, which then only folds (trymany_par(..., pre=true)); the start / dedup logic
+   moved to tm_starts / tm_unique / tm_ring_offset, shared by both. 8x8: trymany 20.3 -> 10.0 ms per SD frame,
+   trymanyall 38.8 -> 12.9 ms; full run_s234 300 / 300. DTL's script with trymany + built-in zero clip: GPU 29.1 -> 18.8 s
+   (300 frames; CPU 22.2 s). Not done: the slice kernel (meander=true: AnaChecker batches, 27.5 vs 13.0 ms without
+   trymany) - the same idea through its batch evaluation is the next step there (QTGMC uses the slice kernel).
 3. Built-in zero predictor clip (2026-11-26 night): MAnalyse `przero_radius=r` (1..10, 8-16 bit, excludes super_przero;
    Nframes_przero defaults to r): per source frame n and reference frame m the level planes (extended area) of the super
    frames n-r..n+r inside the clip without m, averaged pixel by pixel, (sum + c/2) / c (CPU: MVAnalyse::make_przero into

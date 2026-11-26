@@ -1709,26 +1709,15 @@ namespace
     int bx, by, sad, cost, info; // selected vector, its SAD and cost; info: dependent Refines | distinct starts << 8
   };
 
-  // Out of line (one copy per kernel): inlined into k_search it made the trymany instance spill 1.3 KB.
-  __device__ __noinline__ TmOut trymany_par(const TmIn &in, const LevelArgs &a, int lane, int warp, int nwarps,
-    int (*tm)[4], int (*tsad)[2])
+  // PseudoEPZSearch with tryMany: the start state of each of the 7 Refines (zero, global, predictor, predictors[0..3]);
+  // dep: the Refines whose candidate CheckMV0 rejected (they start from the previous Refine's result)
+  __device__ __forceinline__ void tm_starts(const TmIn &in, const LevelArgs &a, const WarpChecker &wk, int *st_x, int *st_y,
+    int *st_s, int *st_c, unsigned &dep)
   {
-    WarpChecker wk = in.wk;
-    wk.lane = lane;
     const int *sl7 = in.sl7, *sc7 = in.sc7;
     const Vec glob = in.glob, pred = in.pred;
     const Vec *pv = in.pv;
-    int bx, by, best_sad, min_cost;
-#ifdef MVC_PHASE_PROF
-    long long tt_ = clock64();
-    const int tbk = 31 - __clz(a.n_blk_x);
-#else
-#define TPH(i) do {} while (0)
-#endif
     const int verybig = 3 * a.bs_x * a.bs_y << a.bits; // PlaneOfBlocks::verybigSAD (integer samples)
-    int st_x[7], st_y[7], st_s[7], st_c[7];
-    unsigned dep = 0;
-    int nu_out = 0;
     {
       int sad = sl7[0] + sc7[0];
       st_x[0] = 0; st_y[0] = a.fshift; st_s[0] = sad; st_c[0] = sad + (int)(((long long)a.pzero * sad) >> 8);
@@ -1767,6 +1756,77 @@ namespace
         st_x[m] = 0; st_y[m] = 0; st_s[m] = 0; st_c[m] = verybig + 1;
       }
     }
+  }
+
+  // the distinct start vectors of the Refines that do not depend on another one (ux, uy: in order of first use; uid[m]: the
+  // distinct start of Refine m); their number
+  __device__ __forceinline__ int tm_unique(const int *st_x, const int *st_y, unsigned dep, int *ux, int *uy, int *uid)
+  {
+    int nu = 0;
+    #pragma unroll
+    for (int m = 0; m < 7; m++)
+    {
+      ux[m] = 0;
+      uy[m] = 0;
+    }
+    #pragma unroll
+    for (int m = 0; m < 7; m++)
+    {
+      uid[m] = 0;
+      if ((dep >> m) & 1u)
+        continue;
+      int f = -1;
+      #pragma unroll
+      for (int j = 0; j < 7; j++)
+        if (j < nu && f < 0 && ux[j] == st_x[m] && uy[j] == st_y[m])
+          f = j;
+      if (f < 0)
+      {
+        #pragma unroll
+        for (int j = 0; j < 7; j++)
+          if (j == nu)
+          {
+            ux[j] = st_x[m];
+            uy[j] = st_y[m];
+          }
+        f = nu++;
+      }
+      uid[m] = f;
+    }
+    return nu;
+  }
+
+  // ring and index of candidate c (0 .. n - 1) of ExpandingSearch(1..r): its offset from the centre
+  __device__ __forceinline__ void tm_ring_offset(int c, int &dx, int &dy)
+  {
+    int ri = 1;
+    while (c >= 4 * ri * (ri + 1))
+      ri++;
+    mvc_refine::expanding_point(ri, c - 4 * ri * (ri - 1), dx, dy);
+  }
+
+  // Out of line (one copy per kernel): inlined into k_search it made the trymany instance spill 1.3 KB.
+  // pre: the exhaustive SAD table tsad is filled by the caller (same layout: distinct start u of tm_unique, ring candidate c)
+  __device__ __noinline__ TmOut trymany_par(const TmIn &in, const LevelArgs &a, int lane, int warp, int nwarps,
+    int (*tm)[4], int (*tsad)[2], bool pre = false)
+  {
+    WarpChecker wk = in.wk;
+    wk.lane = lane;
+    const int *sl7 = in.sl7, *sc7 = in.sc7;
+    const Vec glob = in.glob, pred = in.pred;
+    const Vec *pv = in.pv;
+    int bx, by, best_sad, min_cost;
+#ifdef MVC_PHASE_PROF
+    long long tt_ = clock64();
+    const int tbk = 31 - __clz(a.n_blk_x);
+#else
+#define TPH(i) do {} while (0)
+#endif
+    const int verybig = 3 * a.bs_x * a.bs_y << a.bits; // PlaneOfBlocks::verybigSAD (integer samples)
+    int st_x[7], st_y[7], st_s[7], st_c[7];
+    unsigned dep = 0;
+    int nu_out = 0;
+    tm_starts(in, a, wk, st_x, st_y, st_s, st_c, dep);
     if (a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3)
     {
       // Exhaustive Refine (the default coarse type): its candidates depend only on the start vector, and the start
@@ -1774,50 +1834,16 @@ namespace
       // vector's rings are made once, in groups of 8 spread over all warps, into the shared table tsad; then every
       // Refine folds its own CheckMV sequence (its start cost) over its vector's entries in the CPU order.
       const int r = a.radius, n = 4 * r * (r + 1), gpr = (n + 7) / 8;
-      int ux[7], uy[7], uid[7], nu = 0;
-      #pragma unroll
-      for (int m = 0; m < 7; m++)
-      {
-        ux[m] = 0;
-        uy[m] = 0;
-      }
-      #pragma unroll
-      for (int m = 0; m < 7; m++)
-      {
-        uid[m] = 0;
-        if ((dep >> m) & 1u)
-          continue;
-        int f = -1;
-        #pragma unroll
-        for (int j = 0; j < 7; j++)
-          if (j < nu && f < 0 && ux[j] == st_x[m] && uy[j] == st_y[m])
-            f = j;
-        if (f < 0)
-        {
-          #pragma unroll
-          for (int j = 0; j < 7; j++)
-            if (j == nu)
-            {
-              ux[j] = st_x[m];
-              uy[j] = st_y[m];
-            }
-          f = nu++;
-        }
-        uid[m] = f;
-      }
+      int ux[7], uy[7], uid[7];
+      const int nu = tm_unique(st_x, st_y, dep, ux, uy, uid);
       nu_out = nu;
       TPH(0);
       const int bits = a.bits, pnew = a.pnew;
-      // ring and index of candidate c (0 .. n - 1) of ExpandingSearch(1..r): its offset from the centre
-      auto ring_offset = [](int c, int &dx, int &dy) {
-        int ri = 1;
-        while (c >= 4 * ri * (ri + 1))
-          ri++;
-        mvc_refine::expanding_point(ri, c - 4 * ri * (ri - 1), dx, dy);
-      };
-      // the nu * n candidates spread evenly over the warps (q per warp and round; table entry u * n + c)
+      auto ring_offset = [](int c, int &dx, int &dy) { tm_ring_offset(c, dx, dy); };
+      // the nu * n candidates spread evenly over the warps (q per warp and round; table entry u * n + c); pre: the caller
+      // has filled the table already (wavefront kernel: wave_tm_table, the whole CTA's packed SAD path)
       const int total = nu * n, q0 = (total + nwarps - 1) / nwarps, q = q0 < 4 ? q0 : 4; // groups of <= 4: registers
-      for (int t0 = warp * q; t0 < total; t0 += nwarps * q)
+      for (int t0 = warp * q; !pre && t0 < total; t0 += nwarps * q)
       {
         const int m = total - t0 < q ? total - t0 : q;
         int cx[8], cy[8];
@@ -4667,7 +4693,43 @@ namespace
               g_ws.tmin.pv[3] = p3;
             }
             __syncthreads();
-            const TmOut o = trymany_par(g_ws.tmin, g_ws.a, lane & 31, lane >> 5, WAVE_NW, g_ws.tm, s_tsad);
+            // Exhaustive Refines (radius <= 3): the SAD table of trymany_par (every distinct start vector's ring
+            // candidates) made here with the whole CTA through wave_eval_inl (packed reads), in batches; trymany_par then
+            // only folds. Same SADs, same table layout (tm_starts / tm_unique / tm_ring_offset).
+            bool tm_pre = false;
+            if (a.search_type == mvc_refine::S_EXHAUSTIVE && a.radius <= 3)
+            {
+              int st_x[7], st_y[7], st_s[7], st_c[7];
+              unsigned dep = 0;
+              int ux[7], uy[7], uid[7];
+              tm_starts(g_ws.tmin, g_ws.a, g_ws.tmin.wk, st_x, st_y, st_s, st_c, dep);
+              const int nu = tm_unique(st_x, st_y, dep, ux, uy, uid);
+              const int r = a.radius, n = 4 * r * (r + 1), total = nu * n;
+              for (int t0 = 0; t0 < total; t0 += mvc_refine::MAX_BATCH)
+              {
+                const int batch = total - t0 < mvc_refine::MAX_BATCH ? total - t0 : mvc_refine::MAX_BATCH;
+                for (int c = lane; c < batch; c += WAVE_NT)
+                {
+                  const int t = t0 + c, u = t / n, cc = t - u * n;
+                  int dx, dy;
+                  tm_ring_offset(cc, dx, dy);
+                  g_ws.xs[c] = pick7(ux, u) + dx;
+                  g_ws.ys[c] = pick7(uy, u) + dy;
+                }
+                if (lane == 0)
+                  g_ws.n = batch;
+                __syncthreads();
+                wave_eval_inl<GW, BSY, CHH>(lane, true); // out-of-range candidates are never folded (WarpChecker::ok)
+                for (int c = lane; c < batch; c += WAVE_NT)
+                {
+                  s_tsad[t0 + c][0] = g_ws.sl[c];
+                  s_tsad[t0 + c][1] = g_ws.sc[c];
+                }
+                __syncthreads();
+              }
+              tm_pre = true;
+            }
+            const TmOut o = trymany_par(g_ws.tmin, g_ws.a, lane & 31, lane >> 5, WAVE_NW, g_ws.tm, s_tsad, tm_pre);
             best_x = o.bx;
             best_y = o.by;
             best_sad = o.sad;
