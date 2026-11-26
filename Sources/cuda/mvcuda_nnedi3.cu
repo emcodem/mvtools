@@ -94,29 +94,78 @@ namespace
     return sizeof(T) == 1 ? v : (int)(int16_t)v;
   }
 
-  // one thread per output sample: kept lines copied, missing lines made by the cubic kernel; prescreened pixels queued.
-  // count_next (the queue counter of the next call, used by the previous one) is cleared here.
-  template <typename T>
-  __global__ void k_nn_pre(NnNet net, NnPlanes<T> pl, int off, unsigned *queue, unsigned *count, unsigned *count_next)
+  // integer dot product of a word of two int16 weights with two samples of a word of samples (all products and sums in
+  // int32, wrapping as pmaddwd / paddd): 8-bit samples (4 per word, lo = bytes 0 and 1, hi = bytes 2 and 3) zero-extended,
+  // 16-bit samples (2 per word) as int16
+  __device__ __forceinline__ int dot_u8_lo(unsigned w, unsigned v, int c)
   {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y, p = blockIdx.z;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    int d;
+    asm("dp2a.lo.s32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(w), "r"(v), "r"(c));
+    return d;
+#else
+    return c + (int)(int16_t)(w & 0xffffu) * (int)(v & 0xffu) + (int)(int16_t)(w >> 16) * (int)((v >> 8) & 0xffu);
+#endif
+  }
+  __device__ __forceinline__ int dot_u8_hi(unsigned w, unsigned v, int c)
+  {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    int d;
+    asm("dp2a.hi.s32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(w), "r"(v), "r"(c));
+    return d;
+#else
+    return c + (int)(int16_t)(w & 0xffffu) * (int)((v >> 16) & 0xffu) + (int)(int16_t)(w >> 16) * (int)(v >> 24);
+#endif
+  }
+  __device__ __forceinline__ int dot_i16(unsigned w, unsigned v, int c)
+  {
+    return c + (int)(int16_t)(w & 0xffffu) * (int)(int16_t)(v & 0xffffu) + (int)(int16_t)(w >> 16) * (int)(int16_t)(v >> 16);
+  }
+
+  constexpr int PRE_NT = 128;            // output columns per CTA
+  constexpr int PRE_TW = PRE_NT + 16;    // field columns base - 6 .. base + 137 (the last group needs up to base + 133)
+  constexpr int PRE_WS = 72;             // prescreener weight row stride in the shared copy (16-byte rows, 4 rows on 4 banks)
+
+  // one CTA per 128 output samples of a row: kept lines copied, missing lines made by the cubic kernel; prescreened
+  // pixels queued. The 4 field lines around the row are read once into shared memory; in each group of 4 pixels lane j
+  // computes neuron j of the prescreener and the lanes exchange the results (integer sums: the same values as the
+  // plugin's in any order; the float steps per lane as before). count_next (the queue counter of the next call, used by
+  // the previous one) is cleared here.
+  template <typename T>
+  __global__ void __launch_bounds__(PRE_NT) k_nn_pre(NnNet net, NnPlanes<T> pl, int off, unsigned *queue, unsigned *count, unsigned *count_next)
+  {
+    __shared__ __align__(16) T tile[4][PRE_TW];
+    __shared__ __align__(16) int16_t sw[4][PRE_WS];
+    const int base = blockIdx.x * PRE_NT, c = base + threadIdx.x, r = blockIdx.y, p = blockIdx.z;
     if ((c | r | p) == 0)
       *count_next = 0;
-    if (c >= pl.width[p] || r >= pl.height[p])
+    if (base >= pl.width[p] || r >= pl.height[p]) // whole CTA
       return;
+    const bool in = c < pl.width[p];
     T *drow = pl.dst[p] + (size_t)r * pl.pitch_d[p];
-    if (!pl.interp[p] || (r & 1) == off)
+    if (!pl.interp[p] || (r & 1) == off) // whole CTA
     {
-      drow[c] = pl.src[p][(size_t)r * pl.pitch_s[p] + c];
+      if (in)
+        drow[c] = pl.src[p][(size_t)r * pl.pitch_s[p] + c];
       return;
     }
     const int L0 = (r - off - 3) >> 1; // field line of row r - 3 (r - off is odd)
+    for (int i = threadIdx.x; i < 4 * PRE_TW; i += PRE_NT)
+    {
+      const int y = i / PRE_TW, x = i - y * PRE_TW;
+      tile[y][x] = (T)fld(pl, p, off, L0 + y, base - 6 + x);
+    }
+    for (int i = threadIdx.x; i < 4 * 64; i += PRE_NT)
+      sw[i >> 6][i & 63] = net.pre_w[i];
+    __syncthreads();
+    const int tc = c - base + 6; // tile column of c
 
     // processLine0_AVX2_ASM: (19 * (b + c) -us 3 * (a + d) +us 16) >> 5, clamped, written for every missing pixel;
     // processLine0_AVX2_ASM_16: (19 * (b + c) - 3 * (a + d) + 16) >>a 5 in int32, packusdw, min max, max min: the same
     // result for every input (a negative sum stays below 0 after the shift and saturates to 0)
+    if (in)
     {
-      const int a = fld(pl, p, off, L0, c), b = fld(pl, p, off, L0 + 1, c), cc = fld(pl, p, off, L0 + 2, c), d = fld(pl, p, off, L0 + 3, c);
+      const int a = tile[0][tc], b = tile[1][tc], cc = tile[2][tc], d = tile[3][tc];
       int t = 19 * (b + cc) - 3 * (a + d);
       t = t < 0 ? 0 : t;
       t = (t + 16) >> 5;
@@ -128,22 +177,45 @@ namespace
     }
 
     // computeNetwork0new_AVX2 for the group of 4 pixels this one belongs to: 4 field lines x 16 columns from gx - 6
+    // (tile column gx - base, a multiple of 4); every lane of the group runs, also past the plane's width
     const int gx = c & ~3, lane = c & 3;
-    int s[4] = { 0, 0, 0, 0 };
-    for (int y = 0; y < 4; y++)
-      for (int x = 0; x < 16; x++)
-      {
-        const int v = net_in<T>(fld(pl, p, off, L0 + y, gx - 6 + x));
-        const int k = y * 16 + x;
-        for (int j = 0; j < 4; j++)
-          s[j] += v * (int)__ldg(net.pre_w + j * 64 + k);
-      }
-    float h[4];
-    for (int j = 0; j < 4; j++)
+    int sj = 0;
     {
-      const float t = __fadd_rn(__fmul_rn(__int2float_rn(s[j]), __ldg(net.pre_f + j)), __ldg(net.pre_f + 4 + j));
-      h[j] = __fmul_rn(rcp_hw(net.rcp_tab, __fadd_rn(fabsf(t), 1.0f)), t);
+      const unsigned *wr = reinterpret_cast<const unsigned *>(sw[lane]); // weights k, k + 1 of neuron lane per word
+      #pragma unroll
+      for (int y = 0; y < 4; y++)
+      {
+        const unsigned *tr = reinterpret_cast<const unsigned *>(&tile[y][gx - base]);
+        if (sizeof(T) == 1)
+        {
+          #pragma unroll
+          for (int q = 0; q < 4; q++)
+          {
+            const unsigned v = tr[q];
+            sj = dot_u8_lo(wr[y * 8 + 2 * q], v, sj);
+            sj = dot_u8_hi(wr[y * 8 + 2 * q + 1], v, sj);
+          }
+        }
+        else
+        {
+          #pragma unroll
+          for (int q = 0; q < 8; q++)
+            sj = dot_i16(wr[y * 8 + q], tr[q], sj);
+        }
+      }
     }
+    float hj;
+    {
+      const float t = __fadd_rn(__fmul_rn(__int2float_rn(sj), __ldg(net.pre_f + lane)), __ldg(net.pre_f + 4 + lane));
+      hj = __fmul_rn(rcp_hw(net.rcp_tab, __fadd_rn(fabsf(t), 1.0f)), t);
+    }
+    const int gl = threadIdx.x & 28; // first lane of the group in the warp
+    float h[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+      h[j] = __shfl_sync(0xffffffffu, hj, gl + j);
+    if (!in)
+      return;
     const float *w2 = net.pre_f + 8;
     const float o = __fadd_rn(__fadd_rn(__fadd_rn(__fmul_rn(h[0], __ldg(w2 + lane)), __fmul_rn(h[1], __ldg(w2 + 4 + lane))),
       __fadd_rn(__fmul_rn(h[2], __ldg(w2 + 8 + lane)), __fmul_rn(h[3], __ldg(w2 + 12 + lane)))), __ldg(net.pre_f + 24 + lane));
@@ -158,8 +230,8 @@ namespace
   template <typename T>
   __global__ void k_nn_pred(NnNet net, NnPlanes<T> pl, int off, const unsigned *queue, const unsigned *count)
   {
-    extern __shared__ __align__(16) uint8_t sh_raw[];
-    T *sh = reinterpret_cast<T *>(sh_raw); // window, [k][thread]
+    extern __shared__ __align__(16) unsigned sh[]; // window as words of 4 / 2 samples (taps k in order), [word][thread]
+    constexpr int SPW = 4 / (int)sizeof(T);
     const unsigned n = *count;
     const int tid = threadIdx.x, nt = blockDim.x;
     for (unsigned qi = blockIdx.x * nt + tid; qi - tid < n; qi += gridDim.x * nt) // whole blocks loop together
@@ -178,13 +250,20 @@ namespace
       int sum = 0, sumsq = 0;
       if (act)
         for (int y = 0; y < net.ydia; y++)
-          for (int x = 0; x < net.xdia; x++)
+          for (int xw = 0; xw < net.xdia / SPW; xw++)
           {
-            // extract_m8_i16_AVX2(_16): sum and sum of squares by pmaddwd / psadbw, int32
-            const int v = net_in<T>(fld(pl, p, off, L0 + y, x0 + x));
-            sh[(y * net.xdia + x) * nt + tid] = (T)v;
-            sum += v;
-            sumsq += v * v;
+            unsigned word = 0;
+            #pragma unroll
+            for (int e = 0; e < SPW; e++)
+            {
+              // extract_m8_i16_AVX2(_16): sum and sum of squares by pmaddwd / psadbw, int32
+              const int raw = fld(pl, p, off, L0 + y, x0 + xw * SPW + e);
+              const int v = net_in<T>(raw);
+              word |= (unsigned)raw << (8 * (int)sizeof(T) * e);
+              sum += v;
+              sumsq += v * v;
+            }
+            sh[(y * (net.xdia / SPW) + xw) * nt + tid] = word;
           }
       __syncthreads();
       if (act)
@@ -214,13 +293,26 @@ namespace
           for (int j = 0; j < nns; j++)
           {
             // softmax neuron j and elliott neuron nns + j: int16 dot products, then (float * scale) * istd + bias
+            // (asize is a multiple of 8: 8 weights per 16-byte load, the same load in every lane)
             int s0 = 0, s1 = 0;
-            const int16_t *w0 = w + (size_t)j * asize, *w1 = w + (size_t)(nns + j) * asize;
-            for (int k = 0; k < asize; k++)
+            const uint4 *w0 = reinterpret_cast<const uint4 *>(w + (size_t)j * asize);
+            const uint4 *w1 = reinterpret_cast<const uint4 *>(w + (size_t)(nns + j) * asize);
+            for (int k8 = 0; k8 < asize / 8; k8++)
             {
-              const int v = net_in<T>(sh[k * nt + tid]);
-              s0 += v * (int)__ldg(w0 + k);
-              s1 += v * (int)__ldg(w1 + k);
+              const uint4 a = __ldg(w0 + k8), b = __ldg(w1 + k8);
+              if (sizeof(T) == 1)
+              {
+                const unsigned v0 = sh[(2 * k8) * nt + tid], v1 = sh[(2 * k8 + 1) * nt + tid];
+                s0 = dot_u8_lo(a.x, v0, s0); s0 = dot_u8_hi(a.y, v0, s0); s0 = dot_u8_lo(a.z, v1, s0); s0 = dot_u8_hi(a.w, v1, s0);
+                s1 = dot_u8_lo(b.x, v0, s1); s1 = dot_u8_hi(b.y, v0, s1); s1 = dot_u8_lo(b.z, v1, s1); s1 = dot_u8_hi(b.w, v1, s1);
+              }
+              else
+              {
+                const unsigned v0 = sh[(4 * k8) * nt + tid], v1 = sh[(4 * k8 + 1) * nt + tid];
+                const unsigned v2 = sh[(4 * k8 + 2) * nt + tid], v3 = sh[(4 * k8 + 3) * nt + tid];
+                s0 = dot_i16(a.x, v0, s0); s0 = dot_i16(a.y, v1, s0); s0 = dot_i16(a.z, v2, s0); s0 = dot_i16(a.w, v3, s0);
+                s1 = dot_i16(b.x, v0, s1); s1 = dot_i16(b.y, v1, s1); s1 = dot_i16(b.z, v2, s1); s1 = dot_i16(b.w, v3, s1);
+              }
             }
             const float t0 = __fadd_rn(__fmul_rn(__fmul_rn(__int2float_rn(s0), __ldg(sc + j)), istd), __ldg(bi + j));
             const float t1 = __fadd_rn(__fmul_rn(__fmul_rn(__int2float_rn(s1), __ldg(sc + nns + j)), istd), __ldg(bi + nns + j));
@@ -307,12 +399,12 @@ namespace
       return -2;
     const int off = 1 - field_n;
     const NnNet nv = n; // device pointers only; the net is freed after pipe_flush
-    const dim3 grid((max_w + 127) / 128, max_h, f.planes);
+    const dim3 grid((max_w + PRE_NT - 1) / PRE_NT, max_h, f.planes);
     mvc::pipe_submit([=](cudaStream_t st) { // issued by the pipeline submitter (mvcuda_internal.h)
       // the calls alternate between two queue counters (pipeline order): each clears the other one for the next call
       const unsigned seq = nn_seq++;
       unsigned *count = counts + (seq & 1), *count_next = counts + ((seq + 1) & 1);
-      k_nn_pre<T><<<grid, 128, 0, st>>>(nv, pl, off, qbuf, count, count_next);
+      k_nn_pre<T><<<grid, PRE_NT, 0, st>>>(nv, pl, off, qbuf, count, count_next);
       const int nt = 64;
       k_nn_pred<T><<<1024, nt, (size_t)nv.asize * nt * sizeof(T), st>>>(nv, pl, off, qbuf, count);
     });
@@ -324,7 +416,7 @@ namespace
 extern "C" void *mvcuda_nnedi3_create(const MvCudaNnediParams *p)
 {
   if (!p || !mvc::use_device() || (p->qual != 1 && p->qual != 2) || p->nns < 16 || p->nns % 16 != 0 || p->xdia < 8
-    || p->ydia < 4 || (p->ydia & 1) || p->xdia * p->ydia > 48 * 6)
+    || p->xdia % 8 != 0 || p->ydia < 4 || (p->ydia & 1) || p->xdia * p->ydia > 48 * 6)
     return nullptr;
   NnNet *n = new NnNet();
   n->xdia = p->xdia;
