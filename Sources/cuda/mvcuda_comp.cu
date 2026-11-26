@@ -17,6 +17,7 @@
 // One thread per output sample sums the (at most 2 x 2) blocks covering it; the sum is integer, so the order does not matter.
 
 #include "mvcuda_internal.h"
+#include "mvcuda_vec4.cuh"
 
 #include <cstdint>
 #include <cstring>
@@ -42,6 +43,7 @@ namespace
     int ew[3], eh[3], hp[3], vp[3];   // pel 2: padded sub-pel plane geometry
     const short *win[3];              // overlap windows of this plane (luma or chroma set), nullptr without overlap
     int active[3];
+    int grp4[3];                      // block step and size multiples of 4: k_blocks' 4-sample groups
   };
 
   template <class T>
@@ -95,13 +97,187 @@ namespace
     return wby + wbx;
   }
 
-  // MODE 0: compensate (blocks: mvx, mvy, use_ref), MODE 1: degrain of radius L (blocks: see mvcuda_degrain)
+  // the value of block b at sample (i, j) of the block, plane sample (x, y): compensate (MODE 0) or degrain of radius L
   template <class T, int MODE, int PEL>
-  __global__ void k_blocks(CompPlanes pl, const int *blocks, int nbx, int nby, int ov, int L)
+  __device__ __forceinline__ int block_value(const CompPlanes &pl, const int *b, int bx, int by, int p, int x, int y, int i, int j, int L)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, p = blockIdx.z;
-    if (x >= pl.width[p] || y >= pl.height[p])
+    // block origin in the plane: pos_to_chroma(luma origin * pel, vector, chroma shift), as the CPU since 2.7.48 (#59)
+    const int lx = bx * pl.lstep_x * PEL, ly = by * pl.lstep_y * PEL;
+    if (MODE == 0)
+    {
+      if (b[2])
+        return ref_at<T, PEL>(pl, 0, p, mvc::pos_to_chroma(lx, b[0], pl.log_x[p]), mvc::pos_to_chroma(ly, b[1], pl.log_y[p]), i, j);
+      return at<T>(pl.src[p], pl.pitch[p], x, y);
+    }
+    const int *w = b + 4 * L + (p == 0 ? 0 : 1 + 2 * L); // WSrc, WRefB[L], WRefF[L]
+    int s = at<T>(pl.src[p], pl.pitch[p], x, y) * w[0];
+    for (int k = 0; k < L; k++)
+    {
+      const int *mv = b + 4 * k;
+      const int rb = ref_at<T, PEL>(pl, 2 * k, p, mvc::pos_to_chroma(lx, mv[0], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[1], pl.log_y[p]), i, j);
+      const int rf = ref_at<T, PEL>(pl, 2 * k + 1, p, mvc::pos_to_chroma(lx, mv[2], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[3], pl.log_y[p]), i, j);
+      s += rf * w[1 + L + k] + rb * w[1 + k];
+    }
+    return (s + 128) >> 8;
+  }
+
+  // ref_at for samples i0 .. i0 + 3: one ld4 where none of them needs the clamp, else ref_at per sample
+  template <class T, int PEL>
+  __device__ __forceinline__ void ref4(const CompPlanes &pl, int r, int p, int X, int Y, int i0, int j, int v[4])
+  {
+    const T *q = nullptr;
+    if (PEL == 1 || ((X | Y) & 1) == 0)
+    {
+      const int x = (PEL == 1 ? X : X >> 1) + i0, y = (PEL == 1 ? Y : Y >> 1) + j;
+      if (x >= 0 && x + 3 < pl.width[p] && y >= 0 && y < pl.height[p])
+        q = (const T *)pl.ref[r][p] + (size_t)y * pl.pitch[p] + x;
+    }
+    else
+    {
+      const int ex = (X >> 1) + i0 + pl.hp[p], ey = (Y >> 1) + j + pl.vp[p];
+      if (ex >= 0 && ex + 3 < pl.ew[p] && ey >= 0 && ey < pl.eh[p])
+        q = (const T *)pl.sub[r][p][((X & 1) | ((Y & 1) << 1)) - 1] + (size_t)ey * pl.ew[p] + ex;
+    }
+    if (q)
+      mvc::ld4<T>(q, v);
+    else
+    {
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+        v[k] = ref_at<T, PEL>(pl, r, p, X, Y, i0 + k, j);
+    }
+  }
+
+  // block_value for the 4 samples x0 .. x0 + 3 (block samples i0 .. i0 + 3), sv = their source samples
+  template <class T, int MODE, int PEL>
+  __device__ __forceinline__ void block_value4(const CompPlanes &pl, const int *b, int bx, int by, int p, const int sv[4], int i0, int j, int L, int v[4])
+  {
+    const int lx = bx * pl.lstep_x * PEL, ly = by * pl.lstep_y * PEL;
+    if (MODE == 0)
+    {
+      if (b[2])
+        ref4<T, PEL>(pl, 0, p, mvc::pos_to_chroma(lx, b[0], pl.log_x[p]), mvc::pos_to_chroma(ly, b[1], pl.log_y[p]), i0, j, v);
+      else
+        for (int k = 0; k < 4; k++)
+          v[k] = sv[k];
       return;
+    }
+    const int *w = b + 4 * L + (p == 0 ? 0 : 1 + 2 * L); // WSrc, WRefB[L], WRefF[L]
+    int s[4];
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
+      s[k] = sv[k] * w[0];
+    for (int m = 0; m < L; m++)
+    {
+      const int *mv = b + 4 * m;
+      int rb[4], rf[4];
+      ref4<T, PEL>(pl, 2 * m, p, mvc::pos_to_chroma(lx, mv[0], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[1], pl.log_y[p]), i0, j, rb);
+      ref4<T, PEL>(pl, 2 * m + 1, p, mvc::pos_to_chroma(lx, mv[2], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[3], pl.log_y[p]), i0, j, rf);
+      const int wb = w[1 + m], wf = w[1 + L + m];
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+        s[k] += rf[k] * wf + rb[k] * wb;
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
+      v[k] = (s[k] + 128) >> 8;
+  }
+
+  // the overlap sum's final scaling (8 bit: the CPU's signed 16-bit sum, then packus; 16-bit containers: 32-bit sum)
+  template <class T>
+  __device__ __forceinline__ T ov_out(int acc, int maxv)
+  {
+    if (sizeof(T) == 1)
+    {
+      int r = (short)(acc + 16) >> 5; // _mm_srai_epi16 on the signed 16-bit sum, then packus
+      return (T)(r < 0 ? 0 : r > 255 ? 255 : r);
+    }
+    int r = (acc + 1024) >> 11; // Short2Bytes_Int32toWord16(_sse4): srai, packus, min with the max pixel value
+    return (T)(r < 0 ? 0 : r > maxv ? maxv : r);
+  }
+  template <class T>
+  __device__ __forceinline__ int ov_add(int acc, int v, int wv)
+  {
+    if (sizeof(T) == 1)
+      return (int)(short)(acc + ((v * wv + 32) >> 6)); // 16-bit sum, as the CPU's short buffer
+    return acc + v * wv;                               // 32-bit sum (Overlaps_C<uint16_t>)
+  }
+
+  // MODE 0: compensate (blocks: mvx, mvy, use_ref), MODE 1: degrain of radius L (blocks: see mvcuda_degrain).
+  // 4 neighbouring samples per thread: with block steps and sizes that are multiples of 4 (CompPlanes::grp4) the 4 are
+  // covered by the same blocks, so the cover, the block entry and the block origins are computed once for the 4; the
+  // sums per sample are those of the single-sample path (blocks_px), which takes the planes without grp4 and the edges.
+  constexpr int BLK_NT = 128;
+  template <class T, int MODE, int PEL>
+  __device__ __forceinline__ void blocks_px(const CompPlanes &pl, const int *blocks, int nbx, int nby, int ov, int L, int x, int y, int p);
+
+  template <class T, int MODE, int PEL>
+  __global__ void __launch_bounds__(BLK_NT) k_blocks(CompPlanes pl, const int *blocks, int nbx, int nby, int ov, int L)
+  {
+    const int x0 = (blockIdx.x * BLK_NT + threadIdx.x) * 4, y = blockIdx.y, p = blockIdx.z;
+    if (x0 >= pl.width[p] || y >= pl.height[p])
+      return;
+    if (!pl.active[p] || !pl.grp4[p] || x0 + 4 > pl.wb[p] || x0 + 4 > pl.width[p] || y >= pl.hb[p])
+    {
+      for (int k = 0; k < 4 && x0 + k < pl.width[p]; k++)
+        blocks_px<T, MODE, PEL>(pl, blocks, nbx, nby, ov, L, x0 + k, y, p);
+      return;
+    }
+    const int bw = pl.bw[p], bh = pl.bh[p], sx = pl.step_x[p], sy = pl.step_y[p];
+    const int stride = MODE == 0 ? 3 : 4 * L + 2 * (1 + 2 * L);
+    int bx0, bx1, by0, by1;
+    cover(x0, sx, bw, nbx, bx0, bx1);
+    cover(y, sy, bh, nby, by0, by1);
+    int acc[4] = { 0, 0, 0, 0 }, single[4] = { 0, 0, 0, 0 }, sv[4];
+    mvc::ld4<T>((const T *)pl.src[p] + (size_t)y * pl.pitch[p] + x0, sv);
+    for (int by = by0; by <= by1; by++)
+      for (int bx = bx0; bx <= bx1; bx++)
+      {
+        const int i0 = x0 - bx * sx, j = y - by * sy;
+        if (i0 < 0 || i0 >= bw || j < 0 || j >= bh) // (i0 and bw are multiples of 4: the whole group or none)
+          continue;
+        const int *b = blocks + stride * (by * nbx + bx);
+        int v[4];
+        block_value4<T, MODE, PEL>(pl, b, bx, by, p, sv, i0, j, L, v);
+        if (ov)
+        {
+          // the 4 window weights: 8 bytes, aligned (window offsets and j * bw + i0 are multiples of 4 samples)
+          const short *wr = pl.win[p] + window_index(bx, by, nbx, nby) * bw * bh + j * bw + i0;
+          int wv[4];
+          if (((size_t)wr & 7) == 0)
+          {
+            const uint2 ww = *(const uint2 *)wr;
+            wv[0] = (short)(ww.x & 0xffffu);
+            wv[1] = (short)(ww.x >> 16);
+            wv[2] = (short)(ww.y & 0xffffu);
+            wv[3] = (short)(ww.y >> 16);
+          }
+          else
+          {
+            #pragma unroll
+            for (int k = 0; k < 4; k++)
+              wv[k] = wr[k];
+          }
+          #pragma unroll
+          for (int k = 0; k < 4; k++)
+            acc[k] = ov_add<T>(acc[k], v[k], wv[k]);
+        }
+        else
+        {
+          #pragma unroll
+          for (int k = 0; k < 4; k++)
+            single[k] = v[k];
+        }
+      }
+    T *d = (T *)pl.dst[p] + (size_t)y * pl.pitch[p] + x0;
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
+      d[k] = ov ? ov_out<T>(acc[k], pl.maxv) : (T)single[k];
+  }
+
+  template <class T, int MODE, int PEL>
+  __device__ __forceinline__ void blocks_px(const CompPlanes &pl, const int *blocks, int nbx, int nby, int ov, int L, int x, int y, int p)
+  {
     T *d = (T *)pl.dst[p] + (size_t)y * pl.pitch[p] + x;
     if (!pl.active[p] || x >= pl.wb[p] || y >= pl.hb[p])
     {
@@ -122,55 +298,13 @@ namespace
         if (i < 0 || i >= bw || j < 0 || j >= bh)
           continue;
         const int *b = blocks + stride * (by * nbx + bx);
-        // block origin in the plane: pos_to_chroma(luma origin * pel, vector, chroma shift), as the CPU since 2.7.48 (#59)
-        const int lx = bx * pl.lstep_x * PEL, ly = by * pl.lstep_y * PEL;
-        int v;
-        if (MODE == 0)
-        {
-          if (b[2])
-            v = ref_at<T, PEL>(pl, 0, p, mvc::pos_to_chroma(lx, b[0], pl.log_x[p]), mvc::pos_to_chroma(ly, b[1], pl.log_y[p]), i, j);
-          else
-            v = at<T>(pl.src[p], pl.pitch[p], x, y);
-        }
-        else
-        {
-          const int *w = b + 4 * L + (p == 0 ? 0 : 1 + 2 * L); // WSrc, WRefB[L], WRefF[L]
-          int s = at<T>(pl.src[p], pl.pitch[p], x, y) * w[0];
-          for (int k = 0; k < L; k++)
-          {
-            const int *mv = b + 4 * k;
-            const int rb = ref_at<T, PEL>(pl, 2 * k, p, mvc::pos_to_chroma(lx, mv[0], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[1], pl.log_y[p]), i, j);
-            const int rf = ref_at<T, PEL>(pl, 2 * k + 1, p, mvc::pos_to_chroma(lx, mv[2], pl.log_x[p]), mvc::pos_to_chroma(ly, mv[3], pl.log_y[p]), i, j);
-            s += rf * w[1 + L + k] + rb * w[1 + k];
-          }
-          v = (s + 128) >> 8;
-        }
+        const int v = block_value<T, MODE, PEL>(pl, b, bx, by, p, x, y, i, j, L);
         if (ov)
-        {
-          const int wv = pl.win[p][window_index(bx, by, nbx, nby) * bw * bh + j * bw + i];
-          if (sizeof(T) == 1)
-            acc = (int)(short)(acc + ((v * wv + 32) >> 6)); // 16-bit sum, as the CPU's short buffer
-          else
-            acc += v * wv; // 32-bit sum (Overlaps_C<uint16_t>)
-        }
+          acc = ov_add<T>(acc, v, pl.win[p][window_index(bx, by, nbx, nby) * bw * bh + j * bw + i]);
         else
           single = v;
       }
-    if (ov)
-    {
-      if (sizeof(T) == 1)
-      {
-        int r = (short)(acc + 16) >> 5; // _mm_srai_epi16 on the signed 16-bit sum, then packus
-        *d = (T)(r < 0 ? 0 : r > 255 ? 255 : r);
-      }
-      else
-      {
-        int r = (acc + 1024) >> 11; // Short2Bytes_Int32toWord16(_sse4): srai, packus, min with the max pixel value
-        *d = (T)(r < 0 ? 0 : r > pl.maxv ? pl.maxv : r);
-      }
-    }
-    else
-      *d = (T)single;
+    *d = ov ? ov_out<T>(acc, pl.maxv) : (T)single;
   }
 
   // ---- pel-2 sub-pel planes (MSuper sharp = 2: HorizontalWiener / VerticalWiener over the padded plane) ----------------
@@ -292,7 +426,7 @@ namespace
     const int ov = (g->ov_x || g->ov_y) ? 1 : 0;
     const int nblocks = g->n_blk_x * g->n_blk_y;
     const int stride = MODE == 0 ? 3 : 4 * L + 2 * (1 + 2 * L);
-    const size_t bbytes = (size_t)nblocks * stride * sizeof(int);
+    const size_t bbytes = ((size_t)nblocks * stride * sizeof(int) + 15) & ~(size_t)15; // the windows start 16-byte aligned
     // the overlap windows: 9 luma windows, then 9 chroma windows
     const size_t wl = (size_t)9 * g->blk_x * g->blk_y, wc = (size_t)9 * (g->blk_x >> lx) * (g->blk_y >> ly);
     auto dst = mvc::frame_alloc(f);
@@ -303,7 +437,7 @@ namespace
     const size_t win_bytes = ov ? (wl + (f.planes == 3 ? wc : 0)) * sizeof(short) : 0;
     const size_t up_bytes = bbytes + win_bytes;
     std::vector<unsigned char> host(up_bytes);
-    std::memcpy(host.data(), blocks, bbytes);
+    std::memcpy(host.data(), blocks, (size_t)nblocks * stride * sizeof(int)); // (the padding stays zero)
     if (ov)
     {
       std::memcpy(host.data() + bbytes, g->win_luma, wl * sizeof(short));
@@ -355,22 +489,23 @@ namespace
       pl.hb[p] = hbl >> sy;
       pl.win[p] = ov ? d_win + (p ? wl : 0) : nullptr;
       pl.active[p] = (plane_mask >> p) & 1;
+      pl.grp4[p] = pl.step_x[p] % 4 == 0 && pl.bw[p] % 4 == 0;
       max_w = fs->w[p] > max_w ? fs->w[p] : max_w;
       max_h = fs->h[p] > max_h ? fs->h[p] : max_h;
     }
-    const dim3 grid((max_w + 127) / 128, max_h, f.planes);
+    const dim3 grid((max_w + 4 * BLK_NT - 1) / (4 * BLK_NT), max_h, f.planes);
     const int nbx = g->n_blk_x, nby = g->n_blk_y;
     if (bps == 2)
     {
       if (g->pel == 2)
-        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 2><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 2><<<grid, BLK_NT, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
       else
-        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 1><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+        mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint16_t, MODE, 1><<<grid, BLK_NT, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
     }
     else if (g->pel == 2)
-      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 2><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 2><<<grid, BLK_NT, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
     else
-      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 1><<<grid, 128, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
+      mvc::pipe_submit([=](cudaStream_t s) { k_blocks<uint8_t, MODE, 1><<<grid, BLK_NT, 0, s>>>(pl, d_blocks, nbx, nby, ov, L); });
     mvc::up_free(d_up, up_bytes); // reused once the pipeline stream has passed this point
     mvc::frame_put(dst, producer, frame, *out);
     return 0;
