@@ -88,8 +88,9 @@ namespace
     int *vec;          // device: (vx, vy, sad) triples of this level
     int *bad_flag;
     // wavefront kernel (k_wave) only
-    int *prog;         // device: per block row, number of finished blocks of that row
+    int *prog;         // device: per block row, number of finished blocks of that row (also k_search_fix<EV, true>)
     int *ticket;       // device: next block row to hand out
+    int *rticket;      // device: next block row to hand out (k_search_fix<EV, true>, one level)
     int *nlam;         // device: nLambda per block (k_interp writes it, k_wave reads it); unused on the smallest level
     int *rowbad;       // device: per block row, number of blocks that took the wide "bad vector" search
     int bad_range;     // MAnalyse badrange (> 0 UMH, < 0 exhaustive rings, 0 none)
@@ -2728,6 +2729,58 @@ namespace
     }
   }
 
+  // ld.acquire / st.release (and __nanosleep) need compute capability 7.0. Below that: a volatile load (L2, never a
+  // stale L1 line) followed by a fence, and a fence followed by a volatile store, the classic pre-Volta pattern. The
+  // data published this way is read with __ldcg (ld.global.cg) everywhere in k_wave, which on Pascal is also what keeps
+  // it from coming out of a non-coherent L1 line.
+  __device__ __forceinline__ int ld_acquire(const int *p)
+  {
+#if MVC_ARCH_BELOW(700)
+    const int v = *(const volatile int *)p;
+    __threadfence();
+    return v;
+#else
+    int v;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+#endif
+  }
+  __device__ __forceinline__ void st_release(int *p, int v)
+  {
+#if MVC_ARCH_BELOW(700)
+    __threadfence();
+    *(volatile int *)p = v;
+#else
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+#endif
+  }
+  // pause between polls (7.0+); a plain spin below
+  __device__ __forceinline__ void poll_pause(unsigned ns)
+  {
+#if MVC_ARCH_BELOW(700)
+    (void)ns;
+#else
+    __nanosleep(ns);
+#endif
+  }
+
+  // Waits until *p >= need (acquire loads) and returns the value read; seen: a value read before (with acquire
+  // semantics) or 0. A relaxed poll followed by one fence.acq_rel was measured slower: the fence sits on the wavefront's
+  // critical path at almost every block. MVC_WAVE_SLEEP: optional pause between polls.
+#ifndef MVC_WAVE_SLEEP
+#define MVC_WAVE_SLEEP 0
+#endif
+  __device__ __forceinline__ int wait_at_least(const int *p, int need, int seen)
+  {
+    while (seen < need)
+    {
+      seen = ld_acquire(p);
+      if (MVC_WAVE_SLEEP > 0 && seen < need)
+        poll_pause(MVC_WAVE_SLEEP);
+    }
+    return seen;
+  }
+
 #if MVC_ANALYSE_PART == 0
   // k_search for the fixed-batch plans only (wave_plan != WP_GEN or an exhaustive radius <= 3, no trymany): the same
   // candidates, order and comparisons as k_search (bit-identical vectors), with a shorter serial chain per block:
@@ -2818,8 +2871,210 @@ namespace
 
   // Slice search (meander=true): exact against the stock multi-threaded CPU MAnalyse. Not used by the GPU QTGMC, which
   // runs the wavefront search (meander=false) only; kept for CudaMAnalyse / CudaMRecalculate called with meander=true.
+  //
+  // WF = true: the same search as a wavefront (meander=false, one slice: the CPU result of MAnalyse(meander=false,
+  // mt=false)), one CTA per block row of the level (n_slices = n_blk_y). Rows are handed out in order by a ticket
+  // (a.rticket), so a row only waits for a row whose CTA is already running (no deadlock for any grid size). Block x of
+  // row y needs the row above up to block x + lag (lag 2 where the third predictor is the up-right one: the last row and
+  // the smallest level, else 1, the bottom-right one is the interpolated vector of the row below); each row publishes
+  // its progress (a.prog, release; read with acquire, vectors with __ldcg). Each CTA writes the interpolated predictions
+  // of its own row and of the row below (identical values; the row below's CTA overwrites them with search results only
+  // after this row's first block, which follows these writes). Warp 7 fetches the next block's predictors before the
+  // ring barrier (after waiting for the row above), the result is published by warp 1 (thread 32), so warp 0 never
+  // waits for the release.
+  // The wide "bad vector" search of the wavefront form of k_search_fix, run by all threads of the CTA. Written without
+  // local arrays (the candidate lists are in shared memory, the tables in constant memory): a stack frame in the kernel
+  // made every launch slower (12 % on HD QTGMC), also where no block was bad.
+  // radius-2 hexagon of Hex2Search (repeated entries avoid a modulo, x264), its direction table, UMH's hex grid
+  __constant__ int c_hex2t[8][2] = { {-1,-2}, {-2,0}, {-1,2}, {1,2}, {2,0}, {1,-2}, {-1,-2}, {-2,0} };
+  __constant__ int c_mod6m1[8] = { 5,0,1,2,3,4,5,0 };
+  __constant__ int c_hex4[16][2] = { {-4, 2}, {-4, 1}, {-4, 0}, {-4,-1}, {-4,-2}, { 4,-2}, { 4,-1}, { 4, 0}, { 4, 1}, { 4, 2},
+                                     { 2, 3}, { 0, 4}, {-2, 3}, {-2,-3}, { 0,-4}, { 2,-3} };
+
+  // State of the search (identical in every thread) and the shared batch: a batch is evaluated one candidate per warp
+  // (eval_fix) into shared tables, then folded in every thread in the CPU order with the semantics of CheckMV /
+  // CheckMVdir (as wave_fold; CheckMVdir's direction = vbase + index). Barriers before the evaluation (the list,
+  // written by thread 0) and after the fold (the next batch overwrites the tables).
   template <int EV>
-  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search_fix(LevelArgs a)
+  struct FixChecker
+  {
+    const LevelArgs *a;
+    const pix *s_y, *s_u, *s_v;
+    int x0, y0, x1, y1, dx_min, dx_max, dy_min, dy_max;
+    int bx, by, min_cost, best_sad, pred_x, pred_y, nlambda;
+    int *xs_s, *ys_s, *sl_s, *sc_s; // shared, MAX_BATCH entries each
+    bool pair;
+    __device__ __forceinline__ bool ok(int cx, int cy) const
+    {
+      return cx >= dx_min && cy >= dy_min && cx < dx_max && cy < dy_max;
+    }
+    __device__ __forceinline__ void run_batch(int mode, int n, int vbase, int &dir)
+    {
+      const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
+      __syncthreads();
+      for (int c = warp; c < n; c += nwarps)
+      {
+        const int cx = xs_s[c], cy = ys_s[c];
+        if (!ok(cx, cy))
+          continue; // never read: the fold skips it
+        int sl, sc;
+        eval_fix<EV>(*a, s_y, s_u, s_v, x0, y0, x1, y1, cx, cy, lane, pair, sl, sc);
+        if (lane == 0)
+        {
+          sl_s[c] = sl;
+          sc_s[c] = sc;
+        }
+      }
+      __syncthreads();
+      for (int c = 0; c < n; c++)
+      {
+        const int cx = xs_s[c], cy = ys_s[c];
+        if (!ok(cx, cy))
+          continue;
+        const int dxp = pred_x - cx, dyp = pred_y - cy;
+        const int dist = (int)((unsigned)(dxp * dxp) + (unsigned)(dyp * dyp));
+        int cost = (int)((unsigned)nlambda * (unsigned)dist) >> (16 - a->bits);
+        if (cost >= min_cost)
+          continue;
+        const int sl = sl_s[c], sc = sc_s[c];
+        cost += sl + (int)(((long long)a->pnew * sl) >> 8);
+        if (cost >= min_cost)
+          continue;
+        cost += sc + (int)(((long long)a->pnew * sc) >> 8);
+        if (cost >= min_cost)
+          continue;
+        if (mode != mvc_refine::M_CHECKDIR)
+        {
+          bx = cx;
+          by = cy;
+        }
+        min_cost = cost;
+        best_sad = sl + sc;
+        if (mode != mvc_refine::M_CHECK)
+          dir = vbase + c;
+      }
+      __syncthreads();
+    }
+  };
+
+  // PseudoEPZSearch's wide search for a "bad" block (as wave_bad_search, same candidates in the same order): UMHSearch
+  // (badrange * pel) around (0, 0) for badrange > 0 (CrossSearch, the hex grid rings, Hex2Search with its closing
+  // ExpandingSearch(1, 1)), ExpandingSearch rings around (0, 0) until a good vector is found for badrange < 0, then the
+  // small sub-pel rings around the result.
+  template <int EV>
+  __device__ __forceinline__ void fix_bad_search(FixChecker<EV> &ck)
+  {
+    const LevelArgs &a = *ck.a;
+    const int tid = threadIdx.x;
+    const int found = ck.best_sad;
+    const int range = a.bad_range * a.pel; // badrange * nPel (negative for the exhaustive variant)
+    int n = 0, dummy = 0;
+    auto flush = [&]() {
+      if (n)
+        ck.run_batch(mvc_refine::M_CHECK, n, 0, dummy);
+      n = 0;
+    };
+    auto add = [&](int x, int y) {
+      if (tid == 0) // published by run_batch's first barrier
+      {
+        ck.xs_s[n] = x;
+        ck.ys_s[n] = y;
+      }
+      n++;
+      if (n == mvc_refine::MAX_BATCH)
+        flush();
+    };
+    // ExpandingSearch(r, s, mvx, mvy) in the order of mvc_refine::add_expanding, one batch
+    auto ring = [&](int r, int s, int mvx, int mvy) {
+      for (int i = -r + s; i < r; i += s)
+      {
+        add(mvx + i, mvy - r);
+        add(mvx + i, mvy + r);
+      }
+      for (int j = -r + s; j < r; j += s)
+      {
+        add(mvx - r, mvy + j);
+        add(mvx + r, mvy + j);
+      }
+      add(mvx - r, mvy - r);
+      add(mvx - r, mvy + r);
+      add(mvx + r, mvy - r);
+      add(mvx + r, mvy + r);
+      flush();
+    };
+    if (a.bad_range > 0)
+    {
+      for (int i = 1; i < range; i += 2)
+      {
+        add(-i, 0);
+        add(i, 0);
+      }
+      for (int j = 1; j < range; j += 2)
+      {
+        add(0, j);
+        add(0, -j);
+      }
+      int i = 1;
+      do
+      {
+        for (int j = 0; j < 16; j++)
+          add(c_hex4[j][0] * i, c_hex4[j][1] * i);
+      } while (++i <= range / 4);
+      flush();
+      // Hex2Search(range) as mvc_refine::hex2
+      int bmx = ck.bx, bmy = ck.by;
+      if (range > 1)
+      {
+        int dir = -2;
+        add(bmx - 2, bmy);
+        add(bmx - 1, bmy + 2);
+        add(bmx + 1, bmy + 2);
+        add(bmx + 2, bmy);
+        add(bmx + 1, bmy - 2);
+        add(bmx - 1, bmy - 2);
+        ck.run_batch(mvc_refine::M_CHECKDIR, 6, 0, dir);
+        n = 0;
+        if (dir != -2)
+        {
+          bmx += c_hex2t[dir + 1][0];
+          bmy += c_hex2t[dir + 1][1];
+          for (int k = 1; k < range / 2 && ck.ok(bmx, bmy); k++)
+          {
+            const int odir = c_mod6m1[dir + 1];
+            dir = -2;
+            for (int q = 0; q < 3; q++)
+              add(bmx + c_hex2t[odir + q][0], bmy + c_hex2t[odir + q][1]);
+            ck.run_batch(mvc_refine::M_CHECKDIR, 3, odir - 1, dir);
+            n = 0;
+            if (dir == -2)
+              break;
+            bmx += c_hex2t[dir + 1][0];
+            bmy += c_hex2t[dir + 1][1];
+          }
+        }
+        ck.bx = bmx;
+        ck.by = bmy;
+      }
+      ring(1, 1, bmx, bmy);
+    }
+    else if (a.bad_range < 0)
+    {
+      for (int i = 1; i < -range; i += a.pel)
+      {
+        ring(i, a.pel, 0, 0);
+        if (ck.best_sad < found / 4)
+          break; // a rather good vector is found
+      }
+    }
+    const int mvx = ck.bx, mvy = ck.by; // refine in a small area
+    for (int i = 1; i < a.pel; i++)
+      ring(i, 1, mvx, mvy);
+  }
+
+  // The rows of one slice (WF: one block row) of k_search_fix / k_wfix; a: the level (kernel parameter, or k_wfix's
+  // shared copy). Every thread of the CTA calls it; the caller separates two calls with a barrier.
+  template <int EV, bool WF>
+  __device__ __forceinline__ void fix_body(const LevelArgs &a, int slice)
   {
     static_assert(SEARCH_THREADS >= 256, "warp 7 prepares the next block during phase A (7 candidates)");
     extern __shared__ __align__(16) pix s_dyn[];
@@ -2827,7 +3082,6 @@ namespace
     __shared__ int s_nl[SEARCH_NL_MAX];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
     const int plan = wave_plan(a.search_type, a.radius);
-    const int slice = blockIdx.x;
     const bool row_nl = !a.smallest && a.n_blk_x <= SEARCH_NL_MAX;
 #ifdef MVC_PHASE_PROF
     const int bk = 31 - __clz(a.n_blk_x);
@@ -2839,7 +3093,9 @@ namespace
     const int ring_radius = a.search_type == mvc_refine::S_EXHAUSTIVE ? a.radius : 1;
     const int ring_n = 4 * ring_radius * (ring_radius + 1);
     const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
-    const int glob_x = a.glob[0] * a.pel, glob_y = a.glob[1] * a.pel; // written by k_glob_interp before this kernel
+    // written before this kernel (k_glob_interp or the coarser level's glob_tail), or, in k_wfix, by another CTA of this
+    // launch before the level was released (level_ready): read from L2
+    const int glob_x = (WF ? __ldcg(a.glob) : a.glob[0]) * a.pel, glob_y = (WF ? __ldcg(a.glob + 1) : a.glob[1]) * a.pel;
     pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
     auto issue_src = [&](pix *dst, int bx, int by, int t0, int ts) {
       const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
@@ -2936,20 +3192,34 @@ namespace
     }
     // the interpolated predictions of this slice's rows (k_glob_interp's, for these rows only: a slice reads no other
     // slice's vectors of this level); published by the first row barrier below
+    // (WF: also the row below, the bottom-right predictors of this row)
+    const int ip_end = (WF && end < a.n_blk_y) ? end + 1 : end;
     if (a.interp_head)
-      for (int i = beg * a.n_blk_x + tid; i < end * a.n_blk_x; i += blockDim.x)
+      for (int i = beg * a.n_blk_x + tid; i < ip_end * a.n_blk_x; i += blockDim.x)
       {
         const Vec v = interp_pred(a, a.coarse, a.c_blk_x, a.c_blk_y, 0, i);
-        a.vec[3 * i + 0] = v.x;
-        a.vec[3 * i + 1] = v.y;
-        a.vec[3 * i + 2] = v.sad;
+        if (WF && i >= end * a.n_blk_x)
+        {
+          __stcg(a.vec + 3 * i + 0, v.x);
+          __stcg(a.vec + 3 * i + 1, v.y);
+          __stcg(a.vec + 3 * i + 2, v.sad);
+        }
+        else
+        {
+          a.vec[3 * i + 0] = v.x;
+          a.vec[3 * i + 1] = v.y;
+          a.vec[3 * i + 2] = v.sad;
+        }
       }
 
     for (int blky = beg; blky < end; blky++)
     {
       const int dir = (blky % 2 == 0 || !a.meander) ? 1 : -1;
       const int start = (dir == 1) ? 0 : a.n_blk_x - 1;
-      const bool is_top = (blky == beg), is_bottom = (blky == end - 1);
+      const bool is_top = WF ? blky == 0 : (blky == beg), is_bottom = WF ? blky == a.n_blk_y - 1 : (blky == end - 1);
+      const int lag = (a.smallest || is_bottom) ? 2 : 1; // WF: blocks of the row above that block x needs, beyond x
+      int seen = 0;                                      // WF: progress of the row above as last read (lane 0 of a warp)
+      int row_bad = 0;                                   // WF: blocks of this row that took the wide search
       // the previous row's last vector (thread 0's store) is read by fetch_pred below as the up predictor, and the
       // previous row's last reads of s_nl and of both source buffers are done
       __syncthreads();
@@ -2987,16 +3257,31 @@ namespace
           else
             src = p3_index(bx);
           if (src >= 0)
-            v = a.vec[3 * src + e];
+            v = WF ? __ldcg(a.vec + 3 * src + e) : a.vec[3 * src + e];
         }
         return v;
+      };
+      // WF: the calling warp waits until the row above has finished the blocks that block bx reads
+      auto wf_wait = [&](int bx) {
+        if constexpr (WF)
+          if (!is_top)
+          {
+            const int need = bx + lag < a.n_blk_x ? bx + lag : a.n_blk_x;
+            if (lane == 0)
+              seen = wait_at_least(a.prog + blky - 1, need, seen);
+            __syncwarp();
+          }
       };
       // warp 7 loads the predictors of block it + 2 into nxt_reg during the phase A of block it and stores them into
       // b.nxt during the phase A of block it + 1, so it never waits for the loads
       int nxt_reg = 0;
-      if (warp == 0 && lane < 9)
-        b.nxt[0][lane] = fetch_pred(start, lane);
-      if (warp == 7 && a.n_blk_x > 1)
+      if (warp == 0)
+      {
+        wf_wait(start);
+        if (lane < 9)
+          b.nxt[0][lane] = fetch_pred(start, lane);
+      }
+      if (!WF && warp == 7 && a.n_blk_x > 1)
         nxt_reg = fetch_pred(start + dir, lane);
       issue_src(s_dyn, start, blky, tid, blockDim.x);
       if (row_nl)
@@ -3096,7 +3381,7 @@ namespace
         // ---- phase A: SADs of the 7 candidates (zero, global, predictor, predictors[0..3]), one warp each
         // warp 7 (no candidate here) stores the next block's predictor vectors (loaded during the previous block)
         // into b.nxt and starts loading those of the block after it
-        if (warp == 7 && it + 1 < a.n_blk_x)
+        if (!WF && warp == 7 && it + 1 < a.n_blk_x)
         {
           if (lane < 9)
             b.nxt[(it + 1) & 1][lane] = nxt_reg;
@@ -3252,6 +3537,15 @@ namespace
               }
             }
           }
+        // WF: warp 7 (its ring candidates done) waits for the row above and fetches the next block's predictors; this
+        // barrier publishes them (the previous reader of that buffer was the block before this one)
+        if constexpr (WF)
+          if (warp == 7 && it + 1 < a.n_blk_x)
+          {
+            wf_wait(start + (it + 1) * dir);
+            if (lane < 9)
+              b.nxt[(it + 1) & 1][lane] = fetch_pred(start + (it + 1) * dir, lane);
+          }
         cp_async_wait_all(); // the next block's source (cp.async), published by this barrier
         __syncthreads();
         PH(3);
@@ -3297,13 +3591,77 @@ namespace
             best_sad = wsad;
           }
         }
-        if (tid == 0)
+        // WF: bad vector (PseudoEPZSearch, as k_wave): the threshold grows with badcount, the number of earlier bad blocks
+        // in raster order (one slice). Only a block above badSAD can be bad; it waits until the rows above are finished
+        // (rows finish in order), so their counts are known, and decides exactly as the CPU does.
+        if constexpr (WF)
+          if (idx > 1 && best_sad > a.bad_sad)
+          {
+            __shared__ int s_bcnt;
+            __shared__ int s_bxs[mvc_refine::MAX_BATCH], s_bys[mvc_refine::MAX_BATCH];
+            __shared__ int s_bsl[mvc_refine::MAX_BATCH], s_bsc[mvc_refine::MAX_BATCH];
+            if (tid == 0)
+            {
+              int cnt = row_bad;
+              if (blky > 0)
+              {
+                wait_at_least(a.prog + blky - 1, a.n_blk_x, 0);
+                for (int r = 0; r < blky; r++)
+                  cnt += __ldcg(a.rowbad + r);
+              }
+              s_bcnt = cnt;
+            }
+            __syncthreads();
+            const int badcount = s_bcnt;
+            if (best_sad > a.bad_sad + a.bad_sad * badcount / 16) // BADCOUNT_LIMIT
+            {
+              row_bad++;
+              FixChecker<EV> ck;
+              ck.a = &a;
+              ck.s_y = s_y;
+              ck.s_u = s_u;
+              ck.s_v = s_v;
+              ck.x0 = x0[0];
+              ck.y0 = y0[0];
+              ck.x1 = x0[1];
+              ck.y1 = y0[1];
+              ck.dx_min = dx_min;
+              ck.dx_max = dx_max;
+              ck.dy_min = dy_min;
+              ck.dy_max = dy_max;
+              ck.bx = best_x;
+              ck.by = best_y;
+              ck.min_cost = min_cost;
+              ck.best_sad = best_sad;
+              ck.pred_x = pred.x;
+              ck.pred_y = pred.y;
+              ck.nlambda = nlambda;
+              ck.xs_s = s_bxs;
+              ck.ys_s = s_bys;
+              ck.sl_s = s_bsl;
+              ck.sc_s = s_bsc;
+              ck.pair = pair_chroma;
+              fix_bad_search<EV>(ck);
+              best_x = ck.bx;
+              best_y = ck.by;
+              min_cost = ck.min_cost;
+              best_sad = ck.best_sad;
+            }
+            __syncthreads(); // s_bcnt
+          }
+        if (tid == (WF ? 32 : 0))
         {
-          if (idx > 1 + beg * a.n_blk_x && best_sad > a.bad_sad)
+          if (!WF && idx > 1 + beg * a.n_blk_x && best_sad > a.bad_sad)
             atomicExch(a.bad_flag, 1);
           a.vec[3 * idx + 0] = best_x;
           a.vec[3 * idx + 1] = best_y;
           a.vec[3 * idx + 2] = best_sad;
+          if constexpr (WF)
+          {
+            if (it == a.n_blk_x - 1)
+              a.rowbad[blky] = row_bad; // published by the release below (the row's last one)
+            st_release(a.prog + blky, it + 1); // orders the vector stores above before the counter
+          }
         }
         prev_x = best_x;
         prev_y = best_y;
@@ -3315,11 +3673,29 @@ namespace
 #endif
       }
     }
+  }
+
+  template <int EV, bool WF = false>
+  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search_fix(LevelArgs a)
+  {
+    const int tid = threadIdx.x;
+    int slice = blockIdx.x;
+    if constexpr (WF)
+    {
+      __shared__ int s_row;
+      if (tid == 0)
+        s_row = atomicAdd(a.rticket, 1);
+      __syncthreads();
+      slice = s_row;
+    }
+    fix_body<EV, WF>(a, slice);
     // the global vector of the next finer level (k_glob_interp's CTA 0) by the CTA that finishes last: every CTA has read
     // a.glob at its start, and thread 0 wrote all of its CTA's vectors (fenced before the ticket)
     if (a.glob_tail)
     {
       __shared__ int s_last;
+      if (WF && tid == 32)
+        __threadfence(); // WF: thread 32 wrote the vectors
       __syncthreads();
       if (tid == 0)
       {
@@ -3336,6 +3712,102 @@ namespace
       }
     }
   }
+
+  // k_search_fix<EV, true> for the levels lo .. nl - 1 of a call in one launch (7.0+: the call is a __grid_constant__
+  // parameter): the small coarse levels, whose own launches would cost more submitter time than their search (the large
+  // fine levels run as k_search_fix<EV, true> launches of their own: a CTA of this kernel that took a fine row would hold
+  // its SM slot while it waits for the coarse levels). The rows of these levels, coarsest level first, form one ticket
+  // sequence (WfCall::ticket); a row of a finer level starts
+  // when the coarser level is complete and its global estimate is written (level_ready, made by the CTA that finishes the
+  // coarser level's last row). A CTA takes rows until the tickets run out; the level's arguments go to shared memory
+  // once per level change.
+  struct WfCall
+  {
+    LevelArgs lv[MVCUDA_MAX_LEVELS];
+    int nl;            // number of levels, lv[nl - 1] is the coarsest
+    int lo;            // the finest level of this launch (lv[lo - 1].glob: where its global estimate goes)
+    int use_global;
+    int *ticket;       // device: next row ticket (all levels of the launch)
+    int *level_done;   // device, per level: finished rows
+    int *level_ready;  // device, per level: 1 once lv[l].glob is written (not used for the coarsest level)
+    int *freq;         // device scratch of glob_estimate
+  };
+#if MVC_ARCH_BELOW(700)
+  struct WfArg
+  {
+    int unused;
+  };
+#else
+  struct WfArg
+  {
+    WfCall c;
+  };
+#endif
+  template <int EV>
+  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_wfix(const MVC_GRID_CONSTANT WfArg arg)
+  {
+#if MVC_ARCH_BELOW(700)
+    (void)arg;
+#else
+    const WfCall &c = arg.c;
+    __shared__ LevelArgs s_a;
+    __shared__ int s_t[3]; // level, row, last row of the level
+    const int tid = threadIdx.x;
+    int cur = -1; // thread 0: the level in s_a
+    for (;;)
+    {
+      if (tid == 0)
+      {
+        const int t = atomicAdd(c.ticket, 1);
+        int level = -1, row = 0;
+        for (int l = c.nl - 1, first = 0; l >= c.lo; first += c.lv[l].n_blk_y, l--)
+          if (t < first + c.lv[l].n_blk_y)
+          {
+            level = l;
+            row = t - first;
+            break;
+          }
+        if (level >= 0 && level != cur)
+        {
+          if (level < c.nl - 1)
+            while (ld_acquire(c.level_ready + level) == 0)
+              poll_pause(256);
+          s_a = c.lv[level];
+          cur = level;
+        }
+        s_t[0] = level;
+        s_t[1] = row;
+      }
+      __syncthreads();
+      const int level = s_t[0], row = s_t[1];
+      if (level < 0)
+        return;
+      fix_body<EV, true>(s_a, row);
+      // the CTA that finishes the level's last row makes the global estimate of the next finer level
+      if (tid == 32)
+        __threadfence(); // thread 32 wrote this row's vectors
+      __syncthreads();
+      if (tid == 0)
+      {
+        __threadfence();
+        s_t[2] = atomicAdd(c.level_done + level, 1) == s_a.n_blk_y - 1 ? 1 : 0;
+        __threadfence(); // every other row's vectors (fenced before their counts) after it
+      }
+      __syncthreads();
+      if (s_t[2] && level > 0)
+      {
+        glob_estimate(s_a.vec, s_a.n_blk_x * s_a.n_blk_y, c.freq, const_cast<int *>(c.lv[level - 1].glob), c.use_global,
+          tid, blockDim.x);
+        if (tid == 0)
+        {
+          __threadfence();
+          st_release(c.level_ready + level - 1, 1);
+        }
+      }
+      __syncthreads(); // s_t, s_a and the body's shared memory are reused
+    }
+#endif
+  }
 #endif // MVC_ANALYSE_PART == 0
 
   // ================================================================================================================
@@ -3351,58 +3823,6 @@ namespace
   // Inside a warp the candidates of a batch are spread over groups of GW lanes (GW = block width rounded up to a power
   // of two; lane = column), 32 / GW candidates at a time; no block-wide barriers. The fold over the candidates runs
   // in every lane with identical values, in the CPU order (same code as the slice kernel and AnaChecker).
-
-  // ld.acquire / st.release (and __nanosleep) need compute capability 7.0. Below that: a volatile load (L2, never a
-  // stale L1 line) followed by a fence, and a fence followed by a volatile store, the classic pre-Volta pattern. The
-  // data published this way is read with __ldcg (ld.global.cg) everywhere in k_wave, which on Pascal is also what keeps
-  // it from coming out of a non-coherent L1 line.
-  __device__ __forceinline__ int ld_acquire(const int *p)
-  {
-#if MVC_ARCH_BELOW(700)
-    const int v = *(const volatile int *)p;
-    __threadfence();
-    return v;
-#else
-    int v;
-    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-#endif
-  }
-  __device__ __forceinline__ void st_release(int *p, int v)
-  {
-#if MVC_ARCH_BELOW(700)
-    __threadfence();
-    *(volatile int *)p = v;
-#else
-    asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
-#endif
-  }
-  // pause between polls (7.0+); a plain spin below
-  __device__ __forceinline__ void poll_pause(unsigned ns)
-  {
-#if MVC_ARCH_BELOW(700)
-    (void)ns;
-#else
-    __nanosleep(ns);
-#endif
-  }
-
-  // Waits until *p >= need (acquire loads) and returns the value read; seen: a value read before (with acquire
-  // semantics) or 0. A relaxed poll followed by one fence.acq_rel was measured slower: the fence sits on the wavefront's
-  // critical path at almost every block. MVC_WAVE_SLEEP: optional pause between polls.
-#ifndef MVC_WAVE_SLEEP
-#define MVC_WAVE_SLEEP 0
-#endif
-  __device__ __forceinline__ int wait_at_least(const int *p, int need, int seen)
-  {
-    while (seen < need)
-    {
-      seen = ld_acquire(p);
-      if (MVC_WAVE_SLEEP > 0 && seen < need)
-        poll_pause(MVC_WAVE_SLEEP);
-    }
-    return seen;
-  }
 
   // SAD of one candidate, computed by the GW lanes of a group (col = lane inside the group) and summed over the group;
   // every lane of the group returns the sums. Lanes of an invalid candidate contribute 0. Chroma: for cw <= GW / 2 the
@@ -5185,9 +5605,25 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // trymany: the Refines one per warp (WarpChecker, trymany_par) in both kernels; MVCUDA_TM_PAR=0 restores the older
   // forms (k_search: the 7 Refines one after the other with the whole CTA; meander=false: k_search in one slice)
   static const bool tm_par_allowed = [] { const char *e = getenv("MVCUDA_TM_PAR"); return !(e && e[0] == '0'); }();
-  const bool wave = !ap->meander && wave_allowed && (!ap->try_many || tm_par_allowed);
+  bool wave = !ap->meander && wave_allowed && (!ap->try_many || tm_par_allowed);
   if (use_pr && !wave)
     return MVCUDA_NEEDS_CPU;
+  // meander=false with fixed-batch plans on every level (no trymany, no predictor clips, no field shift, exhaustive radius
+  // <= 3): the slice kernel as a wavefront (k_search_fix<EV, true>, one launch per level), whose per-block chain is much
+  // shorter than k_wave's (also the wide "bad vector" search, as k_wave). MVCUDA_WAVE_FIX=0: always k_wave.
+  static const bool wf_allowed = [] { const char *e = getenv("MVCUDA_WAVE_FIX"); return !(e && e[0] == '0'); }();
+  static const bool fix_allowed0 = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
+  bool wf = wave && wf_allowed && fix_allowed0 && !use_pr;
+  for (int l = 0; l < nl && wf; l++)
+  {
+    const int type = lvl_type[l], radius = (l == 0) ? ap->pel_search : ap->search_param;
+    const bool tm = ap->try_many && (l > 0 || (ap->try_many_all && nl > 1));
+    const int fsh = l == 0 ? ap->field_shift : 0;
+    wf = !tm && fsh == 0 && !(type == mvc_refine::S_EXHAUSTIVE && radius > 3)
+      && ((type == mvc_refine::S_EXHAUSTIVE && radius <= 3) || wave_plan(type, radius) != WP_GEN);
+  }
+  if (wf)
+    wave = false; // the slice path's launches and buffers
   int row_off[MVCUDA_MAX_LEVELS], rows_total = 0;
   for (int l = 0; l < nl; l++)
   {
@@ -5235,7 +5671,19 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // level][global estimate ready per level][global estimate (x, y) per level][bad flag]
   const size_t w_rowbad = rows_total, w_ticket = 2 * (size_t)rows_total, w_done = w_ticket + 1, w_ready = w_done + MVCUDA_MAX_LEVELS;
   const size_t w_glob = w_ready + MVCUDA_MAX_LEVELS, w_bad = w_glob + 2 * MVCUDA_MAX_LEVELS, w_fin = w_bad + 1, wave_words = w_fin + 1;
-  const size_t wave_bytes = wave ? wave_words * sizeof(int) : 2 * sizeof(int); // slice path: bad flag, glob_tail ticket
+  // slice path: bad flag, glob_tail ticket; wavefront form: then the row progress of all levels, a row ticket per level
+  // (per-level launches), and for k_wfix the ticket, finished rows and ready flag per level, the global estimate per level
+  const size_t f_prog = 2, f_rt = f_prog + rows_total, f_ticket = f_rt + nl, f_done = f_ticket + 1, f_ready = f_done + nl;
+  const size_t f_glob = f_ready + nl, f_rowbad = f_glob + 2 * (size_t)nl, f_words = f_rowbad + rows_total;
+  // k_wfix (7.0+: the call as a kernel parameter) for the levels from wf_lo up (at most 48 block rows each); the finer
+  // levels as k_search_fix<EV, true> launches
+  int wf_lo = nl;
+  if (wf && !wave_by_pointer())
+    while (wf_lo > 0 && nby[wf_lo - 1] <= 48)
+      wf_lo--;
+  const bool wf_one = wf_lo < nl;
+  const size_t wave_bytes = wave ? wave_words * sizeof(int) : (wf ? f_words : 2) * sizeof(int);
+  WfCall wfc = {};
   // the wave state (slice kernel: the bad flag) follows the payload in one buffer, so one copy brings back the vectors and
   // the bad flag
   const size_t pay_alloc = pay_bytes + wave_bytes;
@@ -5429,6 +5877,59 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       if (slices > a.n_blk_y / 4)
         slices = a.n_blk_y / 4;
       a.n_slices = slices < 1 ? 1 : slices;
+      if (wf)
+      {
+        a.n_slices = a.n_blk_y; // one CTA per block row
+        a.prog = d_bad + f_prog + row_off[l];
+        a.rticket = d_bad + f_rt + l;
+        a.rowbad = d_bad + f_rowbad + row_off[l];
+        a.bad_range = ap->bad_range;
+      }
+      if (wf_one && l >= wf_lo)
+      {
+        // k_wfix: these levels' arguments in the call; the global estimate per level (the coarsest one stays the zero
+        // k_pay_init wrote; the one of level wf_lo - 1 goes to d_glob, where the next launch reads it), the interpolated
+        // predictions made by the rows themselves
+        a.glob = d_bad + f_glob + 2 * l;
+        a.freq = d_freq;
+        a.interp_head = l < nl - 1 ? 1 : 0;
+        a.glob_tail = 0;
+        if (l < nl - 1)
+        {
+          a.coarse = d_pay + offs[l + 1];
+          a.c_blk_x = nbx[l + 1];
+          a.c_blk_y = nby[l + 1];
+        }
+        wfc.lv[l] = a;
+        prev_fix = true; // the next finer level makes its own interpolated predictions (interp_head)
+        if (l > wf_lo)
+          continue;
+        // the finest level of k_wfix: launch it now (stream order before the finer levels)
+        if (l > 0)
+          wfc.lv[l - 1].glob = d_glob;
+        wfc.nl = nl;
+        wfc.lo = wf_lo;
+        wfc.use_global = ap->use_global;
+        wfc.ticket = d_bad + f_ticket;
+        wfc.level_done = d_bad + f_done;
+        wfc.level_ready = d_bad + f_ready;
+        wfc.freq = d_freq;
+        {
+          const size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source
+          const WfArg arg = { wfc };
+          switch (fix_eval_id(a)) // the same for every level (block size, chroma and packed_s do not change)
+          {
+          case 1: k_wfix<1><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          case 2: k_wfix<2><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          case 3: k_wfix<3><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          case 4: k_wfix<4><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          case 5: k_wfix<5><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          default: k_wfix<0><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
+          }
+        }
+        AN_CHECK(cudaGetLastError());
+        continue;
+      }
       if (wave)
       {
         a.prog = d_wave + row_off[l];
@@ -5523,7 +6024,19 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         else
         {
           // the fixed-batch plans without trymany: the leaner kernel (same result); MVCUDA_SEARCH_FIX=0: k_search
-          if (fix_level)
+          if (fix_level && wf)
+          {
+            switch (fix_eval_id(a))
+            {
+            case 1: k_search_fix<1, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 2: k_search_fix<2, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 3: k_search_fix<3, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 4: k_search_fix<4, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            case 5: k_search_fix<5, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            default: k_search_fix<0, true><<<a.n_slices, SEARCH_THREADS, shm, st>>>(a); break;
+            }
+          }
+          else if (fix_level)
           {
             switch (fix_eval_id(a))
             {

@@ -98,6 +98,16 @@ reference .md files (links to online resources are fine).
   (release / acquire), all levels in one launch. Fixed plans for small Hex2 / UMH in the fast kernel, GEN kernel
   (mvc_refine) otherwise; register cap 96. Runs the bad-vector wide search itself (k_search sends such frames to the
   CPU). `MVCUDA_WAVE=0` forces k_search.
+- **k_search_fix<EV, true> / k_wfix** (meander=false, fixed plans on every level: no trymany, no predictor clips, no
+  field shift, exhaustive radius <= 3; the QTGMC presets): k_search_fix's block body (`fix_body`) as a wavefront, one
+  CTA of 8 warps per block row, rows by ticket, per-row progress counters as k_wave. The small coarse levels (<= 48 rows)
+  run in one k_wfix launch (rows of all of them in one ticket sequence, a level released when the coarser one and its
+  global estimate are done); the finer levels as k_search_fix<EV, true> launches of their own (a k_wfix CTA holding a
+  fine row would block its SM slot while waiting; 2 CTAs per SM). Each row writes the row below's interpolated
+  predictions (`__stcg`); warp 7 fetches the next block's predictors before the ring barrier, thread 32 publishes.
+  The bad-vector wide search runs in the kernel (FixChecker, written without local arrays: a stack frame slowed every
+  launch by about 12 %). Per block about 2.6x faster than k_wave (2026-11-26: HD L0 1.69 vs 4.4 us per block).
+  `MVCUDA_WAVE_FIX=0` forces k_wave.
 - **Packed SADs** (`pk_row`): a lane takes 4 columns of every 4th / 8th row; 8 bit `__vsadu4`, 16 bit `__vsadu2`.
   `MVCUDA_WAVE_PACK=0` / `MVCUDA_SEARCH_PACK=0` for A/B.
 - **exhaustive_fast** (k_search, radius > 3): one block-wide minimum of (cost << 15 | ring index) when every cost part is
