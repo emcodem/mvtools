@@ -146,7 +146,24 @@ normal meander=false path keeps its static shared memory; meander=true + predict
    Tried: groups of 8 (eval_multi<8>, half the rounds): no gain (19.4 vs 20.3 ms), reverted - the rounds are not the
    limit. Next ideas: the reference window of each distinct start in shared memory (as exhaustive_fast of k_search),
    or all 7 Refines' candidates as one CTA-wide batch; needs a closer look at eval_multi_pk's memory pattern first.
-3. Built-in predictor clip generation, the simpler variant (not bit-identical to his MDegrainN chain): MAnalyse computes
+3. Built-in zero predictor clip (2026-11-26 night): MAnalyse `przero_radius=r` (1..10, 8-16 bit, excludes super_przero;
+   Nframes_przero defaults to r): per source frame n and reference frame m the level planes (extended area) of the super
+   frames n-r..n+r inside the clip without m, averaged pixel by pixel, (sum + c/2) / c (CPU: MVAnalyse::make_przero into
+   a super frame of its own; GPU: the neighbours' device supers averaged by k_prz_average into a DevSuper used as
+   predictor clip 0; their device frames come as MvCudaAnalyseParams.prz_token, up to 21). Not the pyramid of an averaged
+   picture (DTL's MDegrainN + MSuper chain), but CPU == GPU by construction.
+   Tests: run_s234 S11 21 / 21 (radius 1 / 3 / 10, trymany, with a separate global clip, fields, luma, meander=true
+   refused + CPU fallback), S9 24 / 24, S10 36 / 36. Bugs found on the way: (a) analyse_dev ordered its stream only after
+   the source / reference uploads (leased_call): the predictor clip frames (also the separate ones of step 5) could be
+   read before their upload finished - now every input frame is passed; (b) make_przero allocated its super frame with
+   the lite super's height (picture only) - access violation in the CPU fallback with CudaMSuper.
+   DTL's script, 300 frames, Prefetch(4), CPU == GPU: zero clips as filters, no trymany: CPU 18.0 / GPU 28.2 s;
+   built-in zero clip (przero_radius=10), no trymany: CPU 17.7 / GPU 15.2 s (~20 fps SD); built-in, trymany: 22.1 / 29.1.
+   The rest of the GPU time: the global clip generation (still filters) and trymany.
+   Built-in GLOBAL clip: not done - needs the global vector from n to every neighbour (a coarse search per neighbour, or
+   constant motion from the current pair) and an averaged block per block inside the search (CPU + both kernels); left
+   for a user decision. The separate-filter global clip (super_prglobal) works with the built-in zero clip.
+   Original note: Built-in predictor clip generation, the simpler variant (not bit-identical to his MDegrainN chain): MAnalyse computes
    the predictor block itself. Proposal: zero clip = plain average of the current frame and its neighbours n-r..n+r at
    the same position without the reference frame of the delta (sum once per frame, minus the reference); global clip =
    the same along the global vector to each neighbour (source of those vectors still to decide). The separate-filter

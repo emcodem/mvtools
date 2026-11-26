@@ -176,6 +176,11 @@ protected:
   float _pr_adj[2];
   MVGroupOfFrames *_pr_gof[2];
   int pglobal_coarse; // global penalty on the coarse levels (pglobal: finest level)
+  // built-in zero predictor clip (przero_radius > 0): made per frame into _prz_frame from the super frames of the current
+  // frame and its neighbours (loaded into _prz_nb), see make_przero
+  int _prz_radius;
+  std::vector<MVGroupOfFrames *> _prz_nb;
+  bool make_przero(int nsrc, int nref, IScriptEnvironment *env, PVideoFrame &out);
 
 public:
 
@@ -186,6 +191,7 @@ public:
     int nframes[2];    // Nframes_przero / _prglobal: frames averaged; < 0: the current frame is included
     float adj[2];      // SADadj_przero / _prglobal; <= 0: automatic
     int pglobal_coarse;
+    int przero_radius; // built-in zero predictor clip (0: off): the average of the super frames n - r .. n + r without the reference frame
   };
 
   MVAnalyse(

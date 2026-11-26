@@ -186,6 +186,7 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
   pr.nframes[1] = args[39].AsInt(0);
   pr.adj[1] = (float)args[40].AsFloat(0.0f);
   pr.pglobal_coarse = args[41].AsInt(args[17].AsInt(0)); // default: pglobal
+  pr.przero_radius = args[42].AsInt(0); // built-in zero predictor clip
 
   return new MVAnalyse(
     args[0].AsClip(),       // super
@@ -781,8 +782,8 @@ AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors) {
   AVS_linkage = vectors;
 #endif
   env->AddFunction("MShow", "cc[scale]i[sil]i[tol]i[showsad]b[number]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVShow, 0);
-  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i", Create_MVAnalyse, 0);
-  env->AddFunction("CudaMAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i", Create_MVAnalyse, (void *)1);
+  env->AddFunction("MAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i[przero_radius]i", Create_MVAnalyse, 0);
+  env->AddFunction("CudaMAnalyse", "c[blksize]i[blksizeV]i[levels]i[search]i[searchparam]i[pelsearch]i[isb]b[lambda]i[chroma]b[delta]i[truemotion]b[lsad]i[plevel]i[global]b[pnew]i[pzero]i[pglobal]i[overlap]i[overlapV]i[outfile]s[dct]i[divide]i[sadx264]i[badSAD]i[badrange]i[isse]b[meander]b[temporal]b[trymany]b[multi]b[mt]b[scaleCSAD]i[search_coarse]i[trymanyall]b[super_przero]c[Nframes_przero]i[SADadj_przero]f[super_prglobal]c[Nframes_prglobal]i[SADadj_prglobal]f[pglobal_coarse]i[przero_radius]i", Create_MVAnalyse, (void *)1);
   env->AddFunction("MMask", "cc[ml]f[gamma]f[kind]i[time]f[Ysc]i[thSCD1]i[thSCD2]i[isse]b[planar]b", Create_MVMask, 0);
   env->AddFunction("MCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, 0);
   env->AddFunction("CudaMCompensate", "ccc[scbehavior]b[recursion]f[thSAD]i[fields]b[time]f[thSCD1]i[thSCD2]i[isse]b[planar]b[mt]b[tr]i[center]b[cclip]c[thSAD2]i", Create_MVCompensate, (void *)1);

@@ -203,6 +203,42 @@ MVAnalyse::MVAnalyse(
     );
   }
 
+  // built-in zero predictor clip (przero_radius): instead of super_przero, the average of the super frames n - r .. n + r
+  // without the reference frame, made per frame (make_przero); Nframes_przero defaults to the radius
+  _prz_radius = pr.przero_radius;
+  if (_prz_radius != 0)
+  {
+    if (_prz_radius < 1 || _prz_radius > 10)
+      env->ThrowError("MAnalyse: przero_radius must be between 1 and 10");
+    if (_pr_clip[0])
+      env->ThrowError("MAnalyse: super_przero and przero_radius cannot be used together");
+    if (_dctmode != 0)
+      env->ThrowError("MAnalyse: przero_radius cannot be used with dct");
+    if (pixelsize > 2)
+      env->ThrowError("MAnalyse: przero_radius needs 8 to 16 bit integer formats");
+    const int n = pr.nframes[0] != 0 ? pr.nframes[0] : _prz_radius;
+    float adj = pr.adj[0];
+    if (adj <= 0.0f)
+    {
+      const float nf = (float)(n > 0 ? n : -n);
+      adj = n > 1 ? std::sqrt(2.0f * nf / (nf + 1.0f)) : n < -1 ? std::sqrt(2.0f * nf / (nf - 1.0f)) : 1.0f;
+    }
+    _pr_adj[0] = adj;
+    _pr_gof[0] = new MVGroupOfFrames(
+      nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
+      nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
+      _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
+      params.nWidth, params.nHeight
+    );
+    for (int i = 0; i < 2 * _prz_radius + 1; i++)
+      _prz_nb.push_back(new MVGroupOfFrames(
+        nSuperLevels, params.LayoutWidth(), params.LayoutHeight(),
+        nSuperPel, nSuperHPad, nSuperVPad, nSuperModeYUV,
+        _isse, analysisData.xRatioUV, analysisData.yRatioUV, pixelsize, bits_per_pixel, mt_flag,
+        params.nWidth, params.nHeight
+      ));
+  }
+
   analysisData.nBlkSizeX = _blksizex;
   analysisData.nBlkSizeY = _blksizey;
   // same blocksize check in MAnalyze and MRecalculate
@@ -516,7 +552,8 @@ MVAnalyse::MVAnalyse(
       .need(!divideExtra, "divide is not supported")
       .need(!_dctmode, "dct is not supported")
       .need(!temporal_flag, "temporal=true is not supported")
-      .need((!_pr_clip[0] && !_pr_clip[1]) || !meander, "temporal predictor clips (super_przero, super_prglobal) need meander=false")
+      .need((!_pr_clip[0] && !_pr_clip[1] && _prz_radius == 0) || !meander,
+        "temporal predictor clips (super_przero, super_prglobal, przero_radius) need meander=false")
       .need(pr_super_ok(0) && pr_super_ok(1),
         "the predictor clips' supers must come from CudaMSuper (or MSuper of this build) with the super clip's rfilter, sharp 2 and no pelclip")
       .need(GpuBackend::search_supported((int)searchType, nPelSearch, nSearchParam, analysisData.nLvCount, (int)searchTypeCoarse),
@@ -645,6 +682,8 @@ MVAnalyse::~MVAnalyse()
   pRefGOF = 0;
   for (int k = 0; k < 2; k++)
     delete _pr_gof[k];
+  for (MVGroupOfFrames *g : _prz_nb)
+    delete g;
   _RPT1(0, "MAnalyze destroyed %d\n",_instance_id);
 
 }
@@ -802,6 +841,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
         pr_frame[k] = MVSuper::CompleteLite(pr_frame[k], _pr_clip[k]->GetVideoInfo(), _mt_flag, env);
       load_src_frame(*_pr_gof[k], pr_frame[k], srd._analysis_data);
     }
+    if (_prz_radius > 0)
+      make_przero(nsrc, nref, env, pr_frame[0]); // built-in zero predictor clip into _pr_gof[0]
     _vectorfields_aptr->SearchMVs(
       pSrcGOF, pRefGOF,
       searchType, nSearchParam, nPelSearch, nLambda, lsad, pnew, plevel,
@@ -868,7 +909,7 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   GpuBackend &gpu = GpuBackend::instance();
   const MVAnalysisData &a = _srd_arr[0]._analysis_data;
 
-  GpuBackend::Input in[4];
+  GpuBackend::Input in[24];
   const VideoInfo &svi = child->GetVideoInfo();
   if (!GpuBackend::super_input(src, svi, (const void *)child.operator->(), nsrc, in[0])
     || !GpuBackend::super_input(ref, svi, (const void *)child.operator->(), nref, in[1]))
@@ -884,6 +925,27 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
     if (!GpuBackend::super_input(pr_frame[k], _pr_clip[k]->GetVideoInfo(), (const void *)_pr_clip[k].operator->(), nsrc, in[n_in]))
       return false;
     pr_in[k] = n_in++;
+  }
+  // built-in zero predictor clip: the current frame (input 0) and its neighbours nsrc - r .. nsrc + r without nref, in the
+  // order make_przero sums them
+  int prz_in[MVCUDA_PRZ_MAX], prz_n = 0;
+  PVideoFrame prz_frame[MVCUDA_PRZ_MAX];
+  if (_prz_radius > 0)
+  {
+    for (int m = nsrc - _prz_radius; m <= nsrc + _prz_radius; m++)
+    {
+      if (m < 0 || m >= svi.num_frames || m == nref)
+        continue;
+      if (m == nsrc)
+      {
+        prz_in[prz_n++] = 0;
+        continue;
+      }
+      prz_frame[prz_n] = child->GetFrame(m, env);
+      if (!GpuBackend::super_input(prz_frame[prz_n], svi, (const void *)child.operator->(), m, in[n_in]))
+        return false;
+      prz_in[prz_n++] = n_in++;
+    }
   }
 
   MvCudaSuperParams sp = {};
@@ -940,6 +1002,9 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
         ap.pr_token[k] = pr_in[k] >= 0 ? tk[pr_in[k]] : 0;
         ap.pr_adj[k] = _pr_adj[k];
       }
+      ap.prz_count = prz_n;
+      for (int i = 0; i < prz_n; i++)
+        ap.prz_token[i] = tk[prz_in[i]];
       return gpu.analyse_token(&sp, &ap, tk[0], tk[1], payload, words);
     });
   }
@@ -950,6 +1015,68 @@ bool MVAnalyse::gpu_search(const PVideoFrame &src, const PVideoFrame &ref, int n
   if (GpuBackend::log_enabled())
     std::fprintf(stderr, "MAnalyse gpu frame %d rc=%d%s\n", nsrc, rc, rc == 0 ? "" : " -> CPU");
   return rc == 0 && payload[0] == words;
+}
+
+// one plane (all levels share this: the extended area incl. padding) of the built-in zero predictor clip: the rounded
+// average of the same plane of c super frames
+template <typename pixel_t>
+static void prz_average(MVPlane *dst, MVPlane *const *src, int c)
+{
+  const int w = dst->GetExtendedWidth(), h = dst->GetExtendedHeight();
+  uint8_t *const d0 = const_cast<uint8_t *>(dst->GetAbsolutePelPointer(0, 0));
+  for (int y = 0; y < h; y++)
+  {
+    pixel_t *const drow = reinterpret_cast<pixel_t *>(d0 + (size_t)y * dst->GetPitch());
+    for (int x = 0; x < w; x++)
+    {
+      int sum = 0;
+      for (int k = 0; k < c; k++)
+        sum += reinterpret_cast<const pixel_t *>(src[k]->GetAbsolutePelPointer(0, 0) + (size_t)y * src[k]->GetPitch())[x];
+      drow[x] = (pixel_t)((sum + c / 2) / c);
+    }
+  }
+}
+
+// The built-in zero predictor clip of source frame nsrc and reference frame nref (MAnalyse przero_radius): the super frames
+// nsrc - r .. nsrc + r inside the clip, without nref, averaged level by level (the planes the search reads), into out
+// (a new super frame) loaded into _pr_gof[0]. The GPU path does the same with the device supers (mvcuda_analyse.cu).
+bool MVAnalyse::make_przero(int nsrc, int nref, IScriptEnvironment *env, PVideoFrame &out)
+{
+  const MVAnalysisData &a = _srd_arr[0]._analysis_data;
+  const int nf = child->GetVideoInfo().num_frames;
+  std::vector<PVideoFrame> frames;
+  int c = 0;
+  for (int m = nsrc - _prz_radius; m <= nsrc + _prz_radius; m++)
+  {
+    if (m < 0 || m >= nf || m == nref)
+      continue;
+    PVideoFrame f = child->GetFrame(m, env);
+    if (_super_lite)
+      f = MVSuper::CompleteLite(f, child->GetVideoInfo(), _mt_flag, env);
+    load_src_frame(*_prz_nb[c], f, a);
+    frames.push_back(f);
+    c++;
+  }
+  // the full super layout: with a lite super (CudaMSuper, picture only) the clip's height is that of the picture, the
+  // completed frames have the height of the whole super
+  VideoInfo fvi = child->GetVideoInfo();
+  fvi.height = frames.front()->GetHeight(PLANAR_Y);
+  out = env->NewVideoFrame(fvi);
+  load_src_frame(*_pr_gof[0], out, a);
+  const MVPlaneSet planes[3] = { YPLANE, UPLANE, VPLANE };
+  MVPlane *src[2 * 10 + 1];
+  for (int l = 0; l < a.nLvCount; l++)
+    for (int p = 0; p < (nModeYUV == YUVPLANES ? 3 : 1); p++)
+    {
+      for (int k = 0; k < c; k++)
+        src[k] = _prz_nb[k]->GetFrame(l)->GetPlane(planes[p]);
+      MVPlane *dst = _pr_gof[0]->GetFrame(l)->GetPlane(planes[p]);
+      if (a.pixelsize == 1)
+        prz_average<uint8_t>(dst, src, c);
+      else
+        prz_average<uint16_t>(dst, src, c);
+    }
+  return true;
 }
 
 void	MVAnalyse::load_src_frame(MVGroupOfFrames &gof, ::PVideoFrame &src, const MVAnalysisData &ana_data)

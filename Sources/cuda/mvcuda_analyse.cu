@@ -4990,10 +4990,30 @@ namespace
 
 // The search on two device frames (source and reference picture); their super frames are kept with them (frame_super).
 // Issued by the pipeline submitter on a leased stream ordered after the ops that made the frames (leased_call).
-static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const std::shared_ptr<mvc::DevFrame> &fs,
-  const std::shared_ptr<mvc::DevFrame> &fr, int *payload, int payload_words, const std::shared_ptr<mvc::DevFrame> *fpr = nullptr)
+// Built-in zero predictor clip (MAnalyse przero_radius): one plane (extended area, packed) of the rounded average of the
+// same plane of count super frames, as MVAnalyse::make_przero
+struct PrzSrc
 {
-  const bool use_pr = fpr && (fpr[0] || fpr[1]); // temporal predictor clips (wavefront kernel only)
+  const pix *p[MVCUDA_PRZ_MAX];
+};
+__global__ void k_prz_average(pix *dst, PrzSrc s, int count, int n)
+{
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+  {
+    int sum = 0;
+    for (int k = 0; k < count; k++)
+      sum += s.p[k][i];
+    dst[i] = (pix)((sum + count / 2) / count);
+  }
+}
+
+static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *ap, const std::shared_ptr<mvc::DevFrame> &fs,
+  const std::shared_ptr<mvc::DevFrame> &fr, int *payload, int payload_words, const std::shared_ptr<mvc::DevFrame> *fpr = nullptr,
+  const std::vector<std::shared_ptr<mvc::DevFrame>> *prz = nullptr)
+{
+  // temporal predictor clips (wavefront kernel only): given as frames, or the built-in zero clip (prz: its frames)
+  const bool use_prz = prz && !prz->empty();
+  const bool use_pr = (fpr && (fpr[0] || fpr[1])) || use_prz;
   if (!sp || !ap || !fs || !fr || !payload)
     return -4;
   // supported: luma only or luma + chroma, pel 1 or 2, field shift 0, every search type of mvcuda_refine.cuh
@@ -5094,6 +5114,9 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   int rc = 0;
   cudaStream_t st = nullptr; // the leased stream of the call (leased_call)
   std::shared_ptr<mvc::DevSuper> s_src, s_ref, s_pr[2];
+  // the supers the built-in zero predictor clip averages: held until the end of the call (a super the frame does not keep
+  // would otherwise go back to the pool while the averaging kernel is still queued)
+  std::vector<std::shared_ptr<mvc::DevSuper>> s_nb;
   int *d_pay = nullptr, *d_freq = nullptr, *d_glob = nullptr, *d_bad = nullptr, *d_wave = nullptr;
   WaveCall *d_wc = nullptr, *h_wc = nullptr; // devices below 7.0: the wavefront call in device memory (k_wave_p)
   const size_t pay_bytes = (size_t)words * sizeof(int), freq_bytes = 2 * 2 * FREQ_HALF * sizeof(int);
@@ -5126,10 +5149,41 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     if (!r)
       r = mvc::frame_super(&MVC_NS::super_build_dev, fr, *sp, st, s_ref);
     for (int k = 0; k < 2 && !r; k++)
-      if (use_pr && fpr[k])
+      if (fpr && fpr[k])
         r = mvc::frame_super(&MVC_NS::super_build_dev, fpr[k], *sp, st, s_pr[k]);
     if (r)
       return r;
+    if (use_prz)
+    {
+      // built-in zero predictor clip: the super frames of prz averaged plane by plane (the searched levels) into a super
+      // of its own, then used as predictor clip 0
+      s_nb.assign(prz->size(), nullptr);
+      for (size_t i = 0; i < prz->size() && !r; i++)
+        r = mvc::frame_super(&MVC_NS::super_build_dev, (*prz)[i], *sp, st, s_nb[i]);
+      if (r)
+        return r;
+      auto avg = std::make_shared<mvc::DevSuper>();
+      avg->p = *sp;
+      avg->esize = (int)sizeof(pix);
+      for (int l = 0; l < ap->n_levels; l++)
+        for (int p = 0; p < (sp->chroma ? 3 : 1); p++)
+        {
+          mvc::DevPlane &dp = avg->pl[l * 3 + p];
+          mvc::plane_dims(*sp, l, p, dp.d);
+          dp.nsub = 1;
+          const int n = dp.d.ew * dp.d.eh;
+          dp.sub[0] = mvc::dev_alloc((size_t)n * sizeof(pix));
+          if (!dp.sub[0])
+            return -2;
+          PrzSrc ps = {};
+          for (size_t i = 0; i < prz->size(); i++)
+            ps.p[i] = (const pix *)s_nb[i]->pl[l * 3 + p].sub[0];
+          const int grid = (n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024;
+          k_prz_average<<<grid, 256, 0, st>>>((pix *)dp.sub[0], ps, (int)prz->size(), n);
+          AN_CHECK(cudaGetLastError());
+        }
+      s_pr[0] = avg;
+    }
   }
   lap("2 x super (kept with the frames)");
 
@@ -5461,8 +5515,16 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // The device frames are results of pipeline ops (or uploads) up to their seq. Issued by the pipeline submitter (one
   // thread for all launches, mvcuda_internal.h) on a leased stream ordered after the ops that made the frames; the host
   // waits for that stream only.
-  const mvc::DevFrame *in[2] = { fs.get(), fr.get() };
-  rc = mvc::leased_call(in, 2, [&](cudaStream_t s) {
+  // every input picture: the stream is ordered after the work that made each of them (an upload still in flight
+  // otherwise gives a stale picture): source, reference, predictor clips, the built-in zero clip's frames
+  std::vector<const mvc::DevFrame *> in = { fs.get(), fr.get() };
+  for (int k = 0; k < 2; k++)
+    if (fpr && fpr[k])
+      in.push_back(fpr[k].get());
+  if (use_prz)
+    for (const auto &f : *prz)
+      in.push_back(f.get());
+  rc = mvc::leased_call(in.data(), (int)in.size(), [&](cudaStream_t s) {
     st = s;
     return issue();
   });
@@ -5543,7 +5605,7 @@ extern "C" int MVC_API(mvcuda_analyse_host)(const MvCudaSuperParams *sp, const M
 {
   if (!sp || !ap || !src || !ref || !src_pitch_bytes || !ref_pitch_bytes || !payload)
     return -4;
-  if (ap->pr_token[0] || ap->pr_token[1]) // predictor clips: device frames only (mvcuda_analyse_token)
+  if (ap->pr_token[0] || ap->pr_token[1] || ap->prz_count) // predictor clips: device frames only (mvcuda_analyse_token)
     return -4;
   if (!mvc::use_device())
     return -1;
@@ -5579,7 +5641,19 @@ extern "C" int MVC_API(mvcuda_analyse_token)(const MvCudaSuperParams *sp, const 
       if (!mvc::super_fits(*fpr[k], *sp, (int)sizeof(mvc_pix)))
         return -4;
     }
-  return analyse_dev(sp, ap, fs, fr, payload, payload_words, fpr);
+  std::vector<std::shared_ptr<mvc::DevFrame>> prz;
+  if (ap->prz_count < 0 || ap->prz_count > MVCUDA_PRZ_MAX || (ap->prz_count > 0 && ap->pr_token[0]))
+    return -4;
+  for (int i = 0; i < ap->prz_count; i++)
+  {
+    auto f = mvc::frame_get(ap->prz_token[i]);
+    if (!f)
+      return MVCUDA_TOKEN_GONE;
+    if (!mvc::super_fits(*f, *sp, (int)sizeof(mvc_pix)))
+      return -4;
+    prz.push_back(f);
+  }
+  return analyse_dev(sp, ap, fs, fr, payload, payload_words, fpr, &prz);
 }
 #endif // MVC_ANALYSE_PART == 0
 

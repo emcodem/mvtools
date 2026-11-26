@@ -106,6 +106,7 @@ MVCUDA_API int mvcuda_recalc_token(const MvCudaSuperParams *sp, const MvCudaReca
 
 // returned when the frame contains blocks that would need the CPU's "bad vector" wide search: use the CPU result
 #define MVCUDA_NEEDS_CPU -5
+#define MVCUDA_PRZ_MAX 21 // frames of a built-in zero predictor clip: radius up to 10
 
 typedef struct
 {
@@ -134,6 +135,10 @@ typedef struct
   unsigned long long pr_token[2];
   float pr_adj[2];
   int field_shift;                        // MAnalyse on separated fields: the zero vector of level 0 is (0, field_shift) (API 34)
+  // MAnalyse przero_radius (built-in zero predictor clip, API 34): the device frames whose super frames are averaged (the
+  // current frame and its neighbours without the reference frame), 0 = not used; pr_token[0] must be 0 then
+  int prz_count;
+  unsigned long long prz_token[MVCUDA_PRZ_MAX];
 } MvCudaAnalyseParams;
 
 // Runs the whole coarse-to-fine search of one frame on the GPU. The super frames (all levels, chroma, pel 1 or 2) are
