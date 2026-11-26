@@ -613,6 +613,7 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
 {
   const int L = level;
   bool usableF[MAX_DEGRAIN] = {}, usableB[MAX_DEGRAIN] = {};
+  GpuScope sc_vec("degrain: vector GetFrame (upstream analyses)");
   // the vector frames in the CPU path's order
   for (int j = L - 1; j >= 0; j--)
   {
@@ -626,6 +627,8 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
     mvClipB[j]->Update(mv, env);
     usableB[j] = mvClipB[j]->IsUsable() && skip_frame != -(j + 1); // SkipFrame: -k = frame n + k
   }
+  sc_vec.stop();
+  GpuScope sc_in("degrain: source + reference GetFrame");
   PVideoFrame src = child->GetFrame(n, env);
   if (props_src)
     *props_src = src;
@@ -663,6 +666,8 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
       return -1;
   }
 
+  sc_in.stop();
+  GpuScope sc_tab("degrain: block table (host)");
   // per block: vectors and the normalised weights for luma and chroma, as use_block_y / use_block_uv + NORMWEIGHTS
   const int nb = nBlkX * nBlkY;
   const int stride = 4 * L + 2 * (1 + 2 * L);
@@ -726,6 +731,8 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
     g.win_luma = OverWins->GetWindow(0);
     g.win_chroma = OverWinsUV->GetWindow(0);
   }
+  sc_tab.stop();
+  GpuScope sc_gpu("degrain: inputs + GPU call");
   GpuBackend &gpu = GpuBackend::instance();
   return gpu.with_inputs(in, 1 + 2 * L, env, [&](const unsigned long long *tk) {
     return gpu.degrain(&g, L, tk[0], tk + 1, tk + 1 + L, blocks.data(), mask, _producer, n, &h);
@@ -734,6 +741,7 @@ int MVDegrainX::gpu_make(int n, IScriptEnvironment *env, MvCudaTokenHeader &h, P
 
 PVideoFrame __stdcall MVDegrainX::GetFrame(int n, IScriptEnvironment* env)
 {
+  GpuScope sc_total("degrain: GetFrame total");
   std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
   if (!_gpu_ok)
     return cpu_frame(n, env);

@@ -24,8 +24,14 @@ public:
   }
   ~GpuScope()
   {
+    stop();
+  }
+  // records the phase now (once); the destructor then adds nothing
+  void stop()
+  {
     if (_on)
       gpu_prof_add(_name, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t).count());
+    _on = false;
   }
   GpuScope(const GpuScope &) = delete;
   GpuScope &operator=(const GpuScope &) = delete;

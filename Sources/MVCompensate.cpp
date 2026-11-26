@@ -376,9 +376,11 @@ int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h,
   MVClip *clip = info._clip_sptr.get();
   const sad_t thsad = info._thsad;
   {
+    GpuScope sc_vec("compensate: vector GetFrame (upstream analysis)");
     PVideoFrame mvn = clip->GetFrame(nvec, env);
     clip->Update(mvn, env);
   }
+  GpuScope sc_in("compensate: super GetFrame + table + GPU call");
   const VideoInfo &svi = super->GetVideoInfo();
   const void *sclip = (const void *)super.operator->();
   PVideoFrame src = super->GetFrame(nsrc, env);
@@ -444,6 +446,7 @@ int MVCompensate::gpu_make(int n, IScriptEnvironment* env, MvCudaTokenHeader &h,
 
 PVideoFrame __stdcall MVCompensate::GetFrame(int n, IScriptEnvironment* env_ptr)
 {
+  GpuScope sc_total("compensate: GetFrame total");
   std::lock_guard<std::mutex> gpu_lock(_gpu_mutex);
   if (!_gpu_ok)
     return cpu_frame(n, env_ptr);

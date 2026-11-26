@@ -10,7 +10,9 @@
 #include "CudaCommon.h"
 #include "dyn_lib.h"
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
 
 namespace cf
 {
@@ -354,6 +356,9 @@ namespace
   {
     MvCudaFrameFormat _fmt;
     bool _fmt_ok;
+    // MVTOOLS_GPU_PROFILE: wall time of the child request (the whole chain above) and of the download, summed over threads
+    bool _prof = std::getenv("MVTOOLS_GPU_PROFILE") != nullptr;
+    std::atomic<long long> _ns_child{ 0 }, _ns_dl{ 0 }, _calls{ 0 };
 
   public:
     CudaDownload(PClip c, IScriptEnvironment *env)
@@ -365,11 +370,16 @@ namespace
     ~CudaDownload()
     {
       print_stats("CudaDownload");
+      if (_prof && _calls)
+        std::fprintf(stderr, "CudaDownload profile: %lld calls, child GetFrame %.1f ms (%.3f ms/call), download %.1f ms (%.3f ms/call)\n",
+          (long long)_calls, _ns_child / 1e6, _ns_child / 1e6 / _calls, _ns_dl / 1e6, _ns_dl / 1e6 / _calls);
     }
 
     PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override
     {
+      const auto t0 = std::chrono::steady_clock::now();
       PVideoFrame src = child->GetFrame(n, env);
+      const auto t1 = std::chrono::steady_clock::now();
       MvCudaTokenHeader h;
       if (!read_token(src, vi, h))
         return src;
@@ -395,6 +405,13 @@ namespace
       }
       if (rc != 0)
         env->ThrowError("CudaDownload: frame %d could not be read from the GPU (code %d)", n, rc);
+      if (_prof)
+      {
+        const auto t2 = std::chrono::steady_clock::now();
+        _ns_child += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        _ns_dl += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        _calls++;
+      }
       return dst;
     }
 
