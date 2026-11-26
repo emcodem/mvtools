@@ -131,6 +131,19 @@ CHAINS = {
     'show': ('hd420p8', ANA[0] + 'out = MShow(sup, fv)\n', ANA[1] + 'out = mv.MShow(sup, fv)\n'),
     'scalevect': ('hd420p8', ANA[0] + 'out = MCompensate(c, sup, MScaleVect(fv, scale=1.0))\n',
                   ANA[1] + 'out = mv.MCompensate(c, sup, mv.MScaleVect(fv, scale=1.0))\n'),
+    # temporal predictor clips: the built-in zero clip (przero_radius), pglobal_coarse, MDegrainN SkipFrame
+    'predclip': ('hd420p8',
+                 'sup = MSuper(c, pel=2)\n'
+                 'out = MAnalyse(sup, przero_radius=2, isb=true, blksize=16, overlap=8, trymany=true, pglobal=-1000, '
+                 'pglobal_coarse=0, meander=false, mt=false)\n',
+                 'sup = mv.MSuper(c, pel=2)\n'
+                 'out = mv.MAnalyse(sup, przero_radius=2, isb=True, blksize=16, overlap=8, trymany=True, pglobal=-1000, '
+                 'pglobal_coarse=0, meander=False, mt=False)\n'),
+    'skipframe': ('hd420p8',
+                  'sup = MSuper(c, pel=2)\nmvm = MAnalyse(sup, multi=true, delta=2, blksize=16, overlap=8)\n'
+                  'out = MDegrainN(c, sup, mvm, 2, SkipFrame=-1, thSAD=300)\n',
+                  'sup = mv.MSuper(c, pel=2)\nmvm = mv.MAnalyse(sup, multi=True, delta=2, blksize=16, overlap=8)\n'
+                  'out = mv.MDegrainN(c, sup, mvm, 2, SkipFrame=-1, thSAD=300)\n'),
     # MSuper edgepad (upstream 2.7.49): 1080 is not covered by 32-pixel blocks (33 rows end 24 pixels before the edge),
     # one more block row reaches into the edge padding; the super parameters travel through the bridge's VideoInfo
     'edgepad': ('hd420p8',
