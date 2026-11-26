@@ -128,7 +128,25 @@ namespace
   // column per RemoveGrain 20 step); plane borders follow the same rules, evaluated in plane coordinates.
   const int KT_X = 64, KT_Y = 32;            // output tile
   const int KR_MAX = 9, KC_MAX = 3;          // largest reach: 3 + 1 + 3 vertical steps + 2 over-dilation, 1 + 2 rg steps
-  const int KB_W = KT_X + 2 * KC_MAX, KB_H = KT_Y + 2 * KR_MAX;
+  const int KB_W = KT_X + 2 * KC_MAX + 2, KB_H = KT_Y + 2 * KR_MAX; // (+ 2: rows of whole 4-byte words)
+
+  // i / n and i % n for 0 <= i < 2^20, n > 0 with rn = 1.0f / n: the float quotient of i + 0.5 is at least 0.5 / n away
+  // from an integer, far more than its rounding error, so the truncation is the integer quotient
+  __device__ __forceinline__ int div_rc(int i, int n, float rn, int &rem)
+  {
+    const int q = __float2int_rz(__fmul_rn(__int2float_rn(i) + 0.5f, rn));
+    rem = i - q * n;
+    return q;
+  }
+
+  // the vertical min / max of three rows on whole words (4 / 2 samples)
+  template <class T>
+  __device__ __forceinline__ unsigned vmm(unsigned a, unsigned b, bool is_max)
+  {
+    if (sizeof(T) == 1)
+      return is_max ? __vmaxu4(a, b) : __vminu4(a, b);
+    return is_max ? __vmaxu2(a, b) : __vminu2(a, b);
+  }
 
   struct KobsPlanes
   {
@@ -147,37 +165,47 @@ namespace
     int vr, int vc, const KobsPlanes &k, int gx0, int gy0, int w, int h, int tid, int nt)
   {
     const int r0 = k.R - vr + 1, r1 = k.R + KT_Y + vr - 1;                       // rows produced (one less halo row)
-    const int c0 = k.C - vc + (kind ? 1 : 0), c1 = k.C + KT_X + vc - (kind ? 1 : 0); // columns produced
+    if (kind == 0)
+    {
+      // the vertical step on whole buffer rows, word by word: the columns outside the valid region (or the plane) get
+      // values no later step reads (a step reads its neighbour columns only inside the region it produced)
+      constexpr int WPR = KB_W * (int)sizeof(T) / 4;
+      const int n = (r1 - r0) * WPR;
+      for (int i = tid; i < n; i += nt)
+      {
+        const int r = r0 + i / WPR, wd = i % WPR;
+        const int gy = gy0 + r;
+        if (gy < 0 || gy >= h)
+          continue;
+        const unsigned v = ((const unsigned *)src[r])[wd];
+        const unsigned up = gy > 0 ? ((const unsigned *)src[r - 1])[wd] : v, dn = gy < h - 1 ? ((const unsigned *)src[r + 1])[wd] : v;
+        ((unsigned *)dst[r])[wd] = vmm<T>(v, vmm<T>(up, dn, is_max), is_max);
+      }
+      return;
+    }
+    const int c0 = k.C - vc + 1, c1 = k.C + KT_X + vc - 1; // columns produced
     const int cols = c1 - c0, n = (r1 - r0) * cols;
+    const float rc = 1.0f / (float)cols;
     for (int i = tid; i < n; i += nt)
     {
-      const int r = r0 + i / cols, c = c0 + i % cols;
+      int cc;
+      const int r = r0 + div_rc(i, cols, rc, cc), c = c0 + cc;
       const int gy = gy0 + r, gx = gx0 + c;
       if (gy < 0 || gy >= h || gx < 0 || gx >= w)
         continue;
       const int v = src[r][c];
-      int out;
-      if (kind == 0)
-      {
-        const int up = gy > 0 ? src[r - 1][c] : v, dn = gy < h - 1 ? src[r + 1][c] : v;
-        out = is_max ? max(v, max(up, dn)) : min(v, min(up, dn));
-      }
-      else
-      {
-        int rg = v; // QTGMC_deflate / inflate: mt_logic(c, c.RemoveGrain(20), "min" / "max"), RemoveGrain borders copied
-        if (gx > 0 && gy > 0 && gx < w - 1 && gy < h - 1)
-          rg = rg20<T>((unsigned)(src[r - 1][c - 1] + src[r - 1][c] + src[r - 1][c + 1] + src[r][c - 1] + v + src[r][c + 1]
-            + src[r + 1][c - 1] + src[r + 1][c] + src[r + 1][c + 1] + 4));
-        out = is_max ? max(v, rg) : min(v, rg);
-      }
-      dst[r][c] = (T)out;
+      int rg = v; // QTGMC_deflate / inflate: mt_logic(c, c.RemoveGrain(20), "min" / "max"), RemoveGrain borders copied
+      if (gx > 0 && gy > 0 && gx < w - 1 && gy < h - 1)
+        rg = rg20<T>((unsigned)(src[r - 1][c - 1] + src[r - 1][c] + src[r - 1][c + 1] + src[r][c - 1] + v + src[r][c + 1]
+          + src[r + 1][c - 1] + src[r + 1][c] + src[r + 1][c + 1] + 4));
+      dst[r][c] = (T)(is_max ? max(v, rg) : min(v, rg));
     }
   }
 
   template <class T>
   __global__ void __launch_bounds__(256) k_kobs(KobsPlanes k)
   {
-    __shared__ T diff[KB_H][KB_W], ba[KB_H][KB_W], bb[KB_H][KB_W], c1[KB_H][KB_W];
+    __shared__ __align__(16) T diff[KB_H][KB_W], ba[KB_H][KB_W], bb[KB_H][KB_W], c1[KB_H][KB_W];
     const int p = blockIdx.z, tid = threadIdx.x, nt = blockDim.x;
     const Plane &in = k.in[p], &rf = k.rf[p], &d = k.d[p];
     const int w = d.w, h = d.h, tx0 = blockIdx.x * KT_X, ty0 = blockIdx.y * KT_Y;
@@ -196,9 +224,11 @@ namespace
     }
     const int gx0 = tx0 - k.C, gy0 = ty0 - k.R; // plane coordinates of buffer [0][0]
     const int rows = KT_Y + 2 * k.R, cols = KT_X + 2 * k.C;
+    const float rcols = 1.0f / (float)cols;
     for (int i = tid; i < rows * cols; i += nt)
     {
-      const int r = i / cols, c = i % cols, gy = gy0 + r, gx = gx0 + c;
+      int c;
+      const int r = div_rc(i, cols, rcols, c), gy = gy0 + r, gx = gx0 + c;
       if (gy >= 0 && gy < h && gx >= 0 && gx < w)
         diff[r][c] = (T)clipv(ld<T>(rf, gx, gy) - ld<T>(in, gx, gy) + half, maxv); // mt_makediff(Ref, Input)
     }
