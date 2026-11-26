@@ -6,6 +6,7 @@
 // i.e. the padded plane without the pitch gap. This is also the layout of the golden-data plane dumps.
 
 #include "mvcuda_internal.h"
+#include "mvcuda_vec4.cuh"
 
 #include <cuda_runtime.h>
 
@@ -171,6 +172,54 @@ namespace MVC_NS
     dst[(size_t)y * W + x] = (pix)v;
   }
 
+  // one sample of a Wiener pass at position t of a line of n samples (k_wiener_h / k_wiener_v's cases), s(k) = sample k
+  template <class S>
+  __device__ __forceinline__ int wiener_line(int t, int n, int maxv, S s)
+  {
+    if (t < 2 || (t >= n - 4 && t < n - 1))
+      return (s(t) + s(t + 1) + 1) >> 1;
+    if (t >= n - 1)
+      return s(t);
+    return wiener6(s(t - 2), s(t - 1), s(t), s(t + 1), s(t + 2), s(t + 3), maxv);
+  }
+
+  // The three pel-2 planes in one launch: s1 = HorizontalWiener(s0), s2 = VerticalWiener(s0), s3 = HorizontalWiener(s2)
+  // (= k_wiener_h + k_wiener_v + k_wiener_h). A CTA takes WN3_W columns of one row; the row of s0 and its vertical pass
+  // (with the 2 + 3 columns a horizontal pass reads around them) go to shared memory, so s3 reads the finished s2 values.
+  constexpr int WN3_NT = 128, WN3_W = 4 * WN3_NT;
+  __global__ void __launch_bounds__(WN3_NT) k_wiener3(pix *s1, pix *s2, pix *s3, const pix *s0, int W, int H, int maxv)
+  {
+    const int x0 = blockIdx.x * WN3_W, y = blockIdx.y;
+    if (x0 >= W || y >= H)
+      return; // the whole CTA
+    constexpr int TW = WN3_W + 5;
+    __shared__ int row[TW], col[TW];
+    for (int i = threadIdx.x; i < TW; i += WN3_NT)
+    {
+      const int k = min(max(x0 - 2 + i, 0), W - 1); // (clamped entries outside the row are never read)
+      row[i] = s0[(size_t)y * W + k];
+      col[i] = wiener_line(y, H, maxv, [&](int m) { return (int)s0[(size_t)m * W + k]; });
+    }
+    __syncthreads();
+    const int xs = x0 + 4 * threadIdx.x;
+    if (xs >= W)
+      return;
+    const int n = min(4, W - xs);
+    int v1[4], v2[4], v3[4];
+    #pragma unroll
+    for (int e = 0; e < 4; e++)
+    {
+      const int x = xs + e;
+      v1[e] = wiener_line(x, W, maxv, [&](int k) { return row[k - x0 + 2]; });
+      v2[e] = col[x - x0 + 2];
+      v3[e] = wiener_line(x, W, maxv, [&](int k) { return col[k - x0 + 2]; });
+    }
+    const size_t o = (size_t)y * W + xs;
+    mvc::st4n<pix>(s1 + o, n, v1); // whole words where the row alignment allows (mvcuda_vec4.cuh)
+    mvc::st4n<pix>(s2 + o, n, v2);
+    mvc::st4n<pix>(s3 + o, n, v3);
+  }
+
   // VerticalWiener over the whole extended plane
   __global__ void k_wiener_v(pix *dst, const pix *src, int W, int H, int maxv)
   {
@@ -305,10 +354,7 @@ namespace MVC_NS
       {
         pix *sub[4] = { (pix *)out.pl[plane].sub[0], (pix *)out.pl[plane].sub[1], (pix *)out.pl[plane].sub[2],
           (pix *)out.pl[plane].sub[3] };
-        const dim3 g = grid_for(d0.ew, d0.eh);
-        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[1], sub[0], d0.ew, d0.eh, maxv);
-        k_wiener_v<<<g, BLOCK, 0, st>>>(sub[2], sub[0], d0.ew, d0.eh, maxv);
-        k_wiener_h<<<g, BLOCK, 0, st>>>(sub[3], sub[2], d0.ew, d0.eh, maxv);
+        k_wiener3<<<dim3((d0.ew + WN3_W - 1) / WN3_W, d0.eh), WN3_NT, 0, st>>>(sub[1], sub[2], sub[3], sub[0], d0.ew, d0.eh, maxv);
       }
       else if (p.pel == 4)
       {

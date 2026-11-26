@@ -389,16 +389,20 @@ namespace
     int words, nl;
     int pos[MVCUDA_MAX_LEVELS], val[MVCUDA_MAX_LEVELS];
   };
-  __global__ void k_pay_header(int *pay, const PayHeader h)
+  // the cleared payload with its header and the cleared global vector, in one launch (instead of two memsets and the
+  // header kernel: one call instead of three on the submitter thread)
+  __global__ void k_pay_init(int *pay, int n, const PayHeader h, int *glob)
   {
-    const int t = threadIdx.x;
-    if (t == 0)
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
     {
-      pay[0] = h.words;
-      pay[1] = 1;
+      int v = i == 0 ? h.words : i == 1 ? 1 : 0;
+      for (int l = 0; l < h.nl; l++)
+        if (i == h.pos[l])
+          v = h.val[l];
+      pay[i] = v;
     }
-    if (t < h.nl)
-      pay[h.pos[t]] = h.val[t];
+    if (blockIdx.x == 0 && threadIdx.x < 2)
+      glob[threadIdx.x] = 0;
   }
 
   // the slice path's result to the pinned host buffer, written by the SMs (as k_wave's host_out): a device-to-host copy
@@ -5281,8 +5285,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     }
     else
     {
-      // the payload header and a cleared bad flag, made on the device (memset + k_pay_header; see k_pay_header for why
-      // not a copy of a host buffer)
+      // the payload header and a cleared bad flag, made on the device (k_pay_init; see PayHeader for why not a copy of
+      // a host buffer)
       PayHeader ph = {};
       ph.words = words;
       ph.nl = nl;
@@ -5291,10 +5295,9 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         ph.pos[l] = offs[l] - 1;
         ph.val[l] = nbx[l] * nby[l] * 3 + 1;
       }
-      AN_CHECK(cudaMemsetAsync(d_pay, 0, pay_alloc, st));
-      k_pay_header<<<1, 32, 0, st>>>(d_pay, ph);
+      const int n_init = (int)(pay_alloc / sizeof(int));
+      k_pay_init<<<(n_init + 255) / 256 < 128 ? (n_init + 255) / 256 : 128, 256, 0, st>>>(d_pay, n_init, ph, d_glob);
       AN_CHECK(cudaGetLastError());
-      AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
     }
     bool wave_gen = false;
 
@@ -5406,8 +5409,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         const int total = a.n_blk_x * a.n_blk_y;
         k_glob_interp<<<1 + (total + 1023) / 1024, 1024, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], d_freq, d_glob, ap->use_global);
       }
-      else
-        AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
+      // (the coarsest level: the global vector is still the zero k_pay_init wrote)
       {
         size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source block
         // exhaustive radius > 3: room for the reference window of AnaChecker::exhaustive_fast when it fits the device
