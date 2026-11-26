@@ -13,6 +13,7 @@
 // the SADs for the next call).
 
 #include "mvcuda_internal.h"
+#include "mvcuda_vec4.cuh"
 
 #include <cstdint>
 
@@ -341,25 +342,41 @@ namespace
   {
     const int p = blockIdx.z;
     const int threshold = p == 0 ? thr_y : thr_c;
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
-    if (x >= prm.width[p] || y >= prm.height[p])
+    // 4 neighbouring samples per thread (mvcuda_vec4.cuh)
+    const int x0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4, y = blockIdx.y;
+    if (x0 >= prm.width[p] || y >= prm.height[p])
       return;
-    const size_t at = (size_t)y * prm.pitch[p] + x;
-    auto px = [&](int k) { return (int)((const pixel_t *)prm.planes[k * 3 + p])[at]; };
-    const int cur = px(2);
+    const int n = min(4, prm.width[p] - x0);
+    const size_t at = (size_t)y * prm.pitch[p] + x0;
     const int slot = prm.slot_of_plane[p];
-    int ts1 = cur, ts2 = cur;
-    if (slot >= 0 && scr->count1[slot] >= 0)
-      ts1 = ts_value<pixel_t>(cur, 2, scr->mask1[slot], scr->count1[slot], threshold, bits, [&](int j) { return px(j == 0 ? 1 : 3); });
-    pixel_t out = (pixel_t)ts1;
-    if (p == 0 || merge_chroma)
+    const bool do1 = slot >= 0 && scr->count1[slot] >= 0, merge = p == 0 || merge_chroma;
+    const bool do2 = merge && slot >= 0 && scr->count[slot] >= 0;
+    int f[5][4] = {};
+    mvc::ld4n<pixel_t>((const pixel_t *)prm.planes[2 * 3 + p] + at, n, f[2]);
+    if (do1 || do2)
+      for (int k = 1; k <= 3; k += 2)
+        mvc::ld4n<pixel_t>((const pixel_t *)prm.planes[k * 3 + p] + at, n, f[k]);
+    if (do2)
+      for (int k = 0; k <= 4; k += 4)
+        mvc::ld4n<pixel_t>((const pixel_t *)prm.planes[k * 3 + p] + at, n, f[k]);
+    int out[4];
+    #pragma unroll
+    for (int e = 0; e < 4; e++)
     {
-      if (slot >= 0 && scr->count[slot] >= 0)
-        ts2 = ts_value<pixel_t>(cur, 4, scr->mask[slot], scr->count[slot], threshold, bits, [&](int j) { return px(j < 2 ? j : j + 1); });
-      const bool simd = x < (p == 0 ? tail_y : tail_c);
-      out = (pixel_t)merge_w<pixel_t>(merge_w<pixel_t>(ts1, ts2, w1, inv1, bits, simd), cur, w2, inv2, bits, simd);
+      const int cur = f[2][e];
+      int ts1 = cur, ts2 = cur;
+      if (do1)
+        ts1 = ts_value<pixel_t>(cur, 2, scr->mask1[slot], scr->count1[slot], threshold, bits, [&](int j) { return f[j == 0 ? 1 : 3][e]; });
+      out[e] = ts1;
+      if (merge)
+      {
+        if (do2)
+          ts2 = ts_value<pixel_t>(cur, 4, scr->mask[slot], scr->count[slot], threshold, bits, [&](int j) { return f[j < 2 ? j : j + 1][e]; });
+        const bool simd = x0 + e < (p == 0 ? tail_y : tail_c);
+        out[e] = (pixel_t)merge_w<pixel_t>(merge_w<pixel_t>(ts1, ts2, w1, inv1, bits, simd), cur, w2, inv2, bits, simd);
+      }
     }
-    ((pixel_t *)prm.dst[p])[at] = out;
+    mvc::st4n<pixel_t>((pixel_t *)prm.dst[p] + at, n, out);
   }
 }
 
@@ -424,7 +441,7 @@ extern "C" int mvcuda_temporal_binomial(const unsigned long long tokens[5], int 
     max_h = cf.h[prm.plane_ids[s]] > max_h ? cf.h[prm.plane_ids[s]] : max_h;
   const bool do_sad = n_slots > 0 && scenechange > 0;
   const dim3 grid_sad(max_h > 0 ? max_h : 1, 4, n_slots > 0 ? n_slots : 1);
-  const dim3 grid_a((cf.w[0] + 127) / 128, cf.h[0], f.planes);
+  const dim3 grid_a((cf.w[0] + 4 * 128 - 1) / (4 * 128), cf.h[0], f.planes); // k_binomial: 4 samples per thread
   const bool b8 = f.bytes_per_sample == 1;
   const int bits = f.bits_per_sample;
   // k_sad works on a TsScratch: TbScratch begins with the same SAD array

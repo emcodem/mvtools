@@ -15,6 +15,7 @@
 //                   (sum of 9 + 4) * 3641 >> 15 (32-bit product), saturated to 65535; border rows / columns copied
 
 #include "mvcuda_internal.h"
+#include "mvcuda_vec4.cuh"
 
 #include <atomic>
 #include <cstdint>
@@ -59,6 +60,13 @@ namespace
   __device__ __forceinline__ int ld(const Plane &q, int x, int y) { return ((const T *)q.p)[(size_t)y * q.pitch + x]; }
   template <class T>
   __device__ __forceinline__ void st(const Plane &q, int x, int y, int v) { ((T *)q.p)[(size_t)y * q.pitch + x] = (T)v; }
+  // the n (1..4) samples of row y of q from column x0 (mvcuda_vec4.cuh)
+  template <class T>
+  __device__ __forceinline__ void ld4p(const Plane &q, int x0, int y, int n, int v[4])
+  {
+    mvc::ld4n<T>((const T *)q.p + (size_t)y * q.pitch + x0, n, v);
+  }
+
   // samples above the bit depth's max (possible in 16-bit containers, e.g. AviSynth+ Sharpen at 10 bit) are read as the
   // max: the table stays in bounds (the CPU filters have no defined result for them either)
   template <class T>
@@ -100,13 +108,50 @@ namespace
 
   // RemoveGrain 12 / 20 (rg_mode12_sse / rg_mode20_sse), borders copied; blockIdx.z = plane
   template <class T>
+  __device__ __forceinline__ int rg_px(const Plane &s, int mode, int x, int y);
+
+  // 4 neighbouring samples per thread: interior groups read the 3 rows around them with word loads (columns x0 - 1 ..
+  // x0 + 4); the border groups take rg_px per sample
+  template <class T>
   __global__ void k_rg(RgPlanes g)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+    const int x0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4, y = blockIdx.y;
     const Plane &s = g.s[blockIdx.z], &d = g.d[blockIdx.z];
     const int mode = g.mode[blockIdx.z] == 11 ? 12 : g.mode[blockIdx.z];
-    if (x >= d.w || y >= d.h)
+    if (x0 >= d.w || y >= d.h)
       return;
+    const int n = min(4, d.w - x0);
+    int r[4];
+    if ((mode == 12 || mode == 20) && x0 > 0 && x0 + 4 < s.w - 1 && y > 0 && y < s.h - 1)
+    {
+      int a[3][6];
+      #pragma unroll
+      for (int i = 0; i < 3; i++)
+      {
+        int lo[4], hi[4];
+        ld4p<T>(s, x0 - 1, y - 1 + i, 4, lo); // columns x0 - 1 .. x0 + 2
+        ld4p<T>(s, x0 + 1, y - 1 + i, 4, hi); // columns x0 + 1 .. x0 + 4
+        a[i][0] = lo[0]; a[i][1] = lo[1]; a[i][2] = lo[2]; a[i][3] = lo[3]; a[i][4] = hi[2]; a[i][5] = hi[3];
+      }
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+      {
+        if (mode == 12)
+          r[k] = rg12(a[0][k], a[0][k + 1], a[0][k + 2], a[1][k], a[1][k + 1], a[1][k + 2], a[2][k], a[2][k + 1], a[2][k + 2]);
+        else
+          r[k] = rg20<T>((unsigned)(a[0][k] + a[0][k + 1] + a[0][k + 2] + a[1][k] + a[1][k + 2] + a[2][k] + a[2][k + 1] + a[2][k + 2]
+            + a[1][k + 1] + 4));
+      }
+    }
+    else
+      for (int k = 0; k < 4; k++)
+        r[k] = k < n ? rg_px<T>(s, mode, x0 + k, y) : 0;
+    mvc::st4n<T>((T *)d.p + (size_t)y * d.pitch + x0, n, r);
+  }
+
+  template <class T>
+  __device__ __forceinline__ int rg_px(const Plane &s, int mode, int x, int y)
+  {
     int r;
     if ((mode != 12 && mode != 20) || x == 0 || y == 0 || x == s.w - 1 || y == s.h - 1)
       r = ld<T>(s, x, y);
@@ -120,7 +165,7 @@ namespace
       else
         r = rg20<T>((unsigned)(a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + c + 4));
     }
-    st<T>(d, x, y, r);
+    return r;
   }
 
   // ---- QTGMC_KeepOnlyBobShimmerFixes fused into one kernel (all planes): the same integer steps as the chain of masktools /
@@ -418,7 +463,7 @@ extern "C" int mvcuda_removegrain(unsigned long long src, const int mode[3], uns
     max_w = fs->w[p] > max_w ? fs->w[p] : max_w;
     max_h = fs->h[p] > max_h ? fs->h[p] : max_h;
   }
-  const dim3 grid((max_w + 127) / 128, max_h, fs->f.planes);
+  const dim3 grid((max_w + 4 * 128 - 1) / (4 * 128), max_h, fs->f.planes); // k_rg: 4 samples per thread
   // issued by the pipeline submitter (mvcuda_internal.h)
   if (fs->f.bytes_per_sample == 2)
     mvc::pipe_submit([=](cudaStream_t st) { k_rg<uint16_t><<<grid, 128, 0, st>>>(g); });
@@ -439,41 +484,55 @@ namespace
     int p1, p2, maxv;
   };
 
-  // op: MVCUDA_MT_* (mvcuda.h)
+  // op: MVCUDA_MT_* (mvcuda.h); 4 neighbouring samples per thread
   template <class T>
   __global__ void k_mt(MtPlanes m)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, p = blockIdx.z;
+    const int x0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4, y = blockIdx.y, p = blockIdx.z;
     const Plane &d = m.d[p];
-    if (x >= d.w || y >= d.h)
+    if (x0 >= d.w || y >= d.h)
       return;
+    const int n = min(4, d.w - x0), op = m.op[p];
     const Plane &a = m.a[p];
-    int r;
-    switch (m.op[p])
+    int va[4], vb[4], vc[4], r[4];
+    if (op == MVCUDA_MT_COPY_B)
+      ld4p<T>(m.b[p], x0, y, n, r);
+    else
     {
-    case MVCUDA_MT_MIN: r = min(ld<T>(a, x, y), ld<T>(m.b[p], x, y)); break;
-    case MVCUDA_MT_MAX: r = max(ld<T>(a, x, y), ld<T>(m.b[p], x, y)); break;
-    case MVCUDA_MT_CLAMP:
-    {
-      // clamp_sse2 / clamp16_core_simd: min with (bright +sat overshoot, at most max), then max with (dark -sat undershoot)
-      int up = ld<T>(m.b[p], x, y) + m.p1, lo = ld<T>(m.c[p], x, y) - m.p2;
-      up = up > m.maxv ? m.maxv : up;
-      lo = lo < 0 ? 0 : lo;
-      r = max(min(ld<T>(a, x, y), up), lo);
-      break;
+      ld4p<T>(a, x0, y, n, va);
+      if (op == MVCUDA_MT_MIN || op == MVCUDA_MT_MAX || op == MVCUDA_MT_CLAMP || op == MVCUDA_MT_LUT)
+        ld4p<T>(m.b[p], x0, y, n, vb);
+      if (op == MVCUDA_MT_CLAMP)
+        ld4p<T>(m.c[p], x0, y, n, vc);
+      if (op == MVCUDA_MT_VEXPAND || op == MVCUDA_MT_VINPAND)
+      {
+        ld4p<T>(a, x0, y > 0 ? y - 1 : y, n, vb);
+        ld4p<T>(a, x0, y < a.h - 1 ? y + 1 : y, n, vc);
+      }
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+      {
+        switch (op)
+        {
+        case MVCUDA_MT_MIN: r[k] = min(va[k], vb[k]); break;
+        case MVCUDA_MT_MAX: r[k] = max(va[k], vb[k]); break;
+        case MVCUDA_MT_CLAMP:
+        {
+          // clamp_sse2 / clamp16_core_simd: min with (bright +sat overshoot, at most max), then max with (dark -sat undershoot)
+          int up = vb[k] + m.p1, lo = vc[k] - m.p2;
+          up = up > m.maxv ? m.maxv : up;
+          lo = lo < 0 ? 0 : lo;
+          r[k] = max(min(va[k], up), lo);
+          break;
+        }
+        case MVCUDA_MT_VEXPAND: r[k] = max(va[k], max(vb[k], vc[k])); break;
+        case MVCUDA_MT_VINPAND: r[k] = min(va[k], min(vb[k], vc[k])); break;
+        case MVCUDA_MT_LUT: r[k] = k < n ? lut_at<T>(m.lut[p ? 1 : 0], m.maxv + 1, va[k], vb[k]) : 0; break;
+        default: r[k] = va[k]; break;
+        }
+      }
     }
-    case MVCUDA_MT_VEXPAND:
-    case MVCUDA_MT_VINPAND:
-    {
-      const int up = ld<T>(a, x, y > 0 ? y - 1 : y), c = ld<T>(a, x, y), dn = ld<T>(a, x, y < a.h - 1 ? y + 1 : y);
-      r = m.op[p] == MVCUDA_MT_VEXPAND ? max(c, max(up, dn)) : min(c, min(up, dn));
-      break;
-    }
-    case MVCUDA_MT_LUT: r = lut_at<T>(m.lut[p ? 1 : 0], m.maxv + 1, ld<T>(a, x, y), ld<T>(m.b[p], x, y)); break;
-    case MVCUDA_MT_COPY_B: r = ld<T>(m.b[p], x, y); break;
-    default: r = ld<T>(a, x, y); break;
-    }
-    st<T>(d, x, y, r);
+    mvc::st4n<T>((T *)d.p + (size_t)y * d.pitch + x0, n, r);
   }
 }
 
@@ -515,7 +574,7 @@ extern "C" int mvcuda_mt(const int op[3], unsigned long long a, unsigned long lo
   m.p1 = p1;
   m.p2 = p2;
   m.maxv = max_of(*fa);
-  const dim3 grid((max_w + 127) / 128, max_h, fa->f.planes);
+  const dim3 grid((max_w + 4 * 128 - 1) / (4 * 128), max_h, fa->f.planes);
   if (fa->f.bytes_per_sample == 2)
     mvc::pipe_submit([=](cudaStream_t s) { k_mt<uint16_t><<<grid, 128, 0, s>>>(m); });
   else

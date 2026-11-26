@@ -5,6 +5,7 @@
 // (weight + invweight = 32767), while the scalar tail of a row uses the plain formula; average (a + b + 1) >> 1.
 
 #include "mvcuda_internal.h"
+#include "mvcuda_vec4.cuh"
 
 #include <cstdint>
 
@@ -18,33 +19,41 @@ namespace
     int width[3], height[3], mode[3], tail[3];
   };
 
+  // 4 neighbouring samples per thread (mvcuda_vec4.cuh), each with the formula of its own column
   template <typename pixel_t>
   __global__ void k_merge(MergeParams prm, int weight_i, int invweight_i, int bits)
   {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y, p = blockIdx.z;
-    if (x >= prm.width[p] || y >= prm.height[p])
+    const int x0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4, y = blockIdx.y, p = blockIdx.z;
+    if (x0 >= prm.width[p] || y >= prm.height[p])
       return;
-    const int a = ((const pixel_t *)prm.a[p])[(size_t)y * prm.pitch_a[p] + x];
-    const int mode = prm.mode[p];
-    int r = a;
+    const int n = min(4, prm.width[p] - x0), mode = prm.mode[p];
+    int a[4], b[4], r[4];
+    mvc::ld4n<pixel_t>((const pixel_t *)prm.a[p] + (size_t)y * prm.pitch_a[p] + x0, n, a);
     if (mode != 0)
+      mvc::ld4n<pixel_t>((const pixel_t *)prm.b[p] + (size_t)y * prm.pitch_b[p] + x0, n, b);
+    #pragma unroll
+    for (int k = 0; k < 4; k++)
     {
-      const int b = ((const pixel_t *)prm.b[p])[(size_t)y * prm.pitch_b[p] + x];
+      r[k] = a[k];
       if (mode == 3)
-        r = b;
+        r[k] = b[k];
       else if (mode == 2)
-        r = (a + b + 1) >> 1;
-      else if (sizeof(pixel_t) == 2 && bits == 16 && x < prm.tail[p])
+        r[k] = (a[k] + b[k] + 1) >> 1;
+      else if (mode != 0)
       {
-        // weighted_merge_planar_uint16_*<false>: shift to signed, madd, round, arithmetic shift, signed saturation, shift back
-        int s = ((a - 32768) * invweight_i + (b - 32768) * weight_i + 16384) >> 15;
-        s = s < -32768 ? -32768 : s > 32767 ? 32767 : s;
-        r = (s + 32768) & 0xffff;
+        if (sizeof(pixel_t) == 2 && bits == 16 && x0 + k < prm.tail[p])
+        {
+          // weighted_merge_planar_uint16_*<false>: shift to signed, madd, round, arithmetic shift, signed saturation,
+          // shift back
+          int s = ((a[k] - 32768) * invweight_i + (b[k] - 32768) * weight_i + 16384) >> 15;
+          s = s < -32768 ? -32768 : s > 32767 ? 32767 : s;
+          r[k] = (s + 32768) & 0xffff;
+        }
+        else
+          r[k] = (a[k] * invweight_i + b[k] * weight_i + 16384) >> 15;
       }
-      else
-        r = (a * invweight_i + b * weight_i + 16384) >> 15;
     }
-    ((pixel_t *)prm.dst[p])[(size_t)y * prm.pitch_d[p] + x] = (pixel_t)r;
+    mvc::st4n<pixel_t>((pixel_t *)prm.dst[p] + (size_t)y * prm.pitch_d[p] + x0, n, r);
   }
 }
 
@@ -83,7 +92,7 @@ extern "C" int mvcuda_merge(unsigned long long a, unsigned long long b, const in
     max_w = fa->w[p] > max_w ? fa->w[p] : max_w;
     max_h = fa->h[p] > max_h ? fa->h[p] : max_h;
   }
-  const dim3 grid((max_w + 127) / 128, max_h, f.planes);
+  const dim3 grid((max_w + 4 * 128 - 1) / (4 * 128), max_h, f.planes);
   const int bytes = f.bytes_per_sample, bits = f.bits_per_sample;
   mvc::pipe_submit([=](cudaStream_t st) { // issued by the pipeline submitter (mvcuda_internal.h)
     if (bytes == 1)
