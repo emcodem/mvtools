@@ -29,7 +29,11 @@
 
 #include <cstdint>
 #include <cstring>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 
@@ -92,6 +96,27 @@ protected:
       _used[slot] = ++_clock;
     }
   };
+
+  // multi=true: the 2 * delta vector frames of a source frame are usually read by several filters (for example one
+  // MDegrainN per SkipFrame), some hundred milliseconds apart. The AviSynth+ cache in front of MAnalyse keeps them only
+  // while it has room: near SetMemoryMax it shrinks caches without a warning, and a run could stay in a state where
+  // every reader made all of them again (6 times the searches, measured with Prefetch 8). The finished frames of the
+  // last source frames are kept here, shared by all instances of the same call (MT_MULTI_INSTANCE makes one per
+  // thread), so a reader that comes too late takes the frame from here instead of searching again.
+  class SharedFrames
+  {
+    std::mutex _m;
+    std::list<std::pair<int, PVideoFrame>> _lru; // most recently used first
+    std::unordered_map<int, std::list<std::pair<int, PVideoFrame>>::iterator> _pos;
+    size_t _capacity;
+  public:
+    explicit SharedFrames(size_t capacity) : _capacity(capacity) {}
+    bool find(int n, PVideoFrame &f);
+    void put(int n, const PVideoFrame &f);
+    // the cache of the call with this key (made on the first request; capacity in frames)
+    static std::shared_ptr<SharedFrames> get(const std::string &key, size_t capacity);
+  };
+  std::shared_ptr<SharedFrames> _shared; // multi=true only
 
   class SrcRefData
   {
@@ -206,6 +231,10 @@ public:
   ~MVAnalyse();
 
   ::PVideoFrame __stdcall	GetFrame(int n, ::IScriptEnvironment* env) override;
+
+  // multi=true: keep the finished frames in the cache shared by all filters made with the same key (the call's
+  // arguments: identical arguments give identical frames)
+  void share_frames(const std::string &key);
 
   int __stdcall SetCacheHints(int cachehints, int frame_range) override {
     return cachehints == CACHE_GET_MTMODE ? (_temporal_flag || lstrlen(outfilename)>0 ? MT_SERIALIZED : MT_MULTI_INSTANCE) : 0;

@@ -664,6 +664,64 @@ MVAnalyse::MVAnalyse(
 
 
 
+bool MVAnalyse::SharedFrames::find(int n, PVideoFrame &f)
+{
+  std::lock_guard<std::mutex> lk(_m);
+  auto it = _pos.find(n);
+  if (it == _pos.end())
+    return false;
+  _lru.splice(_lru.begin(), _lru, it->second);
+  f = it->second->second;
+  return true;
+}
+
+void MVAnalyse::SharedFrames::put(int n, const PVideoFrame &f)
+{
+  std::lock_guard<std::mutex> lk(_m);
+  auto it = _pos.find(n);
+  if (it != _pos.end())
+  {
+    _lru.splice(_lru.begin(), _lru, it->second);
+    return; // made twice at the same time: the frames are identical
+  }
+  _lru.emplace_front(n, f);
+  _pos[n] = _lru.begin();
+  while (_lru.size() > _capacity)
+  {
+    _pos.erase(_lru.back().first);
+    _lru.pop_back();
+  }
+}
+
+std::shared_ptr<MVAnalyse::SharedFrames> MVAnalyse::SharedFrames::get(const std::string &key, size_t capacity)
+{
+  static std::mutex m;
+  static std::unordered_map<std::string, std::weak_ptr<SharedFrames>> reg;
+  std::lock_guard<std::mutex> lk(m);
+  for (auto it = reg.begin(); it != reg.end();)
+    it = it->second.expired() ? reg.erase(it) : std::next(it);
+  std::shared_ptr<SharedFrames> c = reg[key].lock();
+  if (!c)
+  {
+    c = std::make_shared<SharedFrames>(capacity);
+    reg[key] = c;
+  }
+  return c;
+}
+
+void MVAnalyse::share_frames(const std::string &key)
+{
+  if (!_multi_flag || _temporal_flag || outfile != NULL)
+    return;
+  // the frames of up to 32 source frames, at most about 256 MB but at least 2 source frames (a reader came at most 9
+  // source frames after the first one with Prefetch 8; the floor only matters for UHD with small blocks and a large
+  // delta, where the frames would otherwise be kept twice in large amounts)
+  const int ndiv = _delta_max * 2;
+  const size_t frame_bytes = (size_t)headerSize + (size_t)_vectorfields_aptr->GetArraySize() * sizeof(int);
+  const size_t nsrc = std::clamp<size_t>((size_t(256) << 20) / (frame_bytes * ndiv), 2, 32);
+  _shared = SharedFrames::get(key, nsrc * ndiv);
+}
+
 MVAnalyse::~MVAnalyse()
 {
   if (_gpu_ok)
@@ -693,6 +751,12 @@ MVAnalyse::~MVAnalyse()
 PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
 {
   _RPT2(0, "MAnalyze GetFrame, frame=%d id=%d\n", n, _instance_id);
+  if (_shared)
+  {
+    PVideoFrame kept;
+    if (_shared->find(n, kept))
+      return kept;
+  }
   const int		ndiv = (_multi_flag) ? _delta_max * 2 : 1;
   const int		nsrc = n / ndiv;
   const int		srd_index = n % ndiv;
@@ -893,6 +957,8 @@ PVideoFrame __stdcall MVAnalyse::GetFrame(int n, IScriptEnvironment* env)
   }
 
   _RPT3(0, "MAnalyze GetFrame END, frame_nsrc=%d nref=%d id=%d\n", nsrc, nref, _instance_id);
+  if (_shared)
+    _shared->put(n, dst);
   return dst;
 }
 

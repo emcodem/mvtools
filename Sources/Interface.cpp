@@ -22,6 +22,9 @@
 // http://www.gnu.org/copyleft/gpl.html .
 
 // Use MVClip / MVFilter helpers
+#include <cstdint>
+#include <cstdio>
+#include <string>
 #include "MVMask.h"
 #include "MVShow.h"
 #include "MVCompensate.h"
@@ -188,7 +191,7 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
   pr.pglobal_coarse = args[41].AsInt(args[17].AsInt(0)); // default: pglobal
   pr.przero_radius = args[42].AsInt(0); // built-in zero predictor clip
 
-  return new MVAnalyse(
+  MVAnalyse *f = new MVAnalyse(
     args[0].AsClip(),       // super
     blksize,
     blksizeV,                // v.1.7
@@ -227,6 +230,22 @@ AVSValue __cdecl Create_MVAnalyse(AVSValue args, void* user_data, IScriptEnviron
     pr,
     env
   );
+  // the key of the frames shared by the instances of this call (MT_MULTI_INSTANCE: made with the same arguments)
+  std::string key = std::to_string((uintptr_t)env) + (user_data ? "|cuda" : "|cpu");
+  for (int i = 0; i < args.ArraySize(); i++)
+  {
+    const AVSValue &a = args[i];
+    key += '|';
+    if (!a.Defined()) key += '-';
+    else if (a.IsClip()) key += "c" + std::to_string((uintptr_t)(void *)a.AsClip().operator->());
+    else if (a.IsBool()) key += a.AsBool() ? "t" : "f";
+    else if (a.IsInt()) key += "i" + std::to_string(a.AsInt());
+    else if (a.IsFloat()) { char b[32]; std::snprintf(b, sizeof(b), "d%.17g", a.AsFloat()); key += b; }
+    else if (a.IsString()) key += "s" + std::string(a.AsString());
+    else return f; // unknown kind of argument: no sharing
+  }
+  f->share_frames(key);
+  return f;
 }
 
 AVSValue __cdecl Create_MVMask(AVSValue args, void*, IScriptEnvironment* env)
