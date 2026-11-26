@@ -45,6 +45,7 @@ namespace
     const int *offset;
     const short *coeff;
     int taps, row_start, row_step;
+    int vec;                    // vertical pass: rows of src and dst start on 4-sample boundaries (k_resample_v4)
   };
   struct RsPlanes
   {
@@ -86,17 +87,77 @@ namespace
     return (pixel_t)result;
   }
 
-  // vertical (resize_v_c_planar): the program runs over the rows
-  template <typename pixel_t>
-  __global__ void k_resample_v(RsPlanes r)
+  // vertical (resize_v_c_planar): the program runs over the rows; 4 neighbouring samples per thread (one 4- / 8-byte load per tap and row) and the row's coefficients
+  // in registers (TAPS > 0: compile-time tap count, 0: any). The same integer sums per sample as rs_sum. Planes without
+  // aligned rows (q.vec == 0) and the last samples of a row that does not fill 4 take rs_sum.
+  constexpr int RSV_NT = 128;
+  template <typename pixel_t, int TAPS>
+  __global__ void __launch_bounds__(RSV_NT) k_resample_v4(RsPlanes r)
   {
     const RsPlane &q = r.p[blockIdx.z];
-    const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+    const int x = (blockIdx.x * RSV_NT + threadIdx.x) * 4, y = blockIdx.y;
     if (x >= q.width || y >= q.height)
       return;
     const size_t step = (size_t)q.row_step * q.src_pitch;
-    const pixel_t *s = (const pixel_t *)q.src + (size_t)(q.row_start + q.offset[y] * q.row_step) * q.src_pitch + x;
-    ((pixel_t *)q.dst)[(size_t)y * q.dst_pitch + x] = rs_sum<pixel_t>(s, step, q.coeff + (size_t)y * q.taps, q.taps, r.bits);
+    const pixel_t *s = (const pixel_t *)q.src + (size_t)(q.row_start + __ldg(q.offset + y) * q.row_step) * q.src_pitch + x;
+    pixel_t *d = (pixel_t *)q.dst + (size_t)y * q.dst_pitch + x;
+    const short *c = q.coeff + (size_t)y * q.taps;
+    if (!q.vec || x + 4 > q.width)
+    {
+      for (int k = 0; k < 4 && x + k < q.width; k++)
+        d[k] = rs_sum<pixel_t>(s + k, step, c, q.taps, r.bits);
+      return;
+    }
+    const int taps = TAPS > 0 ? TAPS : q.taps;
+    if constexpr (sizeof(pixel_t) == 1)
+    {
+      int acc[4] = { 1 << 13, 1 << 13, 1 << 13, 1 << 13 };
+      #pragma unroll (TAPS > 0 ? TAPS : 4)
+      for (int i = 0; i < taps; i++)
+      {
+        const unsigned v = __ldg((const unsigned *)(s + i * step));
+        const int ci = __ldg(c + i);
+        #pragma unroll
+        for (int k = 0; k < 4; k++)
+          acc[k] += (int)((v >> (8 * k)) & 0xffu) * ci;
+      }
+      unsigned o = 0;
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+      {
+        int t = acc[k] >> 14;
+        t = t > 255 ? 255 : t < 0 ? 0 : t;
+        o |= (unsigned)t << (8 * k);
+      }
+      *(unsigned *)d = o;
+    }
+    else
+    {
+      const int bits = r.bits, limit = (1 << bits) - 1, bias = bits == 16 ? 32768 : 0;
+      int acc[4] = { 1 << 12, 1 << 12, 1 << 12, 1 << 12 };
+      #pragma unroll (TAPS > 0 ? TAPS : 4)
+      for (int i = 0; i < taps; i++)
+      {
+        const uint2 v = __ldg((const uint2 *)(s + i * step));
+        const int ci = __ldg(c + i);
+        acc[0] += ((int)(v.x & 0xffffu) - bias) * ci;
+        acc[1] += ((int)(v.x >> 16) - bias) * ci;
+        acc[2] += ((int)(v.y & 0xffffu) - bias) * ci;
+        acc[3] += ((int)(v.y >> 16) - bias) * ci;
+      }
+      unsigned o[2] = { 0, 0 };
+      #pragma unroll
+      for (int k = 0; k < 4; k++)
+      {
+        int t = acc[k];
+        if (bits == 16)
+          t += 32768 << 13;
+        t >>= 13;
+        t = t > limit ? limit : t < 0 ? 0 : t;
+        o[k >> 1] |= (unsigned)t << (16 * (k & 1));
+      }
+      *(uint2 *)d = make_uint2(o[0], o[1]);
+    }
   }
 
   // the horizontal counterpart (resize_h_c_planar): the program runs over the columns
@@ -120,18 +181,38 @@ namespace
       max_w = r.p[p].width > max_w ? r.p[p].width : max_w;
       max_h = r.p[p].height > max_h ? r.p[p].height : max_h;
     }
-    const dim3 grid((max_w + 127) / 128, max_h, planes);
     if (horizontal)
     {
+      const dim3 grid((max_w + 127) / 128, max_h, planes);
       if (bytes_per_sample == 1)
         k_resample_h<uint8_t><<<grid, 128, 0, st>>>(r);
       else
         k_resample_h<uint16_t><<<grid, 128, 0, st>>>(r);
+      return;
     }
-    else if (bytes_per_sample == 1)
-      k_resample_v<uint8_t><<<grid, 128, 0, st>>>(r);
+    // vertical: 4 samples per thread; the tap count of all planes as a compile-time constant when it is 4 or 8
+    int taps = r.p[0].taps;
+    for (int p = 1; p < planes; p++)
+      if (r.p[p].taps != taps)
+        taps = 0;
+    const dim3 grid((max_w + 4 * RSV_NT - 1) / (4 * RSV_NT), max_h, planes);
+#define RSV_GO(T, N) k_resample_v4<T, N><<<grid, RSV_NT, 0, st>>>(r)
+    if (bytes_per_sample == 1)
+    {
+      if (taps == 4) RSV_GO(uint8_t, 4); else if (taps == 8) RSV_GO(uint8_t, 8); else RSV_GO(uint8_t, 0);
+    }
     else
-      k_resample_v<uint16_t><<<grid, 128, 0, st>>>(r);
+    {
+      if (taps == 4) RSV_GO(uint16_t, 4); else if (taps == 8) RSV_GO(uint16_t, 8); else RSV_GO(uint16_t, 0);
+    }
+#undef RSV_GO
+  }
+
+  // RsPlane::vec: the rows of both planes start on 4-sample boundaries (plane starts are 256-byte aligned)
+  int rs_vec(const void *src, size_t src_pitch, const void *dst, size_t dst_pitch, int bps)
+  {
+    const size_t al = 4 * (size_t)bps - 1;
+    return ((size_t)src & al) == 0 && ((size_t)dst & al) == 0 && ((src_pitch * bps) & al) == 0 && ((dst_pitch * bps) & al) == 0;
   }
 
   // checks one pass over all planes of src into dst (dst sized for the pass) and describes it in r; 0 when it fits.
@@ -145,7 +226,8 @@ namespace
       const DevProgram &pr = *progs[p];
       if (pr.target_size != (horizontal ? dst.w[p] : dst.h[p]) || (horizontal ? src.h[p] != dst.h[p] : src.w[p] != dst.w[p]))
         return -4;
-      r.p[p] = RsPlane{ src.plane[p], dst.plane[p], src.pitch[p] / bps, dst.pitch[p] / bps, dst.w[p], dst.h[p], pr.offset, pr.coeff, pr.taps, 0, 1 };
+      r.p[p] = RsPlane{ src.plane[p], dst.plane[p], src.pitch[p] / bps, dst.pitch[p] / bps, dst.w[p], dst.h[p], pr.offset, pr.coeff, pr.taps, 0, 1,
+        rs_vec(src.plane[p], src.pitch[p] / bps, dst.plane[p], dst.pitch[p] / bps, bps) };
     }
     return 0;
   }
@@ -463,7 +545,8 @@ extern "C" int mvcuda_resample_v(const unsigned long long prog[3], unsigned long
   const int bps = sf.bytes_per_sample;
   for (int p = 0; p < sf.planes; p++)
     r.p[p] = RsPlane{ src->plane[p], dst->plane[p], src->pitch[p] / bps, dst->pitch[p] / bps, dst->w[p], dst->h[p], progs[p]->offset,
-      progs[p]->coeff, progs[p]->taps, row_start[p], row_step[p] };
+      progs[p]->coeff, progs[p]->taps, row_start[p], row_step[p],
+      rs_vec(src->plane[p], src->pitch[p] / bps, dst->plane[p], dst->pitch[p] / bps, bps) };
   const int np = sf.planes;
   mvc::pipe_submit([=](cudaStream_t st) { rs_launch(r, np, bps, false, st); }); // issued by the pipeline submitter (mvcuda_internal.h)
   mvc::frame_put(dst, producer, frame, *out);
