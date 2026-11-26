@@ -265,17 +265,6 @@ namespace
     return Vec{ (x >> norm_factor) << mul_factor, (y >> norm_factor) << mul_factor, (int)(tmp_sad >> 4) };
   }
 
-  __global__ void k_interp(LevelArgs a, const int *coarse, int c_blk_x, int c_blk_y, int log_pel_coarse)
-  {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= a.n_blk_x * a.n_blk_y)
-      return;
-    const Vec v = interp_pred(a, coarse, c_blk_x, c_blk_y, log_pel_coarse, index);
-    a.vec[3 * index + 0] = v.x;
-    a.vec[3 * index + 1] = v.y;
-    a.vec[3 * index + 2] = v.sad;
-  }
-
   // PlaneOfBlocks::estimate_global_mv_doubled_slice on the vectors of the coarser plane, by one CTA of nt threads (tid =
   // thread index; all of them call it). freq: device scratch of 2 * 2 * FREQ_HALF ints. Vectors read with ld.global.cg.
   __device__ void glob_estimate(const int *vec, int n_blk, int *freq, int *glob_out, int use_global, int tid, int nt)
@@ -374,9 +363,22 @@ namespace
     __syncthreads(); // the shared state may be used again
   }
 
-  __global__ void k_global(const int *vec, int n_blk, int *freq, int *glob_out, int use_global)
+  // the global vector and the interpolated predictions of a level in one launch (both only read the coarser level's
+  // vectors): CTA 0 makes the global vector, the other CTAs the predictions
+  __global__ void k_glob_interp(LevelArgs a, const int *coarse, int c_blk_x, int c_blk_y, int *freq, int *glob_out, int use_global)
   {
-    glob_estimate(vec, n_blk, freq, glob_out, use_global, threadIdx.x, blockDim.x);
+    if (blockIdx.x == 0)
+    {
+      glob_estimate(coarse, c_blk_x * c_blk_y, freq, glob_out, use_global, threadIdx.x, blockDim.x);
+      return;
+    }
+    const int index = (blockIdx.x - 1) * blockDim.x + threadIdx.x;
+    if (index >= a.n_blk_x * a.n_blk_y)
+      return;
+    const Vec v = interp_pred(a, coarse, c_blk_x, c_blk_y, 0, index);
+    a.vec[3 * index + 0] = v.x;
+    a.vec[3 * index + 1] = v.y;
+    a.vec[3 * index + 2] = v.sad;
   }
 
   // payload header of the slice path, written on the device into the cleared buffer (no host-to-device copy: a copy above
@@ -2821,7 +2823,7 @@ namespace
     const int ring_radius = a.search_type == mvc_refine::S_EXHAUSTIVE ? a.radius : 1;
     const int ring_n = 4 * ring_radius * (ring_radius + 1);
     const int blk_el = a.bs_x * a.bs_y + 2 * a.cw * a.ch;
-    const int glob_x = a.glob[0] * a.pel, glob_y = a.glob[1] * a.pel; // written by k_global before this kernel
+    const int glob_x = a.glob[0] * a.pel, glob_y = a.glob[1] * a.pel; // written by k_glob_interp before this kernel
     pix *s_y = s_dyn, *s_u = s_dyn, *s_v = s_dyn;
     auto issue_src = [&](pix *dst, int bx, int by, int t0, int ts) {
       const int xs = a.hpad[0] + bx * step_x, ys = a.vpad[0] + by * step_y;
@@ -5401,9 +5403,8 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
       if (l < nl - 1)
       {
         // global MV estimate from the coarser plane (doubled), then the interpolated prediction for this plane
-        k_global<<<1, 1024, 0, st>>>(d_pay + offs[l + 1], nbx[l + 1] * nby[l + 1], d_freq, d_glob, ap->use_global);
         const int total = a.n_blk_x * a.n_blk_y;
-        k_interp<<<(total + 127) / 128, 128, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], 0);
+        k_glob_interp<<<1 + (total + 1023) / 1024, 1024, 0, st>>>(a, d_pay + offs[l + 1], nbx[l + 1], nby[l + 1], d_freq, d_glob, ap->use_global);
       }
       else
         AN_CHECK(cudaMemsetAsync(d_glob, 0, 2 * sizeof(int), st));
