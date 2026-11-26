@@ -498,8 +498,11 @@ mvtools2 `Cuda*` functions. Run it with `python -I make_qtgmc_gpu.py [source.avs
 read. In the patched script, `global QTGMC_gpu = true` after the `Import` switches the GPU on (default false). The motion
 analysis goes through the wrappers `QTGMC_MSuper` / `QTGMC_MAnalyse` / `QTGMC_MRecalculate` (the `Cuda*` function with
 `QTGMC_gpu`, the CPU filter otherwise); the GPU output side calls CudaMSuper / CudaMCompensate / CudaMDegrain directly.
-`QTGMC_gpu_meander` (default true) keeps CudaMAnalyse on the slice search, so the result is byte-identical to the stock
-CPU QTGMC; `global QTGMC_gpu_meander = false` switches to the wavefront search (faster, slightly different vectors).
+CudaMAnalyse always runs the wavefront search (`meander=false`): its result equals the CPU QTGMC with
+`MAnalyse(meander=false, mt=false)`, and differs slightly from the stock CPU QTGMC (about half the output blocks change,
+with no clear quality winner in our tests). The slice search (`meander=true`, byte-identical to the stock CPU
+QTGMC) is not offered for QTGMC any more since 2026-11-26; `global QTGMC_gpu_meander = true` stops with an error.
+CudaMAnalyse called directly keeps both searches.
 `global QTGMC_gpu_nvof = true` takes the MAnalyse vectors from the optical flow accelerator instead (CudaNVOFAnalyse on the
 plain search clip, `QTGMC_gpu_nvof_preset` 1 fast / 2 medium / 3 slow; MRecalculate refines them as usual): not bit-exact. The search
 itself costs about as much as the `meander=false` wavefront search (about 0.2 ms per 1080p frame, against 1.3 ms for

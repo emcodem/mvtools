@@ -170,6 +170,12 @@ pictures look the same: the GPU QTGMC uses `meander=false` by default, `QTGMC_gp
 Switching that default to `meander=true` waits until the slice kernel is clearly faster than the CPU
 (`GPU_PIPELINE_PLAN.md` sections 10, 11, 25).
 
+Update 2026-11-26 (user): the GPU QTGMC uses `meander=false` only; `QTGMC_gpu_meander` is removed (true stops with an
+error), UConvert's `uc_qtgmc_wavefront` is removed (always wavefront). Reasons: the slice search has no use beyond the
+stock result, the wavefront search runs the bad-vector wide search on the GPU (no CPU frames), and a single-path QTGMC
+makes the one-filter QTGMC Slow plan simpler. CudaMAnalyse / CudaMRecalculate keep `meander=true` (their default, exact
+against stock MAnalyse).
+
 ## D3. Three DLLs, one build (2026-10-29, decided)
 
 Kernels and the device frame registry in `mvtools_cuda.dll` (C API, version checked); mvtools filters in `mvtools2.dll`;

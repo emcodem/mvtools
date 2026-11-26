@@ -38,10 +38,8 @@ leaves only that stage to do:
 | --- | --- |
 | `deint` | deinterlacing (QTGMC on the GPU) 1080i29.97 -> 1080p59.94 |
 | `deint_nvof` | the same with QTGMC's motion vectors from the NVIDIA optical flow accelerator (`uc_qtgmc_nvof`) |
-| `deint_wave` | the same with the wavefront motion search (`uc_qtgmc_wavefront`; slightly different vectors than the CPU QTGMC) |
 | `deint_nvenc` | the same with QTGMC's motion vectors from NVENC's motion estimation (`uc_qtgmc_nvenc`, `nvencmv.dll`) |
 | `deint_sd` | deinterlacing 576i25 -> 576p50: one SD picture's motion search fills only a small part of a GPU, so this stage shows whether the searches of the frames in flight run at the same time on this machine |
-| `deint_sd_wave` | the same with the wavefront motion search |
 | `frc` | motion-compensated frame-rate conversion (CudaSplatFps) 1080p59.94 -> 1080p50 |
 | `frc_nvof` | the same with SplatFps' candidates from the NVIDIA optical flow accelerator (`uc_frc_nvof`) |
 | `frc_nvenc` | the same with SplatFps' candidates from NVENC's motion estimation (`uc_frc_nvenc`, `nvencmv.dll`) |

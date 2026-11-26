@@ -33,12 +33,8 @@ global uc_interlace_preset = ""
 global uc_interlace_preset_kernel = "43 -195 -765 4211 9796 4211 -765 -195 43"   # the factor-1 taps of uc_interlace_preset
 
 # GPU QTGMC motion vectors from the NVIDIA optical flow accelerator (faster, not identical to the CPU search).
-# false: the GPU search gives the same vectors as the CPU QTGMC.
+# false: the GPU wavefront search (exact against the CPU MAnalyse with meander=false, mt=false).
 global uc_qtgmc_nvof = false
-
-# GPU QTGMC: wavefront motion search instead of the slice search (faster where few frames run at once, slightly
-# different vectors than the CPU QTGMC; with uc_gpu_threads 10 on an RTX 5090 the gain is small).
-global uc_qtgmc_wavefront = false
 
 # GPU frame-rate conversion: CudaSplatFps candidates from the NVIDIA optical flow accelerator (CudaNVOFAnalyse via
 # MSplatVectors) instead of its built-in phase correlation. Without NVOFA (older than Turing) the built-in one is used.
@@ -227,7 +223,7 @@ function UConvertClip(clip c, int out_h, int out_w, string "out_interlace", int 
         if (i_in) {
             c = uc_Deint(c, scan == "tff", gpu)
             tok = gpu && !c.HasAlpha
-            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : uc_qtgmc_nvenc && uc_NvencOk() ? "-nvenc" : uc_qtgmc_wavefront ? "-wave" : "") : "") + " " + scan
+            plan = plan + " | deint=qtgmc" + (gpu ? "-gpu" + (uc_qtgmc_nvof && uc_NvofOk() ? "-nvof" : uc_qtgmc_nvenc && uc_NvencOk() ? "-nvenc" : "") : "") + " " + scan
         }
         if (spatial && pre_scale && !onestep) {
             c = uc_Scale(c, sc_w, sc_h, s_left, s_top, s_w, s_h, pad_l, pad_t, out_w, out_h, full, was_rgb, gpu, i_out)
@@ -514,7 +510,6 @@ function uc_Deint(clip c, bool tff, bool "gpu")
     global QTGMC_gpu_edi = gpu
     global QTGMC_gpu_nvof = gpu && uc_qtgmc_nvof
     global QTGMC_gpu_nvenc = gpu && uc_qtgmc_nvenc
-    global QTGMC_gpu_meander = !uc_qtgmc_wavefront
     # without alpha the GPU result stays on the GPU as token frames (the caller downloads before CPU steps); with
     # alpha the planes are joined on the CPU
     global QTGMC_gpu_out_tokens = gpu && !c.HasAlpha

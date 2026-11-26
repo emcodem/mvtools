@@ -289,12 +289,10 @@ $t_i25 = '1080, 1920, out_interlace="tff", out_rate_nom=25, out_rate_den=1'
 $all = @(
   [ordered]@{ name = "deint";       rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94";                    src = $src_i2997; target = $t_deint },
   [ordered]@{ name = "deint_nvof";  rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, NVOFA vectors";     src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_nvof = true'; nvof = $true },
-  [ordered]@{ name = "deint_wave";  rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, wavefront search";  src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_wavefront = true' },
   [ordered]@{ name = "deint_nvenc"; rate = 59.94; desc = "deinterlace 1080i29.97 -> 1080p59.94, NVENC vectors";     src = $src_i2997; target = $t_deint; pre = 'global uc_qtgmc_nvenc = true'; nvenc = $true },
   # SD: one picture's motion search fills only a small part of a GPU, so the speed depends on the searches of the
   # frames in flight running at the same time
   [ordered]@{ name = "deint_sd";    rate = 50;    desc = "deinterlace 576i25 -> 576p50";                            src = $src_i25sd; target = $t_deint_sd },
-  [ordered]@{ name = "deint_sd_wave"; rate = 50;  desc = "deinterlace 576i25 -> 576p50, wavefront search";         src = $src_i25sd; target = $t_deint_sd; pre = 'global uc_qtgmc_wavefront = true' },
   [ordered]@{ name = "frc";         rate = 50;   desc = "frame-rate conversion 1080p59.94 -> 1080p50";             src = $src_p5994; target = $t_frc },
   [ordered]@{ name = "frc_nvof";    rate = 50;    desc = "frame-rate conversion 1080p59.94 -> 1080p50, NVOFA vectors"; src = $src_p5994; target = $t_frc; pre = 'global uc_frc_nvof = true'; nvof = $true },
   [ordered]@{ name = "frc_nvenc";   rate = 50;    desc = "frame-rate conversion 1080p59.94 -> 1080p50, NVENC vectors"; src = $src_p5994; target = $t_frc; pre = 'global uc_frc_nvenc = true'; nvenc = $true },

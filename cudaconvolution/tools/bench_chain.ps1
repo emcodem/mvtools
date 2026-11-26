@@ -80,7 +80,6 @@ v = LWLibavVideoSource("$Source")$trim.$assume
 QTGMC_gpu_on()
 global QTGMC_gpu_edi = $(([bool]$EdiOnGpu).ToString().ToLower())
 global QTGMC_gpu_nvof = $($Nvof.ToString().ToLower())
-global QTGMC_gpu_meander = false
 
 "@
 

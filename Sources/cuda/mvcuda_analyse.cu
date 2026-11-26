@@ -2086,6 +2086,8 @@ namespace
   __device__ const int g_fix_dx[26] = { -1, 1, 0, 0, -4, -4, -4, -4, -4, 4, 4, 4, 4, 4, 2, 0, -2, -2, 0, 2, -2, -1, 1, 2, 1, -1 };
   __device__ const int g_fix_dy[26] = { 0, 0, 1, -1, 2, 1, 0, -1, -2, -2, -1, 0, 1, 2, 3, 4, 3, -3, -4, -3, 0, 2, 2, 0, -2, -2 };
 
+  // Slice search (meander=true): exact against the stock multi-threaded CPU MAnalyse. Not used by the GPU QTGMC, which
+  // runs the wavefront search (meander=false) only; kept for CudaMAnalyse / CudaMRecalculate called with meander=true.
   // TM: the instance for the trymany levels (LevelArgs::try_many); the other instance has no trymany code (its register
   // allocation, and so the speed of every other search, stays as without it; inlined, the trymany code made the plain search spill)
   template <bool TM>
@@ -2814,6 +2816,8 @@ namespace
     int nxt[2][9];            // own, up and bottom-right / up-right vector of a block, by block parity (warp 7)
   };
 
+  // Slice search (meander=true): exact against the stock multi-threaded CPU MAnalyse. Not used by the GPU QTGMC, which
+  // runs the wavefront search (meander=false) only; kept for CudaMAnalyse / CudaMRecalculate called with meander=true.
   template <int EV>
   __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search_fix(LevelArgs a)
   {
@@ -5176,6 +5180,7 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
     return -4;
   // meander=false: wavefront kernel = CPU result with meander=false, mt=false (slice_threads is ignored); meander=true:
   // slice kernel = CPU result with slice_threads threads. MVCUDA_WAVE=0 forces the slice kernel (comparisons only).
+  // The GPU QTGMC uses meander=false only; meander=true stays for direct CudaMAnalyse calls (stock result).
   static const bool wave_allowed = [] { const char *e = getenv("MVCUDA_WAVE"); return !(e && e[0] == '0'); }();
   // trymany: the Refines one per warp (WarpChecker, trymany_par) in both kernels; MVCUDA_TM_PAR=0 restores the older
   // forms (k_search: the 7 Refines one after the other with the whole CTA; meander=false: k_search in one slice)

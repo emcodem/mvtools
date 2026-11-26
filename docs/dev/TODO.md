@@ -212,7 +212,7 @@ build behaves the same. Fix (fixed-point atomics, see todo_performance.md) or do
   predictors from the interpolated coarse vectors only, same candidates and costs. Vectors (9 clips, finest level):
   49-98 % identical, > 4 px off 0.03-10 %, total SAD +0..2 %. Speed: search alone t=1 2.8x faster, but no gain at
   t=10 / UConvert (it removes latency, not work; the same SADs per block); a second pass (X1b) is slower. Not pursued.
-- QTGMC with `QTGMC_gpu_meander = false` as the default (**User**): DTL's GTX 1060 (PAL DVCAM, Slow, doom9 #16): meander
+- DONE 2026-11-26 (user: meander=false only for QTGMC, `QTGMC_gpu_meander` removed, DECISIONS D4 update). Was: QTGMC with `QTGMC_gpu_meander = false` as the default (**User**): DTL's GTX 1060 (PAL DVCAM, Slow, doom9 #16): meander
   19 fps vs meander=false 78 / 92 fps, about half the output blocks change, "no clear quality winner". RTX 5090:
   -18..-33 % (rel25), SD PAL default preset whole clip only -8 % (2026-11-15, scaling_test_SD_PAL 576i -> 1080p50:
   median Y PSNR between the two 55 dB, worst 47 dB; differences at moving edges). User to judge the two encodes.

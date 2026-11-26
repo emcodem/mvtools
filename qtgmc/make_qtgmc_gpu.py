@@ -34,7 +34,8 @@ def main():
 
     # the analysis calls go through QTGMC_MSuper / QTGMC_MAnalyse / QTGMC_MRecalculate (defined at the end): CudaMSuper /
     # CudaMAnalyse / CudaMRecalculate with QTGMC_gpu, else the CPU filters; same arguments
-    # (MAnalyse with the GPU: meander=QTGMC_gpu_meander; false = wavefront search, true = the slice kernel = stock result)
+    # (MAnalyse with the GPU: always meander=false, the wavefront search; the slice search, meander=true, gave the stock
+    # result but is not offered for QTGMC any more)
     # 3.39x: the calls are on srchClip_us / srchSuper_us (MEus) and MAnalyse / MRecalculate sit inside eval strings, which
     # run in QTGMC's scope; 1 MSuper line with 2 calls, 12 MAnalyse, 24 MRecalculate (RefineMotion, RefineMotion2) + 2
     # for ShutterBlur
@@ -104,7 +105,6 @@ def main():
         '\t                  && !keep_tv_range && !ShowSettings\n'
         '\taddNoise2 = QTGMC_gpuOut && !QTGMC_gpuTokOut ? addNoise2.CudaDownload() : addNoise2\n', 1)
     text = ('global QTGMC_gpu = false # set to true after Import to run the mvtools motion analysis on the GPU (profile\\qtgmc\\make_qtgmc_gpu.py)\n'
-            'global QTGMC_gpu_meander = true # with QTGMC_gpu: true = as stock QTGMC (slice search, byte-identical to the CPU-mt result), false = wavefront search (meander=false, single slice: faster on the GPU, slightly different vectors)\n'
             'global QTGMC_gpu_nvof = false # with QTGMC_gpu: MAnalyse vectors from the optical flow accelerator (CudaNVOFAnalyse, not bit-exact; MRecalculate refines them); pel 4 and GPUs without NVOFA use the exact search\n'
             'global QTGMC_gpu_nvof_preset = 2 # with QTGMC_gpu_nvof: 1 fast, 2 medium, 3 slow\n'
             'global QTGMC_gpu_nvenc = false # with QTGMC_gpu: MAnalyse vectors from the video encoder (CudaNVENCAnalyse of nvencmv.dll, not bit-exact); pel 4 and GPUs without NVENC ME use the exact search; QTGMC_gpu_nvof wins when both are set\n'
@@ -144,7 +144,7 @@ def main():
                 '\tnvenc = !nvof && QTGMC_gpu && QTGMC_gpu_nvenc && IsClip(nv_clip) && nv_pel <= 2 \\\n'
                 '\t       && FunctionExists("CudaNVENCAvailable") && CudaNVENCAvailable()\n'
                 '\treturn nvof ? %s \\\n\t     : nvenc ? %s \\\n\t             : QTGMC_gpu ? %s \\\n\t                       : %s\n}\n'
-                % (decl, nv, ne, call('CudaMAnalyse', {'meander': 'Default(meander, QTGMC_gpu_meander)'}), call('MAnalyse', {})))
+                % (decl, nv, ne, call('CudaMAnalyse', {'meander': 'QTGMC_gpu_wave_only()'}), call('MAnalyse', {})))
 
     def wrapper(name, clips, params, gpu_extra=None):
         decl = ', '.join('%s "%s"' % (types[p.split()[1]], p.split()[0]) for p in params)
@@ -155,7 +155,13 @@ def main():
         return ('function QTGMC_%s( %s, %s )\n{\n\treturn QTGMC_gpu ? %s \\\n\t                 : %s\n}\n'
                 % (name, cdecl, decl, call('Cuda' + name, gpu_extra or {}), call(name, {})))
     text += ('\n\n# The motion analysis of QTGMC: the Cuda* filters of mvtools2 with QTGMC_gpu, else the CPU filters (same arguments).\n'
-             '# With the GPU, MAnalyse searches with meander=QTGMC_gpu_meander unless meander is given.\n'
+             '# With the GPU, MAnalyse always uses the wavefront search (meander=false; the CPU reference is MAnalyse with\n'
+             '# meander=false, mt=false). The slice search (meander=true, the stock result) is not supported for QTGMC: the old\n'
+             '# switch QTGMC_gpu_meander = true stops with an error.\n'
+             'function QTGMC_gpu_wave_only()\n{\n'
+             '\tAssert(!VarExist("QTGMC_gpu_meander") || !QTGMC_gpu_meander, \\\n'
+             '\t       "QTGMC: QTGMC_gpu_meander = true (slice search) is not supported any more; the GPU always uses meander=false")\n'
+             '\treturn false\n}\n'
              + wrapper('MSuper', ['c'], sup_p)
              + nvof_wrapper(ana_p)
              + wrapper('MRecalculate', ['c', 'vectors'], rec_p))

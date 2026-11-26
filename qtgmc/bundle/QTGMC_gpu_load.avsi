@@ -30,9 +30,9 @@ Import(QTGMC_gpu_bundle + "scripts\Zs_RF_Shared.avsi")
 Import(QTGMC_gpu_bundle + "scripts\SMDegrain.avsi")
 Import(QTGMC_gpu_bundle + "scripts\QTGMC_gpu.avsi")
 
-# every GPU switch on: search clip, motion analysis, NNEDI3 and the output side on the GPU. The motion search follows
-# QTGMC_gpu_meander (scripts\QTGMC_gpu.avsi, default true = byte-identical to the stock CPU QTGMC; set
-# global QTGMC_gpu_meander = false after QTGMC_gpu_on() for the faster wavefront search with slightly different vectors)
+# every GPU switch on: search clip, motion analysis, NNEDI3 and the output side on the GPU. The motion search is the
+# wavefront search (MAnalyse meander=false): exact against the CPU MAnalyse with meander=false, mt=false, with slightly
+# different vectors than the stock CPU QTGMC (the slice search, QTGMC_gpu_meander = true, is not supported any more)
 # QTGMC_gpu_nvof (global QTGMC_gpu_nvof = true after QTGMC_gpu_on()): the vectors come from the NVIDIA optical flow
 # accelerator instead of a search; not exact, about as fast as the wavefront search
 # QTGMC_gpu_nvenc (global QTGMC_gpu_nvenc = true after QTGMC_gpu_on()): the vectors come from the video encoder's motion
