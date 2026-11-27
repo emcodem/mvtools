@@ -14,12 +14,15 @@
 //
 // The plugin pads the kept field by mirroring (32 columns, 3 field lines on each side, the edge not repeated); the
 // kernels read the field through the same reflection. Work per frame: k_nn_pre makes every missing pixel by the cubic
-// kernel and queues the ones the prescreener sends to the predictor; k_nn_pred runs the predictor on the queue.
+// kernel and queues the ones the prescreener sends to the predictor; k_nn_pred runs the predictor on the queue
+// (k_nn_pred_mma on sm_80 and newer: the same results with the integer dot products on the tensor cores).
 
 #include "mvcuda_internal.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace
 {
@@ -34,6 +37,11 @@ namespace
     unsigned *rcp_tab;     // [2048]
     unsigned *rsq_tab;     // [2048]
     float r_asize;         // rcpss((float)asize) as the CPU computes it
+    // tensor core predictor (sm_80 and newer): weights as B fragments of mma m16n8k32, per quality
+    // [neuron group jt][softmax / elliott][k step][lane] uint4 (high bytes b0 b1, low bytes b0 b1)
+    uint4 *pred_mma[2];
+    int ks;                // k steps of 32 taps (asize rounded up to 32, the extra taps have weight 0)
+    bool mma;
   };
 
   template <typename T>
@@ -351,6 +359,214 @@ namespace
     }
   }
 
+  // mma m16n8k32 with 8-bit A (u8 / s8) and B (s8 / u8), int32 accumulators (sm_80 and newer)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#define NN_MMA(NAME, AT, BT)                                                                                          \
+  __device__ __forceinline__ void NAME(int (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1)                 \
+  {                                                                                                                   \
+    asm("mma.sync.aligned.m16n8k32.row.col.s32." AT "." BT ".s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" \
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])                                                              \
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));                                              \
+  }
+  NN_MMA(mma_u8s8, "u8", "s8")
+  NN_MMA(mma_u8u8, "u8", "u8")
+  NN_MMA(mma_s8s8, "s8", "s8")
+  NN_MMA(mma_s8u8, "s8", "u8")
+#undef NN_MMA
+#endif
+
+  constexpr int MMA_WARPS = 4; // warps per CTA, 16 queued pixels per warp and round
+
+  // k_nn_pred with the integer dot products on the tensor cores. Each int16 weight is split into a signed high byte
+  // and an unsigned low byte (w = 256 * hi + lo), 16-bit samples the same way (v = 256 * vh + vl), and each dot product
+  // is put together from the partial sums in int32: the same value as the plugin's pmaddwd / paddd sums (integer sums,
+  // wrapping, in any order). Rows of the mma = 16 pixels, columns = 8 neurons, k = 32 taps per step (the taps beyond
+  // asize have weight 0). In the accumulator layout lane (g, t) holds neurons 2t and 2t + 1 of every group of 8 for
+  // pixels g and g + 8: exactly the plugin's ymm lanes j & 7, visited in increasing j, so every float step and its order
+  // is that of k_nn_pred.
+  template <typename T, int KS>
+  __global__ void __launch_bounds__(32 * MMA_WARPS) k_nn_pred_mma(NnNet net, NnPlanes<T> pl, int off, const unsigned *queue, const unsigned *count)
+  {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int NP = (int)sizeof(T); // sample parts: low bytes, high bytes (16-bit samples)
+    constexpr int S = KS * 32 + 16;    // window row stride in bytes: the 8 rows of a fragment load on different banks
+    __shared__ __align__(16) uint8_t shw[MMA_WARPS][NP][16 * S];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const unsigned n = *count;
+    const int xdia = net.xdia, ydia = net.ydia, nns = net.nns;
+    for (unsigned base = (blockIdx.x * MMA_WARPS + warp) * 16u; base < n; base += gridDim.x * MMA_WARPS * 16u)
+    {
+      // window of pixel i = lane & 15, columns of parity lane >> 4; sum and sum of squares as extract_m8_i16 (int32)
+      const int i = lane & 15, h = lane >> 4;
+      const bool act = base + i < n;
+      const unsigned e = act ? queue[base + i] : 0u;
+      const int p = (int)(e >> 30), r = (int)((e >> 16) & 0x3fff), c = (int)(e & 0xffff);
+      int sum = 0, sumsq = 0;
+      if (act)
+      {
+        const int L0 = (r - off - (ydia - 1)) >> 1;
+        const int x0 = c - ((xdia >> 1) - 1);
+        for (int y = 0; y < ydia; y++)
+          for (int x = h; x < xdia; x += 2)
+          {
+            const int v = net_in<T>(fld(pl, p, off, L0 + y, x0 + x));
+            const int k = i * S + y * xdia + x;
+            shw[warp][0][k] = (uint8_t)(v & 255);
+            if (NP == 2)
+              shw[warp][NP - 1][k] = (uint8_t)((v >> 8) & 255);
+            sum += v;
+            sumsq += v * v;
+          }
+      }
+      sum += __shfl_xor_sync(0xffffffffu, sum, 16);
+      sumsq += __shfl_xor_sync(0xffffffffu, sumsq, 16);
+      const float mean = __fmul_rn(__int2float_rn(sum), net.r_asize);
+      const float msq = __fmul_rn(__int2float_rn(sumsq), net.r_asize);
+      const float var = __fsub_rn(msq, __fmul_rn(mean, mean));
+      float istd = 0.0f, sd = 0.0f;
+      if (var > 1.192092896e-07f)
+      {
+        istd = rsq_hw(net.rsq_tab, var);
+        sd = rcp_hw(net.rcp_tab, istd);
+      }
+      __syncwarp();
+
+      // A fragments of all k steps
+      unsigned a[NP][KS][4];
+      #pragma unroll
+      for (int pt = 0; pt < NP; pt++)
+        #pragma unroll
+        for (int ks = 0; ks < KS; ks++)
+        {
+          const uint8_t *s0 = shw[warp][pt] + g * S + ks * 32 + 4 * t;
+          a[pt][ks][0] = *reinterpret_cast<const unsigned *>(s0);
+          a[pt][ks][1] = *reinterpret_cast<const unsigned *>(s0 + 8 * S);
+          a[pt][ks][2] = *reinterpret_cast<const unsigned *>(s0 + 16);
+          a[pt][ks][3] = *reinterpret_cast<const unsigned *>(s0 + 8 * S + 16);
+        }
+      const float istd0 = __shfl_sync(0xffffffffu, istd, g), istd1 = __shfl_sync(0xffffffffu, istd, g + 8);
+      // lanes t = 0 / 1 finish pixel g / g + 8
+      const int fp = g + 8 * (t & 1);
+      const float mean_f = __shfl_sync(0xffffffffu, mean, fp), sd_f = __shfl_sync(0xffffffffu, sd, fp);
+      const unsigned e_f = __shfl_sync(0xffffffffu, e, fp);
+      const bool act_f = t < 2 && base + fp < n;
+
+      float acc = 0.0f;
+      for (int q = 0; q < net.qual; q++)
+      {
+        const uint4 *wb = net.pred_mma[q] + lane;
+        const float *sc = net.pred_scale[q], *bi = net.pred_bias[q];
+        float lw[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } }, lv[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } }; // [pixel][column]
+        for (int jt = 0; jt < nns / 8; jt++)
+        {
+          int ds[2 * NP][4], de[2 * NP][4];
+          #pragma unroll
+          for (int u = 0; u < 2 * NP; u++)
+            #pragma unroll
+            for (int x = 0; x < 4; x++)
+              ds[u][x] = de[u][x] = 0;
+          #pragma unroll
+          for (int ks = 0; ks < KS; ks++)
+          {
+            const uint4 bs = __ldg(wb + ((jt * 2 + 0) * KS + ks) * 32);
+            const uint4 be = __ldg(wb + ((jt * 2 + 1) * KS + ks) * 32);
+            mma_u8s8(ds[0], a[0][ks], bs.x, bs.y);
+            mma_u8u8(ds[1], a[0][ks], bs.z, bs.w);
+            mma_u8s8(de[0], a[0][ks], be.x, be.y);
+            mma_u8u8(de[1], a[0][ks], be.z, be.w);
+            if (NP == 2)
+            {
+              mma_s8s8(ds[2], a[NP - 1][ks], bs.x, bs.y);
+              mma_s8u8(ds[3], a[NP - 1][ks], bs.z, bs.w);
+              mma_s8s8(de[2], a[NP - 1][ks], be.x, be.y);
+              mma_s8u8(de[3], a[NP - 1][ks], be.z, be.w);
+            }
+          }
+          const int j = jt * 8 + 2 * t;
+          const float2 scS = __ldg(reinterpret_cast<const float2 *>(sc + j)), scE = __ldg(reinterpret_cast<const float2 *>(sc + nns + j));
+          const float2 biS = __ldg(reinterpret_cast<const float2 *>(bi + j)), biE = __ldg(reinterpret_cast<const float2 *>(bi + nns + j));
+          #pragma unroll
+          for (int x = 0; x < 4; x++)
+          {
+            const int col = x & 1, pi = x >> 1;
+            unsigned s0 = (unsigned)ds[0][x] * 256u + (unsigned)ds[1][x];
+            unsigned s1 = (unsigned)de[0][x] * 256u + (unsigned)de[1][x];
+            if (NP == 2)
+            {
+              s0 += ((unsigned)ds[2][x] * 256u + (unsigned)ds[3][x]) * 256u;
+              s1 += ((unsigned)de[2][x] * 256u + (unsigned)de[3][x]) * 256u;
+            }
+            const float is = pi ? istd1 : istd0;
+            const float t0 = __fadd_rn(__fmul_rn(__fmul_rn(__int2float_rn((int)s0), col ? scS.y : scS.x), is), col ? biS.y : biS.x);
+            const float t1 = __fadd_rn(__fmul_rn(__fmul_rn(__int2float_rn((int)s1), col ? scE.y : scE.x), is), col ? biE.y : biE.x);
+            float xe = t0 < 80.0f ? t0 : 80.0f;
+            xe = xe > -80.0f ? xe : -80.0f;
+            const float ex = __int_as_float(__float2int_rn(__fmaf_rn(xe, 12102203.161561486f, 1064866805.0f)));
+            const float el = __fmul_rn(t1, rcp_hw(net.rcp_tab, __fadd_rn(fabsf(t1), 1.0f)));
+            lw[pi][col] = __fadd_rn(lw[pi][col], ex);
+            lv[pi][col] = __fmaf_rn(ex, el, lv[pi][col]);
+          }
+        }
+        // the 8 ymm lanes of the finishing pixel: lane ln sits in column ln & 1 of lane (g, ln >> 1)
+        float W[8], V[8];
+        #pragma unroll
+        for (int s = 0; s < 4; s++)
+          #pragma unroll
+          for (int col = 0; col < 2; col++)
+          {
+            const int src = g * 4 + s;
+            const float w0 = __shfl_sync(0xffffffffu, lw[0][col], src), w1 = __shfl_sync(0xffffffffu, lw[1][col], src);
+            const float v0 = __shfl_sync(0xffffffffu, lv[0][col], src), v1 = __shfl_sync(0xffffffffu, lv[1][col], src);
+            W[2 * s + col] = (t & 1) ? w1 : w0;
+            V[2 * s + col] = (t & 1) ? v1 : v0;
+          }
+        const float aw0 = __fadd_rn(W[0], W[4]), aw1 = __fadd_rn(W[1], W[5]), aw2 = __fadd_rn(W[2], W[6]), aw3 = __fadd_rn(W[3], W[7]);
+        const float av0 = __fadd_rn(V[0], V[4]), av1 = __fadd_rn(V[1], V[5]), av2 = __fadd_rn(V[2], V[6]), av3 = __fadd_rn(V[3], V[7]);
+        const float wsum = __fadd_rn(__fadd_rn(aw0, aw2), __fadd_rn(aw1, aw3));
+        float vsum = __fadd_rn(__fadd_rn(av0, av2), __fadd_rn(av1, av3));
+        if (wsum > 1.0e-10f)
+          vsum = __fmul_rn(__fmul_rn(vsum, 5.0f), rcp_hw(net.rcp_tab, wsum));
+        else
+          vsum = 0.0f;
+        acc = __fadd_rn(__fadd_rn(__fmul_rn(vsum, sd_f), mean_f), acc);
+      }
+      if (act_f)
+      {
+        const int pf = (int)(e_f >> 30), rf = (int)((e_f >> 16) & 0x3fff), cf = (int)(e_f & 0xffff);
+        const float scale = net.qual == 2 ? 0.5f : 1.0f;
+        const float tv = __fadd_rn(__fmul_rn(acc, scale), 0.5f);
+        int iv = (tv > -2147483648.0f && tv < 2147483648.0f) ? __float2int_rz(tv) : (int)0x80000000;
+        if (iv >= pl.vmax[pf])
+          iv = pl.vmax[pf];
+        if (iv <= pl.vmin[pf])
+          iv = pl.vmin[pf];
+        pl.dst[pf][(size_t)rf * pl.pitch_d[pf] + cf] = (T)iv;
+      }
+      __syncwarp(); // the next round reuses the shared window
+    }
+#endif
+  }
+
+  template <typename T, int KS>
+  void launch_pred_mma_ks(const NnNet &nv, const NnPlanes<T> &pl, int off, const unsigned *qbuf, const unsigned *count, cudaStream_t st)
+  {
+    k_nn_pred_mma<T, KS><<<1024, 32 * MMA_WARPS, 0, st>>>(nv, pl, off, qbuf, count);
+  }
+
+  template <typename T>
+  void launch_pred_mma(const NnNet &nv, const NnPlanes<T> &pl, int off, const unsigned *qbuf, const unsigned *count, cudaStream_t st)
+  {
+    switch (nv.ks)
+    {
+    case 1: launch_pred_mma_ks<T, 1>(nv, pl, off, qbuf, count, st); break;
+    case 2: launch_pred_mma_ks<T, 2>(nv, pl, off, qbuf, count, st); break;
+    case 3: launch_pred_mma_ks<T, 3>(nv, pl, off, qbuf, count, st); break;
+    case 4: launch_pred_mma_ks<T, 4>(nv, pl, off, qbuf, count, st); break;
+    case 6: launch_pred_mma_ks<T, 6>(nv, pl, off, qbuf, count, st); break;
+    default: launch_pred_mma_ks<T, 9>(nv, pl, off, qbuf, count, st); break;
+    }
+  }
+
   template <typename T>
   T *upload(const T *src, size_t count)
   {
@@ -405,8 +621,13 @@ namespace
       const unsigned seq = nn_seq++;
       unsigned *count = counts + (seq & 1), *count_next = counts + ((seq + 1) & 1);
       k_nn_pre<T><<<grid, PRE_NT, 0, st>>>(nv, pl, off, qbuf, count, count_next);
-      const int nt = 64;
-      k_nn_pred<T><<<1024, nt, (size_t)nv.asize * nt * sizeof(T), st>>>(nv, pl, off, qbuf, count);
+      if (nv.mma)
+        launch_pred_mma<T>(nv, pl, off, qbuf, count, st);
+      else
+      {
+        const int nt = 64;
+        k_nn_pred<T><<<1024, nt, (size_t)nv.asize * nt * sizeof(T), st>>>(nv, pl, off, qbuf, count);
+      }
     });
     mvc::pipe_free(qbuf, qbytes); // stream-ordered reuse: later pipeline work only
     return 0;
@@ -438,6 +659,41 @@ extern "C" void *mvcuda_nnedi3_create(const MvCudaNnediParams *p)
     const unsigned r = p->rcp_tab ? p->rcp_tab[(u >> 12) & 2047u] - ((unsigned)e << 23) : 0;
     std::memcpy(&n->r_asize, &r, 4);
   }
+  // tensor core predictor on sm_80 and newer (MVCUDA_NNEDI3_MMA=0: the plain kernel)
+  {
+    int dev = 0, major = 0;
+    const char *ev = std::getenv("MVCUDA_NNEDI3_MMA");
+    n->ks = (n->asize + 31) / 32;
+    n->mma = ok && cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess
+      && major >= 8 && !(ev && ev[0] == '0') && (n->ks <= 4 || n->ks == 6 || n->ks == 9);
+    const int nns = n->nns, asize = n->asize, ks = n->ks;
+    for (int q = 0; q < p->qual && n->mma; q++)
+    {
+      const int16_t *w = (const int16_t *)p->pred_w[q]; // [2 * nns][asize]
+      std::vector<uint4> fr((size_t)(nns / 8) * 2 * ks * 32);
+      // 4 taps from k on as bytes (tap k in the lowest), high or low byte of the weights, 0 beyond asize
+      auto pack = [&](int neuron, int k, bool hi) {
+        unsigned u = 0;
+        for (int b = 0; b < 4; b++)
+        {
+          const int wv = k + b < asize ? w[(size_t)neuron * asize + k + b] : 0;
+          u |= (unsigned)((hi ? wv >> 8 : wv) & 255) << (8 * b);
+        }
+        return u;
+      };
+      for (int jt = 0; jt < nns / 8; jt++)
+        for (int part = 0; part < 2; part++)
+          for (int s = 0; s < ks; s++)
+            for (int lane = 0; lane < 32; lane++)
+            {
+              // B fragment of mma m16n8k32: b0 = taps 4t .. 4t + 3, b1 = taps 16 + 4t .., column (neuron) g
+              const int g = lane >> 2, t = lane & 3, neuron = part * nns + jt * 8 + g, k0 = s * 32 + 4 * t;
+              fr[(((size_t)jt * 2 + part) * ks + s) * 32 + lane] =
+                make_uint4(pack(neuron, k0, true), pack(neuron, k0 + 16, true), pack(neuron, k0, false), pack(neuron, k0 + 16, false));
+            }
+      ok = (n->pred_mma[q] = upload(fr.data(), fr.size())) != nullptr;
+    }
+  }
   if (!ok)
   {
     mvcuda_nnedi3_free(n);
@@ -461,6 +717,7 @@ extern "C" void mvcuda_nnedi3_free(void *net)
     cudaFree(n->pred_w[q]);
     cudaFree(n->pred_scale[q]);
     cudaFree(n->pred_bias[q]);
+    cudaFree(n->pred_mma[q]);
   }
   delete n;
 }
