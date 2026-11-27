@@ -5623,7 +5623,10 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
   // shorter than k_wave's (also the wide "bad vector" search, as k_wave). MVCUDA_WAVE_FIX=0: always k_wave.
   static const bool wf_allowed = [] { const char *e = getenv("MVCUDA_WAVE_FIX"); return !(e && e[0] == '0'); }();
   static const bool fix_allowed0 = [] { const char *e = getenv("MVCUDA_SEARCH_FIX"); return !(e && e[0] == '0'); }();
-  bool wf = wave && wf_allowed && fix_allowed0 && !use_pr;
+  // only for luma-only 16x16 blocks (k_search_fix<1, true>, the QTGMC search without ChromaMotion): the other block
+  // evaluators of this kernel need a stack frame on 12.0 and run slower than k_wave there (QTGMC Slower, ChromaMotion:
+  // HD 1.9 s with k_wave against 3.1 s), so they keep k_wave (same vectors)
+  bool wf = wave && wf_allowed && fix_allowed0 && !use_pr && ap->blk_x == 16 && ap->blk_y == 16 && !sp->chroma;
   for (int l = 0; l < nl && wf; l++)
   {
     const int type = lvl_type[l], radius = (l == 0) ? ap->pel_search : ap->search_param;
