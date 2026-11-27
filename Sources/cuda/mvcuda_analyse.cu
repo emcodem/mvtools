@@ -5916,7 +5916,12 @@ static int analyse_dev(const MvCudaSuperParams *sp, const MvCudaAnalyseParams *a
         wfc.freq = d_freq;
         {
           const size_t shm = 2 * ((size_t)a.bs_x * a.bs_y + 2 * (size_t)a.cw * a.ch) * sizeof(pix); // double-buffered source
+#if !MVC_ARCH_BELOW(700)
           const WfArg arg = { wfc };
+#else
+          // (host code: the device pass below 7.0 only parses it, with its placeholder WfArg; wf_lo == nl there)
+          const WfArg arg = {};
+#endif
           switch (fix_eval_id(a)) // the same for every level (block size, chroma and packed_s do not change)
           {
           case 1: k_wfix<1><<<nby[wf_lo], SEARCH_THREADS, shm, st>>>(arg); break;
