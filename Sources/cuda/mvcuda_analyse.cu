@@ -3675,8 +3675,18 @@ namespace
     }
   }
 
+  // CTAs per SM the search kernels are built for (registers): 3 where that costs no local memory and was measured to
+  // pay (luma-only 16x16 wavefront search, the QTGMC case: more searches of the concurrent frames resident at once, HD
+  // +6..11 % on 12.0), else 1 (the compiler's choice). k_search_fix<1, true> already fits 3 below 12.0; k_wfix there
+  // needs ~200 registers and would spill at 80.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define MVC_WFIX_MINB(EV) ((EV) == 1 ? 3 : 1)
+#else
+#define MVC_WFIX_MINB(EV) 1
+#endif
+#define MVC_SFIX_MINB(EV, WF) ((WF) && (EV) == 1 ? 3 : 1)
   template <int EV, bool WF = false>
-  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_search_fix(LevelArgs a)
+  __global__ void __launch_bounds__(SEARCH_THREADS, MVC_SFIX_MINB(EV, WF)) k_search_fix(LevelArgs a)
   {
     const int tid = threadIdx.x;
     int slice = blockIdx.x;
@@ -3744,7 +3754,7 @@ namespace
   };
 #endif
   template <int EV>
-  __global__ void __launch_bounds__(SEARCH_THREADS, 1) k_wfix(const MVC_GRID_CONSTANT WfArg arg)
+  __global__ void __launch_bounds__(SEARCH_THREADS, MVC_WFIX_MINB(EV)) k_wfix(const MVC_GRID_CONSTANT WfArg arg)
   {
 #if MVC_ARCH_BELOW(700)
     (void)arg;
